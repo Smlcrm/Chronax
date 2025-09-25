@@ -3,7 +3,7 @@ The base_forecaster class defines basic attributes and functionalities for all m
 
 Instance Attributes:
 1. alias; model name, declared in model's __init__
-2. conformal_params; a ConformalIntervals object, in statsforecast previously named prediction_intervals
+2. conformal_params; a conformal_intervals object, in statsforecast previously named prediction_intervals
 3. model_; stores fitted model post-training
 
 Class Attributes:
@@ -80,7 +80,7 @@ class base_forecaster:
          # safety checks
         if self.conformal_params is None:
             raise ValueError(
-                "The instance attribute conformal_params must be initialized as a conformalIntervals object."
+                "The instance attribute conformal_params must be initialized as a conformal_intervals object."
             )
         n_windows = self.conformal_params.n_windows
         h = self.conformal_params.h
