@@ -27,6 +27,7 @@ Methods:
 - Proper integration with base_forecaster's conformal prediction framework
 """
 
+import jax
 import jax.numpy as jnp
 from base_forecaster import base_forecaster
 from conformal_intervals import conformal_intervals
@@ -55,13 +56,16 @@ class Naive(base_forecaster):
         dictionary = {'mean': forecasts, 'fitted': fitted_vals, 'sigma': sigma, 'last_y': y[-1]}
         return dictionary
 
+    # JIT-compiled version for performance
+    _naive_core_jit = jax.jit(_naive_core.__func__, static_argnums=(1,))
+
     def fit(
         self,
         y: jnp.ndarray,
         X: jnp.ndarray | None = None,
     ):
         y = utils.ensure_float(y)
-        mod = Naive._naive_core(y, h=1)
+        mod = Naive._naive_core_jit(y, h=1)
         self.model_ = mod
         return self
 
@@ -143,7 +147,7 @@ class Naive(base_forecaster):
             dict: Dictionary with entries `mean` for point predictions and `level_*` for probabilistic predictions.
         """
         y = utils.ensure_float(y)
-        out = Naive._naive_core(y=y, h=h)
+        out = Naive._naive_core_jit(y=y, h=h)
         res = {"mean": out["mean"]}
 
         if fitted:
@@ -197,15 +201,10 @@ class Naive(base_forecaster):
 
     def _calculate_naive_intervals(self, res, level, h, sigmah):
         """Calculate native prediction intervals for naive model using JAX operations."""
-        from scipy.stats import norm
-
         level = sorted(level)
-        alphas = jnp.array([100 - lv for lv in level])
-        z_scores = jnp.array([norm.ppf(0.5 + lv / 200) for lv in level])
+        z_scores = jnp.array([utils._jax_norm_ppf(0.5 + lv / 200) for lv in level])
 
         mean = res["mean"]
-
-        # Calculate intervals: mean ± z_score * sigmah
         intervals = {}
 
         # Lower bounds (in reverse order to match statsforecast convention)
@@ -222,14 +221,12 @@ class Naive(base_forecaster):
 
     def _add_naive_fitted_intervals(self, res, se, level):
         """Add fitted prediction intervals for naive model."""
-        from scipy.stats import norm
-
         level = sorted(level)
         fitted = res["fitted"]
 
         # For fitted intervals, use constant standard error
         for lv in level:
-            z = norm.ppf(0.5 + lv / 200)
+            z = utils._jax_norm_ppf(0.5 + lv / 200)
             res[f"fitted-lo-{lv}"] = fitted - z * se
             res[f"fitted-hi-{lv}"] = fitted + z * se
 
