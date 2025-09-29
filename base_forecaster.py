@@ -46,7 +46,7 @@ import jax.numpy as jnp
 import utils
 from jax import vmap
 
-class base_forecaster:
+class BaseForecaster:
     uses_exog = False
 
     def new(self):
