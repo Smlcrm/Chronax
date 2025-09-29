@@ -7,7 +7,7 @@ Instance Attributes
 3. method
 """
 
-class conformal_intervals:
+class ConformalIntervals:
     # __slots__ = ('n_windows, 'h')
     def __init__(
         self,
