@@ -32,31 +32,11 @@ Methods:
 - Proper integration with base_forecaster's conformal prediction framework
 """
 
+import jax
 import jax.numpy as jnp
 from base_forecaster import base_forecaster
 from conformal_intervals import conformal_intervals
 import utils
-
-def _jax_norm_ppf(p):
-    """JAX implementation of normal percent point function (inverse CDF).
-
-    Uses Beasley-Springer-Moro approximation for the inverse normal CDF.
-    """
-    # Clamp p to avoid numerical issues
-    p = jnp.clip(p, 1e-10, 1 - 1e-10)
-
-    # For p > 0.5, use symmetry
-    sign = jnp.where(p > 0.5, 1.0, -1.0)
-    p_adj = jnp.where(p > 0.5, p, 1.0 - p)
-
-    # Beasley-Springer-Moro approximation
-    c0, c1, c2 = 2.515517, 0.802853, 0.010328
-    d1, d2, d3 = 1.432788, 0.189269, 0.001308
-
-    t = jnp.sqrt(-2 * jnp.log(1 - p_adj))
-    z = t - (c0 + c1 * t + c2 * t**2) / (1 + d1 * t + d2 * t**2 + d3 * t**3)
-
-    return sign * z
 
 class RandomWalkWithDrift(base_forecaster):
     def __init__(
@@ -106,6 +86,9 @@ class RandomWalkWithDrift(base_forecaster):
         }
         return dictionary
 
+    # JIT-compiled version for performance
+    _rwd_core_jit = jax.jit(_rwd_core.__func__, static_argnums=(1,))
+
     def fit(self, y: jnp.ndarray):
         """Fit the RandomWalkWithDrift model.
 
@@ -116,7 +99,7 @@ class RandomWalkWithDrift(base_forecaster):
             self: Fitted RandomWalkWithDrift model
         """
         y = utils.ensure_float(y)
-        mod = RandomWalkWithDrift._rwd_core(y, h=1)
+        mod = RandomWalkWithDrift._rwd_core_jit(y, h=1)
         self.model_ = mod
         return self
 
@@ -191,7 +174,7 @@ class RandomWalkWithDrift(base_forecaster):
             dict: Dictionary with entries `mean` for point predictions and `level_*` for probabilistic predictions
         """
         y = utils.ensure_float(y)
-        out = RandomWalkWithDrift._rwd_core(y=y, h=h)
+        out = RandomWalkWithDrift._rwd_core_jit(y=y, h=h)
         res = {"mean": out["mean"]}
 
         if fitted:
@@ -218,22 +201,25 @@ class RandomWalkWithDrift(base_forecaster):
 
     def _calculate_rwd_intervals(self, res, level, h, sigmah):
         """Calculate native prediction intervals for random walk with drift using JAX operations."""
-        z_scores = jnp.array([_jax_norm_ppf(0.5 + lv / 200) for lv in level])
-
+        z_scores = jnp.array([utils._jax_norm_ppf(0.5 + lv / 200) for lv in level])
         mean = res["mean"]
 
-        # Calculate intervals: mean ± z_score * sigmah
-        intervals = {}
+        # Vectorized computation of all intervals at once
+        z_lower = z_scores[::-1]  # Reverse for lower bounds
+        z_upper = z_scores
 
-        # Lower bounds (in reverse order to match statsforecast convention)
+        # Broadcasting: mean (h,) with z_scores (n_levels,) -> (h, n_levels)
+        lower_bounds = mean[:, None] - z_lower * sigmah[:, None]
+        upper_bounds = mean[:, None] + z_upper * sigmah[:, None]
+
+        intervals = {}
+        # Lower bounds (reversed level order)
         for i, lv in enumerate(reversed(level)):
-            z = z_scores[len(level) - 1 - i]
-            intervals[f"lo-{lv}"] = mean - z * sigmah
+            intervals[f"lo-{lv}"] = lower_bounds[:, i]
 
         # Upper bounds
         for i, lv in enumerate(level):
-            z = z_scores[i]
-            intervals[f"hi-{lv}"] = mean + z * sigmah
+            intervals[f"hi-{lv}"] = upper_bounds[:, i]
 
         return intervals
 
@@ -243,7 +229,7 @@ class RandomWalkWithDrift(base_forecaster):
 
         # For fitted intervals, use constant standard error
         for lv in level:
-            z = _jax_norm_ppf(0.5 + lv / 200)
+            z = utils._jax_norm_ppf(0.5 + lv / 200)
             res[f"fitted-lo-{lv}"] = fitted - z * se
             res[f"fitted-hi-{lv}"] = fitted + z * se
 
