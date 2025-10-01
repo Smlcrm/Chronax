@@ -75,7 +75,8 @@ def _ensure_float(x: jnp.ndarray) -> jnp.ndarray:
         x = x.astype(jnp.float32)
     return x
 
-# Classes
+# Classes 
+#Can remove ConformalIntervals
 class ConformalIntervals:
     """Class for storing conformal intervals metadata information.
 
