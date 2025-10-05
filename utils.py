@@ -6,6 +6,7 @@
 
 import jax
 import jax.numpy as jnp
+from typing import Dict
 
 def ensure_float(y: jnp.ndarray) -> jnp.ndarray:
     if not jnp.issubdtype(y.dtype, jnp.floating):
@@ -150,3 +151,60 @@ def _repeat_val_seas(season_vals: jnp.ndarray, h: int) -> jnp.ndarray:
     import math
     repeats = math.ceil(h / season_vals.size)
     return jnp.tile(season_vals, repeats)[:h]
+
+def _seasonal_naive(
+    y,
+    h: int,
+    season_length: int,
+    fitted: bool = False,
+) -> Dict[str, jnp.ndarray]:
+    """
+    JAX implementation of seasonal-naive forecast.
+    
+    Args:
+        y: 1-D array-like (length T). Will be converted to jax array (float32).
+        h: forecast horizon (int >= 1)
+        season_length: seasonal period m (int >= 1)
+        fitted: if True, also return in-sample fitted values
+        
+    Returns:
+        dict with keys:
+          - "mean": jnp.ndarray shape (h,)
+          - optionally "fitted": jnp.ndarray shape (T,)
+    """
+    # convert input to jax array float32
+    y_j = jnp.asarray(y, dtype=jnp.float32).squeeze()
+    if y_j.ndim != 1:
+        raise ValueError("y must be a 1-D array")
+    T = y_j.shape[0]
+    m = int(season_length)
+    if m <= 0:
+        raise ValueError("season_length must be a positive integer")
+    if T < m:
+        raise ValueError(f"Series length T={T} must be at least season_length={m}")
+    if not isinstance(h, int) or h < 1:
+        raise ValueError("h must be a positive integer")
+
+    # last m observations (shape (m,))
+    last_m = y_j[-m:]
+
+    # build mean forecast by cycling through last_m
+    idx = jnp.arange(h) % m            # shape (h,)
+    mean = last_m[idx]                 # shape (h,)
+
+    out = {"mean": mean}
+
+    if fitted:
+        # build fitted array: NaN for first m entries, and y[0:T-m] mapped to positions m..T-1
+        fitted = jnp.full((T,), jnp.nan, dtype=jnp.float32)
+        # values to place: y[0 : T-m]
+        vals = y_j[: T - m]
+        # scatter assignment into fitted at positions m..T-1
+        positions = jnp.arange(m, T)
+        fitted = fitted.at[positions].set(vals)
+        out["fitted"] = fitted
+
+    return out
+
+# Optional: jitted wrapper (uncomment to use)
+# _seasonal_naive_jit = jax.jit(_seasonal_naive, static_argnums=(1,2,3))

@@ -7,21 +7,21 @@ Original file is located at
     https://colab.research.google.com/drive/1GmVsifwEYOo8gPmDAXqttEX_qyBX8Fcz
 """
 
-!pip install statsforecast
-
 # Import packages
 import jax
 import jax.numpy as jnp
 from jax import jit
 from typing import Optional, List, Dict, Union
-from statsforecast.utils import (
-    ConformalIntervals,
+from utils import (
     _seasonal_naive,
     _repeat_val_seas,
-    _ensure_float,
-    _calculate_sigma,
+    ensure_float,
+    calculate_sigma,
     _calculate_intervals,
     _quantiles
+)
+from conformal_intervals import (
+    ConformalIntervals
 )
 
 # Helper Functions
