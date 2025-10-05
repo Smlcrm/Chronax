@@ -220,31 +220,33 @@ def _add_fitted_pi(res, se, level):
     return res
 
 def _add_conformal_distribution_intervals(
-    fcst: Dict,
+    fcst: dict,
     cs: jnp.ndarray,
-    level: List[Union[int, float]],
-) -> Dict:
-    r"""
-    Adds conformal intervals to the `fcst` dict based on conformal scores `cs`.
-    `level` should be already sorted. This strategy creates forecasts paths
-    based on errors and calculate quantiles using those paths.
+    level: list[float] | list[int],
+) -> dict:
     """
-    alphas = [100 - lv for lv in level]
-    cuts = [alpha / 200 for alpha in reversed(alphas)]
-    cuts.extend(1 - alpha / 200 for alpha in alphas)
-    mean = fcst["mean"].reshape(1, -1)
-    scores = jnp.vstack([mean - cs, mean + cs])
-    quantiles = jnp.quantile(
-        scores,
-        cuts,
-        axis=0,
-    )
-    quantiles = quantiles.reshape(len(cuts), -1)
+    Adds conformal intervals to the `fcst` dict based on conformal scores `cs`.
+    `level` should be already sorted. This strategy creates forecast paths
+    based on errors and calculates quantiles using those paths.
+    """
+    level = sorted(level)
+    alphas = jnp.array([100 - lv for lv in level], dtype=jnp.float32)
+    cuts_lower = (alphas / 200.0)[::-1]          # lower cuts reversed
+    cuts_upper = 1.0 - (alphas / 200.0)         # upper cuts
+    cuts = jnp.concatenate([cuts_lower, cuts_upper])
+
+    mean = fcst["mean"].reshape(1, -1)          # 2D: 1 x horizon
+    scores = jnp.vstack([mean - cs, mean + cs]) # shape: 2 x horizon
+    quantiles = jnp.quantile(scores, cuts, axis=0)
+
+    # generate column names
     lo_cols = [f"lo-{lv}" for lv in reversed(level)]
     hi_cols = [f"hi-{lv}" for lv in level]
     out_cols = lo_cols + hi_cols
+
     for i, col in enumerate(out_cols):
         fcst[col] = quantiles[i]
+
     return fcst
 
 def _get_conformal_method(method: str):
@@ -263,48 +265,44 @@ def _get_conformal_method(method: str):
 # _seasonal_naive_jit = jax.jit(_seasonal_naive, static_argnums=(1,2,3))
 
 @jax.jit
-def _ses_forecast(x: jnp.ndarray, alpha: float) -> Tuple[float, jnp.ndarray]:
-    r"""Compute the one-step ahead forecast for a simple exponential smoothing fit.
-
-    Args:
-        x (numpy.array): Clean time series of shape (n, ).
-        alpha (float): Smoothing parameter.
-
-    Returns:
-        tuple of (float, numpy.array): One-step ahead forecast and in-sample fitted values.
-    """
+def _ses_forecast(x, alpha):
     complement = 1 - alpha
-    fitted = jnp.empty_like(x)
-    fitted = fitted.at[0].set(x[0])
-    j = 0
+    n = x.size
+    fitted = jnp.full_like(x, jnp.nan)
+    fitted = fitted.at[0].set(x[0])  # first value
 
-    for i in range(1, len(x)):
-        fitted[i] = alpha * x[j] + complement * fitted[j]
+    def body_fun(i, val):
+        fitted_arr, j = val
+        fitted_arr = fitted_arr.at[i].set(alpha * x[j] + complement * fitted_arr[j])
         j += 1
+        return fitted_arr, j
 
-    forecast = alpha * x[j] + complement * fitted[j]
-    fitted[0] = jnp.nan
+    fitted, _ = jax.lax.fori_loop(1, n, body_fun, (fitted, 0))
+    forecast = alpha * x[-1] + complement * fitted[-1]
+    fitted = fitted.at[0].set(jnp.nan)  # match original behavior
     return forecast, fitted
 
 
-def _seasonal_exponential_smoothing(
-    y: jnp.ndarray,  # time series
-    h: int,  # forecasting horizon
-    fitted: bool,  # fitted values
-    season_length: int,  # length of season
-    alpha: float,  # smoothing parameter
-) -> Dict[str, jnp.ndarray]:
+def _seasonal_exponential_smoothing(y, h, fitted, season_length, alpha):
     n = y.size
     if n < season_length:
         return {"mean": jnp.full(h, jnp.nan, dtype=y.dtype)}
-    season_vals = jnp.empty(season_length, dtype=y.dtype)
+
+    season_vals = jnp.full((season_length,), jnp.nan, dtype=y.dtype)
     fitted_vals = jnp.full_like(y, jnp.nan)
+
     for i in range(season_length):
         init_idx = i + n % season_length
-        season_vals[i], fitted_vals[init_idx::season_length] = _ses_forecast(
-            y[init_idx::season_length], alpha
-        )
-    out = _repeat_val_seas(season_vals=season_vals, h=h)
+        x = y[init_idx::season_length]  # Python slice, works fine
+
+        forecast, fitted_season = _ses_forecast(x, alpha)
+
+        season_vals = season_vals.at[i].set(forecast)
+
+        for k in range(fitted_season.size):
+            fitted_vals = fitted_vals.at[init_idx + k * season_length].set(fitted_season[k])
+
+    out = _repeat_val_seas(season_vals, h)
     fcst = {"mean": out}
     if fitted:
         fcst["fitted"] = fitted_vals
@@ -315,11 +313,11 @@ def _conformal_method(self):
 
 def _store_cs(self, y, X):
     if self.prediction_intervals is not None:
-        self._cs = self._conformity_scores(y, X)
+        self._cs = self.conformity_scores(y, X)
 
 def _add_conformal_intervals(self, fcst, y, X, level):
     if self.prediction_intervals is not None and level is not None:
-        cs = self._conformity_scores(y, X) if y is not None else self._cs
+        cs = self.conformity_scores(y, X) if y is not None else self._cs
         res = self._conformal_method(fcst=fcst, cs=cs, level=level)
         return res
     return fcst

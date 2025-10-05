@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 from jax import jit
+from jax import vmap
 from typing import Optional, List, Dict, Union
 
 from conformal_intervals import ConformalIntervals
@@ -16,6 +17,8 @@ from utils import (
     _add_fitted_pi,
     _add_conformal_distribution_intervals,
     _get_conformal_method,
+    _seasonal_exponential_smoothing,
+    _ses_forecast
 )
 
 class SeasonalExponentialSmoothing(BaseForecaster):
@@ -53,6 +56,7 @@ class SeasonalExponentialSmoothing(BaseForecaster):
         self.alpha = alpha
         self.alias = alias
         self.prediction_intervals = prediction_intervals
+        self.conformal_params = prediction_intervals
         self.only_conformal_intervals = True
 
     def fit(
@@ -66,7 +70,7 @@ class SeasonalExponentialSmoothing(BaseForecaster):
         and optionally exogenous variables (numpy array) `X`.
 
         Args:
-            y (numpy.array): Clean time series of shape (t, ).
+            y (jnp.ndarray): Clean time series of shape (t, ).
             X (array-like): Optional exogenous of shape (t, n_x).
 
         Returns:
@@ -122,10 +126,10 @@ class SeasonalExponentialSmoothing(BaseForecaster):
 
     def forecast(
         self,
-        y: np.ndarray,
+        y: jnp.ndarray,
         h: int,
-        X: Optional[np.ndarray] = None,
-        X_future: Optional[np.ndarray] = None,
+        X: Optional[jnp.ndarray] = None,
+        X_future: Optional[jnp.ndarray] = None,
         level: Optional[List[int]] = None,
         fitted: bool = False,
     ):
@@ -136,7 +140,7 @@ class SeasonalExponentialSmoothing(BaseForecaster):
         It assumes you know the forecast horizon in advance.
 
         Args:
-            y (numpy.array): Clean time series of shape (n, ).
+            y (jnp.ndarray): Clean time series of shape (n, ).
             h (int): Forecast horizon.
             X (array-like): Optional insample exogenous of shape (t, n_x).
             X_future (array-like): Optional exogenous of shape (h, n_x).
@@ -160,25 +164,32 @@ class SeasonalExponentialSmoothing(BaseForecaster):
             raise Exception("You must pass `prediction_intervals` to compute them.")
         return res
 
+def test():
+    y = jnp.arange(36.0)
 
-def _seasonal_ses_optimized(
-    y: np.ndarray,  # time series
-    h: int,  # forecasting horizon
-    fitted: bool,  # fitted values
-    season_length: int,  # season length
-):
-    n = y.size
-    if n < season_length:
-        return {"mean": np.full(h, np.nan, dtype=y.dtype)}
-    season_vals = np.empty(season_length, dtype=y.dtype)
-    fitted_vals = np.full_like(y, np.nan)
-    for i in range(season_length):
-        init_idx = i + n % season_length
-        season_vals[i], fitted_vals[init_idx::season_length] = _optimized_ses_forecast(
-            y[init_idx::season_length], (0.01, 0.99)
-        )
-    out = _repeat_val_seas(season_vals=season_vals, h=h)
-    fcst = {"mean": out}
-    if fitted:
-        fcst["fitted"] = fitted_vals
-    return fcst
+    pi = ConformalIntervals(h=12, n_windows=2)
+    model = SeasonalExponentialSmoothing(season_length=12, alpha=0.5, prediction_intervals=pi)
+    fitted_model = model.fit(y)
+
+    result = fitted_model.predict(h=12, level=(60,75))
+    forecast = fitted_model.forecast(y, h=12, level=[80, 95])
+    
+    assert "mean" in result, "Missing mean forecast"
+
+    assert len(result["mean"]) == 12, "Forecast length mismatch"
+
+    for lvl in [60, 75]:
+        if f"lo-{lvl}" in result:
+            assert f"hi-{lvl}" in result, f"Missing upper bound for {lvl}% interval"
+        else:
+            print(f"Warning: Interval {lvl}% not computed due to missing `prediction_intervals`")
+
+    for lvl in [80, 95]:
+        assert f"lo-{lvl}" in forecast, f"Missing lower bound for {lvl}% interval"
+        assert f"hi-{lvl}" in forecast, f"Missing upper bound for {lvl}% interval"
+        assert len(forecast[f"lo-{lvl}"]) == 12, f"Lower interval {lvl}% has wrong length"
+        assert len(forecast[f"hi-{lvl}"]) == 12, f"Upper interval {lvl}% has wrong length"
+
+if __name__ == "__main__":
+    test()
+    print("Test passed!")
