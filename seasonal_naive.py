@@ -18,64 +18,14 @@ from utils import (
     ensure_float,
     calculate_sigma,
     _calculate_intervals,
-    _quantiles
+    _quantiles,
+    _add_fitted_pi,
+    _add_conformal_distribution_intervals,
+    _get_conformal_method,
 )
 from conformal_intervals import (
     ConformalIntervals
 )
-
-# Helper Functions
-def _add_fitted_pi(res, se, level):
-    level = sorted(level)
-    level = jnp.asarray(level)
-    quantiles = _quantiles(level=level)
-    lo = res["fitted"].reshape(-1, 1) - quantiles * se.reshape(-1, 1)
-    hi = res["fitted"].reshape(-1, 1) + quantiles * se.reshape(-1, 1)
-    lo = lo[:, ::-1]
-    lo = {f"fitted-lo-{l}": lo[:, i] for i, l in enumerate(reversed(level))}
-    hi = {f"fitted-hi-{l}": hi[:, i] for i, l in enumerate(level)}
-    res = {**res, **lo, **hi}
-    return res
-
-def _add_conformal_distribution_intervals(
-    fcst: Dict,
-    cs: jnp.ndarray,
-    level: List[Union[int, float]],
-) -> Dict:
-    r"""
-    Adds conformal intervals to the `fcst` dict based on conformal scores `cs`.
-    `level` should be already sorted. This strategy creates forecasts paths
-    based on errors and calculate quantiles using those paths.
-    """
-    alphas = [100 - lv for lv in level]
-    cuts = [alpha / 200 for alpha in reversed(alphas)]
-    cuts.extend(1 - alpha / 200 for alpha in alphas)
-    mean = fcst["mean"].reshape(1, -1)
-    scores = jnp.vstack([mean - cs, mean + cs])
-    quantiles = jnp.quantile(
-        scores,
-        cuts,
-        axis=0,
-    )
-    quantiles = quantiles.reshape(len(cuts), -1)
-    lo_cols = [f"lo-{lv}" for lv in reversed(level)]
-    hi_cols = [f"hi-{lv}" for lv in level]
-    out_cols = lo_cols + hi_cols
-    for i, col in enumerate(out_cols):
-        fcst[col] = quantiles[i]
-    return fcst
-
-def _get_conformal_method(method: str):
-    available_methods = {
-        "conformal_distribution": _add_conformal_distribution_intervals,
-        # "conformal_error": _add_conformal_error_intervals,
-    }
-    if method not in available_methods.keys():
-        raise ValueError(
-            f"prediction intervals method {method} not supported "
-            f"please choose one of {', '.join(available_methods.keys())}"
-        )
-    return available_methods[method]
 
 # _TS class
 class _TS:
