@@ -6,7 +6,7 @@
 
 import jax
 import jax.numpy as jnp
-from typing import Optional, List, Dict, Union
+from typing import Optional, List, Dict, Union, Tuple
 
 def ensure_float(y: jnp.ndarray) -> jnp.ndarray:
     if not jnp.issubdtype(y.dtype, jnp.floating):
@@ -63,41 +63,42 @@ def _quantiles(level: list[int | float]) -> jnp.ndarray:
     Returns:
         Array of z-scores corresponding to each level
     """
-    level_arr = jnp.asarray(level, jnp.float32)
+    level_arr = jnp.atleast_1d(jnp.asarray(level, jnp.float32))
     p = 0.5 + (level_arr / 200.0)
     return jax.vmap(_jax_norm_ppf)(p)
 
-
 def _calculate_intervals(
-    mean: jnp.ndarray, 
-    sigmah: jnp.ndarray | float, 
-    level: list[int]
+    res: dict,
+    level: list[int],
+    h: int,
+    sigmah: jnp.ndarray | float
 ) -> dict:
     """
-    Calculate NATIVE (non-conformal) prediction intervals using normal quantiles.
-    JAX equivalent of statsforecast.utils._calculate_intervals()
-    
-    Args:
-        mean: Point forecasts of shape (h,)
-        sigmah: Standard error for predictions (scalar or array)
-        level: Sorted list of confidence levels
-        
-    Returns:
-        Dictionary with 'lo-XX' and 'hi-XX' keys for each level
+    Calculate native (non-conformal) prediction intervals using normal quantiles.
+    Compatible with SeasonalNaive.predict() calls.
     """
-    z = _quantiles(level)
-    # Broadcast to shape (h, len(level))
-    lo = mean[:, None] - z[None, :] * sigmah
-    hi = mean[:, None] + z[None, :] * sigmah
-    
+    # Ensure mean is a JAX array
+    mean = jnp.asarray(res["mean"], dtype=jnp.float32)
+
+    sigmah = jnp.asarray(sigmah, dtype=jnp.float32)
+
+    if sigmah.ndim == 0:
+        sigmah = jnp.ones(h, dtype=jnp.float32) * sigmah
+    elif sigmah.shape[0] != h:
+        raise ValueError(f"sigmah shape {sigmah.shape} does not match h={h}")
+
+    z = jnp.asarray(_quantiles(level), dtype=jnp.float32)
+
+    lo = mean[:, None] - sigmah[:, None] * z[None, :]
+    hi = mean[:, None] + sigmah[:, None] * z[None, :]
+
     out = {}
-    # Add intervals in correct order (reversed for lo, normal for hi)
     for i, lv in enumerate(level[::-1]):
         out[f"lo-{int(lv)}"] = lo[:, len(level) - 1 - i]
     for i, lv in enumerate(level):
         out[f"hi-{int(lv)}"] = hi[:, i]
-    return out
 
+    return out
 
 def _add_fitted_pi(
     fitted: jnp.ndarray, 
@@ -260,3 +261,68 @@ def _get_conformal_method(method: str):
 
 # Optional: jitted wrapper (uncomment to use)
 # _seasonal_naive_jit = jax.jit(_seasonal_naive, static_argnums=(1,2,3))
+
+@jax.jit
+def _ses_forecast(x: jnp.ndarray, alpha: float) -> Tuple[float, jnp.ndarray]:
+    r"""Compute the one-step ahead forecast for a simple exponential smoothing fit.
+
+    Args:
+        x (numpy.array): Clean time series of shape (n, ).
+        alpha (float): Smoothing parameter.
+
+    Returns:
+        tuple of (float, numpy.array): One-step ahead forecast and in-sample fitted values.
+    """
+    complement = 1 - alpha
+    fitted = jnp.empty_like(x)
+    fitted = fitted.at[0].set(x[0])
+    j = 0
+
+    for i in range(1, len(x)):
+        fitted[i] = alpha * x[j] + complement * fitted[j]
+        j += 1
+
+    forecast = alpha * x[j] + complement * fitted[j]
+    fitted[0] = jnp.nan
+    return forecast, fitted
+
+
+def _seasonal_exponential_smoothing(
+    y: jnp.ndarray,  # time series
+    h: int,  # forecasting horizon
+    fitted: bool,  # fitted values
+    season_length: int,  # length of season
+    alpha: float,  # smoothing parameter
+) -> Dict[str, jnp.ndarray]:
+    n = y.size
+    if n < season_length:
+        return {"mean": jnp.full(h, jnp.nan, dtype=y.dtype)}
+    season_vals = jnp.empty(season_length, dtype=y.dtype)
+    fitted_vals = jnp.full_like(y, jnp.nan)
+    for i in range(season_length):
+        init_idx = i + n % season_length
+        season_vals[i], fitted_vals[init_idx::season_length] = _ses_forecast(
+            y[init_idx::season_length], alpha
+        )
+    out = _repeat_val_seas(season_vals=season_vals, h=h)
+    fcst = {"mean": out}
+    if fitted:
+        fcst["fitted"] = fitted_vals
+    return fcst
+
+def _conformal_method(self):
+        return _get_conformal_method(self.prediction_intervals.method)
+
+def _store_cs(self, y, X):
+    if self.prediction_intervals is not None:
+        self._cs = self._conformity_scores(y, X)
+
+def _add_conformal_intervals(self, fcst, y, X, level):
+    if self.prediction_intervals is not None and level is not None:
+        cs = self._conformity_scores(y, X) if y is not None else self._cs
+        res = self._conformal_method(fcst=fcst, cs=cs, level=level)
+        return res
+    return fcst
+
+def _add_predict_conformal_intervals(self, fcst, level):
+    return self._add_conformal_intervals(fcst=fcst, y=None, X=None, level=level)
