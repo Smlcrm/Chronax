@@ -1,56 +1,24 @@
 import jax
 import jax.numpy as jnp
 from jax import jit
+from typing import Optional, List, Dict, Union
 
-from conformal_intervals import (
-    ConformalIntervals
+from conformal_intervals import ConformalIntervals
+from base_forecaster import BaseForecaster
+
+from utils import (
+    _seasonal_naive,
+    _repeat_val_seas,
+    ensure_float,
+    calculate_sigma,
+    _calculate_intervals,
+    _quantiles,
+    _add_fitted_pi,
+    _add_conformal_distribution_intervals,
+    _get_conformal_method,
 )
 
-# _TS class
-class _TS:
-    uses_exog = False
-
-    def new(self):
-        b = type(self).__new__(type(self))
-        b.__dict__.update(self.__dict__)
-        return b
-
-    def __repr__(self):
-        return self.alias
-
-    def _conformity_scores(
-        self,
-        y: jnp.ndarray,
-        X: Optional[jnp.ndarray] = None,
-    ) -> jnp.ndarray:
-        y = ensure_float(y)
-        n_windows = self.prediction_intervals.n_windows  # type: ignore[attr-defined]
-        h = self.prediction_intervals.h  # type_ignore[attr-defined]
-        n_samples = y.size
-        # use as many windows as possible for short series
-        # subtract 1 for the training set
-        n_windows = min(n_windows, (n_samples - 1) // h)
-        if n_windows < 2:
-            raise ValueError(
-                f"Prediction intervals settings require at least {2 * h + 1:,} samples, serie has {n_samples:,}."
-            )
-        test_size = n_windows * h
-        cs = jnp.empty((n_windows, h), dtype=y.dtype)
-        for i_window in range(n_windows):
-            train_end = n_samples - test_size + i_window * h
-            y_train = y[:train_end]
-            y_test = y[train_end : train_end + h]
-            if X is not None:
-                X_train = X[:train_end]
-                X_test = X[train_end : train_end + h]
-            else:
-                X_train = None
-                X_test = None
-            fcst_window = self.forecast(h=h, y=y_train, X=X_train, X_future=X_test)  # type_ignore[attr-defined]
-            cs = cs.at[i_window].set(jnp.abs(fcst_window["mean"] - y_test))
-        return cs
-
-class SeasonalExponentialSmoothing(_TS):
+class SeasonalExponentialSmoothing(BaseForecaster):
     r"""SeasonalExponentialSmoothing model.
 
     Uses a weighted average of all past observations where the weights decrease exponentially into the past.
@@ -89,8 +57,8 @@ class SeasonalExponentialSmoothing(_TS):
 
     def fit(
         self,
-        y: np.ndarray,
-        X: Optional[np.ndarray] = None,
+        y: jnp.ndarray,
+        X: Optional[jnp.ndarray] = None,
     ):
         r"""Fit the SeasonalExponentialSmoothing model.
 
@@ -104,7 +72,7 @@ class SeasonalExponentialSmoothing(_TS):
         Returns:
             SeasonalExponentialSmoothing: SeasonalExponentialSmoothing fitted model.
         """
-        y = _ensure_float(y)
+        y = ensure_float(y)
         mod = _seasonal_exponential_smoothing(
             y=y,
             season_length=self.season_length,
@@ -119,7 +87,7 @@ class SeasonalExponentialSmoothing(_TS):
     def predict(
         self,
         h: int,
-        X: Optional[np.ndarray] = None,
+        X: Optional[jnp.ndarray] = None,
         level: Optional[List[int]] = None,
     ):
         r"""Predict with fitted SeasonalExponentialSmoothing.
@@ -178,7 +146,7 @@ class SeasonalExponentialSmoothing(_TS):
         Returns:
             dict: Dictionary with entries `mean` for point predictions and `level_*` for probabilistic predictions.
         """
-        y = _ensure_float(y)
+        y = ensure_float(y)
         res = _seasonal_exponential_smoothing(
             y=y, h=h, fitted=fitted, alpha=self.alpha, season_length=self.season_length
         )

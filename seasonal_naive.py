@@ -23,74 +23,11 @@ from utils import (
     _add_conformal_distribution_intervals,
     _get_conformal_method,
 )
-from conformal_intervals import (
-    ConformalIntervals
-)
-
-# _TS class
-class _TS:
-    uses_exog = False
-
-    def new(self):
-        b = type(self).__new__(type(self))
-        b.__dict__.update(self.__dict__)
-        return b
-
-    def __repr__(self):
-        return self.alias
-
-    def _conformity_scores(
-        self,
-        y: jnp.ndarray,
-        X: Optional[jnp.ndarray] = None,
-    ) -> jnp.ndarray:
-        y = ensure_float(y)
-        n_windows = self.prediction_intervals.n_windows  # type: ignore[attr-defined]
-        h = self.prediction_intervals.h  # type_ignore[attr-defined]
-        n_samples = y.size
-        # use as many windows as possible for short series
-        # subtract 1 for the training set
-        n_windows = min(n_windows, (n_samples - 1) // h)
-        if n_windows < 2:
-            raise ValueError(
-                f"Prediction intervals settings require at least {2 * h + 1:,} samples, serie has {n_samples:,}."
-            )
-        test_size = n_windows * h
-        cs = jnp.empty((n_windows, h), dtype=y.dtype)
-        for i_window in range(n_windows):
-            train_end = n_samples - test_size + i_window * h
-            y_train = y[:train_end]
-            y_test = y[train_end : train_end + h]
-            if X is not None:
-                X_train = X[:train_end]
-                X_test = X[train_end : train_end + h]
-            else:
-                X_train = None
-                X_test = None
-            fcst_window = self.forecast(h=h, y=y_train, X=X_train, X_future=X_test)  # type_ignore[attr-defined]
-            cs = cs.at[i_window].set(jnp.abs(fcst_window["mean"] - y_test))
-        return cs
-
-    @property
-    def _conformal_method(self):
-        return _get_conformal_method(self.prediction_intervals.method)
-
-    def _store_cs(self, y, X):
-        if self.prediction_intervals is not None:
-            self._cs = self._conformity_scores(y, X)
-
-    def _add_conformal_intervals(self, fcst, y, X, level):
-        if self.prediction_intervals is not None and level is not None:
-            cs = self._conformity_scores(y, X) if y is not None else self._cs
-            res = self._conformal_method(fcst=fcst, cs=cs, level=level)
-            return res
-        return fcst
-
-    def _add_predict_conformal_intervals(self, fcst, level):
-        return self._add_conformal_intervals(fcst=fcst, y=None, X=None, level=level)
+from conformal_intervals import ConformalIntervals
+from base_forecaster import BaseForecaster
 
 # JAX SeasonalNaive Class
-class SeasonalNaive(_TS):
+class SeasonalNaive(BaseForecaster):
     def __init__(
         self,
         season_length: int,

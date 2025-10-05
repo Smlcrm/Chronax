@@ -46,6 +46,8 @@ import jax.numpy as jnp
 import utils
 from jax import vmap
 
+from utils import _get_conformal_method
+
 class BaseForecaster:
     uses_exog = False
 
@@ -155,3 +157,20 @@ class BaseForecaster:
             raise ValueError(f"{method} is not valid. Choose from {str(allowed_methods)[1:-1]}")
         
         return allowed_methods[method](fcst, cs, level)
+    @property
+    def _conformal_method(self):
+        return _get_conformal_method(self.prediction_intervals.method)
+
+    def _store_cs(self, y, X):
+        if self.prediction_intervals is not None:
+            self._cs = self._conformity_scores(y, X)
+
+    def _add_conformal_intervals(self, fcst, y, X, level):
+        if self.prediction_intervals is not None and level is not None:
+            cs = self._conformity_scores(y, X) if y is not None else self._cs
+            res = self._conformal_method(fcst=fcst, cs=cs, level=level)
+            return res
+        return fcst
+
+    def _add_predict_conformal_intervals(self, fcst, level):
+        return self._add_conformal_intervals(fcst=fcst, y=None, X=None, level=level)
