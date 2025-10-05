@@ -94,7 +94,7 @@ class _TS:
         y: jnp.ndarray,
         X: Optional[jnp.ndarray] = None,
     ) -> jnp.ndarray:
-        y = _ensure_float(y)
+        y = ensure_float(y)
         n_windows = self.prediction_intervals.n_windows  # type: ignore[attr-defined]
         h = self.prediction_intervals.h  # type_ignore[attr-defined]
         n_samples = y.size
@@ -181,7 +181,7 @@ class SeasonalNaive(_TS):
         Returns:
             self: SeasonalNaive fitted model.
         r"""
-        y = _ensure_float(y)
+        y = ensure_float(y)
         mod = _seasonal_naive(
             y=y,
             season_length=self.season_length,
@@ -190,7 +190,7 @@ class SeasonalNaive(_TS):
         )
         mod = dict(mod)
         residuals = y - mod["fitted"]
-        mod["sigma"] = _calculate_sigma(residuals, len(y) - self.season_length)
+        mod["sigma"] = calculate_sigma(residuals, len(y) - self.season_length)
         self.model_ = mod
         self._store_cs(y=y, X=X)
         return self
@@ -268,7 +268,7 @@ class SeasonalNaive(_TS):
         Returns:
             dict: Dictionary with entries `mean` for point predictions and `level_*` for probabilistic predictions.
         """
-        y = _ensure_float(y)
+        y = ensure_float(y)
         out = _seasonal_naive(
             y=y,
             h=h,
@@ -283,15 +283,15 @@ class SeasonalNaive(_TS):
             if self.prediction_intervals is not None:
                 res = self._add_conformal_intervals(fcst=res, y=y, X=X, level=level)
             else:
-                k = jnp.floor(np.arange(h) / self.season_length)
+                k = jnp.floor(jnp.arange(h) / self.season_length)
                 residuals = y - out["fitted"]
-                sigma = _calculate_sigma(residuals, len(y) - self.season_length)
+                sigma = calculate_sigma(residuals, len(y) - self.season_length)
                 sigmah = sigma * jnp.sqrt(k + 1)
                 pred_int = _calculate_intervals(out, level, h, sigmah)
                 res = {**res, **pred_int}
             if fitted:
                 residuals = y - out["fitted"]
-                sigma = _calculate_sigma(residuals, len(y) - self.season_length)
+                sigma = calculate_sigma(residuals, len(y) - self.season_length)
                 res = _add_fitted_pi(res=res, se=sigma, level=level)
         return res
 
@@ -317,7 +317,7 @@ class SeasonalNaive(_TS):
         Returns:
             dict: Dictionary with entries `mean` for point predictions and `level_*` for probabilistic predictions.
         """
-        y = _ensure_float(y)
+        y = ensure_float(y)
         res = self.forecast(
             y=y, h=h, X=X, X_future=X_future, level=level, fitted=fitted
         )
