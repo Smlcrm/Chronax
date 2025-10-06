@@ -7,140 +7,27 @@ Original file is located at
     https://colab.research.google.com/drive/1GmVsifwEYOo8gPmDAXqttEX_qyBX8Fcz
 """
 
-!pip install statsforecast
-
 # Import packages
 import jax
 import jax.numpy as jnp
 from jax import jit
 from typing import Optional, List, Dict, Union
-from statsforecast.utils import (
-    ConformalIntervals,
+from utils import (
     _seasonal_naive,
     _repeat_val_seas,
-    _ensure_float,
-    _calculate_sigma,
+    ensure_float,
+    calculate_sigma,
     _calculate_intervals,
-    _quantiles
+    _quantiles,
+    _add_fitted_pi,
+    _add_conformal_distribution_intervals,
+    _get_conformal_method,
 )
-
-# Helper Functions
-def _add_fitted_pi(res, se, level):
-    level = sorted(level)
-    level = jnp.asarray(level)
-    quantiles = _quantiles(level=level)
-    lo = res["fitted"].reshape(-1, 1) - quantiles * se.reshape(-1, 1)
-    hi = res["fitted"].reshape(-1, 1) + quantiles * se.reshape(-1, 1)
-    lo = lo[:, ::-1]
-    lo = {f"fitted-lo-{l}": lo[:, i] for i, l in enumerate(reversed(level))}
-    hi = {f"fitted-hi-{l}": hi[:, i] for i, l in enumerate(level)}
-    res = {**res, **lo, **hi}
-    return res
-
-def _add_conformal_distribution_intervals(
-    fcst: Dict,
-    cs: jnp.ndarray,
-    level: List[Union[int, float]],
-) -> Dict:
-    r"""
-    Adds conformal intervals to the `fcst` dict based on conformal scores `cs`.
-    `level` should be already sorted. This strategy creates forecasts paths
-    based on errors and calculate quantiles using those paths.
-    """
-    alphas = [100 - lv for lv in level]
-    cuts = [alpha / 200 for alpha in reversed(alphas)]
-    cuts.extend(1 - alpha / 200 for alpha in alphas)
-    mean = fcst["mean"].reshape(1, -1)
-    scores = jnp.vstack([mean - cs, mean + cs])
-    quantiles = jnp.quantile(
-        scores,
-        cuts,
-        axis=0,
-    )
-    quantiles = quantiles.reshape(len(cuts), -1)
-    lo_cols = [f"lo-{lv}" for lv in reversed(level)]
-    hi_cols = [f"hi-{lv}" for lv in level]
-    out_cols = lo_cols + hi_cols
-    for i, col in enumerate(out_cols):
-        fcst[col] = quantiles[i]
-    return fcst
-
-def _get_conformal_method(method: str):
-    available_methods = {
-        "conformal_distribution": _add_conformal_distribution_intervals,
-        # "conformal_error": _add_conformal_error_intervals,
-    }
-    if method not in available_methods.keys():
-        raise ValueError(
-            f"prediction intervals method {method} not supported "
-            f"please choose one of {', '.join(available_methods.keys())}"
-        )
-    return available_methods[method]
-
-# _TS class
-class _TS:
-    uses_exog = False
-
-    def new(self):
-        b = type(self).__new__(type(self))
-        b.__dict__.update(self.__dict__)
-        return b
-
-    def __repr__(self):
-        return self.alias
-
-    def _conformity_scores(
-        self,
-        y: jnp.ndarray,
-        X: Optional[jnp.ndarray] = None,
-    ) -> jnp.ndarray:
-        y = _ensure_float(y)
-        n_windows = self.prediction_intervals.n_windows  # type: ignore[attr-defined]
-        h = self.prediction_intervals.h  # type_ignore[attr-defined]
-        n_samples = y.size
-        # use as many windows as possible for short series
-        # subtract 1 for the training set
-        n_windows = min(n_windows, (n_samples - 1) // h)
-        if n_windows < 2:
-            raise ValueError(
-                f"Prediction intervals settings require at least {2 * h + 1:,} samples, serie has {n_samples:,}."
-            )
-        test_size = n_windows * h
-        cs = jnp.empty((n_windows, h), dtype=y.dtype)
-        for i_window in range(n_windows):
-            train_end = n_samples - test_size + i_window * h
-            y_train = y[:train_end]
-            y_test = y[train_end : train_end + h]
-            if X is not None:
-                X_train = X[:train_end]
-                X_test = X[train_end : train_end + h]
-            else:
-                X_train = None
-                X_test = None
-            fcst_window = self.forecast(h=h, y=y_train, X=X_train, X_future=X_test)  # type_ignore[attr-defined]
-            cs = cs.at[i_window].set(jnp.abs(fcst_window["mean"] - y_test))
-        return cs
-
-    @property
-    def _conformal_method(self):
-        return _get_conformal_method(self.prediction_intervals.method)
-
-    def _store_cs(self, y, X):
-        if self.prediction_intervals is not None:
-            self._cs = self._conformity_scores(y, X)
-
-    def _add_conformal_intervals(self, fcst, y, X, level):
-        if self.prediction_intervals is not None and level is not None:
-            cs = self._conformity_scores(y, X) if y is not None else self._cs
-            res = self._conformal_method(fcst=fcst, cs=cs, level=level)
-            return res
-        return fcst
-
-    def _add_predict_conformal_intervals(self, fcst, level):
-        return self._add_conformal_intervals(fcst=fcst, y=None, X=None, level=level)
+from conformal_intervals import ConformalIntervals
+from base_forecaster import BaseForecaster
 
 # JAX SeasonalNaive Class
-class SeasonalNaive(_TS):
+class SeasonalNaive(BaseForecaster):
     def __init__(
         self,
         season_length: int,
@@ -175,13 +62,13 @@ class SeasonalNaive(_TS):
         Fit an SeasonalNaive to a time series (numpy array) `y`.
 
         Args:
-            y (numpy.array): Clean time series of shape (t, ).
+            y (jnp.ndarray): Clean time series of shape (t, ).
             X (array-like): Optional exogenous of shape (t, n_x).
 
         Returns:
             self: SeasonalNaive fitted model.
         r"""
-        y = _ensure_float(y)
+        y = ensure_float(y)
         mod = _seasonal_naive(
             y=y,
             season_length=self.season_length,
@@ -190,7 +77,7 @@ class SeasonalNaive(_TS):
         )
         mod = dict(mod)
         residuals = y - mod["fitted"]
-        mod["sigma"] = _calculate_sigma(residuals, len(y) - self.season_length)
+        mod["sigma"] = calculate_sigma(residuals, len(y) - self.season_length)
         self.model_ = mod
         self._store_cs(y=y, X=X)
         return self
@@ -258,7 +145,7 @@ class SeasonalNaive(_TS):
         It assumes you know the forecast horizon in advance.
 
         Args:
-            y (numpy.array): Clean time series of shape (n, ).
+            y (jnp.ndarray): Clean time series of shape (n, ).
             h (int): Forecast horizon.
             X (array-like): Optional insample exogenous of shape (t, n_x).
             X_future (array-like): Optional exogenous of shape (h, n_x).
@@ -268,7 +155,7 @@ class SeasonalNaive(_TS):
         Returns:
             dict: Dictionary with entries `mean` for point predictions and `level_*` for probabilistic predictions.
         """
-        y = _ensure_float(y)
+        y = ensure_float(y)
         out = _seasonal_naive(
             y=y,
             h=h,
@@ -283,15 +170,15 @@ class SeasonalNaive(_TS):
             if self.prediction_intervals is not None:
                 res = self._add_conformal_intervals(fcst=res, y=y, X=X, level=level)
             else:
-                k = jnp.floor(np.arange(h) / self.season_length)
+                k = jnp.floor(jnp.arange(h) / self.season_length)
                 residuals = y - out["fitted"]
-                sigma = _calculate_sigma(residuals, len(y) - self.season_length)
+                sigma = calculate_sigma(residuals, len(y) - self.season_length)
                 sigmah = sigma * jnp.sqrt(k + 1)
                 pred_int = _calculate_intervals(out, level, h, sigmah)
                 res = {**res, **pred_int}
             if fitted:
                 residuals = y - out["fitted"]
-                sigma = _calculate_sigma(residuals, len(y) - self.season_length)
+                sigma = calculate_sigma(residuals, len(y) - self.season_length)
                 res = _add_fitted_pi(res=res, se=sigma, level=level)
         return res
 
@@ -307,7 +194,7 @@ class SeasonalNaive(_TS):
         r"""Apply fitted model to an new/updated series.
 
         Args:
-            y (numpy.array): Clean time series of shape (n,).
+            y (jnp.ndarray): Clean time series of shape (n,).
             h (int): Forecast horizon.
             X (array-like): Optional insample exogenous of shape (t, n_x).
             X_future (array-like): Optional exogenous of shape (h, n_x).
@@ -317,8 +204,38 @@ class SeasonalNaive(_TS):
         Returns:
             dict: Dictionary with entries `mean` for point predictions and `level_*` for probabilistic predictions.
         """
-        y = _ensure_float(y)
+        y = ensure_float(y)
         res = self.forecast(
             y=y, h=h, X=X, X_future=X_future, level=level, fitted=fitted
         )
         return res
+    
+# Test Cases
+def test():
+    y = jnp.arange(24.0)
+
+    model = SeasonalNaive(season_length=12)
+    fitted_model = model.fit(y)
+
+    result = fitted_model.predict(h=12, level=(60,75))
+    forecast = fitted_model.forecast(y, h=12, level=[80, 95])
+    
+    assert "mean" in result, "Missing mean forecast"
+
+    assert len(result["mean"]) == 12, "Forecast length mismatch"
+
+    for lvl in [60, 75]:
+        assert f"lo-{lvl}" in result, f"Missing lower bound for {lvl}% interval"
+        assert f"hi-{lvl}" in result, f"Missing upper bound for {lvl}% interval"
+        assert f"lo-{lvl}" in result, f"Missing lower bound for {lvl}% interval"
+        assert f"hi-{lvl}" in result, f"Missing upper bound for {lvl}% interval"
+
+    for lvl in [80, 95]:
+        assert f"lo-{lvl}" in forecast, f"Missing lower bound for {lvl}% interval"
+        assert f"hi-{lvl}" in forecast, f"Missing upper bound for {lvl}% interval"
+        assert len(forecast[f"lo-{lvl}"]) == 12, f"Lower interval {lvl}% has wrong length"
+        assert len(forecast[f"hi-{lvl}"]) == 12, f"Upper interval {lvl}% has wrong length"
+
+if __name__ == "__main__":
+    test()
+    print("Test passed!")
