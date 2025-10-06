@@ -42,9 +42,12 @@ Notes:
 -  Exogenous variable support is model-specific, not framework-level. 
    The boolean uses_exog must be overriden in the model's implementation.
 """
+import jax
 import jax.numpy as jnp
 import utils
 from jax import vmap
+
+from utils import _get_conformal_method
 
 class BaseForecaster:
     uses_exog = False
@@ -95,21 +98,38 @@ class BaseForecaster:
             )
         test_size = n_windows * h
         base_train_end = n_samples - test_size
-        def scan_fn(i_window):
+        # def scan_fn(i_window):
+        #     train_end = base_train_end + i_window * h
+        #     y_train = jax.lax.dynamic_slice(y, (0,), (train_end,))
+        #     y_test  = jax.lax.dynamic_slice(y, (train_end,), (h,))
+        #     if X is not None:
+        #         X_train = jax.lax.dynamic_slice(X, (0, 0), (train_end, X.shape[1]))
+        #         X_test  = jax.lax.dynamic_slice(X, (train_end, 0), (h, X.shape[1]))
+        #     else:
+        #         X_train = None
+        #         X_test = None
+        #     fcst_window = self.forecast(h=h, y=y_train, X=X_train, X_future=X_test)  # type: ignore[attr-defined]
+        #     window_scores = jnp.abs(fcst_window['mean'].astype('float32') - y_test)
+        #     return window_scores
+        # cs = vmap(scan_fn)(jnp.arange(n_windows))
+        # # self._cs = cs
+        # return cs
+        cs_list = []
+        for i_window in range(n_windows):
             train_end = base_train_end + i_window * h
             y_train = y[:train_end]
-            y_test = y[train_end : train_end + h]
+            y_test  = y[train_end:train_end + h]
             if X is not None:
                 X_train = X[:train_end]
-                X_test = X[train_end : train_end + h]
+                X_test  = X[train_end:train_end + h]
             else:
                 X_train = None
                 X_test = None
-            fcst_window = self.forecast(h=h, y=y_train, X=X_train, X_future=X_test)  # type: ignore[attr-defined]
+            fcst_window = self.forecast(h=h, y=y_train, X=X_train, X_future=X_test)
             window_scores = jnp.abs(fcst_window['mean'].astype('float32') - y_test)
-            return window_scores
-        cs = vmap(scan_fn)(jnp.arange(n_windows))
-        # self._cs = cs
+            cs_list.append(window_scores)
+
+        cs = jnp.stack(cs_list)
         return cs
 
     # calculates confidence intervals at level(s) for forceasted values based on conformity_score
