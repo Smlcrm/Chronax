@@ -128,6 +128,7 @@ def update(
 # ---------------------------
 # h-step forecast
 # ---------------------------
+# --- forecast: now RETURNS the filled buffer `f` ---
 def forecast(
     f: jnp.ndarray,
     l: float,
@@ -138,40 +139,46 @@ def forecast(
     season: Component,
     phi: float,
     h: int,
-) -> jnp.ndarray:                   # ⬅️ return type
+) -> jnp.ndarray:
     phistar = phi
     for i in range(h):
+        # base forecast by trend
         if trend == Component.Nothing:
             fi = l
         elif trend == Component.Additive:
             fi = l + phistar * b
-        else:
-            fi = jnp.nan if (b < 0) else l * (b**phistar)
+        else:  # multiplicative trend
+            fi = jnp.nan if (b < 0) else l * (b ** phistar)
 
+        # seasonal index (wrap backward)
         j = m - 1 - i
         while j < 0:
             j += m
 
+        # apply seasonality
         if season == Component.Additive:
             fi = fi + float(s[j])
         elif season == Component.Multiplicative:
             fi = fi * float(s[j])
 
+        # write to output buffer (immutable update)
         f = f.at[i].set(float(fi))
 
+        # update phistar for next step
         if i < h - 1:
             if abs(phi - 1.0) < TOL:
                 phistar += 1.0
             else:
                 phistar += phi ** (i + 1)
 
-    return f                         # ⬅️ critical
+    return f
 
 
 
 # ---------------------------
 # Likelihood + error rollout
 # ---------------------------
+# --- _calc_roll: now RETURNS updated x/e/a_mse (and uses returned seasonal state) ---
 def _calc_roll(
     x: jnp.ndarray,
     e: jnp.ndarray,
@@ -186,23 +193,28 @@ def _calc_roll(
     gamma: float,
     phi: float,
     m: int,
-) -> float:
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, float]:
     n = y.shape[0]
     n_s = max(m, 24)
     m_eff = max(m, 1)
     n_mse_eff = min(n_mse, 30)
 
     n_states = m_eff * (season != Component.Nothing) + (trend != Component.Nothing) + 1
-    # initial states in x[0:n_states]
+
+    # read initial state head
     l = float(x[0])
     b = float(x[1]) if trend != Component.Nothing else 0.0
 
     s_vec = jnp.zeros(n_s, dtype=jnp.float64)
     if season != Component.Nothing:
         start = 1 + int(trend != Component.Nothing)
-        s_vec = s_vec.at[:m_eff].set(x[start : start + m_eff])
+        s_vec = s_vec.at[:m_eff].set(x[start:start + m_eff])
 
-    a_mse = a_mse.at[:n_mse_eff].set(0.0)
+    # local copies we will RETURN
+    x_local = x
+    e_local = e.at[:].set(0.0)
+    a_local = a_mse.at[:].set(0.0)
+
     old_s = jnp.zeros(n_s, dtype=jnp.float64)
     denom = jnp.zeros(30, dtype=jnp.float64)
     f = jnp.zeros(30, dtype=jnp.float64)
@@ -217,47 +229,55 @@ def _calc_roll(
         if season != Component.Nothing:
             old_s = old_s.at[:m_eff].set(s_vec[:m_eff])
 
+        # 1..n_mse_eff step-ahead forecasts from current state
         f = forecast(f, old_l, old_b, old_s, m_eff, trend, season, phi, n_mse_eff)
 
         if abs(float(f[0]) - NA) < TOL:
-            return NA
+            return x_local, e_local, a_local, NA
 
+        # residual
         if error == Component.Additive:
-            e = e.at[i].set(float(y[i]) - float(f[0]))
+            e_local = e_local.at[i].set(float(y[i]) - float(f[0]))
         else:
             f0 = float(f[0]) if abs(float(f[0])) >= TOL else float(f[0]) + TOL
-            e = e.at[i].set((float(y[i]) - float(f[0])) / f0)
+            e_local = e_local.at[i].set((float(y[i]) - float(f[0])) / f0)
 
+        # rolling multi-horizon MSE
         for j in range(n_mse_eff):
-            if i + j < n:
+            ij = i + j
+            if ij < n:
                 denom = denom.at[j].set(float(denom[j] + 1.0))
-                tmp = float(y[i + j]) - float(f[j])
-                a_mse = a_mse.at[j].set((float(a_mse[j]) * (float(denom[j]) - 1.0) + tmp * tmp) / float(denom[j]))
+                tmp = float(y[ij]) - float(f[j])
+                a_local = a_local.at[j].set(
+                    (float(a_local[j]) * (float(denom[j]) - 1.0) + tmp * tmp) / float(denom[j])
+                )
 
-        # IMPORTANT: capture updated seasonal state from update()
-        l, b, s_vec = update(
-            s_vec, l, b, old_l, old_b, old_s, m_eff, trend, season, alpha, beta, gamma, phi, float(y[i])
-        )
+        # state update (CAPTURE updated seasonal vector!)
+        l, b, s_vec = update(s_vec, l, b, old_l, old_b, old_s, m_eff,
+                             trend, season, alpha, beta, gamma, phi, float(y[i]))
 
-        x = x.at[n_states * (i + 1)].set(l)
+        # write next row of the state buffer into x_local
+        base = n_states * (i + 1)
+        x_local = x_local.at[base].set(l)
         if trend != Component.Nothing:
-            x = x.at[n_states * (i + 1) + 1].set(b)
+            x_local = x_local.at[base + 1].set(b)
         if season != Component.Nothing:
-            start = n_states * (i + 1) + 1 + int(trend != Component.Nothing)
-            x = x.at[start : start + m_eff].set(s_vec[:m_eff])
+            start = base + 1 + int(trend != Component.Nothing)
+            x_local = x_local.at[start:start + m_eff].set(s_vec[:m_eff])
 
-        lik += float(e[i]) * float(e[i])
+        # likelihood pieces
+        lik += float(e_local[i]) * float(e_local[i])
         val = abs(float(f[0]))
         lik2 += math.log(val if val > 0.0 else val + 1e-8)
 
-    n_float = float(n)
-    lik = n_float * math.log(lik if lik > 0.0 else lik + 1e-8)
+    lik = float(n) * math.log(lik if lik > 0.0 else lik + 1e-8)
     if error == Component.Multiplicative:
-        lik += 2.0 * lik2
-    return float(lik)
+        lik += 2.0 * float(lik2)
+    return x_local, e_local, a_local, float(lik)
 
 
 # --- full-buffer-returning API (for callers that need e/amse/states) ---
+# --- calc_full: now seeds only the head, CAPTURES the returned buffers, and reshapes correctly ---
 def calc_full(
     x: jnp.ndarray,
     e: jnp.ndarray,
@@ -272,24 +292,24 @@ def calc_full(
     gamma: float,
     phi: float,
     m: int,
-):
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, float]:
     n = y.shape[0]
     m_eff = max(m, 1)
     n_states = m_eff * (season != Component.Nothing) + (trend != Component.Nothing) + 1
 
-    # Build a clean work buffer
-    x_work = jnp.zeros_like(x)    # <= instead of jnp.array(x, ...)
+    # working buffers (zeros) and seed ONLY initial state head
+    x_work = jnp.zeros_like(x)
     e_work = jnp.zeros_like(e)
     a_work = jnp.zeros_like(a_mse)
-
-    # Copy just the *initial* state from the head of x
     x_work = x_work.at[:n_states].set(x[:n_states])
 
-    lik = _calc_roll(
+    # rollout (capture returned, updated buffers)
+    x_work, e_work, a_work, lik = _calc_roll(
         x_work, e_work, a_work, n_mse, y,
         error, trend, season, alpha, beta, gamma, phi, m
     )
 
+    # reshape into (n+1, n_states)
     states = x_work.reshape((n + 1, n_states))
     return a_work, e_work, states, float(lik)
 
@@ -375,6 +395,7 @@ def optimize(
         n        = int(Y.size)
         add_season_balancer = int(season != Component.Nothing)
 
+        # state buffer (length = (n_state + add_bal) * (n+1))
         state = jnp.zeros((n_state + add_season_balancer) * (n + 1), dtype=jnp.float64)
         head  = params[n_params - n_state : n_params]
         state = state.at[:n_state].set(head)
@@ -386,11 +407,16 @@ def optimize(
             if season == Component.Multiplicative and float(jnp.min(state[start:])) < 0.0:
                 return float(np.inf)
 
+        # compute residuals/metrics via calc_full and use returned likelihood
         a_mse = jnp.zeros(30, dtype=jnp.float64)
         e     = jnp.zeros(n,  dtype=jnp.float64)
+        a_mse, e, _, lik = calc_full(
+            state, e, a_mse, n_mse, Y,
+            error, trend, season,
+            a, b, g, p, m
+        )
 
-        lik = _calc_roll(state, e, a_mse, n_mse, Y, error, trend, season, a, b, g, p, m)
-        lik = max(lik, -1e10)
+        lik = max(float(lik), -1e10)
         if math.isnan(lik) or abs(lik + 99999.0) < 1e-7:
             lik = -float('inf')
 
@@ -414,11 +440,11 @@ def optimize(
         val     = _objective_function(clipped)
         if not np.isfinite(val):
             val = 1e300
-        return val + penalty
+        return float(val) + penalty
 
     options = {
         "maxiter": int(max_iter),
-        "fatol":   float(tol_std),  # function tolerance (≈ your tol_std)
+        "fatol":   float(tol_std),   # function tolerance
         "xatol":   1e-9,
         "disp":    False,
     }
@@ -439,6 +465,7 @@ def optimize(
         nit=int(getattr(res, "nit", -1)),
         nfev=int(getattr(res, "nfev", -1)),
     )
+
 
 
 __all__ = [

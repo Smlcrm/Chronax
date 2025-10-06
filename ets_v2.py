@@ -106,14 +106,14 @@ def etsforecast(
     season: _ets.Component,
     phi: float,
     h: int,
-    f: jnp.ndarray,    # caller passes a buffer; we’ll fill it
+    f: jnp.ndarray,    # caller may pass a buffer; we’ll fill & return it
 ) -> jnp.ndarray:
     if m < 1:
         m = 1
     dt = x.dtype
 
     l = float(x[0])
-    has_trend = trend != _ets.Component.Nothing
+    has_trend = (trend != _ets.Component.Nothing)
     b = float(x[1]) if has_trend else 0.0
 
     if season != _ets.Component.Nothing:
@@ -122,11 +122,12 @@ def etsforecast(
     else:
         s = jnp.zeros((m,), dtype=dt)
 
-    # ensure we have a valid buffer
+    # ensure there is a buffer of correct shape/dtype
     if (f is None) or (getattr(f, "shape", ()) != (h,)):
         f = jnp.zeros((h,), dtype=dt)
 
-    f = _ets.forecast(  # ⬅️ capture the returned array
+    # NOTE: _ets.forecast returns the filled array; capture it
+    f = _ets.forecast(
         f=f,
         l=l,
         b=b,
@@ -987,12 +988,16 @@ def ets_f(
 
 
 def pegelsfcast_C(h, obj, npaths=None, level=None, bootstrap=None):
-    forecast = jnp.full((h,), jnp.nan)
     states = jnp.asarray(obj["states"][-1, :], dtype=jnp.float64)
     etype, ttype, stype = [switch(comp) for comp in obj["components"][:3]]
-    phi = 1 if obj["components"][3] == "N" else float(obj["par"][3])
+    phi = 1.0 if obj["components"][3] == "N" else float(obj["par"][3])
     m = int(obj["m"])
-    forecast = etsforecast(x=states, m=m, trend=ttype, season=stype, phi=phi, h=h, f=forecast)
+
+    # allocate and CAPTURE the result of etsforecast
+    forecast = jnp.full((h,), jnp.nan, dtype=states.dtype)
+    forecast = etsforecast(
+        x=states, m=m, trend=ttype, season=stype, phi=phi, h=h, f=forecast
+    )
     return forecast
 
 

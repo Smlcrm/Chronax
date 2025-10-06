@@ -6,7 +6,7 @@ import math
 import numpy as np
 from statsmodels.tsa.seasonal import seasonal_decompose
 
-import ets_src as _ets
+import ets_np_versions_testing.ets_src as _ets
 from utils import _calculate_intervals, results
 
 # Global variables

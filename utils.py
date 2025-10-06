@@ -370,6 +370,7 @@ def _calculate_intervals(out, level, h, sigmah):
     }
     return pred_int
 
+@jax.jit
 def _quantiles(level):
     level = jnp.asarray(level)
     # norm.ppf(0.5 + level/200) -> ndtri in JAX

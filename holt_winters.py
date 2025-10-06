@@ -153,11 +153,11 @@ def test_error_type_mapping_only_A_or_M_semantics():
 
 
 if __name__ == "__main__":
-    #test_init_builds_correct_model_string()
+    test_init_builds_correct_model_string()
     test_fit_and_basic_predict_no_intervals()
-   # test_predict_with_native_intervals()
-    # test_forecast_stateless_matches_shapes_and_optionally_fitted()
-    # test_forward_uses_existing_fit_and_outputs_intervals()
-    # test_predict_in_sample_option()
-    # test_error_type_mapping_only_A_or_M_semantics()
+    test_predict_with_native_intervals()
+    test_forecast_stateless_matches_shapes_and_optionally_fitted()
+    test_forward_uses_existing_fit_and_outputs_intervals()
+    test_predict_in_sample_option()
+    test_error_type_mapping_only_A_or_M_semantics()
     print("All HoltWinters tests passed.")
