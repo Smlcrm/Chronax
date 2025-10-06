@@ -8,6 +8,10 @@ import jax
 import jax.numpy as jnp
 from functools import partial as _partial
 from typing import Optional, List, Dict, Union, Tuple
+from jax.scipy.special import ndtri  # JAX inverse normal CDF
+from collections import namedtuple
+
+results = namedtuple("results", "x fn nit simplex")
 
 def ensure_float(y: jnp.ndarray) -> jnp.ndarray:
     if not jnp.issubdtype(y.dtype, jnp.floating):
@@ -339,3 +343,44 @@ def _add_conformal_intervals(self, fcst, y, X, level):
 
 def _add_predict_conformal_intervals(self, fcst, level):
     return self._add_conformal_intervals(fcst=fcst, y=None, X=None, level=level)
+
+
+
+
+def _calculate_intervals(out, level, h, sigmah):
+    # level may be list/tuple/array — keep Python copy for dict keys
+    level_list = list(level)
+
+    # Quantiles as JAX array
+    z = _quantiles(jnp.asarray(level_list))           # shape: (L,)
+
+    # Build (L, h) matrix of quantiles
+    zz = jnp.repeat(z[:, None], h, axis=1)            # shape: (L, h)
+
+    # Ensure (1, h) shapes for broadcasting
+    mean_row = out["mean"][None, :]                   # (1, h)
+    sigmah_row = sigmah[None, :]                      # (1, h)
+
+    lower = mean_row - zz * sigmah_row                # (L, h)
+    upper = mean_row + zz * sigmah_row                # (L, h)
+
+    pred_int = {
+        **{f"lo-{lv}": lower[i] for i, lv in enumerate(level_list)},
+        **{f"hi-{lv}": upper[i] for i, lv in enumerate(level_list)},
+    }
+    return pred_int
+
+def _quantiles(level):
+    level = jnp.asarray(level)
+    # norm.ppf(0.5 + level/200) -> ndtri in JAX
+    z = ndtri(0.5 + level / 200.0)
+    return z
+
+def _calculate_sigma(residuals, n):
+    if n > 0:
+        sigma = jnp.nansum(residuals**2)
+        sigma = sigma / n
+        sigma = jnp.sqrt(sigma)
+    else:
+        sigma = 0
+    return sigma

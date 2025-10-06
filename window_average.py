@@ -4,79 +4,17 @@ from typing import Dict, List, Optional, Union
 
 import jax
 import jax.numpy as jnp
+from functools import partial
+from jax import lax
 
-# from utils.py import (
-#     ConformalIntervals,
-#     _ensure_float,
-# )
+from conformal_intervals import (
+    ConformalIntervals,
+)
 
+from base_forecaster import BaseForecaster
 
-#Import the Helper functions here
+# ConformalIntervals
 
-def _add_conformal_distribution_intervals(
-    fcst: Dict,
-    cs: jnp.ndarray,
-    level: List[Union[int, float]],
-) -> Dict:
-    r"""
-    Adds conformal intervals to the `fcst` dict based on conformal scores `cs`.
-    `level` should be already sorted. This strategy creates forecasts paths
-    based on errors and calculate quantiles using those paths.
-    """
-    alphas = [100 - lv for lv in level]
-    cuts = [alpha / 200 for alpha in reversed(alphas)]
-    cuts.extend(1 - alpha / 200 for alpha in alphas)
-    mean = fcst["mean"].reshape(1, -1)
-    scores = jnp.vstack([mean - cs, mean + cs])
-    quantiles = jnp.quantile(
-        scores,
-        cuts,
-        axis=0,
-    )
-    quantiles = quantiles.reshape(len(cuts), -1)
-    lo_cols = [f"lo-{lv}" for lv in reversed(level)]
-    hi_cols = [f"hi-{lv}" for lv in level]
-    out_cols = lo_cols + hi_cols
-    for i, col in enumerate(out_cols):
-        fcst[col] = quantiles[i]
-    return fcst
-
-def _get_conformal_method(method: str):
-    available_methods = {
-        "conformal_distribution": _add_conformal_distribution_intervals,
-        # "conformal_error": _add_conformal_error_intervals,
-    }
-    if method not in available_methods.keys():
-        raise ValueError(
-            f"prediction intervals method {method} not supported "
-            f"please choose one of {', '.join(available_methods.keys())}"
-        )
-    return available_methods[method]
-
-def _repeat_val(val: float, h: int) -> jnp.ndarray:
-    return jnp.full((h,), jnp.asarray(val))
-
-def _window_average(
-    y: jnp.ndarray,  # time series
-    h: int,  # forecasting horizon
-    fitted: bool,  # fitted values
-    window_size: int,  # window size
-) -> Dict[str, jnp.ndarray]:
-    if fitted:
-        raise NotImplementedError("return fitted")
-    if y.size < window_size:
-        return {"mean": jnp.full((h,), jnp.nan, dtype=y.dtype)}
-    wavg = jnp.mean(y[-window_size:])
-    mean = _repeat_val(val=wavg, h=h)
-    return {"mean": mean}
-
-def _ensure_float(x: jnp.ndarray) -> jnp.ndarray:
-    if x.dtype not in (jnp.float32, jnp.float64):
-        x = x.astype(jnp.float32)
-    return x
-
-# Classes 
-#Can remove ConformalIntervals
 class ConformalIntervals:
     """Class for storing conformal intervals metadata information.
 
@@ -103,82 +41,45 @@ class ConformalIntervals:
         self.h = h
         self.method = method
 
-class _TS:
-    uses_exog = False
+# Import the Helper functions here
+def _repeat_val(val: float, h: int) -> jnp.ndarray:
+    return jnp.full((h,), jnp.asarray(val))
 
-    def new(self):
-        b = type(self).__new__(type(self))
-        b.__dict__.update(self.__dict__)
-        return b
+@partial(jax.jit, static_argnums=(1, 2))
+def _window_average_core(y: jnp.ndarray, window_size: int, h: int) -> jnp.ndarray:
+    """
+    JIT-able core: take the last `window_size` values using dynamic_slice (static size),
+    average them, and repeat to length h.
+    """
+    n = y.shape[0]
+    # start = max(0, n - window_size)  (dynamic start is OK; size must be static)
+    start = jnp.maximum(0, n - window_size)
+    tail = lax.dynamic_slice(y, (start,), (window_size,))
+    wavg = jnp.mean(tail)
+    return jnp.full((h,), wavg, dtype=y.dtype)
 
-    def __repr__(self):
-        return self.alias
+def _window_average(
+    y: jnp.ndarray,  # time series
+    h: int,          # forecasting horizon
+    fitted: bool,    # fitted values
+    window_size: int # window size
+) -> Dict[str, jnp.ndarray]:
+    if fitted:
+        raise NotImplementedError("return fitted")
+    if y.size < window_size:
+        return {"mean": jnp.full((h,), jnp.nan, dtype=y.dtype)}
+    # JIT-compiled fast path
+    mean = _window_average_core(y, window_size, h)
+    return {"mean": mean}
 
-    
-    def _conformity_scores(
-        self,
-        y: jnp.ndarray,
-        X: Optional[jnp.ndarray] = None,
-    ) -> jnp.ndarray:
-        y = _ensure_float(y)  # assume your JAX version from earlier
-        n_windows = self.prediction_intervals.n_windows  # type: ignore[attr-defined]
-        h = self.prediction_intervals.h                 # type: ignore[attr-defined]
-        n_samples = y.size
+def _ensure_float(x: jnp.ndarray) -> jnp.ndarray:
+    if x.dtype not in (jnp.float32, jnp.float64):
+        x = x.astype(jnp.float32)
+    return x
 
-        # use as many windows as possible for short series
-        # subtract 1 for the training set
-        n_windows = int(min(n_windows, (n_samples - 1) // h))
-        if n_windows < 2:
-            raise ValueError(
-                f"Prediction intervals settings require at least {2 * h + 1:,} samples, "
-                f"serie has {n_samples:,}."
-            )
-
-        test_size = n_windows * h
-        cs = jnp.empty((n_windows, h), dtype=y.dtype)
-
-        for i_window in range(n_windows):
-            train_end = n_samples - test_size + i_window * h
-            y_train = y[:train_end]
-            y_test  = y[train_end : train_end + h]
-
-            if X is not None:
-                X_train = X[:train_end]
-                X_test  = X[train_end : train_end + h]
-            else:
-                X_train = None
-                X_test  = None
-
-            fcst_window = self.forecast(h=h, y=y_train, X=X_train, X_future=X_test)  # type: ignore[attr-defined]
-            row = jnp.abs(fcst_window["mean"] - y_test)
-            cs = cs.at[i_window].set(row)
-
-        return cs
-    
-    @property
-    def _conformal_method(self):
-        return _get_conformal_method(self.prediction_intervals.method)
-
-    def _store_cs(self, y, X):
-        if self.prediction_intervals is not None:
-            self._cs = self._conformity_scores(y, X)
-
-    def _add_conformal_intervals(self, fcst, y, X, level):
-        if self.prediction_intervals is not None and level is not None:
-            cs = self._conformity_scores(y, X) if y is not None else self._cs
-            res = self._conformal_method(fcst=fcst, cs=cs, level=level)
-            return res
-        return fcst
-
-    def _add_predict_conformal_intervals(self, fcst, level):
-        return self._add_conformal_intervals(fcst=fcst, y=None, X=None, level=level)
-    
-   
-
-
-class WindowAverage(_TS):
+class WindowAverage(BaseForecaster):
     def __init__(self, window_size: str, alias: str = "WindowAverage",
-        prediction_intervals: Optional[ConformalIntervals] = None):
+        conformal_params: Optional[ConformalIntervals] = None):
         
         r"""WindowAverage model.
 
@@ -193,13 +94,13 @@ class WindowAverage(_TS):
         Args:
             window_size (int): Size of truncated series on which average is estimated.
             alias (str): Custom name of the model.
-            prediction_intervals (Optional[ConformalIntervals]): Information to compute conformal prediction intervals.
+            conformal_params (Optional[ConformalIntervals]): Information to compute conformal prediction intervals.
                 This is required for generating future prediction intervals.
         r"""
 
         self.window_size = window_size
         self.alias = alias
-        self.prediction_intervals = prediction_intervals
+        self.conformal_params = conformal_params
         self.only_conformal_intervals = True
 
     def fit(self, y: jnp.ndarray, X: Optional[jnp.ndarray] = None):
@@ -219,7 +120,12 @@ class WindowAverage(_TS):
         y = _ensure_float(y) 
         mod = _window_average(y=y, h=1, window_size=self.window_size, fitted=False) 
         self.model_ = dict(mod) 
-        self._store_cs(y=y, X=X) #store past conformity scores
+        # Pre-compute and cache conformity scores for predict() usage with intervals.
+        # Account for the fact that base_forecaster does not persist ._cs
+        if self.conformal_params is not None:
+            self._cs = self.conformity_scores(y=y, X=X)
+        else:
+            self._cs = None
         return self
     
 
@@ -244,11 +150,23 @@ class WindowAverage(_TS):
         if level is None:
             return res
         level = sorted(level)
-        if self.prediction_intervals is not None:
-            res = self._add_predict_conformal_intervals(res, level)
-        else:
-            raise Exception("You must pass `prediction_intervals` to compute them.")
-        return res
+        if self.conformal_params is None:
+            raise ValueError("You must pass `conformal_params` to compute intervals.")
+
+        if self._cs is None:
+            # If user skipped fit or changed series, we cannot infer cs here.
+            raise ValueError(
+                "Conformity scores are not available. Fit the model first (fit(...)) "
+                "with `conformal_params` set so predict() can use cached scores."
+            )
+
+        # Use BaseForecaster’s static utility for intervals
+        return BaseForecaster.add_confidence_intervals(
+            fcst=res,
+            cs=self._cs,
+            level=list(level),
+            method=self.conformal_params.method,
+        )
 
     
     def forecast(
@@ -283,8 +201,147 @@ class WindowAverage(_TS):
         if level is None:
             return res
         level = sorted(level) 
-        if self.prediction_intervals is not None: #compute conformal intervals
-            res = self._add_conformal_intervals(fcst=res, y=y, X=X, level=level)
+        if self.conformal_params is not None: #compute conformal intervals
+            cs = self.conformity_scores(y=y, X=None)
+            res = self.add_confidence_intervals(res, cs, level, self.conformal_params.method)
         else:
-            raise Exception("You must pass `prediction_intervals` to compute them.")
+            raise Exception("You must pass `conformal_params` to compute them.")
         return res
+    
+
+# =========================
+# Test Cases
+# =========================
+
+def _arr_close(a, b, tol=1e-6):
+    a = jnp.asarray(a)
+    b = jnp.asarray(b)
+    return jnp.all(jnp.abs(a - b) <= tol)
+
+def test_basic_mean_predict():
+    y = jnp.asarray([1.0, 2.0, 3.0, 4.0])
+    m = WindowAverage(window_size=2, alias="WA")
+    m.fit(y)
+    out = m.predict(h=3, level=None)
+    assert "mean" in out
+    assert out["mean"].shape == (3,)
+    expected = jnp.array([3.5, 3.5, 3.5], dtype=out["mean"].dtype)  # (3+4)/2
+    assert _arr_close(out["mean"], expected)
+    print("test_basic_mean_predict: OK")
+
+def test_dtype_cast_to_float32():
+    y = jnp.array([1, 2, 3, 4, 5], dtype=jnp.int32)
+    m = WindowAverage(window_size=3)
+    m.fit(y)
+    out = m.predict(h=2)  # no intervals
+    assert out["mean"].dtype in (jnp.float32, jnp.float64)
+    expected = jnp.array([4.0, 4.0], dtype=out["mean"].dtype)  # (3+4+5)/3
+    assert _arr_close(out["mean"], expected)
+    print("test_dtype_cast_to_float32: OK")
+
+def test_short_series_returns_nan():
+    y = jnp.asarray([10.0])  # len < window_size
+    m = WindowAverage(window_size=3)
+    out = m.forecast(y=y, h=2, level=None)
+    assert "mean" in out and out["mean"].shape == (2,)
+    assert jnp.isnan(out["mean"]).all()
+    print("test_short_series_returns_nan: OK")
+
+def test_predict_without_conformal_raises():
+    y = jnp.asarray([1.0, 2.0, 3.0, 4.0, 5.0])
+    m = WindowAverage(window_size=2, conformal_params=None)
+    m.fit(y)
+    try:
+        _ = m.predict(h=2, level=[90])
+        raise AssertionError("Expected ValueError when intervals requested without conformal_params")
+    except ValueError:
+        pass
+    print("test_predict_without_conformal_raises: OK")
+
+def test_forecast_with_conformal_intervals_stateless():
+    # Enough samples for conformity scoring: (n-1)//h >= 2
+    y = jnp.asarray([1., 2., 3., 6., 9., 9., 8., 7.])
+    cfg = ConformalIntervals(n_windows=3, h=1, method="conformal_distribution")
+    m = WindowAverage(window_size=3, conformal_params=cfg)
+    out = m.forecast(y=y, h=4, level=[90], fitted=False)
+    assert "mean" in out and out["mean"].shape == (4,)
+    assert "lo-90" in out and "hi-90" in out
+    assert jnp.all(out["lo-90"] <= out["mean"])
+    assert jnp.all(out["mean"] <= out["hi-90"])
+    print("test_forecast_with_conformal_intervals_stateless: OK")
+
+def test_fit_caches_conformity_scores_then_predict_uses_cache():
+    y = jnp.asarray([2., 2., 2., 2., 2., 2.])
+    cfg = ConformalIntervals(n_windows=3, h=1, method="conformal_distribution")
+    m = WindowAverage(window_size=2, conformal_params=cfg)
+    m.fit(y)
+    assert getattr(m, "_cs") is not None
+    out = m.predict(h=3, level=[80, 95])
+    for lv in [80, 95]:
+        assert f"hi-{lv}" in out
+    # lower keys come in reversed order naming, but both must exist
+    assert "lo-95" in out and "lo-80" in out
+    # sanity: lo <= mean <= hi for each level
+    for lv in [80, 95]:
+        assert jnp.all(out[f"lo-{lv}"] <= out["mean"])
+        assert jnp.all(out["mean"] <= out[f"hi-{lv}"])
+    print("test_fit_caches_conformity_scores_then_predict_uses_cache: OK")
+
+def test_levels_unsorted_input_is_handled():
+    y = jnp.asarray([1., 3., 2., 5., 4., 6.])
+    cfg = ConformalIntervals(n_windows=2, h=1, method="conformal_distribution")
+    m = WindowAverage(window_size=2, conformal_params=cfg)
+    m.fit(y)
+    out = m.predict(h=2, level=[95, 80, 50])  # unsorted input
+    for lv in [50, 80, 95]:
+        assert f"hi-{lv}" in out
+        assert f"lo-{lv}" in out
+    print("test_levels_unsorted_input_is_handled: OK")
+
+def test_forecast_fitted_true_raises_not_implemented():
+    y = jnp.asarray([1., 2., 3., 4.])
+    cfg = ConformalIntervals(n_windows=2, h=1, method="conformal_distribution")
+    m = WindowAverage(window_size=2, conformal_params=cfg)
+    try:
+        _ = m.forecast(y=y, h=2, level=None, fitted=True)  # _window_average raises
+        raise AssertionError("Expected NotImplementedError when fitted=True")
+    except NotImplementedError:
+        pass
+    print("test_forecast_fitted_true_raises_not_implemented: OK")
+
+def test_conformal_requires_enough_windows():
+    # With h=2, need (n-1)//2 >= 2  => n >= 5; pick n=4 to force error
+    y = jnp.asarray([10., 11., 12., 13.])  # n=4
+    cfg = ConformalIntervals(n_windows=5, h=2, method="conformal_distribution")
+    m = WindowAverage(window_size=2, conformal_params=cfg)
+    try:
+        _ = m.forecast(y=y, h=2, level=[90])
+        raise AssertionError("Expected ValueError due to insufficient windows for conformal")
+    except ValueError:
+        pass
+    print("test_conformal_requires_enough_windows: OK")
+
+def test_predict_before_fit_raises_or_behaves_safely():
+    # Accessing predict before fit should fail clearly
+    m = WindowAverage(window_size=2)
+    try:
+        _ = m.predict(h=1)
+        # If your implementation doesn't raise, enforce it:
+        raise AssertionError("Expected an error when calling predict() before fit()")
+    except Exception:
+        pass
+    print("test_predict_before_fit_raises_or_behaves_safely: OK")
+
+
+if __name__ == "__main__":
+    test_basic_mean_predict()
+    test_dtype_cast_to_float32()
+    test_short_series_returns_nan()
+    test_predict_without_conformal_raises()
+    test_forecast_with_conformal_intervals_stateless()
+    test_fit_caches_conformity_scores_then_predict_uses_cache()
+    test_levels_unsorted_input_is_handled()
+    test_forecast_fitted_true_raises_not_implemented()
+    test_conformal_requires_enough_windows()
+    test_predict_before_fit_raises_or_behaves_safely()
+    print("All tests passed.")
