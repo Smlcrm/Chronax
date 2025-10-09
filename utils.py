@@ -10,6 +10,7 @@ from functools import partial as _partial
 from typing import Optional, List, Dict, Union, Tuple
 from jax.scipy.special import ndtri  # JAX inverse normal CDF
 from collections import namedtuple
+from functools import partial
 
 results = namedtuple("results", "x fn nit simplex")
 
@@ -385,3 +386,33 @@ def _calculate_sigma(residuals, n):
     else:
         sigma = 0
     return sigma
+
+def _repeat_val(val: float, h: int) -> jnp.ndarray:
+    return jnp.full((h,), jnp.asarray(val))
+
+@partial(jax.jit, static_argnums=(1, 2))
+def _window_average_core(y: jnp.ndarray, window_size: int, h: int) -> jnp.ndarray:
+    """
+    JIT-able core: take the last `window_size` values using dynamic_slice (static size),
+    average them, and repeat to length h.
+    """
+    n = y.shape[0]
+    # start = max(0, n - window_size)  (dynamic start is OK; size must be static)
+    start = jnp.maximum(0, n - window_size)
+    tail = lax.dynamic_slice(y, (start,), (window_size,))
+    wavg = jnp.mean(tail)
+    return jnp.full((h,), wavg, dtype=y.dtype)
+
+def _window_average(
+    y: jnp.ndarray,  # time series
+    h: int,          # forecasting horizon
+    fitted: bool,    # fitted values
+    window_size: int # window size
+):
+    if fitted:
+        raise NotImplementedError("return fitted")
+    if y.size < window_size:
+        return {"mean": jnp.full((h,), jnp.nan, dtype=y.dtype)}
+    # JIT-compiled fast path
+    mean = _window_average_core(y, window_size, h)
+    return {"mean": mean}

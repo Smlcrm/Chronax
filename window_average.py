@@ -13,69 +13,10 @@ from conformal_intervals import (
 
 from base_forecaster import BaseForecaster
 
-# ConformalIntervals
-
-class ConformalIntervals:
-    """Class for storing conformal intervals metadata information.
-
-    Args:
-        n_windows (int, optional): Number of windows for conformal intervals. Defaults to 2.
-        h (int, optional): Forecasting horizon. Defaults to 1.
-        method (str, optional): Method for conformal intervals. Defaults to "conformal_distribution".
-    """
-
-    def __init__(
-        self,
-        n_windows: int = 2,
-        h: int = 1,
-        method: str = "conformal_distribution",
-    ):
-        if n_windows < 2:
-            raise ValueError(
-                "You need at least two windows to compute conformal intervals"
-            )
-        allowed_methods = ["conformal_distribution"]
-        if method not in allowed_methods:
-            raise ValueError(f"method must be one of {allowed_methods}")
-        self.n_windows = n_windows
-        self.h = h
-        self.method = method
+from utils import _repeat_val, _window_average, ensure_float
 
 # Import the Helper functions here
-def _repeat_val(val: float, h: int) -> jnp.ndarray:
-    return jnp.full((h,), jnp.asarray(val))
 
-@partial(jax.jit, static_argnums=(1, 2))
-def _window_average_core(y: jnp.ndarray, window_size: int, h: int) -> jnp.ndarray:
-    """
-    JIT-able core: take the last `window_size` values using dynamic_slice (static size),
-    average them, and repeat to length h.
-    """
-    n = y.shape[0]
-    # start = max(0, n - window_size)  (dynamic start is OK; size must be static)
-    start = jnp.maximum(0, n - window_size)
-    tail = lax.dynamic_slice(y, (start,), (window_size,))
-    wavg = jnp.mean(tail)
-    return jnp.full((h,), wavg, dtype=y.dtype)
-
-def _window_average(
-    y: jnp.ndarray,  # time series
-    h: int,          # forecasting horizon
-    fitted: bool,    # fitted values
-    window_size: int # window size
-) -> Dict[str, jnp.ndarray]:
-    if fitted:
-        raise NotImplementedError("return fitted")
-    if y.size < window_size:
-        return {"mean": jnp.full((h,), jnp.nan, dtype=y.dtype)}
-    # JIT-compiled fast path
-    mean = _window_average_core(y, window_size, h)
-    return {"mean": mean}
-
-def _ensure_float(x: jnp.ndarray) -> jnp.ndarray:
-    if x.dtype not in (jnp.float32, jnp.float64):
-        x = x.astype(jnp.float32)
-    return x
 
 class WindowAverage(BaseForecaster):
     def __init__(self, window_size: str, alias: str = "WindowAverage",
@@ -117,7 +58,7 @@ class WindowAverage(BaseForecaster):
             self: WindowAverage fitted model.
         """
 
-        y = _ensure_float(y) 
+        y = ensure_float(y) 
         mod = _window_average(y=y, h=1, window_size=self.window_size, fitted=False) 
         self.model_ = dict(mod) 
         # Pre-compute and cache conformity scores for predict() usage with intervals.
@@ -195,7 +136,7 @@ class WindowAverage(BaseForecaster):
         Returns:
             dict: Dictionary with entries `mean` for point predictions and `level_*` for probabilistic predictions.
         """
-        y = _ensure_float(y) 
+        y = ensure_float(y) 
         res = _window_average(y=y, h=h, fitted=fitted, window_size=self.window_size) #compute window avg
         res = dict(res) #make it a dict
         if level is None:

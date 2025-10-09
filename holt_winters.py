@@ -1,3 +1,9 @@
+#implement everything where everything is a parameter -> 
+#input: hyperparams
+#see simple exp smoothing
+#regular ets
+#use pytest
+
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
@@ -105,12 +111,21 @@ def test_forecast_stateless_matches_shapes_and_optionally_fitted():
     out = m.forecast(y=y, h=4, level=None, fitted=False)
     assert _has_keys(out, ["mean"])
     assert out["mean"].shape == (4,)
+    # print mean (stateless)
+    print(out["mean"], "mean (stateless)")
 
     # With fitted=True return 'fitted' and native intervals
     out2 = m.forecast(y=y, h=3, level=[90], fitted=True)
     assert _has_keys(out2, ["mean", "fitted", "lo-90", "hi-90"])
     assert out2["mean"].shape == (3,)
     assert out2["fitted"].ndim == 1
+
+    # print fitted + intervals like in test_predict_with_native_intervals
+    print(out2["fitted"], "fitted")
+    print(out2["lo-90"])
+    print(out2["mean"], "mean")
+    print(out2["hi-90"])
+
     # sanity: intervals ordered around mean
     assert jnp.all(out2["lo-90"] <= out2["mean"])
     assert jnp.all(out2["mean"] <= out2["hi-90"])
@@ -124,11 +139,19 @@ def test_forward_uses_existing_fit_and_outputs_intervals():
     out = m.forward(y=y_new, h=4, level=[80, 95], fitted=False)
     assert _has_keys(out, ["mean", "lo-80", "hi-80", "lo-95", "hi-95"])
     assert out["mean"].shape == (4,)
+
+    # prints, like in test_predict_with_native_intervals
+    for lv in [80, 95]:
+        print(out[f"lo-{lv}"])
+        print(out["mean"], "mean")
+        print(out[f"hi-{lv}"])
+
     # sanity: intervals ordered around mean
     for lv in [80, 95]:
         assert jnp.all(out[f"lo-{lv}"] <= out["mean"])
         assert jnp.all(out["mean"] <= out[f"hi-{lv}"])
     print("test_forward_uses_existing_fit_and_outputs_intervals: OK")
+
 
 def test_predict_in_sample_option():
     y = jnp.asarray([10., 20., 15., 25.] * 4)  # n=16
@@ -137,12 +160,20 @@ def test_predict_in_sample_option():
     ins = m.predict_in_sample(level=None)
     assert _has_keys(ins, ["fitted"])
     assert ins["fitted"].shape == (y.shape[0],)
+    # prints
+    print(ins["fitted"], "fitted (no intervals)")
 
     # with intervals over fitted values
     ins2 = m.predict_in_sample(level=[80])
     assert _has_keys(ins2, ["fitted", "fitted-lo-80", "fitted-hi-80"])
     assert ins2["fitted"].shape == (y.shape[0],)
+    # prints (like interval tests)
+    print(ins2["fitted-lo-80"])
+    print(ins2["fitted"], "fitted (with 80)")
+    print(ins2["fitted-hi-80"])
+
     print("test_predict_in_sample_option: OK")
+
 
 def test_error_type_mapping_only_A_or_M_semantics():
     mA = HoltWinters(season_length=6, error_type="A")
@@ -153,11 +184,19 @@ def test_error_type_mapping_only_A_or_M_semantics():
 
 
 if __name__ == "__main__":
+    print("Running HoltWinters tests...")
     test_init_builds_correct_model_string()
+    print("____________________________________________")
     test_fit_and_basic_predict_no_intervals()
+    print("____________________________________________")
     test_predict_with_native_intervals()
+    print("____________________________________________")
     test_forecast_stateless_matches_shapes_and_optionally_fitted()
+    print("____________________________________________")
     test_forward_uses_existing_fit_and_outputs_intervals()
+    print("____________________________________________")
     test_predict_in_sample_option()
+    print("____________________________________________")
     test_error_type_mapping_only_A_or_M_semantics()
+    print("____________________________________________")
     print("All HoltWinters tests passed.")
