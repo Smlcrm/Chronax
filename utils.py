@@ -5,6 +5,7 @@
 
 
 import jax
+from jax import lax
 import jax.numpy as jnp
 from functools import partial as _partial
 from typing import Optional, List, Dict, Union, Tuple
