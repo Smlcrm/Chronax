@@ -6,6 +6,7 @@
 
 import jax
 import jax.numpy as jnp
+from functools import partial as _partial
 from typing import Optional, List, Dict, Union, Tuple
 
 def ensure_float(y: jnp.ndarray) -> jnp.ndarray:
@@ -153,6 +154,20 @@ def _repeat_val_seas(season_vals: jnp.ndarray, h: int) -> jnp.ndarray:
     repeats = math.ceil(h / season_vals.size)
     return jnp.tile(season_vals, repeats)[:h]
 
+@_partial(jax.jit, static_argnums=(1,))
+def _repeat_val(val: float, h: int) -> jnp.ndarray:
+    """
+    Repeat scalar value h times.
+    JAX equivalent of statsforecast.utils._repeat_val()
+    
+    Args:
+        val: Scalar value to repeat
+        h: Number of repetitions (forecast horizon)
+        
+    Returns:
+        Array of length h filled with val
+    """
+    return jnp.full(h, val, dtype=jnp.float32)
 def _seasonal_naive(
     y,
     h: int,
