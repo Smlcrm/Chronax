@@ -5,9 +5,11 @@
 
 
 import jax
+from jax import jit, lax
 import jax.numpy as jnp
 from functools import partial as _partial
 from typing import Optional, List, Dict, Union, Tuple
+from jax.scipy.optimize import minimize
 
 def ensure_float(y: jnp.ndarray) -> jnp.ndarray:
     if not jnp.issubdtype(y.dtype, jnp.floating):
@@ -333,9 +335,105 @@ def _store_cs(self, y, X):
 def _add_conformal_intervals(self, fcst, y, X, level):
     if self.prediction_intervals is not None and level is not None:
         cs = self.conformity_scores(y, X) if y is not None else self._cs
-        res = self._conformal_method(fcst=fcst, cs=cs, level=level)
+        conformal_fn = _conformal_method(self)
+        res = conformal_fn(fcst=fcst, cs=cs, level=level)
         return res
     return fcst
 
 def _add_predict_conformal_intervals(self, fcst, level):
-    return self._add_conformal_intervals(fcst=fcst, y=None, X=None, level=level)
+    return _add_conformal_intervals(self, fcst=fcst, y=None, X=None, level=level)
+
+def _intervals(y: jnp.ndarray) -> jnp.ndarray:
+    """
+    Return intervals between non-zero observations as a float32 array of length len(y).
+    The valid intervals are placed at the front of the returned array and the rest
+    are padded with 0.0 to ensure a stable shape/dtype for JAX control-flow.
+    """
+    n = y.size
+    nz_idx = jnp.where(y != 0)[0]  # indices of non-zero entries (int32)
+
+    def no_nz():
+        # no non-zero values: return zero-padded float32 array length n
+        return jnp.zeros((n,), dtype=jnp.float32)
+
+    def some_nz():
+        # diffs are integers; cast to float32 and pad with zeros up to length n
+        diffs = jnp.diff(nz_idx).astype(jnp.float32)  # shape (k-1,) if k>=1 else (0,)
+        k = diffs.size
+        pad_len = n - k
+        pad = jnp.zeros((pad_len,), dtype=jnp.float32)
+        return jnp.concatenate([diffs, pad], axis=0)
+
+    return lax.cond(nz_idx.size == 0, no_nz, some_nz)
+
+
+def _chunk_sums(array: jnp.ndarray, chunk_size: int) -> jnp.ndarray:
+    r"""Splits an array into chunks and returns the sum of each chunk.
+    Incomplete chunks are discarded"""
+    n_chunks = array.size // chunk_size
+    n_elems = n_chunks * chunk_size
+    return array[:n_elems].reshape(n_chunks, chunk_size).sum(axis=1)
+
+@jit
+def _ses_sse(alpha: float, x: jnp.ndarray) -> float:
+    r"""Compute the residual sum of squares for a simple exponential smoothing fit.
+
+    Args:
+        alpha (float): Smoothing parameter.
+        x (numpy.array): Clean time series of shape (n, ).
+
+    Returns:
+        sse (float): Residual sum of squares for the fit.
+    """
+    complement = 1 - alpha
+    forecast = x[0]
+    sse = 0.0
+
+    for i in range(1, len(x)):
+        forecast = alpha * x[i - 1] + complement * forecast
+        sse += (x[i] - forecast) ** 2
+
+    return sse
+
+def _optimized_ses_forecast(
+    x: jnp.ndarray, bounds: Tuple[float, float] = (0.1, 0.3), n_grid: int = 50
+) -> Tuple[float, jnp.ndarray]:
+    alphas = jnp.linspace(bounds[0], bounds[1], n_grid)
+
+    def sse_for_alpha(alpha):
+        return _ses_sse(alpha, x)
+
+    sses = jax.vmap(sse_for_alpha)(alphas)
+    best_idx = jnp.argmin(sses)
+    best_alpha = alphas[best_idx]
+
+    forecast, fitted = _ses_forecast(x, best_alpha)
+    return forecast, fitted
+
+def _chunk_forecast(y, aggregation_level):
+    lost_remainder_data = len(y) % aggregation_level
+    y_cut = y[lost_remainder_data:]
+    aggregation_sums = _chunk_sums(y_cut, aggregation_level)
+    sums_forecast, _ = _optimized_ses_forecast(aggregation_sums)
+    return sums_forecast
+
+@jit
+def _expand_fitted_intervals(fitted: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
+    out = jnp.empty_like(y)
+    out[0] = jnp.nan
+    fitted_idx = 0
+    for i in range(1, y.size):
+        if y[i - 1] != 0:
+            fitted_idx += 1
+            if fitted[fitted_idx] == 0:
+                # to avoid division by zero
+                out[i] = 1
+            else:
+                out[i] = fitted[fitted_idx]
+        elif fitted_idx > 0:
+            # if this entry is zero, the model didn't change
+            out[i] = out[i - 1]
+        else:
+            # if we haven't seen any intervals, use 1 to avoid division by zero
+            out[i] = 1
+    return out
