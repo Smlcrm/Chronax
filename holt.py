@@ -15,17 +15,50 @@ Features:
 The model fits level and trend smoothing parameters (alpha, beta) using
 maximum likelihood optimization via gradient descent.
 
-Example:
-    >>> import jax.numpy as jnp
-    >>> from holt import Holt
-    >>>
-    >>> # Create and fit model
-    >>> model = Holt(error_type='A', damped=False)
-    >>> y = jnp.array([10, 12, 15, 18, 22, 27, 33, 40])
-    >>> model.fit(y)
-    >>>
-    >>> # Generate forecasts with 95% prediction intervals
-    >>> predictions = model.predict(h=5, level=[95])
+Instance Attributes:
+1. season_length: int - Number of observations per unit of time (kept for API consistency)
+2. error_type: str - Type of error: 'A' (additive) or 'M' (multiplicative)
+3. damped: bool - Whether to use damped trend
+4. phi: float | None - Damping parameter (0.8-0.98), used only if damped=True
+5. alias: str - Custom name for the model
+6. conformal_params: ConformalIntervals | None - Parameters for conformal prediction intervals
+7. model_: dict - Fitted model parameters (created after fit())
+   - fitted: In-sample fitted values
+   - level: Final level state
+   - trend: Final trend state
+   - alpha: Estimated level smoothing parameter
+   - beta: Estimated trend smoothing parameter
+   - sigma: Residual standard error
+   - residuals: Forecast residuals
+   - y_train: Original training data (for conformal prediction)
+
+Class Attributes:
+1. uses_exog: bool - Whether model supports exogenous variables (False for Holt)
+
+Methods:
+1. __init__() - Initialize Holt model with error type and damping parameters
+2. fit(y, X=None) - Fit model to training data, estimates alpha and beta via optimization
+3. predict(h, X=None, level=None) - Generate forecasts with fitted model
+4. predict_in_sample(level=None) - Return fitted values with optional intervals
+5. forecast(y, h, X=None, X_future=None, level=None, fitted=False) - Stateless prediction
+6. forward(y, h, X=None, X_future=None, level=None, fitted=False) - Apply fitted model to new data
+
+Helper Methods:
+- _validate_h() - Validate forecast horizon parameter
+- _validate_level() - Validate prediction interval levels
+- _initialize_states() - Initialize level and trend via linear regression
+- _get_phi() - Get damping factor
+- _fit_parameters() - Core optimization routine using JAX/optax
+- _generate_forecasts() - Compute h-step ahead point forecasts
+- _calculate_native_intervals() - Analytical prediction interval formulas
+- _add_interval_bounds() - Add interval bounds to result dictionary
+
+Implementation Notes:
+- Uses optax.adam optimizer with exponential learning rate decay
+- Default 1000 iterations for parameter optimization
+- Supports both native (analytical) and conformal prediction intervals
+- Level and trend initialized via linear regression on first 10 observations
+- Analytical interval formulas from Hyndman et al. (2008)
 """
 import jax
 import jax.numpy as jnp
