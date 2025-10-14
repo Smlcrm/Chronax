@@ -44,7 +44,7 @@ Notes:
 """
 import jax.numpy as jnp
 import utils
-from jax import vmap
+from jax import lax, vmap
 
 class BaseForecaster:
     uses_exog = False
@@ -95,20 +95,39 @@ class BaseForecaster:
             )
         test_size = n_windows * h
         base_train_end = n_samples - test_size
-        def scan_fn(i_window):
+        max_train_size = base_train_end + (n_windows - 1) * h
+
+        # Pad arrays to maximum training size for fixed-size operations
+        y_padded = jnp.pad(y, (0, max(0, max_train_size - n_samples)), mode='edge')
+        if X is not None:
+            X_padded = jnp.pad(X, ((0, max(0, max_train_size - n_samples)), (0, 0)), mode='edge')
+        else:
+            X_padded = None
+
+        def compute_window_scores(i_window):
             train_end = base_train_end + i_window * h
-            y_train = y[:train_end]
-            y_test = y[train_end : train_end + h]
-            if X is not None:
-                X_train = X[:train_end]
-                X_test = X[train_end : train_end + h]
+
+            # Slice with STATIC maximum size (JAX-compatible)
+            y_train = lax.dynamic_slice(y_padded, (0,), (max_train_size,))
+            y_test = lax.dynamic_slice(y_padded, (train_end,), (h,))
+
+            if X_padded is not None:
+                X_train = lax.dynamic_slice(X_padded, (0, 0), (max_train_size, X_padded.shape[1]))
+                X_test = lax.dynamic_slice(X_padded, (train_end, 0), (h, X_padded.shape[1]))
             else:
                 X_train = None
                 X_test = None
+
+            # Forecast uses padded data (valid data at [:train_end], padding at [train_end:])
+            # The padding is from 'edge' mode so won't cause issues for most models
             fcst_window = self.forecast(h=h, y=y_train, X=X_train, X_future=X_test)  # type: ignore[attr-defined]
+
+            # Compute scores (padding doesn't affect test set which is always valid)
             window_scores = jnp.abs(fcst_window['mean'].astype('float32') - y_test)
             return window_scores
-        cs = vmap(scan_fn)(jnp.arange(n_windows))
+
+        # Use vmap for parallel processing across windows
+        cs = vmap(compute_window_scores)(jnp.arange(n_windows))
         # self._cs = cs
         return cs
 
