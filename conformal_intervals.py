@@ -8,11 +8,12 @@ Instance Attributes
 """
 
 class ConformalIntervals:
-    # __slots__ = ('n_windows, 'h')
+    # __slots__ = ('n_windows, 'h', 'method')
     def __init__(
         self,
         n_windows: int = 2,
         h: int = 1,
+        method: str = "conformal_distribution",
     ):
         if n_windows < 2:
             raise ValueError(
@@ -20,3 +21,4 @@ class ConformalIntervals:
             )
         self.n_windows = n_windows
         self.h = h
+        self.method = method
