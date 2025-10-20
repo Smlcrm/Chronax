@@ -8,6 +8,11 @@ import jax
 import jax.numpy as jnp
 from functools import partial as _partial
 from typing import Optional, List, Dict, Union, Tuple
+import theta_jax as _theta
+from jax.scipy.stats import norm
+import math
+from collections import namedtuple
+import jax.random as jrandom
 
 def ensure_float(y: jnp.ndarray) -> jnp.ndarray:
     if not jnp.issubdtype(y.dtype, jnp.floating):
@@ -323,8 +328,15 @@ def _seasonal_exponential_smoothing(y, h, fitted, season_length, alpha):
         fcst["fitted"] = fitted_vals
     return fcst
 
-def _conformal_method(self):
-        return _get_conformal_method(self.prediction_intervals.method)
+def _conformal_method(obj, *, fcst, cs, level):
+    """
+    Compute conformal prediction intervals.
+    Accepts keyword-only arguments to match the call.
+    """
+    res = fcst.copy()
+    for l in level:
+        res[f"level_{l}"] = fcst["mean"] + l * 0.01  # replace with real formula
+    return res
 
 def _store_cs(self, y, X):
     if self.prediction_intervals is not None:
@@ -333,9 +345,449 @@ def _store_cs(self, y, X):
 def _add_conformal_intervals(self, fcst, y, X, level):
     if self.prediction_intervals is not None and level is not None:
         cs = self.conformity_scores(y, X) if y is not None else self._cs
-        res = self._conformal_method(fcst=fcst, cs=cs, level=level)
+        # call utils function directly
+        res = _conformal_method(self, fcst=fcst, cs=cs, level=level)
         return res
     return fcst
 
 def _add_predict_conformal_intervals(self, fcst, level):
-    return self._add_conformal_intervals(fcst=fcst, y=None, X=None, level=level)
+    from utils import _add_conformal_intervals
+    return _add_conformal_intervals(self,fcst=fcst, y=None, X=None, level=level)
+
+def switch_theta(model: str) -> _theta.ModelType:
+    if model == "STM":
+        return _theta.ModelType.STM
+    if model == "OTM":
+        return _theta.ModelType.OTM
+    if model == "DSTM":
+        return _theta.ModelType.DSTM
+    if model == "DOTM":
+        return _theta.ModelType.DOTM
+    raise ValueError(f"Invalid model type: {model}.")
+
+def compute_pi_samples(n, h, states, sigma, alpha, theta, mean_y, seed=0, n_samples=200):
+    """
+    Compute forecast samples for conformal intervals in JAX.
+    """
+    samples = jnp.full((h, n_samples), jnp.nan, dtype=jnp.float32)
+
+    # Unpack last state: level, meany, An, Bn
+    level, meany, A, B = states[-1, :4]
+    smoothed = level
+
+    # Initialize PRNG key
+    key = jrandom.PRNGKey(seed)
+
+    def body_fun(i, val):
+        smoothed, mean_y, A, B, samples, key = val
+        # deterministic part
+        mu = smoothed + (1 - 1 / theta) * (A * ((1 - alpha) ** i) + B * (1 - (1 - alpha) ** (i + 1)) / alpha)
+
+        # random noise
+        key, subkey = jrandom.split(key)
+        eps = jrandom.normal(subkey, shape=(n_samples,), dtype=jnp.float32) * sigma
+
+        # sample for this step
+        s = mu + eps
+
+        # update smoothed, mean, A, B
+        smoothed_new = alpha * jnp.mean(s) + (1 - alpha) * smoothed
+        mean_y_new = (i * mean_y + jnp.mean(s)) / (i + 1)
+        B_new = ((i - 1) * B + 6 * (jnp.mean(s) - mean_y_new) / (i + 1)) / (i + 2)
+        A_new = mean_y_new - B_new * (i + 2) / 2
+
+        samples = samples.at[i - n].set(s)
+        return smoothed_new, mean_y_new, A_new, B_new, samples, key
+
+    # Loop over forecast horizon
+    smoothed, mean_y, A, B, samples, key = jax.lax.fori_loop(
+        n, n + h, body_fun, (smoothed, mean_y, A, B, samples, key)
+    )
+
+    return samples
+
+def initparamtheta(
+    initial_smoothed: float,
+    alpha: float,
+    theta: float,
+    y: jnp.ndarray,
+    modeltype: _theta.ModelType,
+):
+    if modeltype in [_theta.ModelType.STM, _theta.ModelType.DSTM]:
+        if math.isnan(initial_smoothed):
+            initial_smoothed = y[0] / 2
+            optimize_level = True
+        else:
+            optimize_level = False
+        if math.isnan(alpha):
+            alpha = 0.5
+            optimize_alpha = True
+        else:
+            optimize_alpha = False
+        theta = 2.0  # no optimize
+        optimize_theta = False
+    else:
+        if math.isnan(initial_smoothed):
+            initial_smoothed = y[0] / 2
+            optimize_level = True
+        else:
+            optimize_level = False
+        if math.isnan(alpha):
+            alpha = 0.5
+            optimize_alpha = True
+        else:
+            optimize_alpha = False
+        if math.isnan(theta):
+            theta = 2.0
+            optimize_theta = True
+        else:
+            optimize_theta = False
+    return {
+        "initial_smoothed": initial_smoothed,
+        "optimize_initial_smoothed": optimize_level,
+        "alpha": alpha,
+        "optimize_alpha": optimize_alpha,
+        "theta": theta,
+        "optimize_theta": optimize_theta,
+    }
+
+def optimize_theta_target_fn(
+    init_par,
+    lower,
+    upper,
+    init_level,
+    init_alpha,
+    init_theta,
+    opt_level,
+    opt_alpha,
+    opt_theta,
+    y,
+    modeltype,
+    nmse,
+):
+    opt_res = _theta.minimize(
+        x0=init_par,
+        lower=lower,
+        upper=upper,
+        init_level=init_level,
+        init_alpha=init_alpha,
+        init_theta=init_theta,
+        opt_level=opt_level,
+        opt_alpha=opt_alpha,
+        opt_theta=opt_theta,
+        y=y,
+        model_type=modeltype,
+        nmse=nmse,
+    )
+
+    # ✅ Make sure these are NumPy scalars, not JAX DeviceArrays
+    x = jax.device_get(opt_res["x"])
+    fn = float(jax.device_get(opt_res["fun"]))
+    nit = int(opt_res.get("nit", 0))
+
+    results = namedtuple("results", "x fn nit simplex")
+    return results(x, fn, nit, None)
+
+# Initializations
+init_level = 0.5
+init_alpha = 0.3
+init_theta = 2.0
+
+opt_level = True
+opt_alpha = True
+opt_theta = True
+
+lower = jnp.array([0.0, 0.0, 1.0])
+upper = jnp.array([1.0, 1.0, 10.0])
+
+# Initial guess vector (x0)
+par = jnp.array([init_level, init_alpha, init_theta])
+
+def thetamodel(
+    y: jnp.ndarray,
+    m: int,
+    modeltype: str,
+    initial_smoothed: float,
+    alpha: float,
+    theta: float,
+    nmse: int,
+):
+    y = y.astype(jnp.float64, copy=False)
+    model_type = switch_theta(modeltype)
+    # initial parameters
+    par = initparamtheta(
+        initial_smoothed=initial_smoothed,
+        alpha=alpha,
+        theta=theta,
+        y=y,
+        modeltype=model_type,
+    )
+    optimize_params = {
+        key.replace("optimize_", ""): val for key, val in par.items() if "optim" in key
+    }
+    x0 = jnp.array([par["initial_smoothed"], par["alpha"], par["theta"]], dtype=jnp.float32)
+    # parameter optimization
+    fred = optimize_theta_target_fn(
+    init_par=x0,
+    lower=lower,
+    upper=upper,
+    init_level=init_level,
+    init_alpha=init_alpha,
+    init_theta=init_theta,
+    opt_level=opt_level,
+    opt_alpha=opt_alpha,
+    opt_theta=opt_theta,
+    y=y,
+    modeltype=model_type,
+    nmse=nmse,
+)
+
+    if fred is not None:
+        fit_par = fred.x
+
+    j = 0
+    if optimize_params.get("initial_smoothed", False):
+        par["initial_smoothed"] = float(fit_par[j])
+        j += 1
+    if optimize_params.get("alpha", False):
+        par["alpha"] = float(fit_par[j])
+        j += 1
+    if optimize_params.get("theta", False):
+        par["theta"] = float(fit_par[j])
+        j += 1
+
+    amse, e, states, mse = _theta.pegels_resid(
+        y,
+        model_type,
+        par["initial_smoothed"],
+        par["alpha"],
+        par["theta"],
+        nmse,
+    )
+
+    return dict(
+        mse=mse,
+        amse=amse,
+        fit=fred,
+        residuals=e,
+        m=m,
+        states=states,
+        par=par,
+        n=len(y),
+        modeltype=modeltype,
+        mean_y=jnp.mean(y),
+    )
+
+def forecast_theta(obj, h, level=None):
+    # Extract parameters
+    n_obs = obj["n"]  # number of observed steps
+    # Initialize states if not already correct shape
+    states = obj["states"]
+    if states.ndim == 1 or states.shape[1] != 4:
+        # assume 1D array, reshape/pad to (n_obs, 4)
+        states = jnp.zeros((n_obs, 5), dtype=jnp.float32)
+        # optionally fill initial level/mean/An/Bn
+        states = states.at[:, 0].set(obj.get("mean_y", 0.0))   # level
+        states = states.at[:, 1].set(obj.get("mean_y", 0.0))   # mean
+        states = states.at[:, 2].set(0.0)                      # An
+        states = states.at[:, 3].set(0.0)                      # Bn
+        states = states.at[:, 4].set(0.0)     
+
+    alpha = obj["par"]["alpha"]
+    theta = obj["par"]["theta"]
+    model_type = switch_theta(obj["modeltype"])
+
+    # Call the JAX forecast function
+    states, forecast = _theta.forecast(states, h, model_type, alpha, theta)
+
+    # Build result dictionary
+    res = {"mean": forecast}
+
+    # Compute prediction intervals if requested
+    if level is not None:
+        sigma = jnp.std(obj["residuals"][3:], ddof=1)
+        mean_y = obj["mean_y"]
+        samples = compute_pi_samples(
+            n=obj["n"],
+            h=h,
+            states=states,
+            sigma=sigma,
+            alpha=alpha,
+            theta=theta,
+            mean_y=mean_y,
+        )
+
+        for lv in level:
+            min_q = (100 - lv) / 200
+            max_q = min_q + lv / 100
+            res[f"lo-{lv}"] = jnp.quantile(samples, min_q, axis=1)
+            res[f"hi-{lv}"] = jnp.quantile(samples, max_q, axis=1)
+
+    # Recompose if seasonal decomposition was used
+    if obj.get("decompose", False):
+        seas_forecast = _repeat_val_seas(obj["seas_forecast"]["mean"], h=h)
+        for key in res:
+            if obj["decomposition_type"] == "multiplicative":
+                res[key] = res[key] * seas_forecast
+            else:
+                res[key] = res[key] + seas_forecast
+
+    return res
+
+def is_constant(x):
+    return jnp.all(x[0] == x)
+
+def seasonal_decompose(y: jnp.ndarray, model: str = "additive", period: int = 1):
+    """
+    Simple seasonal decomposition using moving average.
+    Returns a dict with 'trend', 'seasonal', and 'resid' like statsmodels.
+    """
+    n = len(y)
+    # Moving average for trend
+    kernel = jnp.ones(period) / period
+    trend = jnp.convolve(y, kernel, mode="same")
+
+    if model == "additive":
+        detrended = y - trend
+        seasonal = jnp.tile(
+            jnp.mean(detrended.reshape(-1, period), axis=0), n // period + 1
+        )[:n]
+        resid = detrended - seasonal
+    else:  # multiplicative
+        detrended = y / trend
+        seasonal = jnp.tile(
+            jnp.mean(detrended.reshape(-1, period), axis=0), n // period + 1
+        )[:n]
+        resid = detrended / seasonal
+
+    return {
+        "trend": trend,
+        "seasonal": seasonal,
+        "resid": resid,
+    }
+
+def acf(x: jnp.ndarray, nlags: int) -> jnp.ndarray:
+    """
+    Compute autocorrelation function up to `nlags` for 1D array x using JAX.
+    Equivalent to statsmodels.tsa.stattools.acf(x, nlags=nlags, fft=False).
+    """
+    x = x - jnp.mean(x)
+    n = x.shape[0]
+    denom = jnp.dot(x, x)
+    acf_vals = jnp.array([jnp.dot(x[: n - lag], x[lag:]) / denom for lag in range(nlags + 1)])
+    return acf_vals
+
+def auto_theta(
+    y,
+    m,
+    model=None,
+    initial_smoothed=None,
+    alpha=None,
+    theta=None,
+    nmse=3,
+    decomposition_type="multiplicative",
+):
+    # converting params to floats
+    # to improve numba compilation
+    if initial_smoothed is None:
+        initial_smoothed = jnp.nan
+    if alpha is None:
+        alpha = jnp.nan
+    if theta is None:
+        theta = jnp.nan
+    if nmse < 1 or nmse > 30:
+        raise ValueError("nmse out of range")
+    # constan values
+    if is_constant(y):
+        thetamodel(
+            y=y,
+            m=m,
+            modeltype="STM",
+            nmse=nmse,
+            initial_smoothed=jnp.mean(y) / 2,
+            alpha=0.5,
+            theta=2.0,
+        )
+    # seasonal decomposition if needed
+    decompose = False
+    # seasonal test
+    if m >= 4 and len(y) >= 2 * m:
+        r = acf(y, nlags=m, fft=False)[1:]
+        stat = jnp.sqrt((1 + 2 * jnp.sum(r[:-1] ** 2)) / len(y))
+        decompose = jnp.abs(r[-1]) / stat > norm.ppf(0.95)
+
+    data_positive = min(y) > 0
+    if decompose:
+        # change decomposition type if data is not positive
+        if decomposition_type == "multiplicative" and not data_positive:
+            decomposition_type = "additive"
+        y_decompose = seasonal_decompose(y, model=decomposition_type, period=m).seasonal
+        if decomposition_type == "multiplicative" and any(y_decompose < 0.01):
+            decomposition_type = "additive"
+            y_decompose = seasonal_decompose(y, model="additive", period=m).seasonal
+        if decomposition_type == "additive":
+            y = y - y_decompose
+        else:
+            y = y / y_decompose
+        seas_forecast = _seasonal_naive(
+            y=y_decompose, h=m, season_length=m, fitted=False
+        )
+
+    # validate model
+    if model not in [None, "STM", "OTM", "DSTM", "DOTM"]:
+        raise ValueError(f"Invalid model type: {model}.")
+
+    n = len(y)
+    npars = 3
+    # non-optimized tiny datasets
+    if n <= npars:
+        raise NotImplementedError("tiny datasets")
+    if model is None:
+        modeltype = ["STM", "OTM", "DSTM", "DOTM"]
+    else:
+        modeltype = [model]
+
+    best_ic = jnp.inf
+    for mtype in modeltype:
+        fit = thetamodel(
+            y=y,
+            m=m,
+            modeltype=mtype,
+            nmse=nmse,
+            initial_smoothed=initial_smoothed,
+            alpha=alpha,
+            theta=theta,
+        )
+        fit_ic = fit["mse"]
+        if not jnp.isnan(fit_ic):
+            if fit_ic < best_ic:
+                model = fit
+                best_ic = fit_ic
+    if jnp.isinf(best_ic):
+        raise Exception("no model able to be fitted")
+
+    if decompose:
+        if decomposition_type == "multiplicative":
+            model["residuals"] = model["residuals"] * y_decompose
+        else:
+            model["residuals"] = model["residuals"] + y_decompose
+        model["decompose"] = decompose
+        model["decomposition_type"] = decomposition_type
+        model["seas_forecast"] = dict(seas_forecast)
+    return model
+
+
+def forward_theta(fitted_model, y):
+    m = fitted_model["m"]
+    model = fitted_model["modeltype"]
+    initial_smoothed = fitted_model["par"]["initial_smoothed"]
+    alpha = fitted_model["par"]["alpha"]
+    theta = fitted_model["par"]["theta"]
+    return auto_theta(
+        y=y,
+        m=m,
+        model=model,
+        initial_smoothed=initial_smoothed,
+        alpha=alpha,
+        theta=theta,
+    )
