@@ -281,20 +281,51 @@ def _get_conformal_method(method: str):
 
 @jax.jit
 def _ses_forecast(x, alpha):
+    """
+    Simple Exponential Smoothing forecast with NaN handling.
+    
+    Skips NaN values in computation - useful for padded arrays from Croston models.
+    """
     complement = 1 - alpha
     n = x.size
     fitted = jnp.full_like(x, jnp.nan)
-    fitted = fitted.at[0].set(x[0])  # first value
-
-    def body_fun(i, val):
-        fitted_arr, j = val
-        fitted_arr = fitted_arr.at[i].set(alpha * x[j] + complement * fitted_arr[j])
-        j += 1
-        return fitted_arr, j
-
-    fitted, _ = jax.lax.fori_loop(1, n, body_fun, (fitted, 0))
-    forecast = alpha * x[-1] + complement * fitted[-1]
-    fitted = fitted.at[0].set(jnp.nan)  # match original behavior
+    
+    # Find first non-NaN value
+    is_valid = ~jnp.isnan(x)
+    first_valid_idx = jnp.argmax(is_valid)  # Index of first True (non-NaN)
+    first_valid_val = x[first_valid_idx]
+    
+    # Initialize fitted with first valid value
+    fitted = fitted.at[first_valid_idx].set(first_valid_val)
+    
+    def body_fun(i, fitted_arr):
+        # Only update if current value is not NaN
+        val = x[i]
+        prev_fitted = fitted_arr[i-1]
+        
+        # Compute new fitted value: use previous fitted if current is NaN
+        new_fitted = jnp.where(
+            jnp.isnan(val),
+            jnp.nan,  # Keep NaN if input is NaN
+            jnp.where(
+                jnp.isnan(prev_fitted),
+                val,  # If no previous fitted, use current value
+                alpha * val + complement * prev_fitted
+            )
+        )
+        fitted_arr = fitted_arr.at[i].set(new_fitted)
+        return fitted_arr
+    
+    # Apply SES to all positions after first valid
+    fitted = jax.lax.fori_loop(first_valid_idx + 1, n, body_fun, fitted)
+    
+    # Forecast: find last non-NaN value
+    last_valid_idx = n - 1 - jnp.argmax(is_valid[::-1])
+    forecast = fitted[last_valid_idx]
+    
+    # Set first fitted to NaN to match original behavior
+    fitted = fitted.at[first_valid_idx].set(jnp.nan)
+    
     return forecast, fitted
 
 
@@ -322,6 +353,176 @@ def _seasonal_exponential_smoothing(y, h, fitted, season_length, alpha):
     if fitted:
         fcst["fitted"] = fitted_vals
     return fcst
+
+
+@jax.jit
+def _demand(x: jnp.ndarray) -> jnp.ndarray:
+    """
+    Extract positive (non-zero) elements from array.
+    Used by Croston-family models for intermittent demand.
+    
+    Args:
+        x: Input array
+        
+    Returns:
+        Fixed-size array with non-zero values packed at start, rest filled with NaN
+        
+    Example:
+        >>> x = jnp.array([0., 5., 0., 3., 0.])
+        >>> _demand(x)
+        array([5., 3., nan, nan, nan])
+        
+    Note:
+        Returns fixed-size array (same size as input) for JIT compatibility.
+        Non-zero values are packed at the start, remaining positions filled with NaN.
+    """
+    # Get indices where x > 0, with fill_value for padding
+    indices = jnp.where(x > 0, size=x.size, fill_value=-1)[0]
+    
+    # Create result array: gather values where indices are valid, else NaN
+    result = jnp.where(
+        indices >= 0,
+        jnp.where(indices < x.size, x[jnp.clip(indices, 0, x.size-1)], jnp.nan),
+        jnp.nan
+    )
+    return result
+
+
+@jax.jit
+def _intervals(x: jnp.ndarray) -> jnp.ndarray:
+    """
+    Compute intervals between non-zero elements.
+    Used by Croston-family models for intermittent demand.
+    
+    Args:
+        x: Input array
+        
+    Returns:
+        Fixed-size array with intervals packed at start, rest filled with NaN
+        
+    Example:
+        >>> x = jnp.array([0., 5., 0., 0., 3., 0., 2.])
+        >>> _intervals(x)
+        array([1., 3., 2., nan, nan, nan, nan])  # First interval at position 1, then gap of 3, then gap of 2
+        
+    Note:
+        Returns fixed-size array (same size as input) for JIT compatibility.
+        Intervals are packed at the start, remaining positions filled with NaN.
+    """
+    # Get indices of non-zero elements, with fill_value for padding
+    nonzero_idxs = jnp.where(x != 0, size=x.size, fill_value=-1)[0]
+    
+    # Compute positions (1-indexed)
+    positions = jnp.where(nonzero_idxs >= 0, nonzero_idxs + 1, -1)
+    
+    # Compute intervals using diff with prepend
+    intervals = jnp.diff(positions, prepend=0)
+    
+    # Mask out invalid intervals (where positions were -1)
+    valid_mask = positions >= 0
+    result = jnp.where(valid_mask, intervals.astype(x.dtype), jnp.nan)
+    
+    return result
+
+
+def _expand_fitted_demand(fitted: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
+    """
+    Expand demand fitted values back to original series length.
+    Used by Croston-family models.
+    
+    Args:
+        fitted: SES fitted values for demand (length = num_nonzero + 1)
+        y: Original time series
+        
+    Returns:
+        Fitted values expanded to match y's length
+        
+    Logic:
+        - If y[i-1] > 0: Use next fitted value (demand occurred)
+        - If y[i-1] == 0 and we've seen demand: Carry forward previous value
+        - If y[i-1] == 0 and no demand yet: Use naive forecast (y[i-1])
+    """
+    n = y.size
+    out = jnp.full_like(y, jnp.nan)
+    
+    def body_fn(i, state):
+        out_arr, fitted_idx = state
+        
+        # If previous value was positive, advance fitted index
+        fitted_idx = jnp.where(
+            y[i - 1] > 0,
+            fitted_idx + 1,
+            fitted_idx
+        )
+        
+        # Determine output value based on conditions
+        val = jax.lax.cond(
+            y[i - 1] > 0,
+            lambda: fitted[fitted_idx],  # Use new fitted value
+            lambda: jax.lax.cond(
+                fitted_idx > 0,
+                lambda: out_arr[i - 1],  # Carry forward previous
+                lambda: y[i - 1]  # Use naive (no demand seen yet)
+            )
+        )
+        
+        out_arr = out_arr.at[i].set(val)
+        return out_arr, fitted_idx
+    
+    out, _ = jax.lax.fori_loop(1, n, body_fn, (out, 0))
+    return out
+
+
+def _expand_fitted_intervals(fitted: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
+    """
+    Expand interval fitted values back to original series length.
+    Used by Croston-family models.
+    
+    Args:
+        fitted: SES fitted values for intervals (length = num_nonzero + 1)
+        y: Original time series
+        
+    Returns:
+        Fitted intervals expanded to match y's length (avoids division by zero)
+        
+    Logic:
+        - If y[i-1] != 0: Use next fitted value, but replace 0 with 1 (avoid div by zero)
+        - If y[i-1] == 0 and we've seen intervals: Carry forward previous value
+        - If y[i-1] == 0 and no intervals yet: Use 1 (avoid division by zero)
+    """
+    n = y.size
+    out = jnp.full_like(y, jnp.nan)
+    
+    def body_fn(i, state):
+        out_arr, fitted_idx = state
+        
+        # If previous value was non-zero, advance fitted index
+        fitted_idx = jnp.where(
+            y[i - 1] != 0,
+            fitted_idx + 1,
+            fitted_idx
+        )
+        
+        # Determine output value based on conditions
+        val = jax.lax.cond(
+            y[i - 1] != 0,
+            lambda: jnp.where(
+                fitted[fitted_idx] == 0,
+                1.0,  # Avoid division by zero
+                fitted[fitted_idx]
+            ),
+            lambda: jax.lax.cond(
+                fitted_idx > 0,
+                lambda: out_arr[i - 1],  # Carry forward previous
+                lambda: 1.0  # No intervals seen yet, use 1
+            )
+        )
+        
+        out_arr = out_arr.at[i].set(val)
+        return out_arr, fitted_idx
+    
+    out, _ = jax.lax.fori_loop(1, n, body_fn, (out, 0))
+    return out
 
 def _conformal_method(self):
         return _get_conformal_method(self.prediction_intervals.method)
