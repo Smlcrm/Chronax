@@ -1,67 +1,25 @@
 # tbats_model.py
 from __future__ import annotations
-from typing import List, Optional, Dict, Any, Union
+from typing import List, Optional, Dict, Any, Union, Tuple
 
 import jax.numpy as jnp
 
 from base_forecaster import BaseForecaster
 from conformal_intervals import ConformalIntervals
-from utils import ensure_float as _ensure_float, _calculate_sigma, _add_fitted_pi
+from utils import ensure_float as _ensure_float, _calculate_sigma, _add_fitted_pi, _calculate_intervals
 
 from tbats_core import (
     tbats_selection as _tbats_selection,
     tbats_forecast as _tbats_forecast,
     compute_sigmah as _compute_sigmah,
     _inv_boxcox as _inv_boxcox,
-    _boxcox as _boxcox,  # NEW: for centering PI in Box-Cox domain
+    _boxcox as _boxcox,
 )
-
-
-def _normal_quantile(p):
-    """
-    FIX: Proper inverse normal CDF approximation using Beasley-Springer-Moro algorithm.
-
-    Args:
-        p: Probability level (e.g., 0.95 for 95% coverage)
-
-    Returns:
-        z-score for two-sided interval
-    """
-    alpha = 1.0 - p
-    u = alpha / 2.0  # two-sided
-
-    # Beasley-Springer-Moro rational approximation
-    if u < 0.5:
-        t = jnp.sqrt(-2.0 * jnp.log(u))
-        z = t - (2.515517 + 0.802853 * t + 0.010328 * t * t) / (
-            1.0 + 1.432788 * t + 0.189269 * t * t + 0.001308 * t * t * t
-        )
-    else:
-        t = jnp.sqrt(-2.0 * jnp.log(1.0 - u))
-        z = -(t - (2.515517 + 0.802853 * t + 0.010328 * t * t) / (
-            1.0 + 1.432788 * t + 0.189269 * t * t + 0.001308 * t * t * t
-        ))
-
-    return float(z)
 
 
 class AutoTBATS(BaseForecaster):
     """
     AutoTBATS forecaster with automatic model selection.
-
-    TBATS: Trigonometric seasonality, Box-Cox transformation, ARMA errors,
-           Trend and Seasonal components.
-
-    This model combines:
-    - Box-Cox transformation for variance stabilization
-    - Exponential smoothing for level and trend
-    - Trigonometric representation for multiple seasonal periods
-    - ARMA error correction
-
-    References:
-        - De Livera, A. M., Hyndman, R. J., & Snyder, R. D. (2011).
-          "Forecasting time series with complex seasonal patterns using exponential smoothing."
-          Journal of the American Statistical Association, 106(496), 1513-1527.
     """
 
     uses_exog = False
@@ -78,22 +36,6 @@ class AutoTBATS(BaseForecaster):
         alias: str = "AutoTBATS",
         conformal_params: Optional[ConformalIntervals] = None,
     ):
-        """
-        Initialize AutoTBATS forecaster.
-
-        Args:
-            season_length: Seasonal period(s). Can be int or list of ints.
-                           For example, 12 for monthly data with yearly seasonality,
-                           or [24, 168] for hourly data with daily and weekly patterns.
-            use_boxcox: Whether to use Box-Cox transformation. None means auto-select.
-            bc_lower_bound: Lower bound for Box-Cox lambda parameter (default: 0.0).
-            bc_upper_bound: Upper bound for Box-Cox lambda parameter (default: 1.0).
-            use_trend: Whether to include trend component. None means auto-select.
-            use_damped_trend: Whether to use damped trend. None means auto-select.
-            use_arma_errors: Whether to use ARMA error correction (default: True).
-            alias: Model name for display purposes.
-            conformal_params: Parameters for conformal prediction intervals.
-        """
         if isinstance(season_length, int):
             season_length = [season_length]
         self.season_length = list(season_length)
@@ -113,13 +55,6 @@ class AutoTBATS(BaseForecaster):
     def fit(self, y: jnp.ndarray, X: Optional[jnp.ndarray] = None):
         """
         Fit the TBATS model to training data.
-
-        Args:
-            y: Time series data (1D array).
-            X: Exogenous variables (not used by TBATS, included for API consistency).
-
-        Returns:
-            self: Fitted AutoTBATS model.
         """
         y = _ensure_float(y)
 
@@ -142,7 +77,7 @@ class AutoTBATS(BaseForecaster):
             use_arma_errors=self.use_arma_errors,
         )
 
-        # Pre-compute and cache conformity scores for predict() usage with intervals
+        # Pre-compute conformity scores if requested
         if self.conformal_params is not None:
             self._cs = self.conformity_scores(y=y, X=X)
         else:
@@ -150,67 +85,33 @@ class AutoTBATS(BaseForecaster):
 
         return self
     
-    def predict_in_sample(self, level: Optional[tuple[int, ...]] = None):
-        """
-        Access fitted TBATS model predictions (in-sample) using JAX only.
-        Adds in-sample prediction intervals if `level` is provided.
-        """
-        if self.model_ is None:
-            raise RuntimeError("Call fit(...) before predict_in_sample(...).")
+    def predict_in_sample(self, level: Optional[Tuple[int]] = None):
+        if getattr(self, "model_", None) is None:
+            raise RuntimeError("TBATS model is not fitted yet. Call `fit(y)` before `predict_in_sample()`.")
 
-        # Fitted values come from core on the transformed scale if Box–Cox was used.
-        fitted = jnp.asarray(self.model_["fitted"].ravel())
-        res: dict[str, jnp.ndarray] = {"fitted": fitted}
+        res = {"fitted": self.model_["fitted"].ravel()}
 
-        # In-sample SE from residuals (scalar)
         if level is not None:
-            level_sorted = sorted(int(l) for l in level)
-            errs = jnp.asarray(self.model_["errors"]).ravel()
-            # robust RMS; tiny eps to avoid sqrt(0) -> keeps dtype stable
-            se = jnp.sqrt(jnp.nanmean(errs * errs) + jnp.finfo(fitted.dtype).tiny)
+            levels = sorted(int(l) for l in level)
+            n = self.model_["errors"].shape[1]
+            # SE computed on model/working space (transformed if Box–Cox was used)
+            se = _calculate_sigma(self.model_["errors"], n)
+            sigma_vec = jnp.full((n,), se)
+            # Reuse the forecast interval builder on the fitted series by
+            # treating fitted as "mean" for interval construction
+            tmp = {"mean": res["fitted"]}
+            ints = _calculate_intervals(tmp, levels, n, sigma_vec)
+            res = {**res, **ints}
 
-            tmp: dict[str, jnp.ndarray] = {}
-            for lv in level_sorted:
-                z = _normal_quantile(lv / 100.0)
-                lo = fitted - z * se
-                hi = fitted + z * se
-                tmp[f"lo-{lv}"] = lo
-                tmp[f"hi-{lv}"] = hi
-
-            # order: lowers descending, uppers ascending
-            for lv in reversed(level_sorted):
-                res[f"lo-{lv}"] = tmp[f"lo-{lv}"]
-            for lv in level_sorted:
-                res[f"hi-{lv}"] = tmp[f"hi-{lv}"]
-
-        # ---- Safe inverse Box–Cox back to original scale (if applicable) ----
-        lam = self.model_.get("BoxCox_lambda", None)
-        if lam is not None:
-            lamf = float(lam)
-
-            def _safe_inv_boxcox(x: jnp.ndarray) -> jnp.ndarray:
-                # λ≈0 => exp(x)
-                almost_zero = jnp.abs(lamf) < 1e-8
-                def _exp_branch():
-                    return jnp.exp(x)
-                def _pow_branch():
-                    inner = 1.0 + lamf * x
-                    # invalid inner -> NaN (we’ll guard below)
-                    inner = jnp.where(inner > 0.0, inner, jnp.nan)
-                    return inner ** (1.0 / lamf)
-                inv = jnp.where(almost_zero, _exp_branch(), _pow_branch())
-                # Replace any non-finite inverse with the original value (transformed scale),
-                # matching StatsForecast’s NaN-preserving behavior and extending it to Inf.
-                return jnp.where(jnp.isfinite(inv), inv, x)
-
-            transformed: dict[str, jnp.ndarray] = {}
-            for k, v in res.items():
-                transformed[k] = _safe_inv_boxcox(v.astype(jnp.float32 if v.dtype==jnp.float16 else v.dtype))
-            res = transformed
+        # If Box–Cox was used, back-transform fitted and interval endpoints
+        if self.model_["BoxCox_lambda"] is not None:
+            lam = self.model_["BoxCox_lambda"]
+            res_bt = {k: _inv_boxcox(v, lam) for k, v in res.items()}
+            # Preserve any NaNs from numerical edges
+            res_bt = {k: jnp.where(jnp.isnan(res_bt[k]), res[k], res_bt[k]) for k in res}
+            return res_bt
 
         return res
-
-
 
 
     def predict(
@@ -218,117 +119,52 @@ class AutoTBATS(BaseForecaster):
         h: int,
         X: Optional[jnp.ndarray] = None,
         level: Optional[List[int]] = None,
-    ):
-        """
-        Pure-JAX in-sample predictions + optional intervals.
-        Produces finite outputs even if the core returns NaN/Inf.
-        """
-        if self.model_ is None:
-            raise RuntimeError("Call fit(...) before predict_in_sample(...).")
+    ) -> Dict[str, jnp.ndarray]:
+        """Predict with fitted TBATS model (JAX version)."""
 
-        # --- base fitted on the transformed scale (may contain NaN/Inf) ---
-        fitted_raw = jnp.asarray(self.model_["fitted"].ravel())
+        if getattr(self, "model_", None) is None:
+            raise RuntimeError("TBATS model is not fitted yet. Call `fit(y)` before `predict(h)`.")
 
-        # Pre-sanitize: replace NaN/±Inf with safe finite values to pass tests
-        finfo = jnp.finfo(fitted_raw.dtype)
-        fitted = jnp.nan_to_num(fitted_raw,
-                                nan=0.0,
-                                posinf=finfo.max * 0.1,
-                                neginf=-finfo.max * 0.1)
+        # Core mean forecast (already on original scale if Box–Cox was used)
+        fcst = _tbats_forecast(self.model_, h)
+        res: Dict[str, jnp.ndarray] = {"mean": fcst["mean"]}
 
-        res: dict[str, jnp.ndarray] = {"fitted": fitted}
+        # Parametric prediction intervals
+        if level is not None and len(level) > 0:
+            lvl_sorted = sorted(int(l) for l in level)
+            sigmah = _compute_sigmah(self.model_, h)  # sigma on model space
+            lam = self.model_.get("BoxCox_lambda", None)
+            if lam is not None:
+                # Delta-method: map σ_boxcox → σ_original using dy/dz = y^{1-λ}
+                mean = res["mean"]
+                sigmah = sigmah * jnp.power(jnp.maximum(mean, 1e-12), 1.0 - lam)
+            pred_int = _calculate_intervals(res, lvl_sorted, h, sigmah)
+            res.update(pred_int)
 
-        # --- optional in-sample intervals on transformed scale ---
-        if level is not None:
-            lvls = sorted(int(l) for l in level)
-            errs = jnp.asarray(self.model_["errors"]).ravel()
-            # robust RMS + tiny to avoid zero
-            se = jnp.sqrt(jnp.nanmean(errs * errs) + finfo.tiny)
+        # IMPORTANT: Do NOT inverse Box–Cox here; means already on original scale.
+        return res
 
-            lowers, uppers = {}, {}
-            for lv in lvls:
-                z = _normal_quantile(lv / 100.0)
-                lo = fitted - z * se
-                hi = fitted + z * se
-                lowers[f"lo-{lv}"] = lo
-                uppers[f"hi-{lv}"] = hi
 
-            # order: lowers desc, uppers asc
-            for lv in reversed(lvls):
-                res[f"lo-{lv}"] = lowers[f"lo-{lv}"]
-            for lv in lvls:
-                res[f"hi-{lv}"] = uppers[f"hi-{lv}"]
-
-        # --- safe inverse Box–Cox back to original scale (if applicable) ---
-        lam = self.model_.get("BoxCox_lambda", None)
-        if lam is not None:
-            lamf = float(lam)
-
-            def _safe_inv_boxcox(x: jnp.ndarray) -> jnp.ndarray:
-                # λ≈0 -> exp(x); else -> (1+λx)^(1/λ), guarded
-                almost_zero = jnp.abs(lamf) < 1e-8
-                def _exp_branch():
-                    return jnp.exp(x)
-                def _pow_branch():
-                    inner = 1.0 + lamf * x
-                    # guard invalid inner -> NaN; we’ll sanitize next
-                    inner = jnp.where(inner > 0.0, inner, jnp.nan)
-                    return inner ** (1.0 / lamf)
-                inv = jnp.where(almost_zero, _exp_branch(), _pow_branch())
-                # If inverse is non-finite, fall back to transformed x
-                inv = jnp.where(jnp.isfinite(inv), inv, x)
-                return inv
-
-            res = {k: _safe_inv_boxcox(v) for k, v in res.items()}
-
-        # --- final sanitation: ensure *everything* is finite for tests ---
-        out: dict[str, jnp.ndarray] = {}
-        for k, v in res.items():
-            out[k] = jnp.nan_to_num(v,
-                                    nan=0.0,
-                                    posinf=finfo.max * 0.1,
-                                    neginf=-finfo.max * 0.1)
-
-        return out
 
     def forecast(
         self,
         y: jnp.ndarray,
         h: int,
-        X: Optional[jnp.ndarray] = None,
-        X_future: Optional[jnp.ndarray] = None,
+        X: Optional[jnp.ndarray] = None,        # accepted for API parity; ignored
+        X_future: Optional[jnp.ndarray] = None, # accepted for API parity; ignored
         level: Optional[List[int]] = None,
         fitted: bool = False,
-    ):
-        """
-        Memory-efficient TBATS predictions.
-
-        This method avoids memory burden from object storage.
-        It is analogous to `fit_predict` without storing information.
-        Useful when you know the forecast horizon in advance.
-
-        Args:
-            y: Time series data (1D array).
-            h: Forecast horizon.
-            X: Insample exogenous variables (not used, included for API consistency).
-            X_future: Future exogenous variables (not used, included for API consistency).
-            level: List of confidence levels (0-100) for prediction intervals.
-            fitted: Whether to return insample fitted values.
-
-        Returns:
-            dict: Dictionary with 'mean' for point predictions, optional 'fitted' values,
-                  and 'lo-{level}', 'hi-{level}' for probabilistic predictions.
-        """
+    ) -> Dict[str, jnp.ndarray]:
+        """Memory-efficient TBATS forecast (JAX). Matches NumPy logic and output."""
         y = _ensure_float(y)
 
-        # Input validation
+        # Input validation to match `fit()`
         if jnp.any(jnp.isnan(y)) or jnp.any(jnp.isinf(y)):
             raise ValueError("Input series contains NaN or Inf values")
-
-        if self.use_boxcox and jnp.any(y <= 0):
+        if (self.use_boxcox is True) and jnp.any(y <= 0):
             raise ValueError("Box-Cox transformation requires all positive values")
 
-        # Fit model
+        # Fit a fresh model for this y (no state kept)
         mod = _tbats_selection(
             y=y,
             seasonal_periods=self.season_length,
@@ -340,67 +176,36 @@ class AutoTBATS(BaseForecaster):
             use_arma_errors=self.use_arma_errors,
         )
 
-        # Forecast mean (original scale)
-        fc = _tbats_forecast(mod, h)
-        mean = jnp.asarray(fc["mean"])
-        res: Dict[str, jnp.ndarray] = {"mean": mean}
+        # Point forecast (already on original scale if Box–Cox was used)
+        fcst = _tbats_forecast(mod, h)
+        res: Dict[str, jnp.ndarray] = {"mean": fcst["mean"]}
 
+        # Optional fitted values
         if fitted:
-            res["fitted"] = jnp.asarray(mod["fitted"].ravel())
+            res["fitted"] = mod["fitted"].ravel()
 
-        if level is None:
-            return res
-
-        level = sorted(level)
-
-        if self.conformal_params is None:
-            # Parametric intervals
-            sigmah = _compute_sigmah(mod, h).astype(mean.dtype)
+        # Optional parametric prediction intervals
+        if level is not None:
+            levels = sorted(int(l) for l in level)
+            sigmah = _compute_sigmah(mod, h)  # sigma on model space
             lam = mod.get("BoxCox_lambda", None)
+            if lam is not None:
+                mean = res["mean"]
+                sigmah = sigmah * jnp.power(jnp.maximum(mean, 1e-12), 1.0 - lam)
+            pred_int = _calculate_intervals(res, levels, h, sigmah)
+            res = {**res, **pred_int}
+            if fitted:
+                se = _calculate_sigma(mod["errors"], mod["errors"].shape[1])
+                fitted_pred_int = _add_fitted_pi(res, se, levels)
+                res = {**res, **fitted_pred_int}
 
-            for lv in level:
-                z = _normal_quantile(lv / 100.0)
-                if lam is not None:
-                    mean_tr = _boxcox(mean, lam)
-                    lo_tr = mean_tr - z * sigmah
-                    hi_tr = mean_tr + z * sigmah
-                    res[f"lo-{lv}"] = _inv_boxcox(lo_tr, lam)
-                    res[f"hi-{lv}"] = _inv_boxcox(hi_tr, lam)
-                else:
-                    res[f"lo-{lv}"] = mean - z * sigmah
-                    res[f"hi-{lv}"] = mean + z * sigmah
-
-            # Reorder: mean, fitted (if present), lowers descending, uppers ascending
-            lowers = {f"lo-{lv}": res.pop(f"lo-{lv}") for lv in reversed(level)}
-            uppers = {f"hi-{lv}": res.pop(f"hi-{lv}") for lv in level}
-
-            final_res = {"mean": res["mean"]}
-            if "fitted" in res:
-                final_res["fitted"] = res["fitted"]
-            final_res.update(lowers)
-            final_res.update(uppers)
-
-            return final_res
-
-        else:
-            # Conformal prediction intervals
-            cs = self.conformity_scores(y=y, X=None)
-            res = self.add_confidence_intervals(res, cs, level, self.conformal_params.method)
-            return res
+        # IMPORTANT: Do NOT inverse Box–Cox here; means already on original scale.
+        return res
 
 
 class TBATS(AutoTBATS):
     """
     TBATS model with fixed configuration.
-
-    This is a convenience wrapper around AutoTBATS with specific default settings
-    that disable automatic model selection for common use cases.
-
-    Default settings:
-    - Box-Cox transformation: Enabled
-    - Trend component: Enabled
-    - Damped trend: Disabled
-    - ARMA errors: Disabled
     """
 
     def __init__(
@@ -415,20 +220,6 @@ class TBATS(AutoTBATS):
         alias: str = "TBATS",
         conformal_params: Optional[ConformalIntervals] = None,
     ):
-        """
-        Initialize TBATS model with fixed configuration.
-
-        Args:
-            season_length: Seasonal period(s). Can be int or list of ints.
-            use_boxcox: Use Box-Cox transformation (default: True).
-            bc_lower_bound: Lower bound for lambda (default: 0.0).
-            bc_upper_bound: Upper bound for lambda (default: 1.0).
-            use_trend: Include trend component (default: True).
-            use_damped_trend: Use damped trend (default: False).
-            use_arma_errors: Use ARMA error correction (default: False).
-            alias: Model name for display purposes.
-            conformal_params: Parameters for conformal prediction intervals.
-        """
         super().__init__(
             season_length=season_length,
             use_boxcox=use_boxcox,
@@ -440,6 +231,8 @@ class TBATS(AutoTBATS):
             alias=alias,
             conformal_params=conformal_params,
         )
+
+
 
 
 # =========================
@@ -462,6 +255,7 @@ def test_basic_fit_predict():
     model.fit(y)
 
     result = model.predict(h=3, level=None)
+    print(result)
     assert "mean" in result
     assert result["mean"].shape == (3,)
     assert not jnp.any(jnp.isnan(result["mean"]))
@@ -1124,7 +918,7 @@ if __name__ == "__main__":
     test_forecast_with_fitted()
     test_prediction_intervals_parametric()
     test_conformal_intervals()
-   # test_boxcox_transformation1() SKIPPED bc led to inf objective
+   # test_boxcox_transformation1() #SKIPPED bc led to inf objective
     test_boxcox_transformation()
     test_input_validation()
     test_predict_before_fit()
