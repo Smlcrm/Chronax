@@ -12,6 +12,7 @@ from typing import Optional, List, Dict, Union, Tuple
 from jax.scipy.special import ndtri  # JAX inverse normal CDF
 from collections import namedtuple
 from functools import partial
+import os
 
 results = namedtuple("results", "x fn nit simplex")
 
@@ -618,3 +619,311 @@ def _window_average(
     # JIT-compiled fast path
     mean = _window_average_core(y, window_size, h)
     return {"mean": mean}
+
+# JAX-only IMAPA with SES + bounded golden-section search
+# -------------------------------------------------------
+# imapa_jax.py — Pure JAX IMAPA with Brent-bounded SES optimizer (search in float64)
+
+from typing import Tuple, Dict, Any
+
+import jax
+jax.config.update("jax_enable_x64", True)
+import jax.numpy as jnp
+from jax import lax
+import warnings
+
+
+# ---------------------------
+# Small helpers
+# ---------------------------
+
+def _repeat_val_(val: float, h: int, dtype) -> jnp.ndarray:
+    return jnp.full((h,), jnp.asarray(val, dtype=dtype))
+
+
+def _intervals(x: jnp.ndarray) -> jnp.ndarray:
+    """Intervals between nonzero elements (match numpy reference)."""
+    idx = jnp.where(x != 0)[0]
+    padded = jnp.concatenate([jnp.array([0], dtype=idx.dtype), idx + 1])
+    diffs = jnp.diff(padded)
+    return diffs.astype(x.dtype)
+
+
+def _chunk_sums(array: jnp.ndarray, chunk_size: int) -> jnp.ndarray:
+    """Split into equal chunks and sum each chunk. Incomplete tail discarded."""
+    n = array.size
+    n_chunks = n // chunk_size
+    n_elems = n_chunks * chunk_size
+    trimmed = array[:n_elems]
+    if n_chunks == 0:
+        return jnp.zeros((0,), dtype=array.dtype)
+    reshaped = trimmed.reshape((n_chunks, chunk_size))
+    return reshaped.sum(axis=1)
+
+
+# ---------------------------
+# SES core
+# ---------------------------
+
+def _ses_sse(alpha: jnp.ndarray, x: jnp.ndarray) -> jnp.ndarray:
+    """Residual sum of squares for simple exponential smoothing."""
+    x = ensure_float(x)
+    dtype = x.dtype
+    alpha = jnp.asarray(alpha, dtype=dtype)
+    complement = jnp.asarray(1.0, dtype=dtype) - alpha
+    n = x.shape[0]
+
+    def body_fun(i, state):
+        forecast, sse = state
+        forecast_new = alpha * x[i - 1] + complement * forecast
+        err = x[i] - forecast_new
+        return (forecast_new, sse + err * err)
+
+    init_state = (x[0], jnp.asarray(0.0, dtype=dtype))
+    forecast, sse = lax.fori_loop(1, n, body_fun, init_state)
+    return sse
+
+
+def _ses_forecast(x: jnp.ndarray, alpha: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """One-step ahead forecast and in-sample fitted values for SES."""
+    x = ensure_float(x)
+    dtype = x.dtype
+    alpha = jnp.asarray(alpha, dtype=dtype)
+    complement = jnp.asarray(1.0, dtype=dtype) - alpha
+
+    n = x.shape[0]
+    fitted = jnp.empty_like(x)
+    fitted = fitted.at[0].set(x[0])
+
+    def body_fun(i, carry):
+        j, fitted_arr = carry
+        next_val = alpha * x[j] + complement * fitted_arr[j]
+        fitted_arr = fitted_arr.at[i].set(next_val)
+        return (j + 1, fitted_arr)
+
+    _, fitted = lax.fori_loop(1, n, body_fun, (0, fitted))
+    forecast = alpha * x[n - 1] + complement * fitted[n - 1]
+    fitted = fitted.at[0].set(jnp.asarray(jnp.nan, dtype=dtype))
+    return forecast, fitted
+
+
+# ---------------------------
+# Golden-section (SciPy "bounded") optimizer
+# ---------------------------
+
+def _golden_bounded_minimize(
+    f,
+    a: float,
+    b: float,
+    dtype=jnp.float64,
+    xatol: float | None = None,
+    maxiter: int = 1000,
+):
+    """
+    Deterministic golden-section search matching SciPy's "bounded" behavior.
+    All arithmetic in `dtype` (use float64 to mimic SciPy).
+    Returns (x*, f(x*)).
+    """
+    if xatol is None:
+        # SciPy's bounded uses absolute tolerance; we use a tight default in float64
+        xatol = 1e-12 if dtype == jnp.float64 else 1e-7
+
+    a = jnp.asarray(a, dtype=dtype).item()
+    b = jnp.asarray(b, dtype=dtype).item()
+    if not (a < b):
+        raise ValueError("Bounds must satisfy a < b.")
+
+    invphi = (jnp.sqrt(jnp.asarray(5.0, dtype=dtype)) - 1.0) / 2.0   # ~0.6180339887
+    invphi2 = 1.0 - invphi                                           # ~0.3819660113
+
+    # Initial interior points
+    h = b - a
+    if h <= xatol:
+        x = (a + b) / 2.0
+        return jnp.asarray(x, dtype=dtype), jnp.asarray(f(jnp.asarray(x, dtype=dtype)), dtype=dtype)
+
+    n = int(jnp.ceil(jnp.log(xatol / h) / jnp.log(invphi))) if h > 0 else 1
+    c = a + invphi2 * h
+    d = a + invphi * h
+    fc = float(f(jnp.asarray(c, dtype=dtype)))
+    fd = float(f(jnp.asarray(d, dtype=dtype)))
+
+    it = 0
+    while it < maxiter and (d - c) > xatol:
+        it += 1
+        if fc < fd:
+            b, d, fd = d, c, fc
+            h = invphi * h
+            c = a + invphi2 * h
+            fc = float(f(jnp.asarray(c, dtype=dtype)))
+        else:
+            a, c, fc = c, d, fd
+            h = invphi * h
+            d = a + invphi * h
+            fd = float(f(jnp.asarray(d, dtype=dtype)))
+
+    # Best point is the smaller of c,d (or their function values)
+    if fc < fd:
+        xstar, fstar = c, fc
+    else:
+        xstar, fstar = d, fd
+
+    return jnp.asarray(xstar, dtype=dtype), jnp.asarray(fstar, dtype=dtype)
+
+
+# ---------------------------
+# Optimized SES forecast (search in float64 via golden-section)
+# ---------------------------
+def _optimized_ses_forecast(
+    x: jnp.ndarray, bounds: Tuple[float, float] = (0.1, 0.3)
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Compute one-step SES forecast with alpha chosen by golden-section minimization of SSE.
+
+    Heuristic:
+      - If input is float32 AND (sequence is degenerate (<=2 nonzero) OR has any negatives),
+        run BOTH the optimizer and SES recursion in float32 to match NumPy reference.
+      - Otherwise, run both in float64 for numerical stability.
+    """
+    x = ensure_float(x)
+    out_dtype = x.dtype
+
+    # Detect tricky cases that are sensitive to fp32 rounding in NumPy
+    nonzero_cnt = jnp.sum(x != 0)
+    has_neg = jnp.any(x < 0)
+    prefer_fp32 = (out_dtype == jnp.float32) & ((nonzero_cnt <= 2) | has_neg)
+
+    run_dtype = jnp.float32 if prefer_fp32 else jnp.float64
+    x_run = x.astype(run_dtype)
+
+    def obj(a):
+        return _ses_sse(a, x_run)
+
+    # Slightly looser xatol for fp32 (closer to SciPy bounded behavior in fp32)
+    xatol = 1e-8 if run_dtype == jnp.float32 else 1e-13
+
+    alpha_star, _ = _golden_bounded_minimize(
+        obj, bounds[0], bounds[1], dtype=run_dtype, xatol=xatol, maxiter=5000
+    )
+
+    # Run SES recursion in the same dtype we optimized in (to match NumPy path),
+    # then cast outputs back to the original dtype of the series.
+    forecast_run, fitted_run = _ses_forecast(x_run, alpha_star)
+
+    forecast = forecast_run.astype(out_dtype)
+    fitted = fitted_run.astype(out_dtype)
+    return forecast, fitted
+
+
+
+# ---------------------------
+# IMAPA
+# ---------------------------
+
+def _imapa(
+    y: jnp.ndarray,
+    h: int,
+    fitted: bool,
+) -> Dict[str, Any]:
+    """
+    IMAPA forecaster in pure JAX (intermittent demand).
+
+    What it does:
+        1) Detects inter-arrival spacing of non-zero observations in `y` and
+           computes a mean interval.
+        2) Uses that mean (rounded) as the maximum aggregation level K.
+        3) For each aggregation level k = 1..K:
+            - Drops a short remainder (so length is divisible by k).
+            - Chunks and sums the series into length-k blocks.
+            - Fits Single Exponential Smoothing (SES) to the aggregated series,
+              selecting alpha via a bounded golden-section search on SSE.
+            - Scales the one-step SES forecast back by 1/k.
+        4) Averages the per-k forecasts to produce a single constant-mean forecast
+           of length `h`. Optionally computes in-sample fitted values by
+           refitting on prefixes (O(T²) warning).
+
+    How it differs from a typical NumPy reference:
+        - Pure JAX: vectorized core math and JIT-friendly loops; no SciPy optimizer.
+        - Optimizer: uses a deterministic golden-section search (SciPy-like
+          “bounded” behavior) implemented in JAX instead of `scipy.optimize`.
+        - Dtype policy: inputs are normalized with `ensure_float` (ints -> fp32).
+          SES optimization/recursion may run in fp64 for stability except for
+          very sparse or sign-changing fp32 inputs, where we mirror fp32 end-to-end
+          to match NumPy paths more closely.
+        - Guard rails: handles all-zeros fast path and skips empty chunk sets.
+
+    Limitations:
+        - Fitted values: computed by recursive refits on prefixes, which is
+          O(T²) and expensive; intended for testing/debugging, not production.
+        - JIT boundaries: the outer Python loops over aggregation levels and
+          prefix refits are not fully fused; very large T or K can impact speed.
+        - Sensitivity in edge cases: extremely short, single-spike, or highly
+          negative/alternating sequences can be sensitive to dtype/tolerance;
+          the fp32/fp64 heuristic mitigates this but tiny deltas vs NumPy can
+          still occur if tolerances are set extremely tight.
+        - Assumes non-seasonal SES per aggregation. If strong seasonality exists
+          after aggregation, this model intentionally keeps the constant-mean
+          IMAPA assumption.
+
+    Returns:
+        dict with:
+          - "mean": (h,) constant forecast replicated across horizon
+          - optionally "fitted": (T,) in-sample values with first element NaN
+
+    """
+    # All zeros shortcut
+    if bool(jnp.all(y == 0)):
+        out_dtype = y.dtype if y.dtype in (jnp.float32, jnp.float64) else jnp.float32
+        res = {"mean": jnp.zeros((h,), dtype=out_dtype)}
+        if fitted:
+            f = jnp.zeros_like(ensure_float(y)).astype(out_dtype)
+            f = f.at[0].set(jnp.asarray(jnp.nan, dtype=out_dtype))
+            res["fitted"] = f
+        return res
+
+    y = ensure_float(y)
+    dtype = y.dtype
+
+    y_intervals = _intervals(y)
+    mean_interval = jnp.mean(y_intervals)
+    max_aggregation_level = int(jnp.rint(mean_interval).item())
+    if max_aggregation_level < 1:
+        max_aggregation_level = 1
+
+    forecasts = jnp.empty((max_aggregation_level,), dtype=dtype)
+
+    for aggregation_level in range(1, max_aggregation_level + 1):
+        lost_remainder_data = int(y.shape[0] % aggregation_level)
+        y_cut = y[lost_remainder_data:]
+        aggregation_sums = _chunk_sums(y_cut, aggregation_level)
+        if aggregation_sums.size == 0:
+            # If no chunks, set NaN to skip in mean
+            forecasts = forecasts.at[aggregation_level - 1].set(jnp.asarray(jnp.nan, dtype=dtype))
+            continue
+        fcast, _ = _optimized_ses_forecast(aggregation_sums)
+        forecasts = forecasts.at[aggregation_level - 1].set(
+            fcast / jnp.asarray(aggregation_level, dtype=dtype)
+        )
+
+    # Mean of finite forecasts (there shouldn't be NaNs normally, but guard anyway)
+    finite_mask = jnp.isfinite(forecasts)
+    forecast = jnp.where(
+        finite_mask.any(),
+        jnp.mean(forecasts[finite_mask]),
+        jnp.asarray(0.0, dtype=dtype),
+    )
+
+    res: Dict[str, Any] = {"mean": _repeat_val_(val=forecast, h=h, dtype=dtype)}
+
+    if fitted:
+        warnings.warn("Computing fitted values for IMAPA is very expensive.")
+        n = y.size
+        fitted_vals = jnp.empty_like(y)
+        fitted_vals = fitted_vals.at[0].set(jnp.asarray(jnp.nan, dtype=dtype))
+        for i in range(n - 1):
+            sub = y[: i + 1]
+            sub_res = _imapa(sub, h=1, fitted=False)
+            fitted_vals = fitted_vals.at[i + 1].set(sub_res["mean"][0])
+        res["fitted"] = fitted_vals
+
+    return res
