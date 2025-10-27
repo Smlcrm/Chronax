@@ -3,8 +3,24 @@
    It is a helper method for to ensure that the datatypes within a given array are float32. 
 """
 
+
+import os
+from collections import namedtuple
+from functools import partial
+from typing import Optional, List, Dict, Union, Tuple
+import theta_jax as _theta
+from jax.scipy.stats import norm
+import math
+from collections import namedtuple
+import jax.random as jrandom
+
 import jax
+from jax import jit, lax
 import jax.numpy as jnp
+from jax.scipy.optimize import minimize
+from jax.scipy.special import ndtri  # JAX inverse normal CDF
+
+results = namedtuple("results", "x fn nit simplex")
 
 def ensure_float(y: jnp.ndarray) -> jnp.ndarray:
     if not jnp.issubdtype(y.dtype, jnp.floating):
