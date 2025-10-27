@@ -49,3 +49,41 @@ def _jax_norm_ppf(p):
     z = t - (c0 + c1 * t + c2 * t**2) / (1 + d1 * t + d2 * t**2 + d3 * t**3)
 
     return sign * z
+
+def extract_demand(y: jnp.ndarray) -> jnp.ndarray:
+    """Extract positive (non-zero) demand values from a time series.
+
+    This is used for intermittent demand models like TSB and Croston,
+    where we need to separate demand occurrences from no-demand periods.
+
+    Args:
+        y: Time series array that may contain zeros
+
+    Returns:
+        Array containing only positive values from y
+
+    Example:
+        >>> y = jnp.array([0, 5, 0, 0, 3, 2, 0])
+        >>> extract_demand(y)
+        Array([5., 3., 2.], dtype=float32)
+    """
+    return y[y > 0]
+
+def extract_probability(y: jnp.ndarray) -> jnp.ndarray:
+    """Convert time series to binary probability indicator (1=demand, 0=no demand).
+
+    This is used for intermittent demand models like TSB to track the
+    probability of demand occurrence at each time step.
+
+    Args:
+        y: Time series array
+
+    Returns:
+        Binary array where 1 indicates demand occurred, 0 indicates no demand
+
+    Example:
+        >>> y = jnp.array([0, 5, 0, 0, 3, 2, 0])
+        >>> extract_probability(y)
+        Array([0., 1., 0., 0., 1., 1., 0.], dtype=float32)
+    """
+    return (y != 0).astype(y.dtype)
