@@ -12,7 +12,8 @@ from conformal_intervals import (
     ConformalIntervals,
 )
 
-from utils import ensure_float, _calculate_sigma, _quantiles
+# from utils import ensure_float, _calculate_sigma, _quantiles
+from utils import ensure_float, calculate_sigma, _quantiles, _add_fitted_pi
 
 from base_forecaster import BaseForecaster
 
@@ -22,17 +23,17 @@ _PHI_UPPER = 0.98
 
 
 
-def _add_fitted_pi(res, se, level):
-    level = sorted(level)
-    level = jnp.asarray(level)
-    quantiles = _quantiles(level=level)
-    lo = res["fitted"].reshape(-1, 1) - quantiles * se.reshape(-1, 1)
-    hi = res["fitted"].reshape(-1, 1) + quantiles * se.reshape(-1, 1)
-    lo = lo[:, ::-1]
-    lo = {f"fitted-lo-{l}": lo[:, i] for i, l in enumerate(reversed(level))}
-    hi = {f"fitted-hi-{l}": hi[:, i] for i, l in enumerate(level)}
-    res = {**res, **lo, **hi}
-    return res
+# def _add_fitted_pi(res, se, level):
+#     level = sorted(level)
+#     level = jnp.asarray(level)
+#     quantiles = _quantiles(level=level)
+#     lo = res["fitted"].reshape(-1, 1) - quantiles * se.reshape(-1, 1)
+#     hi = res["fitted"].reshape(-1, 1) + quantiles * se.reshape(-1, 1)
+#     lo = lo[:, ::-1]
+#     lo = {f"fitted-lo-{l}": lo[:, i] for i, l in enumerate(reversed(level))}
+#     hi = {f"fitted-hi-{l}": hi[:, i] for i, l in enumerate(level)}
+#     res = {**res, **lo, **hi}
+#     return res
 
 class AutoETS(BaseForecaster):
     r"""Automatic Exponential Smoothing model.
@@ -166,7 +167,8 @@ class AutoETS(BaseForecaster):
         res = {"fitted": self.model_["fitted"]}
         if level is not None:
             residuals = self.model_["actual_residuals"]
-            se = _calculate_sigma(residuals, len(residuals) - self.model_["n_params"])
+            # se = _calculate_sigma(residuals, len(residuals) - self.model_["n_params"])
+            se = calculate_sigma(residuals, len(residuals) - self.model_["n_params"])
             res = _add_fitted_pi(res=res, se=se, level=level)
         return res
     
@@ -222,7 +224,8 @@ class AutoETS(BaseForecaster):
                 }
             if fitted:
                 # add prediction intervals for fitted values
-                se = _calculate_sigma(y - mod["fitted"], len(y) - mod["n_params"])
+                # se = _calculate_sigma(y - mod["fitted"], len(y) - mod["n_params"])
+                se = calculate_sigma(y - mod["fitted"], len(y) - mod["n_params"])
                 res = _add_fitted_pi(res=res, se=se, level=level)
         return res
 
@@ -272,7 +275,8 @@ class AutoETS(BaseForecaster):
             res.update({f"hi-{l}": fcst[f"hi-{l}"] for l in level})
 
             if fitted:
-                se = _calculate_sigma(y - mod["fitted"], len(y) - int(mod["n_params"]))
+                # se = _calculate_sigma(y - mod["fitted"], len(y) - int(mod["n_params"]))
+                se = calculate_sigma(y - mod["fitted"], len(y) - int(mod["n_params"]))
                 res = _add_fitted_pi(res=res, se=se, level=level)
         return res
 

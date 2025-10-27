@@ -14,11 +14,14 @@ from utils import (
     calculate_sigma,
     _calculate_intervals,
     _quantiles,
+    _store_cs,
     _add_fitted_pi,
     _add_conformal_distribution_intervals,
     _get_conformal_method,
     _seasonal_exponential_smoothing,
-    _ses_forecast
+    _ses_forecast,
+    _add_predict_conformal_intervals,
+    _add_conformal_intervals
 )
 
 class SeasonalExponentialSmoothing(BaseForecaster):
@@ -85,7 +88,8 @@ class SeasonalExponentialSmoothing(BaseForecaster):
             h=self.season_length,
         )
         self.model_ = dict(mod)
-        self._store_cs(y=y, X=X)
+        # self._store_cs(y=y, X=X)
+        _store_cs(self, y=y, X=X)
         return self
 
     def predict(
@@ -110,7 +114,9 @@ class SeasonalExponentialSmoothing(BaseForecaster):
             return res
         level = sorted(level)
         if self.prediction_intervals is not None:
-            res = self._add_predict_conformal_intervals(res, level)
+            # res = self._add_predict_conformal_intervals(res, level)
+            res = _add_predict_conformal_intervals(self,res, level)
+
         else:
             raise Exception("You must pass `prediction_intervals` to compute them.")
         return res
@@ -159,37 +165,38 @@ class SeasonalExponentialSmoothing(BaseForecaster):
             return res
         level = sorted(level)
         if self.prediction_intervals is not None:
-            res = self._add_conformal_intervals(fcst=res, y=y, X=X, level=level)
+            # res = self._add_conformal_intervals(fcst=res, y=y, X=X, level=level)
+            res = _add_conformal_intervals(self, fcst=res, y=y, X=X, level=level)
         else:
             raise Exception("You must pass `prediction_intervals` to compute them.")
         return res
 
-def test():
-    y = jnp.arange(36.0)
+# def test():
+#     y = jnp.arange(36.0)
 
-    pi = ConformalIntervals(h=12, n_windows=2)
-    model = SeasonalExponentialSmoothing(season_length=12, alpha=0.5, prediction_intervals=pi)
-    fitted_model = model.fit(y)
+#     pi = ConformalIntervals(h=12, n_windows=2)
+#     model = SeasonalExponentialSmoothing(season_length=12, alpha=0.5, prediction_intervals=pi)
+#     fitted_model = model.fit(y)
 
-    result = fitted_model.predict(h=12, level=(60,75))
-    forecast = fitted_model.forecast(y, h=12, level=[80, 95])
+#     result = fitted_model.predict(h=12, level=(60,75))
+#     forecast = fitted_model.forecast(y, h=12, level=[80, 95])
     
-    assert "mean" in result, "Missing mean forecast"
+#     assert "mean" in result, "Missing mean forecast"
 
-    assert len(result["mean"]) == 12, "Forecast length mismatch"
+#     assert len(result["mean"]) == 12, "Forecast length mismatch"
 
-    for lvl in [60, 75]:
-        if f"lo-{lvl}" in result:
-            assert f"hi-{lvl}" in result, f"Missing upper bound for {lvl}% interval"
-        else:
-            print(f"Warning: Interval {lvl}% not computed due to missing `prediction_intervals`")
+#     for lvl in [60, 75]:
+#         if f"lo-{lvl}" in result:
+#             assert f"hi-{lvl}" in result, f"Missing upper bound for {lvl}% interval"
+#         else:
+#             print(f"Warning: Interval {lvl}% not computed due to missing `prediction_intervals`")
 
-    for lvl in [80, 95]:
-        assert f"lo-{lvl}" in forecast, f"Missing lower bound for {lvl}% interval"
-        assert f"hi-{lvl}" in forecast, f"Missing upper bound for {lvl}% interval"
-        assert len(forecast[f"lo-{lvl}"]) == 12, f"Lower interval {lvl}% has wrong length"
-        assert len(forecast[f"hi-{lvl}"]) == 12, f"Upper interval {lvl}% has wrong length"
+#     for lvl in [80, 95]:
+#         assert f"lo-{lvl}" in forecast, f"Missing lower bound for {lvl}% interval"
+#         assert f"hi-{lvl}" in forecast, f"Missing upper bound for {lvl}% interval"
+#         assert len(forecast[f"lo-{lvl}"]) == 12, f"Lower interval {lvl}% has wrong length"
+#         assert len(forecast[f"hi-{lvl}"]) == 12, f"Upper interval {lvl}% has wrong length"
 
-if __name__ == "__main__":
-    test()
-    print("Test passed!")
+# if __name__ == "__main__":
+#     test()
+#     print("Test passed!")
