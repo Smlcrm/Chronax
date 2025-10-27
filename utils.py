@@ -1089,3 +1089,21 @@ def _expand_fitted_intervals(fitted: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray
             # if we haven't seen any intervals, use 1 to avoid division by zero
             out[i] = 1
     return out
+
+@_partial(jax.jit, static_argnums=(1, 2))
+def _linear_extrapolate_tail(y: jnp.ndarray, tail_window: int, h: int) -> jnp.ndarray:
+    n = y.shape[0]
+    start = jnp.maximum(0, n - tail_window)
+    # Use dynamic_slice with STATIC size for JIT compatibility
+    # tail_window is static, so we can use it directly
+    seg = jax.lax.dynamic_slice(y, (start,), (tail_window,))
+    # If n < tail_window, we'll have padded values - need to handle this
+    m = jnp.minimum(tail_window, n)
+    t = jnp.arange(tail_window)
+    t_mean = jnp.mean(t); y_mean = jnp.mean(seg)
+    cov = jnp.mean((t - t_mean) * (seg - y_mean))
+    var = jnp.mean((t - t_mean) ** 2) + 1e-12
+    slope = cov / var
+    intercept = y_mean - slope * t_mean
+    t_fore = t_mean + (jnp.arange(h) + 1)
+    return intercept + slope * t_fore
