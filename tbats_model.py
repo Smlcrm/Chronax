@@ -99,7 +99,7 @@ class AutoTBATS(BaseForecaster):
             self._cs = None
 
         return self
-    
+        
     def predict_in_sample(self, level: Optional[Tuple[int]] = None):
         if getattr(self, "model_", None) is None:
             raise RuntimeError("TBATS model is not fitted yet. Call `fit(y)` before `predict_in_sample()`.")
@@ -110,13 +110,26 @@ class AutoTBATS(BaseForecaster):
         if level is not None:
             levels = sorted(int(l) for l in level)
             n = int(self.model_["errors"].shape[1])
-            # Constant SE on model scale
-            se = _calculate_sigma(self.model_["errors"], n)
-            sigma_vec = jnp.full((n,), se)
+
+            # --- Guard: ensure nonnegative, finite SE and add a tiny floor ---
+            se = _calculate_sigma(self.model_["errors"], n)          # scalar
+            se = jnp.asarray(se)
+            se = jnp.where(jnp.isfinite(se), se, 0.0)
+            se = jnp.maximum(jnp.abs(se), jnp.array(1e-12, dtype=se.dtype))
+
+            sigma_vec = jnp.full((n,), se, dtype=self.model_["errors"].dtype)
+
             # Build intervals in model space around fitted
             tmp = {"mean": res["fitted"]}
             ints = _calculate_intervals(tmp, levels, n, sigma_vec)
             res = {**res, **ints}
+
+            # --- Enforce monotonicity: lo ≤ fitted ≤ hi ---
+            f = res["fitted"]
+            for L in levels:
+                lo_k, hi_k = f"lo-{L}", f"hi-{L}"
+                res[lo_k] = jnp.minimum(res[lo_k], f)
+                res[hi_k] = jnp.maximum(res[hi_k], f)
 
         lam = self.model_.get("BoxCox_lambda", None)
         if lam is not None:
