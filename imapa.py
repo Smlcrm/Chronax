@@ -45,7 +45,7 @@ from conformal_intervals import (
 
 from base_forecaster import BaseForecaster
 
-from utils import _repeat_val, _window_average, ensure_float, _calculate_sigma, _add_fitted_pi, _imapa
+from utils import _repeat_val, _window_average, ensure_float, calculate_sigma as _calculate_sigma, _add_fitted_pi, _imapa
 
 jax.config.update("jax_enable_x64", True)
 

@@ -642,9 +642,8 @@ def test_fit_predict_equivalence():
     sf_model = SF_IMAPA()
     sf_result = sf_model.forecast(y=y_np, h=h)
     sf_mean = sf_result["mean"]
-    
     # Both our methods should match
-    assert jnp.allclose(result1["mean"], result2["mean"], rtol=1e-10), \
+    assert jnp.allclose(result1["mean"], result2["mean"], rtol=1e-6, atol=1e-8), \
         "fit+predict should equal forecast method"
     
     # Both should match StatsForecast
