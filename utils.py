@@ -102,4 +102,73 @@ def extract_probability(y: jnp.ndarray) -> jnp.ndarray:
         >>> extract_probability(y)
         Array([0., 1., 0., 0., 1., 1., 0.], dtype=float32)
     """
-    return (y != 0).astype(y.dtype)
+    complement = 1 - alpha
+    forecast = x[0]
+    sse = 0.0
+
+    for i in range(1, len(x)):
+        forecast = alpha * x[i - 1] + complement * forecast
+        sse += (x[i] - forecast) ** 2
+
+    return sse
+
+def _optimized_ses_forecast(
+    x: jnp.ndarray, bounds: Tuple[float, float] = (0.1, 0.3), n_grid: int = 50
+) -> Tuple[float, jnp.ndarray]:
+    alphas = jnp.linspace(bounds[0], bounds[1], n_grid)
+
+    def sse_for_alpha(alpha):
+        return _ses_sse(alpha, x)
+
+    sses = jax.vmap(sse_for_alpha)(alphas)
+    best_idx = jnp.argmin(sses)
+    best_alpha = alphas[best_idx]
+
+    forecast, fitted = _ses_forecast(x, best_alpha)
+    return forecast, fitted
+
+def _chunk_forecast(y, aggregation_level):
+    lost_remainder_data = len(y) % aggregation_level
+    y_cut = y[lost_remainder_data:]
+    aggregation_sums = _chunk_sums(y_cut, aggregation_level)
+    sums_forecast, _ = _optimized_ses_forecast(aggregation_sums)
+    return sums_forecast
+
+@jit
+def _expand_fitted_intervals(fitted: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
+    out = jnp.empty_like(y)
+    out[0] = jnp.nan
+    fitted_idx = 0
+    for i in range(1, y.size):
+        if y[i - 1] != 0:
+            fitted_idx += 1
+            if fitted[fitted_idx] == 0:
+                # to avoid division by zero
+                out[i] = 1
+            else:
+                out[i] = fitted[fitted_idx]
+        elif fitted_idx > 0:
+            # if this entry is zero, the model didn't change
+            out[i] = out[i - 1]
+        else:
+            # if we haven't seen any intervals, use 1 to avoid division by zero
+            out[i] = 1
+    return out
+
+@_partial(jax.jit, static_argnums=(1, 2))
+def _linear_extrapolate_tail(y: jnp.ndarray, tail_window: int, h: int) -> jnp.ndarray:
+    n = y.shape[0]
+    start = jnp.maximum(0, n - tail_window)
+    # Use dynamic_slice with STATIC size for JIT compatibility
+    # tail_window is static, so we can use it directly
+    seg = jax.lax.dynamic_slice(y, (start,), (tail_window,))
+    # If n < tail_window, we'll have padded values - need to handle this
+    m = jnp.minimum(tail_window, n)
+    t = jnp.arange(tail_window)
+    t_mean = jnp.mean(t); y_mean = jnp.mean(seg)
+    cov = jnp.mean((t - t_mean) * (seg - y_mean))
+    var = jnp.mean((t - t_mean) ** 2) + 1e-12
+    slope = cov / var
+    intercept = y_mean - slope * t_mean
+    t_fore = t_mean + (jnp.arange(h) + 1)
+    return intercept + slope * t_fore
