@@ -496,6 +496,33 @@ def _seasonal_exponential_smoothing(y, h, fitted, season_length, alpha):
         fcst["fitted"] = fitted_vals
     return fcst
 
+@jax.jit
+def calculate_information_criteria(
+    residuals: jnp.ndarray,
+    n_params: int,
+    n: int,
+) -> Dict[str, jnp.ndarray]:
+    """Calculate AIC, BIC, and AICc from residuals (JIT-compiled, returns JAX arrays)."""
+    sse = jnp.sum(residuals ** 2)
+    lik = n * jnp.log(sse + 1e-10)
+    
+    aic = lik + 2 * n_params
+    bic = lik + jnp.log(n) * n_params
+    denom = n - n_params - 1
+    aicc = jnp.where(
+        denom > 0,
+        aic + (2 * n_params * (n_params + 1)) / denom,
+        jnp.inf
+    )
+    
+    # Return JAX arrays instead of Python floats for JIT compatibility
+    return {
+        'loglik': -0.5 * lik,
+        'aic': aic,
+        'bic': bic,
+        'aicc': aicc,
+    }
+
 
 @jax.jit
 def _demand(x: jnp.ndarray) -> jnp.ndarray:
