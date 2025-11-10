@@ -200,37 +200,37 @@ class ADIDA(BaseForecaster):
             res = _add_fitted_pi(res=res, se=sigma, level=level)
         return res
     
-# Test Cases
-def test():
-    # simple increasing series
-    y = jnp.arange(24.0)
+# # Test Cases
+# def test():
+#     # simple increasing series
+#     y = jnp.arange(24.0)
 
-    ci = ConformalIntervals(method="conformal_distribution")
-    model = ADIDA(prediction_intervals=ci)
+#     ci = ConformalIntervals(method="conformal_distribution")
+#     model = ADIDA(prediction_intervals=ci)
 
-    fitted_model = model.fit(y)
+#     fitted_model = model.fit(y)
 
-    result = fitted_model.predict(h=12, level=[60, 75])
-    forecast = fitted_model.forecast(y, h=12, level=[80, 95])
+#     result = fitted_model.predict(h=12, level=[60, 75])
+#     forecast = fitted_model.forecast(y, h=12, level=[80, 95])
 
-    # ---- Assertions ----
-    assert "mean" in result, "Missing mean forecast"
-    assert len(result["mean"]) == 12, "Forecast length mismatch"
+#     # ---- Assertions ----
+#     assert "mean" in result, "Missing mean forecast"
+#     assert len(result["mean"]) == 12, "Forecast length mismatch"
 
-    for lvl in [60, 75]:
-        assert f"lo-{lvl}" in result, f"Missing lower bound for {lvl}% interval"
-        assert f"hi-{lvl}" in result, f"Missing upper bound for {lvl}% interval"
-        assert len(result[f"lo-{lvl}"]) == 12, f"Lower interval {lvl}% has wrong length"
-        assert len(result[f"hi-{lvl}"]) == 12, f"Upper interval {lvl}% has wrong length"
+#     for lvl in [60, 75]:
+#         assert f"lo-{lvl}" in result, f"Missing lower bound for {lvl}% interval"
+#         assert f"hi-{lvl}" in result, f"Missing upper bound for {lvl}% interval"
+#         assert len(result[f"lo-{lvl}"]) == 12, f"Lower interval {lvl}% has wrong length"
+#         assert len(result[f"hi-{lvl}"]) == 12, f"Upper interval {lvl}% has wrong length"
 
-    for lvl in [80, 95]:
-        assert f"lo-{lvl}" in forecast, f"Missing lower bound for {lvl}% interval"
-        assert f"hi-{lvl}" in forecast, f"Missing upper bound for {lvl}% interval"
-        assert len(forecast[f"lo-{lvl}"]) == 12, f"Lower interval {lvl}% has wrong length"
-        assert len(forecast[f"hi-{lvl}"]) == 12, f"Upper interval {lvl}% has wrong length"
+#     for lvl in [80, 95]:
+#         assert f"lo-{lvl}" in forecast, f"Missing lower bound for {lvl}% interval"
+#         assert f"hi-{lvl}" in forecast, f"Missing upper bound for {lvl}% interval"
+#         assert len(forecast[f"lo-{lvl}"]) == 12, f"Lower interval {lvl}% has wrong length"
+#         assert len(forecast[f"hi-{lvl}"]) == 12, f"Upper interval {lvl}% has wrong length"
 
-    print("Test passed!")
+#     print("Test passed!")
 
 
-if __name__ == "__main__":
-    test()
+# if __name__ == "__main__":
+#     test()

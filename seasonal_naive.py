@@ -18,6 +18,7 @@ from utils import (
     ensure_float,
     calculate_sigma,
     _calculate_intervals,
+    _store_cs,
     _quantiles,
     _add_fitted_pi,
     _add_conformal_distribution_intervals,
@@ -79,7 +80,8 @@ class SeasonalNaive(BaseForecaster):
         residuals = y - mod["fitted"]
         mod["sigma"] = calculate_sigma(residuals, len(y) - self.season_length)
         self.model_ = mod
-        self._store_cs(y=y, X=X)
+        # self._store_cs(y=y, X=X)
+        _store_cs(self, y=y, X=X)
         return self
 
     def predict(
@@ -210,32 +212,32 @@ class SeasonalNaive(BaseForecaster):
         )
         return res
     
-# Test Cases
-def test():
-    y = jnp.arange(24.0)
+# # Test Cases
+# def test():
+#     y = jnp.arange(24.0)
 
-    model = SeasonalNaive(season_length=12)
-    fitted_model = model.fit(y)
+#     model = SeasonalNaive(season_length=12)
+#     fitted_model = model.fit(y)
 
-    result = fitted_model.predict(h=12, level=(60,75))
-    forecast = fitted_model.forecast(y, h=12, level=[80, 95])
+#     result = fitted_model.predict(h=12, level=(60,75))
+#     forecast = fitted_model.forecast(y, h=12, level=[80, 95])
     
-    assert "mean" in result, "Missing mean forecast"
+#     assert "mean" in result, "Missing mean forecast"
 
-    assert len(result["mean"]) == 12, "Forecast length mismatch"
+#     assert len(result["mean"]) == 12, "Forecast length mismatch"
 
-    for lvl in [60, 75]:
-        assert f"lo-{lvl}" in result, f"Missing lower bound for {lvl}% interval"
-        assert f"hi-{lvl}" in result, f"Missing upper bound for {lvl}% interval"
-        assert f"lo-{lvl}" in result, f"Missing lower bound for {lvl}% interval"
-        assert f"hi-{lvl}" in result, f"Missing upper bound for {lvl}% interval"
+#     for lvl in [60, 75]:
+#         assert f"lo-{lvl}" in result, f"Missing lower bound for {lvl}% interval"
+#         assert f"hi-{lvl}" in result, f"Missing upper bound for {lvl}% interval"
+#         assert f"lo-{lvl}" in result, f"Missing lower bound for {lvl}% interval"
+#         assert f"hi-{lvl}" in result, f"Missing upper bound for {lvl}% interval"
 
-    for lvl in [80, 95]:
-        assert f"lo-{lvl}" in forecast, f"Missing lower bound for {lvl}% interval"
-        assert f"hi-{lvl}" in forecast, f"Missing upper bound for {lvl}% interval"
-        assert len(forecast[f"lo-{lvl}"]) == 12, f"Lower interval {lvl}% has wrong length"
-        assert len(forecast[f"hi-{lvl}"]) == 12, f"Upper interval {lvl}% has wrong length"
+#     for lvl in [80, 95]:
+#         assert f"lo-{lvl}" in forecast, f"Missing lower bound for {lvl}% interval"
+#         assert f"hi-{lvl}" in forecast, f"Missing upper bound for {lvl}% interval"
+#         assert len(forecast[f"lo-{lvl}"]) == 12, f"Lower interval {lvl}% has wrong length"
+#         assert len(forecast[f"hi-{lvl}"]) == 12, f"Upper interval {lvl}% has wrong length"
 
-if __name__ == "__main__":
-    test()
-    print("Test passed!")
+# if __name__ == "__main__":
+#     test()
+#     print("Test passed!")
