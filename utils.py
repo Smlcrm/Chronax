@@ -337,7 +337,7 @@ def _seasonal_naive(
     T = y_j.shape[0]
     m = int(season_length)
     if m <= 0:
-        raise ValueError("season_length must be a positive integer")
+ƒ        raise ValueError("season_length must be a positive integer")
     if T < m:
         raise ValueError(f"Series length T={T} must be at least season_length={m}")
     if not isinstance(h, int) or h < 1:
