@@ -40,7 +40,7 @@ def spis(y, y_pred):
 # Percentage Errors
 ## Mean Absolute Percentage Error
 def mean_absolute_percentage_error(y, y_pred):
-  error = jnp.abs(y - y_pred) / jnp.abs(y)
+  error = jnp.abs(y - y_pred) / (jnp.abs(y) + 1e-8)
   return jnp.mean(error)
 
 ## Symmetric Mean Absolute Percentage Error
@@ -123,19 +123,19 @@ def multi_quantile_loss(y: jnp.ndarray, y_pred: jnp.ndarray, quantiles: jnp.ndar
     Multi-Quantile Loss (MQL) in JAX (barebones version).
 
     Args:
-        y:         (N,) array of true values.
+        y:         (N, Q) array of true values.
         y_pred:    (N, Q) array of predicted quantiles for each observation.
         quantiles: (Q,) array of quantile levels (e.g., [0.1, 0.5, 0.9]).
 
     Returns:
         Scalar mean MQL across all samples and quantiles.
     """
-    errors = y[:, None] - y_pred              # shape (N, Q)
+    errors = jnp.expand_dims(y, axis=-1) - y_pred              # shape (N, Q)
     loss = jnp.maximum(errors * quantiles, errors * (quantiles - 1))
     return jnp.mean(loss)
 
 ## Multi Scaled Quantile Loss
-def scaled_multi_quantile_loss(y: jnp.ndarray, y_pred_quantiles: jnp.ndarray, quantiles: jnp.ndarray, seasonality: int,y_seasonal: jnp.ndarray) -> jnp.ndarray:
+def scaled_multi_quantile_loss(y: jnp.ndarray, y_pred_quantiles: jnp.ndarray, quantiles: jnp.ndarray, y_seasonal: jnp.ndarray) -> jnp.ndarray:
     """
     Scaled Multi-Quantile Loss (SMQL) in JAX.
     Equivalent to the original DataFrame-based `scaled_mqloss` logic.
@@ -205,7 +205,7 @@ def scaled_crps(y: jnp.ndarray,y_pred: jnp.ndarray,quantiles: jnp.ndarray,) -> j
 
 ## tweedie_deviance
 
-def tweedie_deviance_jax(y: jnp.ndarray, y_pred: jnp.ndarray, power: float) -> jnp.ndarray:
+def tweedie_deviance(y: jnp.ndarray, y_pred: jnp.ndarray, power: float) -> jnp.ndarray:
     """
     Compute Tweedie deviance for multiple models in JAX.
 
@@ -225,8 +225,10 @@ def tweedie_deviance_jax(y: jnp.ndarray, y_pred: jnp.ndarray, power: float) -> j
     if power < 0:
         raise ValueError("Power must be non-negative.")
 
-    # Broadcast y_true to match y_pred shape
-    y_b = jnp.expand_dims(y, axis=-1)  # shape (N, 1)
+    if y_pred.ndim == y.ndim + 1:
+        y_b = jnp.expand_dims(y, axis=-1)
+    else:
+        y_b = y
     
     # Check positivity constraints
     if power >= 2 and jnp.any(y_b <= 0):
@@ -237,13 +239,9 @@ def tweedie_deviance_jax(y: jnp.ndarray, y_pred: jnp.ndarray, power: float) -> j
     if power == 0:
         dev = (y_pred - y_b) ** 2
     elif power == 1:
-        dev = jnp.where(
-            y_b == 0,
-            2 * y_pred,
-            2 * (y_b * (jnp.log(y_b) - jnp.log(y_pred)) - (y_b - y_pred))
-        )
+        dev = 2 * (xlogy(y_b, y_b / y_pred) - (y_b - y_pred))
     elif power == 2:
-        dev = 2 * (jnp.log(y_pred) - jnp.log(y_b)) + (y_b / y_pred) - 1
+        dev = 2 * ((jnp.log(y_pred) - jnp.log(y_b)) + (y_b / y_pred) - 1)
     else:
         y_clip = jnp.clip(y_b, 0)
         dev = 2 * (
@@ -251,4 +249,4 @@ def tweedie_deviance_jax(y: jnp.ndarray, y_pred: jnp.ndarray, power: float) -> j
             - y_clip * (y_pred ** (1 - power)) / (1 - power)
             + y_pred ** (2 - power) / (2 - power)
         )
-    return jnp.mean(dev, axis=0)  # shape (M,)
+    return jnp.mean(dev)  # shape (M,)
