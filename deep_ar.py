@@ -1,11 +1,6 @@
-# DeepAR with horizon-wise calibrated uncertainty and robust sigma floor
-# ---------------------------------------------------------------------
-# 1) Sigma floor set from *noise* (volatility), not level.
-# 2) Mild horizon-aware σ inflation: sqrt(1 + γ·h).
-# 3) Per-horizon in-sample calibration via free-roll backtesting:
-#    compute f[h] so the 80% interval calibrates at each horizon h.
-# 4) AdamW + dropout; trainer.step(..., key=None) is legacy-compatible.
-# 5) Test-harness friendly returns (has_nan_loss / has_nan_forecast).
+# Minimal Encoder–Decoder DeepAR (NumPy-free, JAX/Flax)
+# -----------------------------------------------------
+# Comments added throughout for clarity.
 
 import jax
 import jax.numpy as jnp
@@ -13,555 +8,385 @@ from jax import random, value_and_grad, jit
 import flax.linen as nn
 import optax
 
-
 # -------------------------
-# Synthetic series generators (pure JAX / Python)
+# Utilities
 # -------------------------
 
-def make_series(T=200, H=24, seed=0):
-    """Original series with seasonality and trend"""
-    key = random.PRNGKey(seed)
-    eps = 0.3 * random.normal(key, (T + H,))
-    y = jnp.zeros(T + H, dtype=jnp.float32)
-    def body_fun(i, y_):
-        val = (
-            0.6 * y_[i - 1]
-            + 0.9 * jnp.sin(2 * jnp.pi * i / 12.0)
-            + 0.35 * jnp.cos(2 * jnp.pi * i / 12.0)
-            + 0.02 * i
-            + eps[i]
-        )
-        return y_.at[i].set(val)
-    y = jax.lax.fori_loop(1, T + H, body_fun, y)
-    return y[:T].astype(jnp.float32), y[T:].astype(jnp.float32)
+def _safe_cat(a, b):
+    """
+    Concatenate a and b handling None.
+    Returns 0-dummy vector if both None.
+    """
+    if a is None and b is None:
+        return jnp.zeros((0,), dtype=jnp.float32)
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return jnp.concatenate([a, b], axis=-1)
 
 
-def make_linear_trend(T=200, H=24, seed=0):
-    """Simple linear trend with noise"""
-    key = random.PRNGKey(seed)
-    t = jnp.arange(T + H)
-    eps = 0.5 * random.normal(key, (T + H,))
-    y = 5.0 + 0.1 * t + eps
-    return y[:T].astype(jnp.float32), y[T:].astype(jnp.float32)
-
-
-def make_seasonal_only(T=200, H=24, seed=0):
-    """Pure seasonality, no trend"""
-    key = random.PRNGKey(seed)
-    t = jnp.arange(T + H)
-    eps = 0.2 * random.normal(key, (T + H,))
-    y = 10.0 + 3.0 * jnp.sin(2 * jnp.pi * t / 24.0) + eps
-    return y[:T].astype(jnp.float32), y[T:].astype(jnp.float32)
-
-
-def make_volatile_series(T=200, H=24, seed=0):
-    """High volatility series"""
-    key = random.PRNGKey(seed)
-    eps = 1.5 * random.normal(key, (T + H,))
-    y = jnp.zeros(T + H, dtype=jnp.float32)
-    def body_fun(i, y_):
-        val = 0.3 * y_[i - 1] + 2.0 * jnp.sin(2 * jnp.pi * i / 15.0) + eps[i]
-        return y_.at[i].set(val)
-    y = jax.lax.fori_loop(1, T + H, body_fun, y)
-    return y[:T].astype(jnp.float32), y[T:].astype(jnp.float32)
-
-
-def make_step_change(T=200, H=24, seed=0):
-    """Series with a step change in the middle"""
-    key = random.PRNGKey(seed)
-    eps = 0.3 * random.normal(key, (T + H,))
-    y = jnp.zeros(T + H, dtype=jnp.float32)
-    def body_fun(i, y_):
-        base = jnp.where(i < 150, 10.0, 20.0)
-        val = 0.5 * y_[i - 1] + base + eps[i]
-        return y_.at[i].set(val)
-    y = jax.lax.fori_loop(1, T + H, body_fun, y)
-    return y[:T].astype(jnp.float32), y[T:].astype(jnp.float32)
+def nll_gauss(y, mu, sigma):
+    """
+    Gaussian negative log-likelihood.
+    sigma clipped for numerical safety.
+    """
+    sigma = jnp.clip(sigma, 1e-6, 1e6)
+    return 0.5 * jnp.log(2 * jnp.pi) + jnp.log(sigma) + 0.5 * ((y - mu) / sigma) ** 2
 
 
 # -------------------------
 # Model
 # -------------------------
-class MiniDeepAR(nn.Module):
-    """
-    Minimal DeepAR-style model with calibrated uncertainty.
 
-    Parameters
-    ----------
-    hidden : int
-        LSTM hidden size.
-    dropout_rate : float
-        Dropout rate (training only).
-    min_sigma_scale : float
-        Sigma floor *in scaled space*; typically noise_scale / level_scale,
-        but we also clip to a small absolute minimum to avoid collapse.
-    horizon_coeff : float
-        Coefficient γ for sqrt(1 + γ·h) horizon inflation.
+class DeepAR_EncDec(nn.Module):
+    """
+    Encoder–Decoder DeepAR model implemented in Flax.
+
+    - Encoder LSTM consumes history y_{1:T}
+      (plus optional static features)
+      to produce hidden state (h_T, c_T).
+
+    - Decoder one_step() takes [y_prev, x_f, x_static]
+      and produces Gaussian parameters (mu, sigma).
+
+    - training_roll() unrolls decoder with teacher forcing.
     """
     hidden: int = 64
     dropout_rate: float = 0.1
-    min_sigma_scale: float = 0.05
-    horizon_coeff: float = 0.06  # a bit stronger to help low coverage
+    min_sigma: float = 0.02
 
     def setup(self):
+        # Separate projections for encoder and decoder inputs
+        self.enc_proj = nn.Dense(self.hidden)
+        self.dec_proj = nn.Dense(self.hidden)
+
+        # LSTM wrapped inside nn.scan to run over time dimension
         self.lstm = nn.scan(
             nn.LSTMCell,
             variable_broadcast="params",
             split_rngs={"params": False},
-            in_axes=1, out_axes=1,
+            in_axes=1,
+            out_axes=1,
         )(features=self.hidden)
 
+        # Dropout for regularization
         self.dropout = nn.Dropout(rate=self.dropout_rate)
 
-        # Heads
-        self.head_mu = nn.Dense(
-            1,
-            kernel_init=nn.initializers.variance_scaling(
-                scale=0.1, mode='fan_in', distribution='truncated_normal'
-            )
-        )
-        self.head_sigma = nn.Dense(
-            1,
-            kernel_init=nn.initializers.constant(0.0),
-            bias_init=nn.initializers.constant(0.0)  # neutral start
-        )
+        # Output heads for Gaussian parameters
+        self.head_mu = nn.Dense(1)
+        self.head_sigma = nn.Dense(1)
 
+    # ---------- Encoder ----------
     @nn.compact
-    def __call__(self, y_in: jnp.ndarray, training: bool = False):
+    def encode(self, y_hist: jnp.ndarray, x_static: jnp.ndarray = None):
         """
-        y_in: (L,) teacher-forced input
-        returns: mu, sigma of shape (L,)
+        Encode history y_hist (T,) + static to get (h_T, c_T).
         """
-        x_seq = y_in[None, :, None]  # (1, L, 1)
-        B, L, _ = x_seq.shape
+        T = y_hist.shape[0]
 
+        # Repeat static features across time if provided
+        if x_static is None:
+            xs_rep = jnp.zeros((T, 0), dtype=jnp.float32)
+        else:
+            xs_rep = jnp.tile(x_static[None, :], (T, 1))
+
+        # Encoder input = [y_t, x_static]
+        x_enc = jnp.concatenate([y_hist[:, None], xs_rep], axis=-1)
+        x_enc = x_enc[None, :, :]  # (1, T, D)
+
+        # Initial hidden/cell states
+        B = 1
         h0 = jnp.zeros((B, self.hidden))
         c0 = jnp.zeros((B, self.hidden))
-        (hT, cT), hs = self.lstm((h0, c0), x_seq)  # hs: (B, L, hidden)
-        hs = hs.squeeze(0)  # (L, hidden)
 
-        hs = self.dropout(hs, deterministic=not training)
+        # Project encoder input
+        x_proj = self.enc_proj(x_enc)
 
-        mu = self.head_mu(hs)[..., 0]
-        sraw = self.head_sigma(hs)[..., 0]
-        sigma = nn.softplus(sraw) + jnp.maximum(self.min_sigma_scale, 1e-3)
-        return mu, sigma
+        # Run through LSTM
+        (hT, cT), _ = self.lstm((h0, c0), x_proj)
 
-    @nn.compact
-    def condition(self, y_hist: jnp.ndarray):
-        """Return final LSTM state after consuming history."""
-        x_seq = y_hist[None, :, None]
-        h0 = jnp.zeros((1, self.hidden))
-        c0 = jnp.zeros((1, self.hidden))
-        (hT, cT), _ = self.lstm((h0, c0), x_seq)
         return hT, cT
 
+    # ---------- Decoder one-step ----------
     @nn.compact
-    def one_step(self, y_prev_scalar: jnp.ndarray, h: jnp.ndarray, c: jnp.ndarray,
-                 step_ahead: int = 1):
+    def one_step(self,
+                 y_prev_scalar: jnp.ndarray,
+                 x_f_step: jnp.ndarray = None,
+                 x_static: jnp.ndarray = None,
+                 h: jnp.ndarray = None,
+                 c: jnp.ndarray = None,
+                 deterministic: bool = True):
         """
-        Autoregressive single step with mild horizon-aware σ growth.
+        One decoding step:
+        Input = [y_prev, x_f_step, x_static]
+        Output = (mu, sigma, h_new, c_new)
         """
-        x1 = y_prev_scalar[None, None, None]
-        (h_new, c_new), hs = self.lstm((h, c), x1)
-        h_out = hs[:, -1, :]
 
-        mu = self.head_mu(h_out)[..., 0]
-        sraw = self.head_sigma(h_out)[..., 0]
-        sigma_base = nn.softplus(sraw) + jnp.maximum(self.min_sigma_scale, 1e-3)
+        # If hidden states not provided, start from zero
+        if h is None:
+            h = jnp.zeros((1, self.hidden))
+        if c is None:
+            c = jnp.zeros((1, self.hidden))
 
-        horizon_scale = jnp.sqrt(1.0 + self.horizon_coeff * step_ahead)
-        sigma = sigma_base * horizon_scale
+        # Build concatenated input vector
+        parts = [y_prev_scalar[None]]
+        if x_f_step is not None:
+            parts.append(x_f_step)
+        if x_static is not None:
+            parts.append(x_static)
+
+        # Shape (1,1,D)
+        x_vec = jnp.concatenate(parts, axis=0)[None, None, :]
+
+        # Linear projection
+        x_proj = self.dec_proj(x_vec)
+
+        # LSTM step
+        (h_new, c_new), hs = self.lstm((h, c), x_proj)
+
+        # Extract hidden vector
+        z = hs[:, -1, :]
+        z = self.dropout(z, deterministic=deterministic)
+
+        # Output Gaussian parameters
+        mu = self.head_mu(z)[..., 0]
+        sraw = self.head_sigma(z)[..., 0]
+        sigma = nn.softplus(sraw) + jnp.maximum(self.min_sigma, 1e-3)
 
         return mu[0], sigma[0], h_new, c_new
 
+    # ---------- Training roll with teacher forcing ----------
+    @nn.compact
+    def training_roll(self,
+                      y_seq: jnp.ndarray,
+                      x_f_all: jnp.ndarray = None,
+                      x_static: jnp.ndarray = None,
+                      training: bool = True):
+        """
+        Compute mu_t, sigma_t for t = 0..L-2 predicting y_{t+1}.
 
-ImprovedDeepAR = MiniDeepAR  # compatibility alias
+        Teacher forcing:
+            Input at step t = [y_t, x_f_{t+1}, x_static]
+
+        Encoder processes only y_seq[:-1] (history) to avoid leakage.
+        """
+        L = y_seq.shape[0]
+
+        # Repeat static inputs over L-1 decoding steps
+        if x_static is None:
+            xs_rep = jnp.zeros((L - 1, 0), dtype=jnp.float32)
+        else:
+            xs_rep = jnp.tile(x_static[None, :], (L - 1, 1))
+
+        # y_t (teacher forcing inputs)
+        y_t = y_seq[:-1][:, None]
+
+        # x_f_{t+1}
+        if x_f_all is None:
+            xf_tp1 = jnp.zeros((L - 1, 0), dtype=jnp.float32)
+        else:
+            xf_tp1 = x_f_all[1:]
+
+        # Build decoder input matrix (L-1, D)
+        dec_inputs = jnp.concatenate([y_t, xf_tp1, xs_rep], axis=-1)
+        dec_inputs = dec_inputs[None, :, :]
+
+        # Encode only the historical part
+        hT, cT = self.encode(y_seq[:-1], x_static)
+
+        # Projection + dropout
+        x_proj = self.dec_proj(dec_inputs)
+        z0 = self.dropout(x_proj, deterministic=not training)
+
+        # LSTM unroll
+        (h_final, c_final), hs = self.lstm((hT, cT), z0)
+        hs = hs.squeeze(0)
+        hs = self.dropout(hs, deterministic=not training)
+
+        # Output Gaussian parameters per step
+        mu = self.head_mu(hs)[..., 0]
+        sraw = self.head_sigma(hs)[..., 0]
+        sigma = nn.softplus(sraw) + jnp.maximum(self.min_sigma, 1e-3)
+
+        return mu, sigma
 
 
 # -------------------------
-# NLL and trainer
+# Training wrapper
 # -------------------------
-def nll_gauss(y, mu, sigma):
-    sigma = jnp.clip(sigma, 1e-6, 1e6)
-    return 0.5 * jnp.log(2 * jnp.pi) + jnp.log(sigma) + 0.5 * ((y - mu) / sigma) ** 2
-
 
 def make_trainer(model, lr=1e-3, weight_decay=1e-5):
     """
-    Create AdamW optimizer and training step function.
-    
-    Parameters
-    ----------
-    model : MiniDeepAR
-        The model instance
-    lr : float
-        Learning rate
-    weight_decay : float
-        L2 regularization coefficient
-        
-    Returns
-    -------
-    tx : optax.GradientTransformation
-        The optimizer
-    step : callable
-        Training step function with signature:
-        step(params, opt_state, y_hist, key=None) -> (params, opt_state, loss)
+    Build Optax optimizer + loss function.
     """
     tx = optax.adamw(learning_rate=lr, weight_decay=weight_decay)
 
-    def loss_fn(params, y_hist, key):
-        """
-        Compute negative log-likelihood loss with teacher forcing.
-        
-        The model predicts y[t] given y[t-1], so we compute NLL
-        for predictions mu[:-1] against targets y[1:].
-        """
-        mu, sigma = model.apply(params, y_hist, training=True, rngs={'dropout': key})
-        
-        # One-step-ahead NLL with teacher forcing
-        nll = jnp.mean(nll_gauss(y_hist[1:], mu[:-1], sigma[:-1]))
-        
-        # No additional sigma penalty - let min_sigma_scale handle the floor
-        # (Removed redundant penalty that conflicted with min_sigma_scale)
+    def loss_fn(params, y_hist, x_f_all, x_static, key):
+        # Forward pass through training_roll()
+        mu, sigma = model.apply(
+            params,
+            y_hist,
+            x_f_all,
+            x_static,
+            True,
+            method=type(model).training_roll,
+            rngs={'dropout': key}
+        )
+        # Targets = y[1:]
+        y_target = y_hist[1:]
+        nll = jnp.mean(nll_gauss(y_target, mu, sigma))
         return nll
 
     @jit
-    def step(params, opt_state, y_hist, key=None):
-        """
-        Perform one training step.
-        
-        Parameters
-        ----------
-        params : PyTree
-            Current model parameters
-        opt_state : optax.OptState
-            Current optimizer state
-        y_hist : jnp.ndarray
-            Training sequence (scaled)
-        key : jax.random.PRNGKey, optional
-            Random key for dropout. If None, uses fixed seed.
-            
-        Returns
-        -------
-        params : PyTree
-            Updated parameters
-        opt_state : optax.OptState
-            Updated optimizer state
-        loss : float
-            Loss value for this step
-        """
+    def step(params, opt_state, y_hist, x_f_all, x_static, key=None):
+        # Single optimizer step
         if key is None:
             key = random.PRNGKey(0)
-        
-        loss, grads = value_and_grad(loss_fn)(params, y_hist, key)
+
+        loss, grads = value_and_grad(loss_fn)(params, y_hist, x_f_all, x_static, key)
         updates, opt_state = tx.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
-        
         return params, opt_state, loss
 
     return tx, step
 
 
-# -------------------------
-# Horizon-wise calibration via free-roll backtest
-# -------------------------
-def _free_roll_metrics(params, model, y_hist, Hc=24, K=8):
-    """
-    Free-roll forecasts to gather |resid|/σ stats per horizon 1..Hc.
-    Returns list[r_h], each r_h is jnp.array of ratios for that horizon.
-    """
-    L = int(y_hist.shape[0])
-    if L < Hc + 5:
-        return [jnp.array([], dtype=jnp.float32) for _ in range(Hc)]
-
-    last_anchor_end = L - Hc - 1
-    first_anchor = max(1, last_anchor_end - K + 1)
-    anchors = list(range(first_anchor, last_anchor_end + 1))
-    r_by_h = [[] for _ in range(Hc)]
-
-    model_class = type(model)
-
-    for a in anchors:
-        hist = y_hist[:a+1]
-        hT, cT = model.apply(params, hist, method=model_class.condition)
-        y_prev = hist[-1]
-        h, c = hT, cT
-
-        for hidx in range(1, Hc + 1):
-            mu, sigma, h, c = model.apply(params, y_prev, h, c, hidx, method=model_class.one_step)
-            t = a + hidx
-            if t < L:
-                resid = jnp.abs(y_hist[t] - mu)
-                denom = jnp.maximum(sigma, 1e-6)
-                r_by_h[hidx - 1].append(float(resid / denom))
-            # deterministic free-roll step
-            y_prev = mu
-
-    return [jnp.array(rs, dtype=jnp.float32) if rs else jnp.array([], dtype=jnp.float32)
-            for rs in r_by_h]
-
-
-def _compute_sigma_calibration_per_h(params, model, y_hist, H):
-    """
-    Per-horizon sigma calibration multipliers via free-roll backtesting.
-    
-    Computes f[h] such that the empirical 90th percentile of |resid|/σ 
-    matches the theoretical value (1.28) for an 80% prediction interval.
-    
-    For horizons beyond H_eff (default 24), we extrapolate using the last
-    calibrated value to maintain consistency.
-    
-    Parameters
-    ----------
-    params : PyTree
-        Model parameters
-    model : MiniDeepAR
-        The model instance
-    y_hist : jnp.ndarray
-        Historical time series (scaled)
-    H : int
-        Total forecast horizon
-        
-    Returns
-    -------
-    f : jnp.ndarray of shape (H,)
-        Per-horizon calibration multipliers
-    """
-    Hc = int(H)
-    H_eff = min(Hc, 24)  # Calibrate up to 24 horizons
-    
-    # Gather free-roll statistics
-    K = min(12, max(5, int(y_hist.shape[0]) // 20))  # Adaptive number of anchors
-    r_by_h = _free_roll_metrics(params, model, y_hist, Hc=H_eff, K=K)
-    
-    # Target: 90th percentile should equal 1.28155 for 80% coverage
-    z90 = 1.281551565545
-
-    # Initialize all multipliers to 1.0 (neutral)
-    f = jnp.ones((Hc,), dtype=jnp.float32)
-    f_list = []
-    
-    for h in range(H_eff):
-        rs = r_by_h[h]
-        if rs.size >= 5:  # Need at least 5 samples for reliable quantile
-            r90 = jnp.quantile(rs, 0.90)
-            f_h = r90 / z90
-            # Conservative clipping: allow slight deflation but prefer wider intervals
-            f_h = jnp.clip(f_h, 0.90, 2.0)
-        else:
-            # Neutral fallback when insufficient data
-            f_h = jnp.array(1.0, dtype=jnp.float32)
-        f_list.append(f_h)
-
-    if H_eff > 0:
-        f = f.at[:H_eff].set(jnp.stack(f_list))
-        
-        # Extrapolate beyond H_eff using the last calibrated value
-        if Hc > H_eff:
-            f = f.at[H_eff:].set(f_list[-1])
-
-    return f
-
-
-# -------------------------
-# Forecasting
-# -------------------------
-def forecast_mc(params, model, y_hist, H=24, N=1000, seed=2025, calibrate=True):
-    """
-    Monte Carlo forecasting with optional per-horizon σ calibration.
-    """
-    if calibrate:
-        fph = _compute_sigma_calibration_per_h(params, model, y_hist, H)
-    else:
-        fph = jnp.ones((H,), dtype=jnp.float32)
-
-    model_class = type(model)
-    hT, cT = model.apply(params, y_hist, method=model_class.condition)
-
-    len_fph_minus1 = jnp.int32(fph.shape[0] - 1)
-
-    @jit
-    def forecast_one_path(key, h0, c0, y_last):
-        def step_fn(carry, step_key):
-            y_prev, h, c, step_idx = carry
-            mu, sigma, h_new, c_new = model.apply(
-                params, y_prev, h, c, step_idx, method=model_class.one_step
-            )
-            idx = jnp.minimum(step_idx - 1, len_fph_minus1)
-            sigma_adj = sigma * fph[idx]
-            eps = random.normal(step_key, ())
-            y_next = mu + sigma_adj * eps
-            return (y_next, h_new, c_new, step_idx + 1), y_next
-
-        keys = random.split(key, H)
-        _, samples = jax.lax.scan(
-            step_fn,
-            (y_last, h0, c0, jnp.array(1, dtype=jnp.int32)),
-            keys
-        )
-        return samples  # (H,)
-
-    key = random.PRNGKey(seed)
-    y_last = y_hist[-1]
-    path_keys = random.split(key, N)
-    paths = jax.vmap(lambda k: forecast_one_path(k, hT, cT, y_last))(path_keys)
-    return paths  # (N, H) jnp.array
-
-
-# -------------------------
-# Training
-# -------------------------
-def train_model(y_scaled, hidden_size=64, lr=1e-3, steps=800,
-                dropout_rate=0.1, min_sigma_scale=0.05, horizon_coeff=0.04,
+def train_model(y_hist,
+                x_f_all=None,
+                x_static=None,
+                hidden=64,
+                lr=1e-3,
+                steps=800,
+                dropout=0.1,
+                min_sigma=0.02,
                 verbose=True):
     """
-    Train the model. min_sigma_scale is in *scaled* units.
+    High-level training loop.
     """
-    model = ImprovedDeepAR(
-        hidden=hidden_size,
-        dropout_rate=dropout_rate,
-        min_sigma_scale=min_sigma_scale,
-        horizon_coeff=horizon_coeff,
+
+    # Create model instance
+    model = DeepAR_EncDec(hidden=hidden, dropout_rate=dropout, min_sigma=min_sigma)
+
+    # Determine dimensions for initialization
+    L = y_hist.shape[0]
+    d_f = 0 if x_f_all is None else int(x_f_all.shape[1])
+    d_s = 0 if x_static is None else int(x_static.shape[0])
+
+    # Initialize parameters with dummy call
+    key = random.PRNGKey(1)
+    params = model.init(
+        {'params': key, 'dropout': key},
+        jnp.array(y_hist),
+        None if x_f_all is None else jnp.zeros((L, d_f), dtype=jnp.float32),
+        None if x_static is None else jnp.zeros((d_s,), dtype=jnp.float32),
+        True,
+        method=DeepAR_EncDec.training_roll
     )
 
-    key = random.PRNGKey(1)
-    init_key, dropout_key = random.split(key)
-    params = model.init({'params': init_key, 'dropout': dropout_key},
-                        jnp.array(y_scaled), training=True)
-
+    # Build optimizer
     tx, step_fn = make_trainer(model, lr=lr, weight_decay=1e-5)
     opt_state = tx.init(params)
 
     losses = []
-    step_key = random.PRNGKey(42)
+    dkey = random.PRNGKey(42)
+
+    # Training loop
     for s in range(1, steps + 1):
-        step_key, sk = random.split(step_key)
-        params, opt_state, l = step_fn(params, opt_state, jnp.array(y_scaled), sk)
+        dkey, sk = random.split(dkey)
+        params, opt_state, loss = step_fn(params, opt_state, y_hist, x_f_all, x_static, sk)
+        losses.append(float(loss))
+
         if verbose and (s % 100 == 0 or s == 1):
-            print(f"  step {s:4d} | loss {float(l):.4f}")
-        losses.append(float(l))
+            print(f" step {s:4d} | nll {float(loss):.4f}")
 
     return model, params, losses
 
 
 # -------------------------
-# Convenience wrapper for testing/running (NumPy-free)
+# Forecasting
 # -------------------------
-def run_test(test_name, series_fn, T=200, H=24, N=1000, steps=800,
-             hidden_size=64, dropout_rate=0.1,
-             horizon_coeff=0.06, seed=0, verbose=True):
+
+def forecast_mc(params,
+                model,
+                y_hist,
+                x_f_future=None,
+                x_static=None,
+                H=24,
+                N=1000,
+                seed=2025):
     """
-    Full pipeline (NumPy-free):
-      - generate data
-      - compute level & noise scales
-      - train (in scaled space)
-      - forecast with per-horizon σ calibration
-      - return quantiles and metrics
+    Monte Carlo forecast:
+
+    1) Encode history -> initial (h_T, c_T)
+    2) For each horizon step h:
+       input = [y_{t+h-1}, x_f_future[h], x_static]
+       sample y_{t+h} from N(mu, sigma)
     """
-    if verbose:
-        print(f"\n{'='*60}")
-        print(f"TEST: {test_name}")
-        print(f"{'='*60}")
 
-    # Data
-    y_hist, y_true_future = series_fn(T=T, H=H, seed=seed)
+    model_cls = type(model)
 
-    # Level scale for normalization
-    level_scale = jnp.maximum(1e-3, jnp.mean(jnp.abs(y_hist)))
+    # Encode history
+    hT, cT = model.apply(params, y_hist, x_static, method=model_cls.encode)
 
-    # Robust noise scale for sigma floor (level-invariant)
-    dy = jnp.diff(y_hist, prepend=y_hist[0])
-    mad = jnp.median(jnp.abs(dy - jnp.median(dy)))
-    noise_scale = jnp.maximum(1e-6, 1.4826 * mad)
+    # Ensure covariates exist
+    if x_f_future is None:
+        x_f_future = jnp.zeros((H, 0), dtype=jnp.float32)
 
-    # Prepare scaled training series
-    y_scaled = (y_hist / level_scale).astype(jnp.float32)
+    @jit
+    def sample_one_path(key, y_last, h0, c0):
+        """
+        Draw one full forecast trajectory of length H.
+        """
+        def step_fn(carry, inputs):
+            (y_prev, h, c), (x_f_step, k) = carry, inputs
 
-    # Sigma floor in scaled space = noise_scale / level_scale, also clip to ≥ 0.02
-    min_sigma_scale = jnp.maximum(noise_scale / level_scale, 0.02)
+            # Deterministic=True (no dropout)
+            mu, sigma, h_new, c_new = model.apply(
+                params,
+                y_prev,
+                x_f_step,
+                x_static,
+                h,
+                c,
+                True,
+                method=model_cls.one_step
+            )
 
-    if verbose:
-        print(f"Scaling: level_scale={float(level_scale):.4g}, noise_scale={float(noise_scale):.4g}, "
-              f"min_sigma_scale(scaled)={float(min_sigma_scale):.4g}")
+            # Sample from Gaussian
+            eps = random.normal(k, ())
+            y_next = mu + sigma * eps
+            return (y_next, h_new, c_new), y_next
 
-    # Train
-    if verbose:
-        print("Training...")
-    model, params, losses = train_model(
-        y_scaled,
-        hidden_size=hidden_size,
-        steps=steps,
-        dropout_rate=dropout_rate,
-        min_sigma_scale=float(min_sigma_scale),
-        horizon_coeff=horizon_coeff,
-        verbose=verbose
-    )
+        # Provide separate random keys per step
+        keys = random.split(key, H)
+        inputs = (x_f_future, keys)
 
-    # Forecast (calibrated), then unscale
-    if verbose:
-        print(f"Forecasting {N} paths...")
-    paths_scaled = forecast_mc(params, model, jnp.array(y_scaled), H=H, N=N, seed=2025, calibrate=True)
-    paths = paths_scaled * level_scale  # (N, H)
+        y0 = y_hist[-1]
 
-    # Quantiles (NumPy-free)
-    q10 = jnp.quantile(paths, 0.10, axis=0)
-    q50 = jnp.quantile(paths, 0.50, axis=0)
-    q90 = jnp.quantile(paths, 0.90, axis=0)
-
-    # Metrics
-    mae = jnp.mean(jnp.abs(q50 - y_true_future))
-    coverage = jnp.mean((y_true_future >= q10) & (y_true_future <= q90))
-
-    if verbose:
-        print(f"✓ MAE (median forecast): {float(mae):.3f}")
-        print(f"✓ 80% Coverage: {float(coverage)*100:.1f}%")
-
-    # NaN flags
-    has_nan_loss = bool(jnp.any(jnp.isnan(jnp.array(losses))))
-    has_nan_forecast = bool(jnp.any(jnp.isnan(paths)))
-
-    return {
-        'y_hist': y_hist,
-        'y_true_future': y_true_future,
-        'q10': q10, 'q50': q50, 'q90': q90,
-        'losses': losses,
-        'mae': float(mae),
-        'coverage': float(coverage),
-        'has_nan_loss': has_nan_loss,
-        'has_nan_forecast': has_nan_forecast
-    }
-
-
-# -------------------------
-# Example usage
-# -------------------------
-if __name__ == "__main__":
-    print("=" * 60)
-    print("Improved DeepAR Demo (NumPy-free; noise-based σ floor + per-horizon calibration)")
-    print("=" * 60)
-
-    test_cases = {
-        "Original (Seasonal+Trend+AR)": make_series,
-        "Linear Trend": make_linear_trend,
-        "Pure Seasonal": make_seasonal_only,
-    }
-
-    for test_name, series_fn in test_cases.items():
-        _ = run_test(
-            test_name=test_name,
-            series_fn=series_fn,
-            T=200,
-            H=24,
-            N=1000,
-            steps=600,
-            hidden_size=64,
-            dropout_rate=0.1,
-            horizon_coeff=0.04,
-            seed=42,
-            verbose=True
+        # Scan through decoder
+        (_, _, _), samples = jax.lax.scan(
+            step_fn,
+            (y0, h0, c0),
+            inputs
         )
+        return samples
 
-    print("\n" + "=" * 60)
-    print("✓ All tests complete!")
-    print("=" * 60)
+    # Sample N Monte Carlo trajectories
+    base_key = random.PRNGKey(seed)
+    path_keys = random.split(base_key, N)
+
+    paths = jax.vmap(lambda k: sample_one_path(k, y_hist[-1], hT, cT))(path_keys)
+    return paths
+
+
+# -------------------------
+# Quantiles
+# -------------------------
+
+def quantiles(paths, qs=(0.1, 0.5, 0.9)):
+    """
+    Compute per-time quantiles of MC forecast paths.
+    """
+    q_list = [jnp.quantile(paths, q, axis=0) for q in qs]
+    return q_list
