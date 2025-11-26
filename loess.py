@@ -340,7 +340,7 @@ if __name__ == "__main__":
     # Test 10: JIT compilation verification
     print("\n[Test 10] JIT compilation check")
     import time
-    y10 = jnp.linspace(0, 20, 200) + jnp.random.normal(0, 0.5, 200, key=jax.random.PRNGKey(42))
+    y10 = jnp.linspace(0, 20, 200) + jax.random.normal(jax.random.PRNGKey(42), (200,)) * 0.5
     
     # Warm-up
     _ = loess_window_jump(y10, window=15, deg=1, robust_outer=0, jump=1)

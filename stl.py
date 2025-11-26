@@ -248,7 +248,7 @@ if __name__ == "__main__":
     t = jnp.arange(n)
     trend = 0.5 * t
     seasonal = 2.0 * jnp.sin(2 * jnp.pi * t / period)
-    noise = jnp.random.normal(0, 0.3, n, key=jax.random.PRNGKey(42))
+    noise = jax.random.normal(jax.random.PRNGKey(42), (n,)) * 0.3
     y1 = trend + seasonal + noise
     
     model1 = STL(period=period, seasonal=7, trend=15)
@@ -414,10 +414,10 @@ if __name__ == "__main__":
     
     print(f"  Forecast keys: {list(forecast10.keys())}")
     assert 'mean' in forecast10, "Should have 'mean'!"
-    assert 'lower_90' in forecast10, "Should have 'lower_90'!"
-    assert 'upper_90' in forecast10, "Should have 'upper_90'!"
+    assert 'lo-90' in forecast10, "Should have 'lo-90'!"
+    assert 'hi-90' in forecast10, "Should have 'hi-90'!"
     print(f"  Mean forecast (first 5): {forecast10['mean'][:5]}")
-    print(f"  90% interval width (first): {forecast10['upper_90'][0] - forecast10['lower_90'][0]:.4f}")
+    print(f"  90% interval width (first): {forecast10['hi-90'][0] - forecast10['lo-90'][0]:.4f}")
     print("  ✓ Conformal intervals work")
     
     print("\n" + "=" * 60)

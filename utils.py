@@ -422,7 +422,7 @@ def _get_conformal_method(method: str):
 # _seasonal_naive_jit = jax.jit(_seasonal_naive, static_argnums=(1,2,3))
 
 @jax.jit
-def _ses_forecast(x, alpha):
+def _ses_forecast_nan(x, alpha):
     """
     Simple Exponential Smoothing forecast with NaN handling.
     
@@ -2644,23 +2644,38 @@ def _chunk_forecast(y, aggregation_level):
 
 @jit
 def _expand_fitted_intervals(fitted: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
-    out = jnp.empty_like(y)
-    out[0] = jnp.nan
-    fitted_idx = 0
-    for i in range(1, y.size):
-        if y[i - 1] != 0:
-            fitted_idx += 1
-            if fitted[fitted_idx] == 0:
-                # to avoid division by zero
-                out[i] = 1
-            else:
-                out[i] = fitted[fitted_idx]
-        elif fitted_idx > 0:
-            # if this entry is zero, the model didn't change
-            out[i] = out[i - 1]
-        else:
-            # if we haven't seen any intervals, use 1 to avoid division by zero
-            out[i] = 1
+    n = y.size
+    out = jnp.full_like(y, jnp.nan)
+    
+    def body_fn(i, state):
+        out_arr, fitted_idx = state
+        
+        # If previous value was non-zero, advance fitted index
+        fitted_idx = jnp.where(
+            y[i - 1] != 0,
+            fitted_idx + 1,
+            fitted_idx
+        )
+        
+        # Determine output value based on conditions
+        val = jax.lax.cond(
+            y[i - 1] != 0,
+            lambda: jnp.where(
+                fitted[fitted_idx] == 0,
+                1.0,  # Avoid division by zero
+                fitted[fitted_idx]
+            ),
+            lambda: jax.lax.cond(
+                fitted_idx > 0,
+                lambda: out_arr[i - 1],  # Carry forward previous
+                lambda: 1.0  # No intervals seen yet, use 1
+            )
+        )
+        
+        out_arr = out_arr.at[i].set(val)
+        return out_arr, fitted_idx
+    
+    out, _ = jax.lax.fori_loop(1, n, body_fn, (out, 0))
     return out
 
 

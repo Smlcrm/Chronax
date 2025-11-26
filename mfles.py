@@ -401,11 +401,11 @@ class MFLES(BaseForecaster):
                     Xb = _hinge_basis_from_knots(n, knots)
                     lam = float(alpha)
                     beta = _lasso_ista(Xb, resids, lam, maxiter=200, tol=1e-4)
-                    return (Xb @ beta) * float(linear_lr)
+                    return ((Xb @ beta) * float(linear_lr)).astype(jnp.float32)
                 def trend_robust():
-                    return _siegel_repeated_medians(x_idx, resids) * float(linear_lr)
+                    return (_siegel_repeated_medians(x_idx, resids) * float(linear_lr)).astype(jnp.float32)
                 def trend_ols():
-                    return _fast_ols_fit_predict(x_idx, resids) * float(linear_lr)
+                    return (_fast_ols_fit_predict(x_idx, resids) * float(linear_lr)).astype(jnp.float32)
                 tren = jax.lax.cond(bool(self.robust),
                                     lambda _: trend_robust(),
                                     lambda _: jax.lax.cond(bool(changepoints) & (n_cps > 0),
