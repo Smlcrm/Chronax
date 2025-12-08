@@ -97,14 +97,14 @@ def _croston_classic(
     def croston_forecast():
         """Standard Croston algorithm when demand exists."""
         # Forecast demand using SES
-        ydp, ydf = utils._ses_forecast(yd, alpha)
+        ydp, ydf = utils._ses_forecast_nan(yd, alpha)
         
         # Extract intervals between non-zero values
         # yi = utils._intervals(y)
         yi = utils._intervals_c(y)
         
         # Forecast intervals using SES
-        yip, yif = utils._ses_forecast(yi, alpha)
+        yip, yif = utils._ses_forecast_nan(yi, alpha)
         
         # Compute mean forecast: demand / interval
         # If interval forecast is 0, just use demand to avoid division by zero
