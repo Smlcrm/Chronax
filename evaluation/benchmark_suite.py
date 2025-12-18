@@ -7,14 +7,20 @@ import os
 # Add parent directory for chronax model imports
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+# --- DYNAMIC PATCH FOR BUGGED INTERN MODELS ---
+# Some models (naive, randomWalkWithDrift) try to import 'base_forecaster' (lowercase)
+# from 'base_forecaster' (module), but the class is actually 'BaseForecaster'.
+try:
+    import base_forecaster
+    if not hasattr(base_forecaster, 'base_forecaster'):
+        base_forecaster.base_forecaster = base_forecaster.BaseForecaster
+except ImportError:
+    pass
+# ----------------------------------------------
+
 import time
-import jax
-import jax.numpy as jnp
-from jax import random
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
 from tqdm import tqdm
 from typing import List, Dict, Any
 import warnings
@@ -115,25 +121,31 @@ def generate_series(series_type: str, length: int, seed: int = 42) -> np.ndarray
     else:
         raise ValueError(f"Unknown series_type: {series_type}")
 
-def prepare_inputs(y_array: np.ndarray):
+def prepare_inputs(y_array: np.ndarray, return_jax: bool = True):
     """
     Converts raw numpy array into library-specific inputs.
     
     Args:
         y_array (np.ndarray): The raw 1D float32 array.
+        return_jax (bool): Whether to return JAX DeviceArray. 
+                          Set to False if JAX is not installed.
         
     Returns:
         tuple: (jax_input, sf_input)
-            - jax_input: jax.numpy.DeviceArray (float32)
+            - jax_input: jax.numpy.DeviceArray (float32) or None
             - sf_input: pd.DataFrame columns=['unique_id', 'ds', 'y']
     """
     # 1. Chronax Input: Direct Cast to DeviceArray
-    # This ensures the transfer to GPU happens here, NOT inside the timing loop later.
-    jax_input = jnp.array(y_array, dtype=jnp.float32)
+    jax_input = None
+    if return_jax:
+        try:
+            import jax.numpy as jnp
+            jax_input = jnp.array(y_array, dtype=jnp.float32)
+        except ImportError:
+            # Fallback for environments without JAX
+            pass
     
     # 2. StatsForecast Input: DataFrame Construction
-    # We create an arbitrary hourly index. The exact dates don't matter for 
-    # scalability testing, but the format is strictly required by SF.
     n = len(y_array)
     sf_input = pd.DataFrame({
         'unique_id': ['series_0'] * n,
@@ -147,8 +159,6 @@ def prepare_inputs(y_array: np.ndarray):
 # ==========================================
 # 4. WRAPPERS
 # ==========================================
-
-from statsforecast import StatsForecast
 
 class SFWrapper:
     def __init__(self, model_cls, model_params: dict, horizon: int, seasonality: int):
@@ -168,6 +178,7 @@ class SFWrapper:
 
         self.model_obj = model_cls(**final_params)
         
+        from statsforecast import StatsForecast
         # We instantiate StatsForecast object once
         self.sf = StatsForecast(
             models=[self.model_obj],
@@ -189,6 +200,7 @@ class SFWrapper:
 
 class ChronaxWrapper:
     def __init__(self, model_cls, model_params: dict, horizon: int, seasonality: int):
+        from jax import random
         self.horizon = horizon
         self.seasonality = seasonality
         self.key = random.PRNGKey(0)
@@ -224,72 +236,121 @@ class ChronaxWrapper:
         return preds['mean']
 
 
-# ==========================================
-# 5. REGISTRY (from core/registry.py)
-# ==========================================
-
-from statsforecast.models import (
-    WindowAverage as SFWindowAverage,
-    ADIDA as SFADIDA,
-    CrostonClassic as SFCrostonClassic,
-    # AutoETS as SFAutoETS,
-    # ARIMA as SFARIMA,
-    # CES as SFCES,
-    ETS as SFETS,
-    # GARCH as SFGARCH,
-    HistoricAverage as SFHistoricAverage,
-    # Holt as SFHolt,
-    # HoltWinters as SFHoltWinters,
-    IMAPA as SFIMAPA,
-    # MFLES as SFMFLES,
-    # MSTL as SFMSTL,
-    # Naive as SFNaive,
-    RandomWalkWithDrift as SFRandomWalkWithDrift,
-    SeasonalExponentialSmoothing as SFSeasonalExponentialSmoothing,
-    SeasonalNaive as SFSeasonalNaive,
-    SeasonalWindowAverage as SFSeasonalWindowAverage,
-    SimpleExponentialSmoothing as SFSimpleExponentialSmoothing,
-    # STL as SFSTL,
-    # TBATS as SFTBATS,
-    # Theta as SFTheta,
-    TSB as SFTSB
-)
-
-# Chronax imports will be handled dynamically or assumed to be in path
-# because this registry might be imported before sys.path is patched in some contexts.
-# However, assuming standard usage via engine.py:
-import adida
-# import arima
-# import auto_ets
-# import ces
-import croston_classic
-import ets_model
-# import garch
-import historic_average
-# import holt
-# import holt_winters
-import imapa
-# import mfles
-# import mstl
-# import naive
-# import randomWalkWithDrift
-import seasonal_exponential_smoothing
-import seasonal_naive
-import seasonal_window_average
-import simple_exponential_smoothing
-# import stl
-# import tbats_model
-# import theta_model
-import tsb
-import window_average
-
 class ModelRegistry:
     """
     Central registry defining valid benchmark models and their configurations.
     """
     
     @staticmethod
+    def get_chronax_model(name: str):
+        """Lazy loader for Chronax models to avoid JAX leak."""
+        try:
+            if name == "WindowAverage":
+                import window_average
+                return window_average.WindowAverage
+            elif name == "ADIDA":
+                import adida
+                return adida.ADIDA
+            elif name == "CrostonClassic":
+                import croston_classic
+                return croston_classic.CrostonClassic
+            elif name == "ETS":
+                import ets_model
+                return ets_model.ETS
+            elif name == "HistoricAverage":
+                import historic_average
+                return historic_average.HistoricAverage
+            elif name == "IMAPA":
+                import imapa
+                return imapa.IMAPA
+            elif name == "Naive":
+                import naive
+                return naive.Naive
+            elif name == "RandomWalkWithDrift":
+                import randomWalkWithDrift
+                return randomWalkWithDrift.RandomWalkWithDrift
+            elif name == "ARIMA":
+                import arima
+                return arima.ARIMA
+            elif name == "SeasonalExponentialSmoothing":
+                import seasonal_exponential_smoothing
+                return seasonal_exponential_smoothing.SeasonalExponentialSmoothing
+            elif name == "SeasonalNaive":
+                import seasonal_naive
+                return seasonal_naive.SeasonalNaive
+            elif name == "SeasonalWindowAverage":
+                import seasonal_window_average
+                return seasonal_window_average.SeasonalWindowAverage
+            elif name == "SimpleExponentialSmoothing":
+                import simple_exponential_smoothing
+                return simple_exponential_smoothing.SimpleExponentialSmoothing
+            elif name == "TSB":
+                import tsb
+                return tsb.TSB
+        except (ImportError, AttributeError, NameError):
+            pass 
+        return None
+
+    @staticmethod
+    def get_sf_model(name: str):
+        """Lazy loader for StatsForecast models."""
+        try:
+            from statsforecast import models as sf_models
+            return getattr(sf_models, name, None)
+        except ImportError:
+            return None
+
+    @staticmethod
     def get_registry():
+        # Lazy imports for statsforecast models
+        from statsforecast import models as sf_models
+        
+        def get_sf_model(name):
+            try:
+                return getattr(sf_models, name)
+            except AttributeError:
+                return None
+
+        SFWindowAverage = get_sf_model('WindowAverage')
+        SFADIDA = get_sf_model('ADIDA')
+        SFCrostonClassic = get_sf_model('CrostonClassic')
+        SFETS = get_sf_model('ETS')
+        SFHistoricAverage = get_sf_model('HistoricAverage')
+        SFIMAPA = get_sf_model('IMAPA')
+        SFNaive = get_sf_model('Naive')
+        SFRandomWalkWithDrift = get_sf_model('RandomWalkWithDrift')
+        SFSeasonalExponentialSmoothing = get_sf_model('SeasonalExponentialSmoothing')
+        SFSeasonalNaive = get_sf_model('SeasonalNaive')
+        SFSeasonalWindowAverage = get_sf_model('SeasonalWindowAverage')
+        SFSimpleExponentialSmoothing = get_sf_model('SimpleExponentialSmoothing')
+        SFTSB = get_sf_model('TSB')
+        SFARIMA = get_sf_model('ARIMA')
+
+        import adida
+        import arima
+        # import auto_ets
+        # import ces
+        import croston_classic
+        import ets_model
+        # import garch
+        import historic_average
+        # import holt
+        # import holt_winters
+        import imapa
+        # import mfles
+        # import mstl
+        import naive
+        import randomWalkWithDrift
+        import seasonal_exponential_smoothing
+        import seasonal_naive
+        import seasonal_window_average
+        import simple_exponential_smoothing
+        # import stl
+        # import tbats_model
+        # import theta_model
+        import tsb
+        import window_average
+
         return {
             "WindowAverage": {
                 "chronax_cls": window_average.WindowAverage,
@@ -321,16 +382,21 @@ class ModelRegistry:
                 "sf_cls": SFIMAPA,
                 "params": {}
             },
-            # "Naive": {
-            #     "chronax_cls": naive.Naive,
-            #     "sf_cls": None, # Manually disabled
-            #     "params": {}
-            # },
-            # "RandomWalkWithDrift": {
-            #     "chronax_cls": randomWalkWithDrift.RandomWalkWithDrift,
-            #     "sf_cls": SFRandomWalkWithDrift,
-            #     "params": {}
-            # },
+            "Naive": {
+                "chronax_cls": naive.Naive,
+                "sf_cls": SFNaive,
+                "params": {}
+            },
+            "RandomWalkWithDrift": {
+                "chronax_cls": randomWalkWithDrift.RandomWalkWithDrift,
+                "sf_cls": SFRandomWalkWithDrift,
+                "params": {}
+            },
+            "ARIMA": {
+                "chronax_cls": arima.ARIMA,
+                "sf_cls": SFARIMA,
+                "params": {"order": (1, 1, 1)}
+            },
             "SeasonalExponentialSmoothing": {
                 "chronax_cls": seasonal_exponential_smoothing.SeasonalExponentialSmoothing,
                 "sf_cls": SFSeasonalExponentialSmoothing,
@@ -360,10 +426,33 @@ class ModelRegistry:
 
     @staticmethod
     def get_model_entry(model_name: str):
-        reg = ModelRegistry.get_registry()
+        # We need a unified entry for the worker scripts
+        # Use a static registry first for params
+        reg = {
+            "WindowAverage": {"params": {"window_size": 24}},
+            "ADIDA": {"params": {}},
+            "CrostonClassic": {"params": {}},
+            "ETS": {"params": {}},
+            "HistoricAverage": {"params": {}},
+            "IMAPA": {"params": {}},
+            "Naive": {"params": {}},
+            "RandomWalkWithDrift": {"params": {}},
+            "ARIMA": {"params": {"order": (1, 1, 1)}},
+            "SeasonalExponentialSmoothing": {"params": {}},
+            "SeasonalNaive": {"params": {}},
+            "SeasonalWindowAverage": {"params": {"window_size": 24, "season_length": 24}},
+            "SimpleExponentialSmoothing": {"params": {}},
+            "TSB": {"params": {}}
+        }
+        
         if model_name not in reg:
             raise ValueError(f"Model '{model_name}' not found in registry. Available: {list(reg.keys())}")
-        return reg[model_name]
+        
+        entry = reg[model_name].copy()
+        # Add loaders lazily
+        entry['chronax_cls'] = ModelRegistry.get_chronax_model(model_name)
+        entry['sf_cls'] = ModelRegistry.get_sf_model(model_name)
+        return entry
 
 
 # ==========================================
@@ -384,6 +473,8 @@ def plot_results(csv_path="results/benchmark_results.csv"):
         return
 
     df = pd.read_csv(csv_path)
+    import matplotlib.pyplot as plt
+    import seaborn as sns
     sns.set_theme(style="whitegrid")
     
     # Define results directory for output
@@ -668,6 +759,7 @@ def run_benchmark(model_name: str = "WindowAverage", dataset_path: str = None):
 
 if __name__ == "__main__":
     import argparse
+    import jax
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="WindowAverage", help="Model name (e.g. WindowAverage, ETS)")
     parser.add_argument("--dataset", type=str, default=None, help="Optional external dataset path (CSV)")
