@@ -2689,9 +2689,9 @@ jax.config.update("jax_enable_x64", True)
 # Small helpers
 # ---------------------------
 
-def _repeat_val_(val: float, h: int, dtype) -> jnp.ndarray:
-    return jnp.full((h,), jnp.asarray(val, dtype=dtype))
-
+@partial(jax.jit, static_argnames=['h'])
+def _repeat_val_(val: float, h: int) -> jnp.ndarray:
+    return jnp.full((h,), jnp.asarray(val, dtype=val.dtype))
 
 def _intervals(x: jnp.ndarray) -> jnp.ndarray:
     """Intervals between nonzero elements (match numpy reference)."""
@@ -2700,7 +2700,7 @@ def _intervals(x: jnp.ndarray) -> jnp.ndarray:
     diffs = jnp.diff(padded)
     return diffs.astype(x.dtype)
 
-
+@partial(jax.jit, static_argnames=['chunk_size'])
 def _chunk_sums(array: jnp.ndarray, chunk_size: int) -> jnp.ndarray:
     """Split into equal chunks and sum each chunk. Incomplete tail discarded."""
     n = array.size
@@ -2716,7 +2716,7 @@ def _chunk_sums(array: jnp.ndarray, chunk_size: int) -> jnp.ndarray:
 # ---------------------------
 # SES core
 # ---------------------------
-
+@jax.jit
 def _ses_sse(alpha: jnp.ndarray, x: jnp.ndarray) -> jnp.ndarray:
     """Residual sum of squares for simple exponential smoothing."""
     x = ensure_float(x)
@@ -2735,7 +2735,7 @@ def _ses_sse(alpha: jnp.ndarray, x: jnp.ndarray) -> jnp.ndarray:
     forecast, sse = lax.fori_loop(1, n, body_fun, init_state)
     return sse
 
-
+@jax.jit
 def _ses_forecast(x: jnp.ndarray, alpha: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """One-step ahead forecast and in-sample fitted values for SES."""
     x = ensure_float(x)
@@ -2926,7 +2926,7 @@ def _imapa(
     # All zeros shortcut
     if bool(jnp.all(y == 0)):
         out_dtype = y.dtype if y.dtype in (jnp.float32, jnp.float64) else jnp.float32
-        res = {"mean": jnp.zeros((h,), dtype=out_dtype)}
+        res = {"mean": jnp.zeros((h,), dtype=out_dtype)}  # Keep this as-is
         if fitted:
             f = jnp.zeros_like(ensure_float(y)).astype(out_dtype)
             f = f.at[0].set(jnp.asarray(jnp.nan, dtype=out_dtype))
@@ -2965,7 +2965,7 @@ def _imapa(
         jnp.asarray(0.0, dtype=dtype),
     )
 
-    res: Dict = {"mean": _repeat_val_(val=forecast, h=h, dtype=dtype)}
+    res: Dict = {"mean": _repeat_val_(val=forecast, h=h)}
 
     if fitted:
         warnings.warn("Computing fitted values for IMAPA is very expensive.")
