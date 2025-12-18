@@ -137,3 +137,133 @@ Image(filename='results/ETS_scalability_plot.png')
     *   `Warm=...`: Throughput speed.
     *   `Cold=...`: Compilation cost.
     *   `MAPE=...`: Accuracy check.
+
+
+---
+
+## Tutorial: Multi-Environment Orchestration (`run_benchmark.py`)
+
+For large-scale production testing where `JAX` and `StatsForecast` versions might conflict, use the orchestration workflow. This launches separate worker processes in dedicated Conda environments.
+
+### 1. Environment Preparation
+Ensure you have two Conda environments:
+*   **Chronax Environment**: (e.g., `chronax_env_1`) with `jax`, `jaxlib`, and Chronax models.
+*   **StatsForecast Environment**: (e.g., `statsforecast_env`) with the latest `statsforecast`.
+
+### 2. Configure `config.yaml`
+Update the `environments` section in `config.yaml` with the absolute paths to your python executables:
+```yamls
+environments:
+  chronax_python: "C:\\Users\\<USER>\\anaconda3\\envs\\chronax_env_1\\python.exe"
+  sf_python: "C:\\Users\\<USER>\\anaconda3\\envs\\statsforecast_env\\python.exe"
+```
+
+### 3. Run the Orchestrator
+Execute the benchmark from the base directory:
+```bash
+python evaluation/run_benchmark.py --config evaluation/config.yaml
+```
+
+### 4. How it Works
+*   The script reads `config.yaml` and iterates through all requested models.
+*   It spawns `chronax_worker.py` and `sf_worker.py` as subprocesses.
+*   Results are captured via a robust `RESULT_JSON:::` delimiter in the worker output.
+*   The orchestrator aggregates all data into a single timestamped CSV in `results/`.
+
+---
+
+# config.yaml
+
+models:
+  # ==========================================
+  # ✅ CONFIRMED WORKING MODELS
+  # ==========================================
+  - name: "WindowAverage"
+    library: "chronax"
+    params: { window_size: 24 }
+  - name: "WindowAverage"
+    library: "statsforecast"
+    params: { window_size: 24 }
+
+  - name: "ADIDA"
+    library: "chronax"
+    params: {}
+  - name: "ADIDA"
+    library: "statsforecast"
+    params: {}
+
+  - name: "CrostonClassic"
+    library: "chronax"
+    params: {}
+  - name: "CrostonClassic"
+    library: "statsforecast"
+    params: {}
+
+  - name: "HistoricAverage"
+    library: "chronax"
+    params: {}
+  - name: "HistoricAverage"
+    library: "statsforecast"
+    params: {}
+
+  # ARIMA (Only works in StatsForecast currently)
+  - name: "ARIMA"
+    library: "statsforecast"
+    params: { order: [1, 1, 1] }
+
+  # ==========================================
+  # 🛠️ FIXED MODELS (Added missing params)
+  # ==========================================
+  
+  - name: "SeasonalExponentialSmoothing"
+    library: "chronax"
+    params: { season_length: 24, alpha: 0.5 }
+  - name: "SeasonalExponentialSmoothing"
+    library: "statsforecast"
+    params: { season_length: 24, alpha: 0.5 }
+
+  - name: "SeasonalNaive"
+    library: "chronax"
+    params: { season_length: 24 }
+  - name: "SeasonalNaive"
+    library: "statsforecast"
+    params: { season_length: 24 }
+
+  - name: "SimpleExponentialSmoothing"
+    library: "chronax"
+    params: { alpha: 0.5 }
+  - name: "SimpleExponentialSmoothing"
+    library: "statsforecast"
+    params: { alpha: 0.5 }
+
+  - name: "TSB"
+    library: "chronax"
+    params: { alpha_d: 0.5, alpha_p: 0.5 }
+  - name: "TSB"
+    library: "statsforecast"
+    params: { alpha_d: 0.5, alpha_p: 0.5 }
+
+  # ==========================================
+  # ⚠️ MODELS WITH KNOWN ISSUES (Commented Out)
+  # ==========================================
+
+  # Failed on Scale=100 (Input too small for reshape). Use only on scales >= 1000.
+  # - name: "SeasonalWindowAverage"
+  #   library: "chronax"
+  #   params: { window_size: 24, season_length: 24 }
+  
+  # Failed: "Model not available in StatsForecast" (Check import name in registry)
+  # - name: "ETS"
+  #   library: "statsforecast"
+  #   params: {}
+
+  # Failed: Chronax General Error (NaNs or Logic Bug)
+  # - name: "IMAPA"
+  #   library: "chronax"
+  #   params: {}
+  # - name: "Naive"
+  #   library: "chronax"
+  #   params: {}
+  # - name: "RandomWalkWithDrift"
+  #   library: "chronax"
+  #   params: {}
