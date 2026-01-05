@@ -34,15 +34,15 @@ Methods:
 
 import jax
 import jax.numpy as jnp
-from base_forecaster import base_forecaster
-from conformal_intervals import conformal_intervals
+from base_forecaster import BaseForecaster
+from conformal_intervals import ConformalIntervals
 import utils
 
-class RandomWalkWithDrift(base_forecaster):
+class RandomWalkWithDrift(BaseForecaster):
     def __init__(
         self,
         alias: str = "RWD",
-        conformal_params: conformal_intervals | None = None,
+        conformal_params: ConformalIntervals | None = None,
     ):
         self.alias = alias
         self.conformal_params = conformal_params
@@ -89,17 +89,19 @@ class RandomWalkWithDrift(base_forecaster):
     # JIT-compiled version for performance
     _rwd_core_jit = jax.jit(_rwd_core.__func__, static_argnums=(1,))
 
-    def fit(self, y: jnp.ndarray):
+    def fit(self, y: jnp.ndarray, X: jnp.ndarray | None = None):
         """Fit the RandomWalkWithDrift model.
 
         Args:
             y: Clean time series of shape (t,)
+            X: Optional exogenous variables (not used, for API compatibility)
 
         Returns:
             self: Fitted RandomWalkWithDrift model
         """
         y = utils.ensure_float(y)
         mod = RandomWalkWithDrift._rwd_core_jit(y, h=1)
+        mod['y_train'] = y  # Store for conformal prediction
         self.model_ = mod
         return self
 
@@ -124,7 +126,7 @@ class RandomWalkWithDrift(base_forecaster):
         level = sorted(level)
         if self.conformal_params is not None:
             # Use base class conformal prediction
-            cs = self.conformity_scores(y=None, X=None)  # Uses stored conformity scores
+            cs = self.conformity_scores(y=self.model_['y_train'], X=None)
             res = self.add_confidence_intervals(res, cs, level, self.conformal_params.method)
         else:
             # Native prediction intervals for random walk with drift
@@ -155,6 +157,8 @@ class RandomWalkWithDrift(base_forecaster):
         self,
         h: int,
         y: jnp.ndarray,
+        X: jnp.ndarray | None = None,
+        X_future: jnp.ndarray | None = None,
         level: list[int] | None = None,
         fitted: bool = False,
     ):
@@ -167,6 +171,8 @@ class RandomWalkWithDrift(base_forecaster):
         Args:
             h: Forecast horizon
             y: Clean time series of shape (n,)
+            X: Optional insample exogenous of shape (t, n_x) (not used, for API compatibility)
+            X_future: Optional exogenous of shape (h, n_x) (not used, for API compatibility)
             level: Confidence levels (0-100) for prediction intervals
             fitted: Whether or not to return insample predictions
 

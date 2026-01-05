@@ -29,15 +29,15 @@ Methods:
 
 import jax
 import jax.numpy as jnp
-from base_forecaster import base_forecaster
-from conformal_intervals import conformal_intervals
+from base_forecaster import BaseForecaster
+from conformal_intervals import ConformalIntervals
 import utils
 
-class Naive(base_forecaster):
+class Naive(BaseForecaster):
     def __init__(
         self,
         alias: str = "Naive",
-        conformal_params: conformal_intervals | None = None,
+        conformal_params: ConformalIntervals | None = None,
     ):
         self.alias = alias
         self.conformal_params = conformal_params
@@ -66,6 +66,7 @@ class Naive(base_forecaster):
     ):
         y = utils.ensure_float(y)
         mod = Naive._naive_core_jit(y, h=1)
+        mod['y_train'] = y  # Store for conformal prediction
         self.model_ = mod
         return self
 
@@ -95,7 +96,7 @@ class Naive(base_forecaster):
         level = sorted(level)
         if self.conformal_params is not None:
             # Use base class conformal prediction
-            cs = self.conformity_scores(y=None, X=X)  # Uses stored conformity scores
+            cs = self.conformity_scores(y=self.model_['y_train'], X=X)
             res = self.add_confidence_intervals(res, cs, level, self.conformal_params.method)
         else:
             # Native prediction intervals for naive model
