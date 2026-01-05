@@ -99,13 +99,19 @@ def _seasonal_window_average(
     if fitted:
         raise NotImplementedError("fitted values not supported for SeasonalWindowAverage")
     
-    min_samples = season_length * window_size
+    min_samples = season_length * window_size  # This is static (known at compile time)
+    
+    # Always pad y with min_samples NaNs at the start to ensure we can always
+    # slice min_samples elements. This is necessary because lax.cond traces both 
+    # branches at compile time, and the reshape operation needs a fixed-size array.
+    # Using static min_samples (not y.size) ensures the shape is known at compile time.
+    y_padded = jnp.concatenate([jnp.full(min_samples, jnp.nan, dtype=y.dtype), y])
+    
+    # Take the last min_samples elements (always guaranteed to have correct size)
+    y_window = y_padded[-min_samples:]
     
     def sufficient_data(_):
         """Compute seasonal forecast when we have enough data."""
-        # Take last window_size complete seasonal cycles
-        y_window = y[-min_samples:]
-        
         # Reshape to (window_size, season_length) and average across windows (axis=0)
         # This gives us the average value for each position in the seasonal period
         season_avgs = y_window.reshape(window_size, season_length).mean(axis=0)
