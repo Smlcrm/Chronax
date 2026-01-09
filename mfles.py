@@ -474,8 +474,8 @@ class MFLES(BaseForecaster):
         self.fitted_ = fitted  # Store fitted values
         return self  # Return self for method chaining
 
-    def predict(self, forecast_horizon: int, X=None, level: list[int | float] | None = None):
-        h = int(forecast_horizon)
+    def predict(self, h: int, X=None, level: list[int | float] | None = None):
+        h = int(h)
         last, prev = self.trend[1], self.trend[0]
         slope = (last - prev)
         if self.trend_penalty and (self.penalty is not None):
