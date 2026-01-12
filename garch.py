@@ -37,32 +37,39 @@ from base_forecaster import BaseForecaster
 from conformal_intervals import ConformalIntervals
 import utils
 
-_EPSILON = 1e-8
+_EPSILON = jnp.float32(1e-8)
 _MAX_ITER = 1000
 
 def _compute_sigma2_series(y: jnp.ndarray, omega: float, alpha: jnp.ndarray, beta: jnp.ndarray, p: int, q: int) -> jnp.ndarray:
     n = len(y)
+    y = y.astype(jnp.float32)
     y_squared = y ** 2
-    init_var = jnp.var(y)
+    init_var = jnp.var(y).astype(jnp.float32)
     max_lag = max(p, q)
-    y_squared_padded = jnp.concatenate([jnp.full(max_lag, init_var), y_squared])
+    y_squared_padded = jnp.concatenate([jnp.full(max_lag, init_var, dtype=jnp.float32), y_squared])
+
+    # Cast parameters to float32 for type consistency in lax.scan
+    omega_f32 = jnp.float32(omega)
+    alpha_f32 = alpha.astype(jnp.float32)
+    beta_f32 = beta.astype(jnp.float32) if q > 0 else jnp.array([], dtype=jnp.float32)
+    zero_f32 = jnp.float32(0.0)
 
     def step(carry, t):
         sigma2_series = carry
         arch_start = t + max_lag - p
         y2_lagged = lax.dynamic_slice(y_squared_padded, (arch_start,), (p,))
-        arch_sum = jnp.dot(alpha, jnp.flip(y2_lagged))
-        garch_sum = 0.0
+        arch_sum = jnp.dot(alpha_f32, jnp.flip(y2_lagged))
+        garch_sum = zero_f32
         if q > 0:
             garch_start = t + max_lag - q
             sigma2_lagged = lax.dynamic_slice(sigma2_series, (garch_start,), (q,))
-            garch_sum = jnp.dot(beta, jnp.flip(sigma2_lagged))
+            garch_sum = jnp.dot(beta_f32, jnp.flip(sigma2_lagged))
 
-        sigma2_t = jnp.maximum(omega + arch_sum + garch_sum, _EPSILON)
+        sigma2_t = jnp.maximum(omega_f32 + arch_sum + garch_sum, _EPSILON)
         sigma2_series = sigma2_series.at[t + max_lag].set(sigma2_t)
         return sigma2_series, sigma2_t
 
-    init_sigma2 = jnp.full(n + max_lag, init_var)
+    init_sigma2 = jnp.full(n + max_lag, init_var, dtype=jnp.float32)
     final_sigma2, _ = lax.scan(step, init_sigma2, jnp.arange(n))
     return lax.dynamic_slice(final_sigma2, (max_lag,), (n,))
 
@@ -158,21 +165,27 @@ class GARCH(BaseForecaster):
 
     def _forecast_sigma2(self, omega: float, alpha: jnp.ndarray, beta: jnp.ndarray, y_last: jnp.ndarray, sigma2_last: jnp.ndarray, h: int) -> jnp.ndarray:
         """Forecast variance h steps ahead by iterating GARCH equation."""
+        # Cast all parameters to float32 for type consistency in lax.scan
+        omega_f32 = jnp.float32(omega)
+        alpha_f32 = alpha.astype(jnp.float32)
+        beta_f32 = beta.astype(jnp.float32) if self.q > 0 else jnp.array([], dtype=jnp.float32)
+        zero_f32 = jnp.float32(0.0)
+
         def step(carry, _):
             y_buffer, sigma2_buffer = carry
 
-            arch_sum = jnp.sum(alpha * jnp.flip(y_buffer ** 2))
-            garch_sum = jnp.sum(beta * jnp.flip(sigma2_buffer)) if self.q > 0 else 0.0
-            sigma2_next = jnp.maximum(omega + arch_sum + garch_sum, _EPSILON)
+            arch_sum = jnp.sum(alpha_f32 * jnp.flip(y_buffer ** 2))
+            garch_sum = jnp.sum(beta_f32 * jnp.flip(sigma2_buffer)) if self.q > 0 else zero_f32
+            sigma2_next = jnp.maximum(omega_f32 + arch_sum + garch_sum, _EPSILON)
 
-            y_buffer = jnp.concatenate([y_buffer[1:], jnp.array([0.0])])
+            y_buffer = jnp.concatenate([y_buffer[1:], jnp.array([zero_f32])])
             if self.q > 0:
-                sigma2_buffer = jnp.concatenate([sigma2_buffer[1:], jnp.array([sigma2_next])])
+                sigma2_buffer = jnp.concatenate([sigma2_buffer[1:], jnp.array([sigma2_next], dtype=jnp.float32)])
 
             return (y_buffer, sigma2_buffer), sigma2_next
 
-        init_y = y_last
-        init_sigma2 = sigma2_last if self.q > 0 else jnp.array([])
+        init_y = y_last.astype(jnp.float32)
+        init_sigma2 = sigma2_last.astype(jnp.float32) if self.q > 0 else jnp.array([], dtype=jnp.float32)
         _, forecasts = lax.scan(step, (init_y, init_sigma2), None, length=h)
         return forecasts
 
@@ -337,25 +350,31 @@ class GARCH(BaseForecaster):
         h: int,
         key: jnp.ndarray
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        # Cast all parameters to float32 for type consistency in lax.scan
+        omega_f32 = jnp.float32(omega)
+        alpha_f32 = alpha.astype(jnp.float32)
+        beta_f32 = beta.astype(jnp.float32) if self.q > 0 else jnp.array([], dtype=jnp.float32)
+        zero_f32 = jnp.float32(0.0)
+
         def step(carry, subkey):
             y_buffer, sigma2_buffer = carry
 
-            arch_sum = jnp.sum(alpha * jnp.flip(y_buffer ** 2))
-            garch_sum = jnp.sum(beta * jnp.flip(sigma2_buffer)) if self.q > 0 else 0.0
-            sigma2_next = jnp.maximum(omega + arch_sum + garch_sum, _EPSILON)
+            arch_sum = jnp.sum(alpha_f32 * jnp.flip(y_buffer ** 2))
+            garch_sum = jnp.sum(beta_f32 * jnp.flip(sigma2_buffer)) if self.q > 0 else zero_f32
+            sigma2_next = jnp.maximum(omega_f32 + arch_sum + garch_sum, _EPSILON)
 
             # generate random shock and realized level
-            epsilon = jax.random.normal(subkey)
+            epsilon = jax.random.normal(subkey, dtype=jnp.float32)
             y_next = epsilon * jnp.sqrt(sigma2_next)
-            y_buffer = jnp.concatenate([y_buffer[1:], jnp.array([y_next])])
+            y_buffer = jnp.concatenate([y_buffer[1:], jnp.array([y_next], dtype=jnp.float32)])
             if self.q > 0:
-                sigma2_buffer = jnp.concatenate([sigma2_buffer[1:], jnp.array([sigma2_next])])
+                sigma2_buffer = jnp.concatenate([sigma2_buffer[1:], jnp.array([sigma2_next], dtype=jnp.float32)])
 
             return (y_buffer, sigma2_buffer), (y_next, sigma2_next)
 
         subkeys = jax.random.split(key, h)
-        init_y = y_last
-        init_sigma2 = sigma2_last if self.q > 0 else jnp.array([])
+        init_y = y_last.astype(jnp.float32)
+        init_sigma2 = sigma2_last.astype(jnp.float32) if self.q > 0 else jnp.array([], dtype=jnp.float32)
         _, (y_path, sigma2_path) = lax.scan(step, (init_y, init_sigma2), subkeys)
 
         return y_path, sigma2_path
