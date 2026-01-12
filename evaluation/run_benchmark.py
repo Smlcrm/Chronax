@@ -61,7 +61,7 @@ def run_benchmark(config_path):
                 
                 try:
                     result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-                    
+                    print("result", result)
                     # Robust Parsing: Search for the special delimiter
                     output = result.stdout
                     if "RESULT_JSON:::" in output:
@@ -84,6 +84,8 @@ def run_benchmark(config_path):
                     # -----------------------
                 except Exception as e:
                     print(f"     ❌ Unexpected error: {e}")
+                    import traceback
+                    traceback.print_exc()  # Add this line to see full error
 
     # Aggregation
     if results_records:

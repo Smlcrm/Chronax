@@ -50,9 +50,19 @@ def run_worker(model_name, dataset_name, scale, config_path):
     n_iterations = experiment_cfg.get('n_iterations', 5)
 
     # Find model params
-    entry = ModelRegistry.get_model_entry(model_name)
+    # entry = ModelRegistry.get_model_entry(model_name)
+    # model_params = entry.get('params', {}).copy()
+
+    # To:
+    try:
+        entry = ModelRegistry.get_model_entry(model_name)
+    except Exception as e:
+        msg = json.dumps({"error": f"Registry error for {model_name}: {str(e)}"})
+        print(f"RESULT_JSON:::{msg}", flush=True)
+        return
+
     model_params = entry.get('params', {}).copy()
-    
+        
     config_params = {}
     for mod in config['models']:
         if mod['name'] == model_name and mod['library'] == 'chronax':
@@ -62,7 +72,10 @@ def run_worker(model_name, dataset_name, scale, config_path):
     
     chronax_cls = entry['chronax_cls']
     if chronax_cls is None:
-        msg = json.dumps({"error": f"Model {model_name} not available in Chronax"})
+        # Show more detail about why it's None
+        msg = json.dumps({
+            "error": f"Model {model_name} not available in Chronax. Import may have failed. Check that imapa.py exists and has no syntax errors."
+        })
         print(f"RESULT_JSON:::{msg}", flush=True)
         return
 
