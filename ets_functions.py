@@ -16,11 +16,13 @@ keeping kernels JIT-friendly and deterministic.
 __all__ = ['ets_f']
 
 import math
+from functools import partial
 from typing import Dict, Any
 import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import jax.random as jrand
+from jax import lax
 from statsmodels.tsa.seasonal import seasonal_decompose
 
 import ets_backend as _ets
@@ -32,7 +34,8 @@ _PHI_LOWER = 0.8
 _PHI_UPPER = 0.98
 
 
-def etssimulate(
+@partial(jax.jit, static_argnames=("m", "error", "trend", "season", "h"))
+def _etssimulate_jit(
     x: jnp.ndarray,
     m: int,
     error: _ets.Component,
@@ -43,9 +46,8 @@ def etssimulate(
     gamma: float,
     phi: float,
     h: int,
-    y: jnp.ndarray,
     e: jnp.ndarray,
-) -> None:
+) -> jnp.ndarray:
     """
     Simulate h-step future sample paths from a given ETS state.
 
@@ -71,73 +73,123 @@ def etssimulate(
     This is a *stateful* helper used by interval simulation for Class 4/5
     models; it mirrors the kernel `_ets.update` and `_ets.forecast` behavior.
     """
-    oldb = 0.0
-    olds = jnp.zeros(24)
-    s = jnp.zeros(24)
-    f = jnp.zeros(10)
     if m > 24 and season != _ets.Component.Nothing:
-        return
+        return jnp.zeros((h,), dtype=x.dtype)
     elif m < 1:
         m = 1
+    dt = x.dtype
+    oldb = jnp.asarray(0.0, dtype=dt)
     # Copy initial state components
-    l = float(x[0])
+    l = jnp.asarray(x[0], dtype=dt)
     if trend != _ets.Component.Nothing:
-        b = float(x[1])
+        b = jnp.asarray(x[1], dtype=dt)
     else:
-        b = 0.0
+        b = jnp.asarray(0.0, dtype=dt)
     if season != _ets.Component.Nothing:
         # x offset = 1 + (trend != Nothing)
         off = 1 + int(trend != _ets.Component.Nothing)
-        for j in range(m):
-            s = s.at[j].set(float(x[off + j]))
+        s = jnp.asarray(x[off : off + m], dtype=dt)
+    else:
+        s = jnp.zeros((m,), dtype=dt)
 
-    for i in range(h):
-        # Copy previous state
-        oldl = l
-        if trend != _ets.Component.Nothing:
-            oldb = b
-        if season != _ets.Component.Nothing:
-            olds = olds.at[:m].set(s[:m])
+    y = jnp.zeros((h,), dtype=dt)
 
-        # one step forecast
-        f = _ets.forecast(
-            f,
-            oldl,
-            oldb,
-            olds,
-            m,
-            trend,
-            season,
-            phi,
-            1,
-        )
-        if math.fabs(float(f[0]) - _ets.NA) < _ets.TOL:
-            y = y.at[0].set(_ets.NA)
-            return
-        if error == _ets.Component.Additive:
-            y = y.at[i].set(float(f[0]) + float(e[i]))
-        else:
-            y = y.at[i].set(float(f[0]) * (1.0 + float(e[i])))
+    def step(i, carry):
+        l, b, s, y, alive = carry
 
-        # Update state
-        l, b, s = _ets.update(
-            s,
-            l,
-            b,
-            oldl,
-            oldb,
-            olds,
-            m,
-            trend,
-            season,
-            alpha,
-            beta,
-            gamma,
-            phi,
-            float(y[i]),
-        )
+        def do_alive(carry_inner):
+            l_i, b_i, s_i, y_i, _ = carry_inner
+            oldl = l_i
+            oldb = b_i
+            olds = s_i
+            f = _ets.forecast(
+                jnp.zeros((1,), dtype=dt),
+                oldl,
+                oldb,
+                olds,
+                m,
+                trend,
+                season,
+                jnp.asarray(phi, dtype=dt),
+                1,
+            )
+            invalid = jnp.abs(f[0] - _ets.NA) < _ets.TOL
+
+            def on_invalid(args):
+                l_j, b_j, s_j, y_j = args
+                y_j = y_j.at[0].set(_ets.NA)
+                return l_j, b_j, s_j, y_j, False
+
+            def on_valid(args):
+                l_j, b_j, s_j, y_j = args
+                if error == _ets.Component.Additive:
+                    y_val = f[0] + e[i]
+                else:
+                    y_val = f[0] * (1.0 + e[i])
+                y_j = y_j.at[i].set(y_val)
+                l_new, b_new, s_new = _ets.update(
+                    s_j,
+                    l_j,
+                    b_j,
+                    oldl,
+                    oldb,
+                    olds,
+                    m,
+                    trend,
+                    season,
+                    jnp.asarray(alpha, dtype=dt),
+                    jnp.asarray(beta, dtype=dt),
+                    jnp.asarray(gamma, dtype=dt),
+                    jnp.asarray(phi, dtype=dt),
+                    y_val,
+                )
+                return l_new, b_new, s_new, y_j, True
+
+            return lax.cond(invalid, on_invalid, on_valid, (l_i, b_i, s_i, y_i))
+
+        def do_dead(carry_inner):
+            return carry_inner
+
+        return lax.cond(alive, do_alive, do_dead, carry)
+
+    l, b, s, y, _ = lax.fori_loop(0, h, step, (l, b, s, y, True))
+    return y
 
 
+def etssimulate(
+    x: jnp.ndarray,
+    m: int,
+    error: _ets.Component,
+    trend: _ets.Component,
+    season: _ets.Component,
+    alpha: float,
+    beta: float,
+    gamma: float,
+    phi: float,
+    h: int,
+    y: jnp.ndarray,
+    e: jnp.ndarray,
+) -> jnp.ndarray:
+    """
+    Simulate h-step future sample paths from a given ETS state.
+    """
+    y = _etssimulate_jit(
+        x,
+        m,
+        error,
+        trend,
+        season,
+        alpha,
+        beta,
+        gamma,
+        phi,
+        h,
+        e,
+    )
+    return y
+
+
+@partial(jax.jit, static_argnames=("m", "trend", "season", "h"))
 def etsforecast(
     x: jnp.ndarray,
     m: int,
@@ -174,9 +226,9 @@ def etsforecast(
         m = 1
     dt = x.dtype
 
-    l = float(x[0])
+    l = jnp.asarray(x[0], dtype=dt)
     has_trend = (trend != _ets.Component.Nothing)
-    b = float(x[1]) if has_trend else 0.0
+    b = jnp.asarray(x[1], dtype=dt) if has_trend else jnp.asarray(0.0, dtype=dt)
 
     if season != _ets.Component.Nothing:
         start = 1 + int(has_trend)
@@ -195,7 +247,7 @@ def etsforecast(
         m=int(m),
         trend=trend,
         season=season,
-        phi=float(phi),
+        phi=jnp.asarray(phi, dtype=dt),
         h=int(h),
     )
     return f
@@ -1331,6 +1383,7 @@ def pegelsfcast_C(h, obj, npaths=None, level=None, bootstrap=None):
     return forecast
 
 
+@partial(jax.jit, static_argnames=("h",))
 def _compute_sigmah(pf, h, sigma, cvals):
     """
     Helper for multiplicative-error variance recursion used in intervals.
@@ -1361,6 +1414,7 @@ def _compute_sigmah(pf, h, sigma, cvals):
     return (1 + sigma) * theta - pf**2
 
 
+@partial(jax.jit, static_argnames=("h", "season_length", "trend", "damped"))
 def _class3models(
     h,
     sigma,
@@ -1417,8 +1471,10 @@ def _class3models(
     var = jnp.zeros(h)
 
     for i in range(h):
-        mu = mu.at[i].set((H1 @ (Mh @ H2.T)).item())
-        var = var.at[i].set(((1 + sigma) * (H21 @ (Vh @ H21.T))).item() + sigma * float(mu[i] ** 2))
+        mu_i = jnp.squeeze(H1 @ (Mh @ H2.T))
+        var_i = jnp.squeeze((1 + sigma) * (H21 @ (Vh @ H21.T))) + sigma * (mu_i ** 2)
+        mu = mu.at[i].set(mu_i)
+        var = var.at[i].set(var_i)
         vecMh = Mh.flatten()
         exp1 = F21 @ (Vh @ F21.T)
         exp2 = F21 @ (Vh @ G21.T)
@@ -1568,9 +1624,8 @@ def _compute_pred_intervals(model: Dict[str, Any], forecasts: Dict[str, jnp.ndar
         key = jrand.PRNGKey(1)
         e = jrand.normal(key, shape=(nsim, h)) * math.sqrt(sigma)
 
-        def run_sim(k):
-            yhat = jnp.zeros((h,), dtype=jnp.float64)
-            etssimulate(
+        def run_sim(e_k):
+            return _etssimulate_jit(
                 last_state,
                 season_length,
                 switch(error),
@@ -1581,12 +1636,10 @@ def _compute_pred_intervals(model: Dict[str, Any], forecasts: Dict[str, jnp.ndar
                 gamma_sim,
                 phi_sim,
                 h,
-                yhat,
-                e[k],
+                e_k,
             )
-            return yhat
 
-        y_path = jnp.stack([run_sim(k) for k in range(nsim)], axis=0)
+        y_path = jax.vmap(run_sim)(e)
 
         lower_q = 0.5 - jnp.asarray(level) / 200.0
         upper_q = 0.5 + jnp.asarray(level) / 200.0

@@ -48,12 +48,12 @@ models:
   # - name: "HistoricAverage"
   #   library: "statsforecast"
   #   params: {}
-  - name: "IMAPA"
-    library: "chronax"
-    params: {}
-  - name: "IMAPA"
-    library: "statsforecast"
-    params: {}
+  # - name: "IMAPA"
+  #   library: "chronax"
+  #   params: {}
+  # - name: "IMAPA"
+  #   library: "statsforecast"
+  #   params: {}
   # - name: "Naive"
   #   library: "chronax"
   #   params: {}

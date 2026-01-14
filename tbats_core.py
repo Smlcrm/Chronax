@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from typing import Optional, Sequence, Tuple, List
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -75,7 +76,7 @@ def _guerrero_lambda(y: jnp.ndarray, season_length: int, lower: float, upper: fl
         means = jnp.abs(jnp.mean(yt, axis=1)) + 1e-10
         return jnp.std(stds / means)
 
-    cvs = jnp.stack([cv_for_lambda(l) for l in lambdas])
+    cvs = jax.vmap(cv_for_lambda)(lambdas)
     best_idx = jnp.argmin(cvs)
     return float(jnp.clip(lambdas[best_idx], lower, upper))
 
@@ -111,42 +112,56 @@ def find_harmonics(y: jnp.ndarray, m: int) -> Tuple[int, jnp.ndarray]:
         return 1, y
 
     t = jnp.arange(n, dtype=dtype)
+    i = jnp.arange(1, max_h + 1, dtype=dtype)
+    ang = 2.0 * jnp.pi * (i[:, None] * t[None, :]) / jnp.asarray(m, dtype=dtype)
+    cos = jnp.cos(ang).T
+    sin = jnp.sin(ang).T
+    X_full = jnp.stack([cos, sin], axis=2).reshape(n, 2 * max_h)
 
-    def design(h):
-        cols = []
-        for i in range(1, h + 1):
-            ang = 2.0 * jnp.pi * i * t / jnp.asarray(m, dtype=dtype)
-            cols.append(jnp.cos(ang))
-            cols.append(jnp.sin(ang))
-        return jnp.stack(cols, axis=1)
-
-    best_aic = jnp.inf
-    k_best = 1
-    aic_prev = jnp.inf
-    wout = 0
     tol_no_improv = 2
-
-    for h in range(1, max_h + 1):
-        X = design(h)
-        beta = _ridge_solve(X, z, ridge=1e-8)
-        resid = z - X @ beta
-        k = beta.shape[0]
-        aic = n * jnp.log(jnp.sum(resid * resid) / n + 1e-12) + 2.0 * k
-        better = bool(aic < best_aic - 1e-12)
-        best_aic = jnp.where(better, aic, best_aic)
-        k_best = int(jnp.where(better, h, k_best))
-        if not bool(aic < aic_prev - 1e-9):
-            wout += 1
-            if wout >= tol_no_improv:
-                break
-        else:
-            wout = 0
-        aic_prev = aic
-
-    X_best = design(k_best)
+    k_best = int(_select_harmonics(z, X_full, max_h, tol_no_improv))
+    X_best = X_full[:, : 2 * k_best]
     beta_best = _ridge_solve(X_best, z, ridge=1e-8)
     z_res = z - X_best @ beta_best
     return k_best, z_res
+
+
+@partial(jax.jit, static_argnames=("max_h", "tol_no_improv"))
+def _select_harmonics(z: jnp.ndarray, X_full: jnp.ndarray, max_h: int, tol_no_improv: int) -> jnp.ndarray:
+    n = z.shape[0]
+    dtype = X_full.dtype
+    best_aic = jnp.asarray(jnp.inf, dtype=dtype)
+    k_best = jnp.asarray(1, dtype=jnp.int32)
+    aic_prev = jnp.asarray(jnp.inf, dtype=dtype)
+    wout = jnp.asarray(0, dtype=jnp.int32)
+    stopped = jnp.asarray(False)
+
+    def body(h, state):
+        best_aic, k_best, aic_prev, wout, stopped = state
+
+        def do_step(state_in):
+            best_aic_in, k_best_in, aic_prev_in, wout_in, stopped_in = state_in
+            mask = (jnp.arange(2 * max_h) < (2 * h)).astype(X_full.dtype)
+            X = X_full * mask
+            beta = _ridge_solve(X, z, ridge=1e-8)
+            resid = z - X @ beta
+            k = 2 * h
+            aic = n * jnp.log(jnp.sum(resid * resid) / n + 1e-12) + 2.0 * k
+            better = aic < best_aic_in - 1e-12
+            best_aic_out = jnp.where(better, aic, best_aic_in)
+            k_best_out = jnp.where(better, h, k_best_in)
+
+            no_improv = ~(aic < aic_prev_in - 1e-9)
+            wout_next = jnp.where(no_improv, wout_in + 1, 0)
+            will_stop = wout_next >= tol_no_improv
+            aic_prev_next = jnp.where(will_stop, aic_prev_in, aic)
+            stopped_next = stopped_in | will_stop
+            return best_aic_out, k_best_out, aic_prev_next, wout_next, stopped_next
+
+        return lax.cond(stopped, lambda s: s, do_step, (best_aic, k_best, aic_prev, wout, stopped))
+
+    best_aic, k_best, aic_prev, wout, stopped = lax.fori_loop(1, max_h + 1, body, (best_aic, k_best, aic_prev, wout, stopped))
+    return k_best
 
 
 # -------------------------------------
@@ -158,22 +173,20 @@ def _estimate_arma_orders(residuals: jnp.ndarray, max_p: int = 3, max_q: int = 3
     Estimate ARMA orders using a crude AIC criterion.
     """
     n = residuals.shape[0]
-    best_aic = jnp.inf
-    best_p, best_q = 0, 0
+    sigma2 = jnp.var(residuals) + 1e-10
+    base_aic = n * jnp.log(sigma2)
 
-    for p in range(0, max_p + 1):
-        for q in range(0, max_q + 1):
-            if p == 0 and q == 0:
-                continue
-            k = p + q
-            if n <= k + 2:
-                continue
-            sigma2 = jnp.var(residuals) + 1e-10
-            aic = n * jnp.log(sigma2) + 2 * k
-            if aic < best_aic:
-                best_aic = aic
-                best_p, best_q = p, q
-    return best_p, best_q
+    p_vals = jnp.arange(max_p + 1, dtype=jnp.int32)
+    q_vals = jnp.arange(max_q + 1, dtype=jnp.int32)
+    P, Q = jnp.meshgrid(p_vals, q_vals, indexing="ij")
+    K = P + Q
+    valid = ~((P == 0) & (Q == 0)) & (n > (K + 2))
+    aic = jnp.where(valid, base_aic + 2 * K, jnp.inf)
+    aic_flat = aic.ravel()
+    idx = jnp.argmin(aic_flat)
+    p_best = P.ravel()[idx]
+    q_best = Q.ravel()[idx]
+    return int(p_best), int(q_best)
 
 
 def _initialize_arma_coeffs(residuals: jnp.ndarray, p: int, q: int, dtype) -> Tuple[Optional[jnp.ndarray], Optional[jnp.ndarray]]:
@@ -224,6 +237,21 @@ def _pq(ar_coeffs: Optional[jnp.ndarray], ma_coeffs: Optional[jnp.ndarray]) -> T
     q = 0 if ma_coeffs is None else int(ma_coeffs.shape[0])
     return p, q
 
+def _seasonal_offsets(k_vector: jnp.ndarray) -> jnp.ndarray:
+    k_vector = jnp.asarray(k_vector, dtype=jnp.int32)
+    two_k = 2 * k_vector
+    return jnp.cumsum(two_k) - two_k
+
+def _seasonal_masks(k_vector: jnp.ndarray, tau: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    k_vector = jnp.asarray(k_vector, dtype=jnp.int32)
+    idx = jnp.arange(tau, dtype=jnp.int32)[None, :]
+    starts = _seasonal_offsets(k_vector)[:, None]
+    mids = (starts[:, 0] + k_vector)[:, None]
+    ends = (mids[:, 0] + k_vector)[:, None]
+    mask1 = (idx >= starts) & (idx < mids)
+    mask2 = (idx >= mids) & (idx < ends)
+    return mask1, mask2
+
 def make_w(phi, k_vector, ar_coeffs, ma_coeffs, tau, beta, dtype):
     """Build the observation row vector `w^T` (shape 1×d)."""
     adj_phi = 1 if beta is not None else 0
@@ -233,12 +261,13 @@ def make_w(phi, k_vector, ar_coeffs, ma_coeffs, tau, beta, dtype):
     if adj_phi:
         phi_eff = 0.0 if (beta is not None and phi is None) else (float(phi) if phi is not None else 1.0)
         w = w.at[0, 1].set(phi_eff)
-    pos = 0
     start = 1 + adj_phi
-    for k in k_vector:
-        k = int(k)
-        w = w.at[0, start + pos : start + pos + k].set(1.0)
-        pos += 2 * k
+    if tau > 0:
+        k_vector = jnp.asarray(k_vector, dtype=jnp.int32)
+        if k_vector.size > 0:
+            mask1, _ = _seasonal_masks(k_vector, tau)
+            seasonal = jnp.sum(mask1, axis=0).astype(dtype)
+            w = w.at[0, start : start + tau].set(seasonal)
     return w
 
 def make_g(k_vector, alpha, beta, p, q, tau, dtype):
@@ -375,12 +404,14 @@ def update_g(g, gamma_bold, alpha, beta, k_vector, gamma_one_v, gamma_two_v, dty
         g = g.at[1, 0].set(beta)
 
     gb = jnp.zeros_like(gamma_bold)
-    endPos = 0
-    for k, g1, g2 in zip(k_vector, gamma_one_v, gamma_two_v):
-        k = int(k)
-        gb = gb.at[0, endPos : endPos + k].set(g1)
-        gb = gb.at[0, endPos + k : endPos + 2 * k].set(g2)
-        endPos += 2 * k
+    if gamma_bold.shape[1] > 0:
+        k_vector = jnp.asarray(k_vector, dtype=jnp.int32)
+        g1 = jnp.asarray(gamma_one_v, dtype=dtype)
+        g2 = jnp.asarray(gamma_two_v, dtype=dtype)
+        if k_vector.size > 0:
+            mask1, mask2 = _seasonal_masks(k_vector, gamma_bold.shape[1])
+            gb_row = jnp.sum(mask1 * g1[:, None] + mask2 * g2[:, None], axis=0)
+            gb = gb.at[0, :].set(gb_row)
 
     start = 1 + adj_phi
     g = g.at[start : start + gb.shape[1], 0].set(gb.ravel())
@@ -426,8 +457,14 @@ def update_F(F, phi, alpha, beta, gamma_bold, ar_coeffs, ma_coeffs, p, q, tau, d
 # Kalman-like simple filter
 # -------------------------
 
-def _calc_filter(y: jnp.ndarray, w: jnp.ndarray, g: jnp.ndarray, F: jnp.ndarray, x0: jnp.ndarray
-                 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+@jax.jit
+def _calc_filter(
+    y: jnp.ndarray,
+    w: jnp.ndarray,
+    g: jnp.ndarray,
+    F: jnp.ndarray,
+    x0: jnp.ndarray,
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Run the simple innovations filter."""
     dtype = y.dtype
     y = jnp.asarray(y, dtype=dtype)
@@ -946,26 +983,29 @@ def tbats_selection(
 
 
 
-def tbats_forecast(mod, h: int):
-    """Multi-step mean forecast from a fitted TBATS model."""
-    dtype = mod["F"].dtype
-    h = int(h)
+@partial(jax.jit, static_argnames=("h",))
+def _tbats_forecast_core(F: jnp.ndarray, w: jnp.ndarray, x_last: jnp.ndarray, h: int) -> jnp.ndarray:
+    dtype = F.dtype
     fcst = jnp.zeros((h,), dtype=dtype)
-    xx = jnp.zeros((h, mod["x"].shape[1]), dtype=dtype)
-    w = mod["w_transpose"][0]
-
-    fcst = fcst.at[0].set(jnp.dot(w, mod["x"][-1]))
-    xx = xx.at[0].set(jnp.dot(mod["F"], mod["x"][-1]))
+    x1 = jnp.dot(F, x_last)
+    fcst = fcst.at[0].set(jnp.dot(w, x_last))
 
     def step(prev_x, _):
-        nxt_x = jnp.dot(mod["F"], prev_x)
+        nxt_x = jnp.dot(F, prev_x)
         yhat = jnp.dot(w, prev_x)
-        return nxt_x, (nxt_x, yhat)
+        return nxt_x, yhat
 
     if h > 1:
-        _, (xx_tail, yhat_tail) = lax.scan(step, xx[0], jnp.arange(h - 1))
-        xx = xx.at[1:].set(xx_tail)
+        _, yhat_tail = lax.scan(step, x1, jnp.arange(h - 1))
         fcst = fcst.at[1:].set(yhat_tail)
+    return fcst
+
+
+def tbats_forecast(mod, h: int):
+    """Multi-step mean forecast from a fitted TBATS model."""
+    h = int(h)
+    w = mod["w_transpose"][0]
+    fcst = _tbats_forecast_core(mod["F"], w, mod["x"][-1], h)
 
     # Return forecasts on original data scale
     if mod["BoxCox_lambda"] is None:
@@ -976,32 +1016,53 @@ def tbats_forecast(mod, h: int):
     return {"mean": fcst_orig}
 
 
-def compute_sigmah(mod, h: int) -> jnp.ndarray:
-    """Parametric forecast std-devs σ_h for horizons 1..h."""
-    F = mod["F"]; w = mod["w_transpose"][0]; g = mod["g"][:, 0]
+@partial(jax.jit, static_argnames=("h", "use_boxcox"))
+def _compute_sigmah_core(
+    F: jnp.ndarray,
+    w: jnp.ndarray,
+    g: jnp.ndarray,
+    sigma2: jnp.ndarray,
+    y_sigma: jnp.ndarray,
+    h: int,
+    use_boxcox: bool,
+) -> jnp.ndarray:
     dtype = F.dtype
-    h = int(h)
-
     var0 = jnp.asarray(1.0, dtype=dtype)
 
     if h == 1:
-        sigma2h = mod["sigma2"] * var0
-        if mod["BoxCox_lambda"] is None:
-            sigma2h = (mod["y_sigma"] ** 2) * sigma2h
+        sigma2h = sigma2 * var0
+        if not use_boxcox:
+            sigma2h = (y_sigma ** 2) * sigma2h
         return jnp.sqrt(jnp.maximum(sigma2h, 0.0))
 
     def body(carry, _):
-        Fpow, var_acc, j = carry
+        Fpow, var_acc = carry
         Fpow_next = jnp.dot(Fpow, F)
         cj = jnp.dot(jnp.dot(w, Fpow_next), g)
         var_next = var_acc + cj * cj
-        return (Fpow_next, var_next, j + 1), var_next
+        return (Fpow_next, var_next), var_next
 
-    init = (jnp.eye(F.shape[1], dtype=dtype), var0, jnp.asarray(0, dtype=jnp.int32))
+    init = (jnp.eye(F.shape[1], dtype=dtype), var0)
     _, var_tail = lax.scan(body, init, jnp.arange(h - 1))
     var_mult = jnp.concatenate([var0[None], var_tail], axis=0)
 
-    sigma2h = mod["sigma2"] * var_mult
-    if mod["BoxCox_lambda"] is None:
-        sigma2h = (mod["y_sigma"] ** 2) * sigma2h
+    sigma2h = sigma2 * var_mult
+    if not use_boxcox:
+        sigma2h = (y_sigma ** 2) * sigma2h
     return jnp.sqrt(jnp.maximum(sigma2h, 0.0))
+
+
+def compute_sigmah(mod, h: int) -> jnp.ndarray:
+    """Parametric forecast std-devs σ_h for horizons 1..h."""
+    F = mod["F"]; w = mod["w_transpose"][0]; g = mod["g"][:, 0]
+    h = int(h)
+    use_boxcox = mod["BoxCox_lambda"] is not None
+    return _compute_sigmah_core(
+        F,
+        w,
+        g,
+        jnp.asarray(mod["sigma2"], dtype=F.dtype),
+        jnp.asarray(mod["y_sigma"], dtype=F.dtype),
+        h,
+        use_boxcox,
+    )
