@@ -1425,10 +1425,10 @@ def auto_theta(
         # change decomposition type if data is not positive
         if decomposition_type == "multiplicative" and not data_positive:
             decomposition_type = "additive"
-        y_decompose = seasonal_decompose(y, model=decomposition_type, period=m).seasonal
+        y_decompose = seasonal_decompose(y, model=decomposition_type, period=m)['seasonal']
         if decomposition_type == "multiplicative" and any(y_decompose < 0.01):
             decomposition_type = "additive"
-            y_decompose = seasonal_decompose(y, model="additive", period=m).seasonal
+            y_decompose = seasonal_decompose(y, model="additive", period=m)['seasonal']
         if decomposition_type == "additive":
             y = y - y_decompose
         else:
@@ -1922,10 +1922,10 @@ def auto_theta(
         # change decomposition type if data is not positive
         if decomposition_type == "multiplicative" and not data_positive:
             decomposition_type = "additive"
-        y_decompose = seasonal_decompose(y, model=decomposition_type, period=m).seasonal
+        y_decompose = seasonal_decompose(y, model=decomposition_type, period=m)['seasonal']
         if decomposition_type == "multiplicative" and any(y_decompose < 0.01):
             decomposition_type = "additive"
-            y_decompose = seasonal_decompose(y, model="additive", period=m).seasonal
+            y_decompose = seasonal_decompose(y, model="additive", period=m)['seasonal']
         if decomposition_type == "additive":
             y = y - y_decompose
         else:
@@ -2419,10 +2419,10 @@ def auto_theta(
         # change decomposition type if data is not positive
         if decomposition_type == "multiplicative" and not data_positive:
             decomposition_type = "additive"
-        y_decompose = seasonal_decompose(y, model=decomposition_type, period=m).seasonal
+        y_decompose = seasonal_decompose(y, model=decomposition_type, period=m)['seasonal']
         if decomposition_type == "multiplicative" and any(y_decompose < 0.01):
             decomposition_type = "additive"
-            y_decompose = seasonal_decompose(y, model="additive", period=m).seasonal
+            y_decompose = seasonal_decompose(y, model="additive", period=m)['seasonal']
         if decomposition_type == "additive":
             y = y - y_decompose
         else:
