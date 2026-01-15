@@ -39,6 +39,7 @@ import utils
 
 _EPSILON = jnp.float32(1e-8)
 _MAX_ITER = 1000
+_GRAD_TOL = 1e-6
 
 def _compute_sigma2_series(y: jnp.ndarray, omega: float, alpha: jnp.ndarray, beta: jnp.ndarray, p: int, q: int) -> jnp.ndarray:
     n = len(y)
@@ -73,6 +74,8 @@ def _compute_sigma2_series(y: jnp.ndarray, omega: float, alpha: jnp.ndarray, bet
     final_sigma2, _ = lax.scan(step, init_sigma2, jnp.arange(n))
     return lax.dynamic_slice(final_sigma2, (max_lag,), (n,))
 
+_compute_sigma2_series = jax.jit(_compute_sigma2_series, static_argnums=(4, 5))  # p, q are static
+
 # negative log likelihood
 def _log_likelihood(params: jnp.ndarray, y: jnp.ndarray, p: int, q: int):
     omega = jax.nn.softplus(params[0]) + _EPSILON
@@ -85,6 +88,76 @@ def _log_likelihood(params: jnp.ndarray, y: jnp.ndarray, p: int, q: int):
     return -log_lik + penalty
 
 _log_likelihood = jax.jit(_log_likelihood, static_argnums=(2, 3))
+
+
+def _forecast_sigma2_impl(omega: float, alpha: jnp.ndarray, beta: jnp.ndarray,
+                          y_last: jnp.ndarray, sigma2_last: jnp.ndarray,
+                          h: int, p: int, q: int) -> jnp.ndarray:
+    """JIT-compiled variance forecast h steps ahead."""
+    omega_f32 = jnp.float32(omega)
+    alpha_f32 = alpha.astype(jnp.float32)
+    beta_f32 = beta.astype(jnp.float32) if q > 0 else jnp.array([], dtype=jnp.float32)
+    zero_f32 = jnp.float32(0.0)
+
+    def step(carry, _):
+        y_buffer, sigma2_buffer = carry
+
+        arch_sum = jnp.sum(alpha_f32 * jnp.flip(y_buffer ** 2))
+        garch_sum = jnp.sum(beta_f32 * jnp.flip(sigma2_buffer)) if q > 0 else zero_f32
+        sigma2_next = jnp.maximum(omega_f32 + arch_sum + garch_sum, _EPSILON)
+
+        # Use jnp.roll instead of concatenation for buffer shifting
+        y_buffer = jnp.roll(y_buffer, -1).at[-1].set(zero_f32)
+        if q > 0:
+            sigma2_buffer = jnp.roll(sigma2_buffer, -1).at[-1].set(sigma2_next)
+
+        return (y_buffer, sigma2_buffer), sigma2_next
+
+    init_y = y_last.astype(jnp.float32)
+    init_sigma2 = sigma2_last.astype(jnp.float32) if q > 0 else jnp.array([], dtype=jnp.float32)
+    _, forecasts = lax.scan(step, (init_y, init_sigma2), None, length=h)
+    return forecasts
+
+_forecast_sigma2_impl = jax.jit(_forecast_sigma2_impl, static_argnums=(5, 6, 7))  # h, p, q are static
+
+
+def _forecast_sigma2_stochastic_impl(
+    omega: float, alpha: jnp.ndarray, beta: jnp.ndarray,
+    y_last: jnp.ndarray, sigma2_last: jnp.ndarray,
+    h: int, p: int, q: int, key: jnp.ndarray
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """JIT-compiled stochastic variance forecast."""
+    omega_f32 = jnp.float32(omega)
+    alpha_f32 = alpha.astype(jnp.float32)
+    beta_f32 = beta.astype(jnp.float32) if q > 0 else jnp.array([], dtype=jnp.float32)
+    zero_f32 = jnp.float32(0.0)
+
+    def step(carry, subkey):
+        y_buffer, sigma2_buffer = carry
+
+        arch_sum = jnp.sum(alpha_f32 * jnp.flip(y_buffer ** 2))
+        garch_sum = jnp.sum(beta_f32 * jnp.flip(sigma2_buffer)) if q > 0 else zero_f32
+        sigma2_next = jnp.maximum(omega_f32 + arch_sum + garch_sum, _EPSILON)
+
+        # Generate random shock and realized level
+        epsilon = jax.random.normal(subkey, dtype=jnp.float32)
+        y_next = epsilon * jnp.sqrt(sigma2_next)
+
+        # Use jnp.roll instead of concatenation for buffer shifting
+        y_buffer = jnp.roll(y_buffer, -1).at[-1].set(y_next)
+        if q > 0:
+            sigma2_buffer = jnp.roll(sigma2_buffer, -1).at[-1].set(sigma2_next)
+
+        return (y_buffer, sigma2_buffer), (y_next, sigma2_next)
+
+    subkeys = jax.random.split(key, h)
+    init_y = y_last.astype(jnp.float32)
+    init_sigma2 = sigma2_last.astype(jnp.float32) if q > 0 else jnp.array([], dtype=jnp.float32)
+    _, (y_path, sigma2_path) = lax.scan(step, (init_y, init_sigma2), subkeys)
+
+    return y_path, sigma2_path
+
+_forecast_sigma2_stochastic_impl = jax.jit(_forecast_sigma2_stochastic_impl, static_argnums=(5, 6, 7))  # h, p, q are static
 
 
 class GARCH(BaseForecaster):
@@ -137,14 +210,23 @@ class GARCH(BaseForecaster):
         optimizer = optax.lbfgs()
         opt_state = optimizer.init(init_params)
 
-        def step(carry, _):
-            params, state = carry
-            value, grads = jax.value_and_grad(_log_likelihood)(params, y, self.p, self.q)
-            updates, state = optimizer.update(grads, state, params, value=value, grad=grads, value_fn=lambda p: _log_likelihood(p, y, self.p, self.q))
-            params = optax.apply_updates(params, updates)
-            return (params, state), value
+        def cond_fn(state):
+            _, _, grad_norm, iteration = state
+            return (grad_norm > _GRAD_TOL) & (iteration < _MAX_ITER)
 
-        (final_params, _), losses = lax.scan(step, (init_params, opt_state), None, length=_MAX_ITER)
+        def body_fn(state):
+            params, opt_state, _, iteration = state
+            value, grads = jax.value_and_grad(_log_likelihood)(params, y, self.p, self.q)
+            updates, opt_state = optimizer.update(grads, opt_state, params, value=value, grad=grads, value_fn=lambda p: _log_likelihood(p, y, self.p, self.q))
+            params = optax.apply_updates(params, updates)
+            grad_norm = jnp.sqrt(jnp.sum(grads ** 2))
+            return (params, opt_state, grad_norm, iteration + 1)
+
+        init_grads = jax.grad(_log_likelihood)(init_params, y, self.p, self.q)
+        init_grad_norm = jnp.sqrt(jnp.sum(init_grads ** 2))
+        init_state = (init_params, opt_state, init_grad_norm, 0)
+
+        final_params, _, _, _ = lax.while_loop(cond_fn, body_fn, init_state)
 
         omega = jax.nn.softplus(final_params[0]) + _EPSILON
         alpha = jax.nn.softplus(lax.dynamic_slice(final_params, (1,), (self.p,)))
@@ -165,29 +247,7 @@ class GARCH(BaseForecaster):
 
     def _forecast_sigma2(self, omega: float, alpha: jnp.ndarray, beta: jnp.ndarray, y_last: jnp.ndarray, sigma2_last: jnp.ndarray, h: int) -> jnp.ndarray:
         """Forecast variance h steps ahead by iterating GARCH equation."""
-        # Cast all parameters to float32 for type consistency in lax.scan
-        omega_f32 = jnp.float32(omega)
-        alpha_f32 = alpha.astype(jnp.float32)
-        beta_f32 = beta.astype(jnp.float32) if self.q > 0 else jnp.array([], dtype=jnp.float32)
-        zero_f32 = jnp.float32(0.0)
-
-        def step(carry, _):
-            y_buffer, sigma2_buffer = carry
-
-            arch_sum = jnp.sum(alpha_f32 * jnp.flip(y_buffer ** 2))
-            garch_sum = jnp.sum(beta_f32 * jnp.flip(sigma2_buffer)) if self.q > 0 else zero_f32
-            sigma2_next = jnp.maximum(omega_f32 + arch_sum + garch_sum, _EPSILON)
-
-            y_buffer = jnp.concatenate([y_buffer[1:], jnp.array([zero_f32])])
-            if self.q > 0:
-                sigma2_buffer = jnp.concatenate([sigma2_buffer[1:], jnp.array([sigma2_next], dtype=jnp.float32)])
-
-            return (y_buffer, sigma2_buffer), sigma2_next
-
-        init_y = y_last.astype(jnp.float32)
-        init_sigma2 = sigma2_last.astype(jnp.float32) if self.q > 0 else jnp.array([], dtype=jnp.float32)
-        _, forecasts = lax.scan(step, (init_y, init_sigma2), None, length=h)
-        return forecasts
+        return _forecast_sigma2_impl(omega, alpha, beta, y_last, sigma2_last, h, self.p, self.q)
 
     def fit(self, y: jnp.ndarray, X: jnp.ndarray | None = None) -> 'GARCH':
         # estimate parameters from data
@@ -350,34 +410,9 @@ class GARCH(BaseForecaster):
         h: int,
         key: jnp.ndarray
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        # Cast all parameters to float32 for type consistency in lax.scan
-        omega_f32 = jnp.float32(omega)
-        alpha_f32 = alpha.astype(jnp.float32)
-        beta_f32 = beta.astype(jnp.float32) if self.q > 0 else jnp.array([], dtype=jnp.float32)
-        zero_f32 = jnp.float32(0.0)
-
-        def step(carry, subkey):
-            y_buffer, sigma2_buffer = carry
-
-            arch_sum = jnp.sum(alpha_f32 * jnp.flip(y_buffer ** 2))
-            garch_sum = jnp.sum(beta_f32 * jnp.flip(sigma2_buffer)) if self.q > 0 else zero_f32
-            sigma2_next = jnp.maximum(omega_f32 + arch_sum + garch_sum, _EPSILON)
-
-            # generate random shock and realized level
-            epsilon = jax.random.normal(subkey, dtype=jnp.float32)
-            y_next = epsilon * jnp.sqrt(sigma2_next)
-            y_buffer = jnp.concatenate([y_buffer[1:], jnp.array([y_next], dtype=jnp.float32)])
-            if self.q > 0:
-                sigma2_buffer = jnp.concatenate([sigma2_buffer[1:], jnp.array([sigma2_next], dtype=jnp.float32)])
-
-            return (y_buffer, sigma2_buffer), (y_next, sigma2_next)
-
-        subkeys = jax.random.split(key, h)
-        init_y = y_last.astype(jnp.float32)
-        init_sigma2 = sigma2_last.astype(jnp.float32) if self.q > 0 else jnp.array([], dtype=jnp.float32)
-        _, (y_path, sigma2_path) = lax.scan(step, (init_y, init_sigma2), subkeys)
-
-        return y_path, sigma2_path
+        return _forecast_sigma2_stochastic_impl(
+            omega, alpha, beta, y_last, sigma2_last, h, self.p, self.q, key
+        )
 
     def _simulate_paths(
         self,
@@ -411,7 +446,7 @@ class GARCH(BaseForecaster):
         level: list[int] | None = None,
         return_paths: bool = True
     ) -> dict:
-        # Generate stochastic forecast paths via Monte Carlo simulation.
+        # generate stochastic monte carlo forecast paths 
         if self.model_ is None:
             raise RuntimeError("Model must be fitted before prediction. Call fit() first.")
 
