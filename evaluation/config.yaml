@@ -3,100 +3,100 @@ experiment:
   seasonality: 24
   confidence_level: 95
   n_iterations: 5
-  scales: [100] #, 500, 1000, 5000, 10000, 50000]
+  scales: [50000, 100000, 500000]
 
 environments:
-  chronax_python: "C:\\Users\\omkar\\anaconda3\\envs\\chronax_env_1\\python.exe" # add the environment path for your local env
-  sf_python: "C:\\Users\\omkar\\anaconda3\\envs\\statsforecast_env\\python.exe" # same as above
+  chronax_python: "/Users/aileenh/opt/anaconda3/envs/chronax/bin/python" # add the environment path for your local env
+  sf_python: "/Users/aileenh/opt/anaconda3/envs/sf_python/bin/python" # same as above
 
 datasets:
   - name: "Trend"
     type: "synthetic"
-#  - name: "Seasonality"
-#    type: "synthetic"
-#  - name: "Stochastic"
-#    type: "synthetic"
+  - name: "Seasonality"
+    type: "synthetic"
+  # - name: "Stochastic"
+  #   type: "synthetic"
 
 models:
-  - name: "WindowAverage"
-    library: "chronax"
-    params: { window_size: 24 }
-  - name: "WindowAverage"
-    library: "statsforecast"
-    params: { window_size: 24 }
-  - name: "ADIDA"
-    library: "chronax"
-    params: {}
-  - name: "ADIDA"
-    library: "statsforecast"
-    params: {}
-  - name: "CrostonClassic"
-    library: "chronax"
-    params: {}
-  - name: "CrostonClassic"
-    library: "statsforecast"
-    params: {}
-  - name: "ETS"
-    library: "chronax"
-    params: {}
-  - name: "ETS"
-    library: "statsforecast"
-    params: {}
-  - name: "HistoricAverage"
-    library: "chronax"
-    params: {}
-  - name: "HistoricAverage"
-    library: "statsforecast"
-    params: {}
+  # - name: "WindowAverage"
+  #   library: "chronax"
+  #   params: { window_size: 24 }
+  # - name: "WindowAverage"
+  #   library: "statsforecast"
+  #   params: { window_size: 24 }
+  # - name: "ADIDA"
+  #   library: "chronax"
+  #   params: {}
+  # - name: "ADIDA"
+  #   library: "statsforecast"
+  #   params: {}
+  # - name: "CrostonClassic"
+  #   library: "chronax"
+  #   params: {}
+  # - name: "CrostonClassic"
+  #   library: "statsforecast"
+  #   params: {}
+  # - name: "ETS"
+  #   library: "chronax"
+  #   params: {}
+  # - name: "ETS"
+  #   library: "statsforecast"
+  #   params: {}
+  # - name: "HistoricAverage"
+  #   library: "chronax"
+  #   params: {}
+  # - name: "HistoricAverage"
+  #   library: "statsforecast"
+  #   params: {}
   - name: "IMAPA"
     library: "chronax"
     params: {}
   - name: "IMAPA"
     library: "statsforecast"
     params: {}
-  - name: "Naive"
-    library: "chronax"
-    params: {}
-  - name: "Naive"
-    library: "statsforecast"
-    params: {}
-  - name: "RandomWalkWithDrift"
-    library: "chronax"
-    params: {}
-  - name: "RandomWalkWithDrift"
-    library: "statsforecast"
-    params: {}
-  - name: "SeasonalExponentialSmoothing"
-    library: "chronax"
-    params: {}
-  - name: "SeasonalExponentialSmoothing"
-    library: "statsforecast"
-    params: {}
-  - name: "SeasonalNaive"
-    library: "chronax"
-    params: {}
-  - name: "SeasonalNaive"
-    library: "statsforecast"
-    params: {}
-  - name: "SeasonalWindowAverage"
-    library: "chronax"
-    params: { window_size: 24, season_length: 24 }
-  - name: "SeasonalWindowAverage"
-    library: "statsforecast"
-    params: { window_size: 24, season_length: 24 }
-  - name: "SimpleExponentialSmoothing"
-    library: "chronax"
-    params: {}
-  - name: "SimpleExponentialSmoothing"
-    library: "statsforecast"
-    params: {}
-  - name: "TSB"
-    library: "chronax"
-    params: {}
-  - name: "TSB"
-    library: "statsforecast"
-    params: {}
-  - name: "ARIMA"
-    library: "statsforecast"
-    params: { order: [1, 1, 1] }
+  # - name: "Naive"
+  #   library: "chronax"
+  #   params: {}
+  # - name: "Naive"
+  #   library: "statsforecast"
+  #   params: {}
+  # - name: "RandomWalkWithDrift"
+  #   library: "chronax"
+  #   params: {}
+  # - name: "RandomWalkWithDrift"
+  #   library: "statsforecast"
+  #   params: {}
+  # - name: "SeasonalExponentialSmoothing"
+  #   library: "chronax"
+  #   params: {}
+  # - name: "SeasonalExponentialSmoothing"
+  #   library: "statsforecast"
+  #   params: {}
+  # - name: "SeasonalNaive"
+  #   library: "chronax"
+  #   params: {}
+  # - name: "SeasonalNaive"
+  #   library: "statsforecast"
+  #   params: {}
+  # - name: "SeasonalWindowAverage"
+  #   library: "chronax"
+  #   params: { window_size: 24, season_length: 24 }
+  # - name: "SeasonalWindowAverage"
+  #   library: "statsforecast"
+  #   params: { window_size: 24, season_length: 24 }
+  # - name: "SimpleExponentialSmoothing"
+  #   library: "chronax"
+  #   params: {}
+  # - name: "SimpleExponentialSmoothing"
+  #   library: "statsforecast"
+  #   params: {}
+  # - name: "TSB"
+  #   library: "chronax"
+  #   params: {}
+  # - name: "TSB"
+  #   library: "statsforecast"
+  #   params: {}
+  # - name: "ARIMA"
+  #   library: "statsforecast"
+  #   params: { order: [1, 1, 1] }
 

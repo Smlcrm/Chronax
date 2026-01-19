@@ -287,8 +287,10 @@ class ModelRegistry:
             elif name == "TSB":
                 import tsb
                 return tsb.TSB
-        except (ImportError, AttributeError, NameError):
-            pass 
+        except (ImportError, AttributeError, NameError) as e:
+            print(f"DEBUG: Failed to import {name}: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
         return None
 
     @staticmethod
