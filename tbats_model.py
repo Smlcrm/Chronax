@@ -17,7 +17,7 @@ from tbats_core import (
     compute_sigmah as _compute_sigmah,
     _inv_boxcox as _inv_boxcox,
     _boxcox as _boxcox,
-    _ensure_pos as _ensure_pos,
+    _ensure_pos_strict as _ensure_pos_strict,
 )
 
 
@@ -32,11 +32,11 @@ class AutoTBATS(BaseForecaster):
         self,
         season_length: Union[int, List[int]],
         use_boxcox: Optional[bool] = None,
-        bc_lower_bound: float = 0.0,
-        bc_upper_bound: float = 1.0,
+        bc_lower_bound: float = -1.0,
+        bc_upper_bound: float = 2.0,
         use_trend: Optional[bool] = None,
         use_damped_trend: Optional[bool] = None,
-        use_arma_errors: bool = True,
+        use_arma_errors: bool = False,
         alias: str = "AutoTBATS",
         conformal_params: Optional[ConformalIntervals] = None,
     ):
@@ -64,7 +64,7 @@ class AutoTBATS(BaseForecaster):
 
         # Extra defensive: if Box–Cox is enabled, make sure inputs are strictly positive.
         if self.use_boxcox:
-            y = _ensure_pos(y)
+            y = _ensure_pos_strict(y)
 
         # Friendly heads-up (core will enforce this anyway):
         # when the sample is short relative to the largest season, damped trend and ARMA are curtailed.
@@ -179,11 +179,19 @@ class AutoTBATS(BaseForecaster):
 
         lam = self.model_.get("BoxCox_lambda", None)
         if lam is not None:
+            def _clamp_bc_domain(v: jnp.ndarray, lam: float, eps: float = 1e-9) -> jnp.ndarray:
+                if jnp.abs(lam) < 1e-8:
+                    return v
+                thresh = -1.0 / lam
+                if lam > 0:
+                    return jnp.maximum(v, thresh + eps)
+                return jnp.minimum(v, thresh - eps)
+
             # Align mean to the same center used for PIs
             mean_trans = fcst.get("mean_bc", None)
             if mean_trans is None:
                 mean_trans = _boxcox(res["mean"], lam)  # fallback if core not patched
-            res["mean"] = _inv_boxcox(mean_trans, lam)
+            res["mean"] = _inv_boxcox(_clamp_bc_domain(mean_trans, lam), lam)
 
         if level is not None and len(level) > 0:
             levels = sorted(int(l) for l in level)
@@ -200,7 +208,7 @@ class AutoTBATS(BaseForecaster):
                     mean_trans = _boxcox(res["mean"], lam)
                 pred_int_trans = _calculate_intervals({"mean": mean_trans}, levels, h, sigmah)
                 for k, v in pred_int_trans.items():
-                    res[k] = _inv_boxcox(v, lam)
+                    res[k] = _inv_boxcox(_clamp_bc_domain(v, lam), lam)
 
             # --- Enforce monotonicity: lo ≤ mean ≤ hi (handles σ≈0 ULPs) ---
             m = res["mean"]
@@ -220,22 +228,15 @@ class AutoTBATS(BaseForecaster):
         level: Optional[List[int]] = None,
         fitted: bool = False,
     ) -> Dict[str, jnp.ndarray]:
-        """
-        Stateless forecast (fit on `y`, then predict `h`).
-
-        - Box–Cox PIs built on transform scale centered at mean_bc, then inverted.
-        - Returned 'mean' aligned to inv_boxcox(mean_bc).
-        - Enforce lo ≤ mean ≤ hi to avoid ULP issues when σ(h)≈0.
-        """
+        """Stateless forecast (fit on `y`, then predict `h`)."""
         y = _ensure_float(y)
 
         if self.use_boxcox is True:
-            y = _ensure_pos(y)
+            y = _ensure_pos_strict(y)
 
         if jnp.any(jnp.isnan(y)) or jnp.any(jnp.isinf(y)):
             raise ValueError("Input series contains NaN or Inf values")
 
-        # Fit a fresh model
         mod = _tbats_selection(
             y=y,
             seasonal_periods=self.season_length,
@@ -246,57 +247,74 @@ class AutoTBATS(BaseForecaster):
             use_damped_trend=self.use_damped_trend,
             use_arma_errors=self.use_arma_errors,
         )
-        #print(mod, "MOD")
-        
+
         self.model_ = mod
 
-        # Forecast
-        fcst = _tbats_forecast(mod, h)  # {"mean": orig, "mean_bc": transform or None}
-        
-
+        fcst = _tbats_forecast(mod, h)
         res: Dict[str, jnp.ndarray] = {"mean": fcst["mean"]}
 
         lam = mod.get("BoxCox_lambda", None)
-        if lam is not None:
-            mean_trans = fcst.get("mean_bc", None)
-            if mean_trans is None:
-                mean_trans = _boxcox(res["mean"], lam)
-            res["mean"] = _inv_boxcox(mean_trans, lam)
+
+        def _clamp_bc_domain(v: jnp.ndarray, lam: float, eps: float = 1e-9) -> jnp.ndarray:
+            if jnp.abs(lam) < 1e-8:
+                return v
+            thresh = -1.0 / lam
+            if lam > 0:
+                return jnp.maximum(v, thresh + eps)
+            return jnp.minimum(v, thresh - eps)
 
         if fitted:
-            res["fitted"] = mod["fitted"].ravel()
+            if lam is None:
+                res["fitted"] = mod["fitted"].ravel()
+            else:
+                fitted_bc = mod["fitted"].ravel()
+                res["fitted"] = _inv_boxcox(_clamp_bc_domain(fitted_bc, lam), lam)
 
         if level is not None:
             levels = sorted(int(l) for l in level)
-            sigmah = _compute_sigmah(mod, h)  # σ(h) on model scale (transform scale if BC active)
+            sigmah = _compute_sigmah(mod, h)
 
             if lam is None:
                 pred_int = _calculate_intervals(res, levels, h, sigmah)
-                res = {**res, **pred_int}
+                res.update(pred_int)
+                if fitted:
+                    se = _calculate_sigma(mod["errors"], mod["errors"].shape[1])
+                    fitted_pred_int = _add_fitted_pi({"fitted": res["fitted"]}, se, levels)
+                    res.update(fitted_pred_int)
             else:
                 mean_trans = fcst.get("mean_bc", None)
                 if mean_trans is None:
                     mean_trans = _boxcox(res["mean"], lam)
+
                 pred_int_trans = _calculate_intervals({"mean": mean_trans}, levels, h, sigmah)
                 for k, v in pred_int_trans.items():
-                    res[k] = _inv_boxcox(v, lam)
+                    res[k] = _inv_boxcox(_clamp_bc_domain(v, lam), lam)
 
-            if fitted:
-                se = _calculate_sigma(mod["errors"], mod["errors"].shape[1])
-                fitted_pred_int = _add_fitted_pi({"fitted": mod["fitted"].ravel()}, se, levels)
-                if lam is not None:
-                    for k, v in list(fitted_pred_int.items()):
-                        fitted_pred_int[k] = _inv_boxcox(v, lam)
-                res = {**res, **fitted_pred_int}
+                if fitted:
+                    se = _calculate_sigma(mod["errors"], mod["errors"].shape[1])
+                    fitted_bc = mod["fitted"].ravel()
+                    fitted_int_trans = _add_fitted_pi({"fitted": fitted_bc}, se, levels)
+                    for k, v in fitted_int_trans.items():
+                        if k != "fitted":
+                            res[k] = _inv_boxcox(_clamp_bc_domain(v, lam), lam)
 
-            # --- Enforce monotonicity: lo ≤ mean ≤ hi (handles σ≈0 ULPs) ---
             m = res["mean"]
             for L in levels:
                 lo_k, hi_k = f"lo-{L}", f"hi-{L}"
                 res[lo_k] = jnp.minimum(res[lo_k], m)
                 res[hi_k] = jnp.maximum(res[hi_k], m)
 
+            if fitted:
+                f = res["fitted"]
+                for L in levels:
+                    lo_k, hi_k = f"fitted-lo-{L}", f"fitted-hi-{L}"
+                    if lo_k in res:
+                        res[lo_k] = jnp.minimum(res[lo_k], f)
+                    if hi_k in res:
+                        res[hi_k] = jnp.maximum(res[hi_k], f)
+
         return res
+
 
 
 class TBATS(AutoTBATS):
@@ -308,8 +326,8 @@ class TBATS(AutoTBATS):
         self,
         season_length: Union[int, List[int]],
         use_boxcox: Optional[bool] = True,
-        bc_lower_bound: float = 0.0,
-        bc_upper_bound: float = 1.0,
+        bc_lower_bound: float = -1.0,
+        bc_upper_bound: float = 2.0,
         use_trend: Optional[bool] = True,
         use_damped_trend: Optional[bool] = False,
         use_arma_errors: bool = False,
