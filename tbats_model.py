@@ -1,24 +1,47 @@
-# tbats_model.py
+"""
+tbats_model.py — User-facing AutoTBATS / TBATS forecaster classes.
+
+Wraps :mod:`tbats_core` and inherits from :class:`BaseForecaster`.
+"""
+
 from __future__ import annotations
-from typing import List, Optional, Dict, Any, Union, Tuple
 
 import warnings
+from typing import Any, Dict, List, Optional, Tuple, Union
+
 import jax.numpy as jnp
+from jax import config
 
 from base_forecaster import BaseForecaster
 from conformal_intervals import ConformalIntervals
-from utils import ensure_float as _ensure_float, calculate_sigma as _calculate_sigma, _add_fitted_pi, _calculate_intervals
-from jax import config
-config.update("jax_enable_x64", True)
-
 from tbats_core import (
-    tbats_selection as _tbats_selection,
-    tbats_forecast as _tbats_forecast,
-    compute_sigmah as _compute_sigmah,
-    _inv_boxcox as _inv_boxcox,
     _boxcox as _boxcox,
     _ensure_pos_strict as _ensure_pos_strict,
+    _inv_boxcox as _inv_boxcox,
+    compute_sigmah as _compute_sigmah,
+    tbats_forecast as _tbats_forecast,
+    tbats_selection as _tbats_selection,
 )
+from utils import (
+    _add_fitted_pi,
+    _calculate_intervals,
+    calculate_sigma as _calculate_sigma,
+    ensure_float as _ensure_float,
+)
+
+config.update("jax_enable_x64", True)
+
+
+# ── Utility ────────────────────────────────────────────────────────────
+
+def _clamp_bc_domain(v: jnp.ndarray, lam: float, eps: float = 1e-9) -> jnp.ndarray:
+    """Clamp *v* to the valid domain of the inverse Box-Cox transform."""
+    if jnp.abs(lam) < 1e-8:
+        return v  # log case — exp is defined everywhere
+    thresh = -1.0 / lam
+    if lam > 0:
+        return jnp.maximum(v, thresh + eps)
+    return jnp.minimum(v, thresh - eps)
 
 
 class AutoTBATS(BaseForecaster):
@@ -133,19 +156,6 @@ class AutoTBATS(BaseForecaster):
 
         lam = self.model_.get("BoxCox_lambda", None)
         if lam is not None:
-            # ---- Safe inverse: clamp to valid domain before _inv_boxcox ----
-            def _clamp_bc_domain(v: jnp.ndarray, lam: float, eps: float = 1e-9) -> jnp.ndarray:
-                if jnp.abs(lam) < 1e-8:
-                    # log case → exp is defined for all real v, no clamp needed
-                    return v
-                thresh = -1.0 / lam
-                if lam > 0:
-                    # need v >= -1/lam
-                    return jnp.maximum(v, thresh + eps)
-                else:
-                    # lam < 0 → need v <= -1/lam
-                    return jnp.minimum(v, thresh - eps)
-
             out = {}
             for k, v in res.items():
                 v_clamped = _clamp_bc_domain(v, lam)
@@ -179,14 +189,6 @@ class AutoTBATS(BaseForecaster):
 
         lam = self.model_.get("BoxCox_lambda", None)
         if lam is not None:
-            def _clamp_bc_domain(v: jnp.ndarray, lam: float, eps: float = 1e-9) -> jnp.ndarray:
-                if jnp.abs(lam) < 1e-8:
-                    return v
-                thresh = -1.0 / lam
-                if lam > 0:
-                    return jnp.maximum(v, thresh + eps)
-                return jnp.minimum(v, thresh - eps)
-
             # Align mean to the same center used for PIs
             mean_trans = fcst.get("mean_bc", None)
             if mean_trans is None:
@@ -254,14 +256,6 @@ class AutoTBATS(BaseForecaster):
         res: Dict[str, jnp.ndarray] = {"mean": fcst["mean"]}
 
         lam = mod.get("BoxCox_lambda", None)
-
-        def _clamp_bc_domain(v: jnp.ndarray, lam: float, eps: float = 1e-9) -> jnp.ndarray:
-            if jnp.abs(lam) < 1e-8:
-                return v
-            thresh = -1.0 / lam
-            if lam > 0:
-                return jnp.maximum(v, thresh + eps)
-            return jnp.minimum(v, thresh - eps)
 
         if fitted:
             if lam is None:
