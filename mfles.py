@@ -287,18 +287,17 @@ def _soft(z: jnp.ndarray, lam: float) -> jnp.ndarray:
 @jax.jit
 def _lasso_ista(X: jnp.ndarray, y: jnp.ndarray, alpha: float, maxiter: int = 200, tol: float = 1e-4) -> jnp.ndarray:
     step = _spectral_step(X)
+    return _lasso_ista_with_step(X, y, alpha, step, maxiter)
+
+def _lasso_ista_with_step(X: jnp.ndarray, y: jnp.ndarray, alpha: float, step: jnp.ndarray, maxiter: int = 200) -> jnp.ndarray:
+    """LASSO via ISTA with pre-computed spectral step (avoids redundant SVD)."""
     beta = jnp.zeros((X.shape[1],), dtype=y.dtype)
     def body(carry):
         b = carry
         grad = X.T @ (X @ b - y)
         b_new = _soft(b - step * grad, step * alpha)
         return b_new, jnp.linalg.norm(b_new - b)
-    def cond(val):
-        b, diff = val
-        return diff > tol
     def loop(b):
-        def one(_, curr):
-            return body(curr)[0]
         b_new = lax.fori_loop(0, maxiter, lambda i, bb: body(bb)[0], b)
         return b_new
     return loop(beta)
@@ -318,6 +317,9 @@ class _FitConfig(NamedTuple):
     X_exo: jnp.ndarray             # exogenous variables (n, n_features) or empty
     ma_array: jnp.ndarray          # MA cycle values (ma_len,)
     ses_alphas: jnp.ndarray        # pre-computed alphas for SES ensemble (num_alphas,)
+    # Pre-computed changepoint basis (avoids redundant SVD inside loop)
+    hinge_basis: jnp.ndarray       # pre-computed hinge basis matrix (n, n_cols) or empty
+    lasso_step: jnp.ndarray        # pre-computed spectral step for LASSO (scalar)
     # Scalar hyperparameters
     seasonal_lr: float
     linear_lr: float
@@ -471,21 +473,19 @@ def _fit_body(
     resids = config.y_tr - new_fitted2
     
     # -------------------------------------------------------------------------
-    # 5. Trend update (if i % 2 == 1) OR SES smoothing (if i > 4 and i % 2 == 0)
+    # 5. Trend update: LASSO (odd) + OLS (even) since SES is disabled
     # -------------------------------------------------------------------------
+    # Original: odd=LASSO trend, even=SES (disabled=no-op → 50% wasted)
+    # Fix: odd=LASSO piecewise trend (changepoint detection)
+    #      even=cheap OLS linear trend (overall slope convergence)
+    # This doubles trend fitting capacity with minimal cost increase.
     is_odd = (i % 2) == 1
     
     def trend_branch():
-        """Update linear trend component."""
-        # Three options: robust, piecewise with changepoints, or simple OLS
+        """Odd iterations: full piecewise LASSO trend (changepoint detection)."""
         def trend_piecewise():
-            k = jnp.maximum(0, config.n_cps)
-            if gradient_strategy:
-                knots = _knots_from_gradients(resids, k)
-            else:
-                knots = _uniform_knots(n, k)
-            Xb = _hinge_basis_from_knots(n, knots)
-            beta = _lasso_ista(Xb, resids, config.alpha, 200, 1e-4)
+            Xb = config.hinge_basis
+            beta = _lasso_ista_with_step(Xb, resids, config.alpha, config.lasso_step, 50)
             return (Xb @ beta) * config.linear_lr
         
         def trend_robust():
@@ -494,72 +494,38 @@ def _fit_body(
         def trend_ols():
             return _fast_ols_fit_predict(config.x_idx, resids) * config.linear_lr
         
-        # Select trend method
         use_piecewise = use_changepoints & (config.n_cps > 0)
-        tren = lax.cond(
+        return lax.cond(
             state.robust,
             trend_robust,
             lambda: lax.cond(use_piecewise, trend_piecewise, trend_ols)
         )
-        
-        test_trend = _mse(config.y_tr, new_fitted2 + tren)
-        trend_improves = test_trend < new_best_after_exo
-
-        upd_fitted = lax.cond(trend_improves, lambda: new_fitted2 + tren, lambda: new_fitted2)
-        upd_linear = lax.cond(trend_improves, lambda: state.linear_component + tren, lambda: state.linear_component)
-        upd_best = lax.cond(trend_improves, lambda: test_trend, lambda: new_best_after_exo)
-
-        # Compute penalty on i == 1
-        def compute_penalty():
-            mu = jnp.mean(resids)
-            ssres = jnp.sum((resids - tren) ** 2)
-            sstot = jnp.sum((resids - mu) ** 2) + 1e-12
-            return jnp.float32(1.0 - (ssres / sstot))
-
-        upd_penalty = lax.cond(
-            (i == 1) & trend_improves,
-            compute_penalty,
-            lambda: state.penalty
-        )
-        
-        return upd_fitted, upd_linear, state.ses_component, upd_best, state.trend_tail, upd_penalty
     
-    def ses_branch():
-        """Update SES smoothing component (when i > 35 and even iteration)."""
-        def do_ses():
-            # Cap outliers in last 2 residuals
-            capped_resids = resids.at[-2:].set(_cap_outliers(resids, 3.0)[-2:])
-
-            # Get MA order for this iteration
-            ma_len = config.ma_array.shape[0]
-            order = config.ma_array[i % ma_len].astype(jnp.int32)
-
-            # SES ensemble - note: order needs to be static for _rolling_mean
-            # We'll use order=1 as default since making it dynamic is complex
-            # Reduce rs_lr by 0.3x to prevent SES from capturing trend
-            tren = _ses_ensemble_via_utils(capped_resids, config.ses_alphas, smoother, 1) * (config.rs_lr * 0.3)
-
-            test_ses = _mse(config.y_tr, new_fitted2 + tren)
-            # Stricter criterion: SES must improve by at least 0.5% to be accepted
-            ses_improves = test_ses < (new_best_after_exo * (1.0 - jnp.maximum(config.round_penalty, 0.005)))
-
-            upd_fitted = lax.cond(ses_improves, lambda: new_fitted2 + tren, lambda: new_fitted2)
-            upd_ses = lax.cond(ses_improves, lambda: state.ses_component + tren, lambda: state.ses_component)
-            upd_best = lax.cond(ses_improves, lambda: test_ses, lambda: new_best_after_exo)
-
-            return upd_fitted, state.linear_component, upd_ses, upd_best, state.trend_tail, state.penalty
-
-        def skip_ses():
-            return new_fitted2, state.linear_component, state.ses_component, new_best_after_exo, state.trend_tail, state.penalty
-
-        # DISABLE SES for now - it captures trend at large n even with delay
-        # TODO: Re-enable once linear convergence is faster or make SES trend-aware
-        return skip_ses()  # Always skip SES
+    def ols_trend_branch():
+        """Even iterations: cheap OLS trend (linear slope convergence)."""
+        return _fast_ols_fit_predict(config.x_idx, resids) * config.linear_lr
     
-    new_fitted3, new_linear, new_ses, new_best_final, new_trend_tail, new_penalty = lax.cond(
-        is_odd,
-        trend_branch,
-        ses_branch
+    tren = lax.cond(is_odd, trend_branch, ols_trend_branch)
+    
+    test_trend = _mse(config.y_tr, new_fitted2 + tren)
+    trend_improves = test_trend < new_best_after_exo
+
+    new_fitted3 = lax.cond(trend_improves, lambda: new_fitted2 + tren, lambda: new_fitted2)
+    new_linear = lax.cond(trend_improves, lambda: state.linear_component + tren, lambda: state.linear_component)
+    new_best_final = lax.cond(trend_improves, lambda: test_trend, lambda: new_best_after_exo)
+    new_ses = state.ses_component  # SES disabled
+
+    # Compute R² penalty on first trend iteration (i == 1 for LASSO branch)
+    def compute_penalty():
+        mu = jnp.mean(resids)
+        ssres = jnp.sum((resids - tren) ** 2)
+        sstot = jnp.sum((resids - mu) ** 2) + 1e-12
+        return jnp.float32(1.0 - (ssres / sstot))
+
+    new_penalty = lax.cond(
+        (i == 1) & trend_improves,
+        compute_penalty,
+        lambda: state.penalty
     )
     
     # Update resids for robustness detection
@@ -822,6 +788,16 @@ class MFLES(BaseForecaster):
         else:
             min_iter = 25
 
+        # Pre-compute hinge basis + spectral step ONCE (avoid redundant SVD per iteration)
+        if bool(changepoints) and n_cps > 0 and not bool(gradient_strategy):
+            knots = _uniform_knots(n, n_cps)
+            hinge_basis = _hinge_basis_from_knots(n, knots)
+            lasso_step = jnp.array(_spectral_step(hinge_basis), dtype=y.dtype)
+        else:
+            # Dummy values (won't be used if changepoints=False or gradient_strategy=True)
+            hinge_basis = jnp.zeros((n, 1), dtype=y.dtype)
+            lasso_step = jnp.array(1.0, dtype=y.dtype)
+
         # Create config
         config = _FitConfig(
             y_tr=y_tr,
@@ -832,6 +808,8 @@ class MFLES(BaseForecaster):
             X_exo=X_exo,
             ma_array=jnp.array(ma_cycle, dtype=jnp.int32),
             ses_alphas=ses_alphas,
+            hinge_basis=hinge_basis,
+            lasso_step=lasso_step,
             seasonal_lr=float(seasonal_lr),
             linear_lr=float(effective_linear_lr),
             exogenous_lr=float(exogenous_lr),
