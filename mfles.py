@@ -344,6 +344,7 @@ def _fit_body(
     use_changepoints: bool,
     gradient_strategy: bool,
     smoother: bool,
+    ses_mode_code: int,
     init_robust: bool,              # Whether robust was None at start (need auto-detect)
 ) -> _LoopState:
     """Single iteration of the MFLES fitting loop.
@@ -473,49 +474,111 @@ def _fit_body(
     resids = config.y_tr - new_fitted2
     
     # -------------------------------------------------------------------------
-    # 5. Trend update: LASSO (odd) + OLS (even) since SES is disabled
+    # 5. Trend + guarded SES update
     # -------------------------------------------------------------------------
-    # Original: odd=LASSO trend, even=SES (disabled=no-op → 50% wasted)
-    # Fix: odd=LASSO piecewise trend (changepoint detection)
-    #      even=cheap OLS linear trend (overall slope convergence)
-    # This doubles trend fitting capacity with minimal cost increase.
+    # Odd rounds: trend (piecewise/robust/OLS)
+    # Even rounds: OLS by default, with late guarded SES attempt.
     is_odd = (i % 2) == 1
-    
-    def trend_branch():
-        """Odd iterations: full piecewise LASSO trend (changepoint detection)."""
-        def trend_piecewise():
-            Xb = config.hinge_basis
-            beta = _lasso_ista_with_step(Xb, resids, config.alpha, config.lasso_step, 50)
-            return (Xb @ beta) * config.linear_lr
-        
-        def trend_robust():
-            return _siegel_repeated_medians(config.x_idx, resids) * config.linear_lr
-        
-        def trend_ols():
-            return _fast_ols_fit_predict(config.x_idx, resids) * config.linear_lr
-        
+
+    def trend_piecewise():
+        Xb = config.hinge_basis
+        beta = _lasso_ista_with_step(Xb, resids, config.alpha, config.lasso_step, 50)
+        return (Xb @ beta) * config.linear_lr
+
+    def trend_robust():
+        return _siegel_repeated_medians(config.x_idx, resids) * config.linear_lr
+
+    def trend_ols():
+        return _fast_ols_fit_predict(config.x_idx, resids) * config.linear_lr
+
+    def odd_round_candidate():
         use_piecewise = use_changepoints & (config.n_cps > 0)
-        return lax.cond(
+        tren = lax.cond(
             state.robust,
             trend_robust,
             lambda: lax.cond(use_piecewise, trend_piecewise, trend_ols)
         )
-    
-    def ols_trend_branch():
-        """Even iterations: cheap OLS trend (linear slope convergence)."""
-        return _fast_ols_fit_predict(config.x_idx, resids) * config.linear_lr
-    
-    tren = lax.cond(is_odd, trend_branch, ols_trend_branch)
-    
-    test_trend = _mse(config.y_tr, new_fitted2 + tren)
-    trend_improves = test_trend < new_best_after_exo
+        test = _mse(config.y_tr, new_fitted2 + tren)
+        improves = test < new_best_after_exo
+        # False -> update linear_component, not ses_component
+        return tren, improves, test, jnp.bool_(False)
+
+    def even_round_candidate():
+        # Fast fallback trend path
+        ols_tren = trend_ols()
+        ols_test = _mse(config.y_tr, new_fitted2 + ols_tren)
+        ols_improves = ols_test < new_best_after_exo
+
+        # SES controller:
+        # 0=off, 1=lite, 2=full, 3=adaptive(lite->full escalation)
+        # Attempt SES only in later rounds with strict gain thresholds.
+        def try_ses():
+            capped_resids = resids.at[-2:].set(_cap_outliers(resids, 3.0)[-2:])
+            # Detrend first so SES focuses on residual autocorrelation, not slope.
+            detrended = capped_resids - _fast_ols_fit_predict(config.x_idx, capped_resids)
+            lite_tren = _ses_ensemble_via_utils(detrended, config.ses_alphas, False, 1) * (config.rs_lr * 0.2)
+            lite_test = _mse(config.y_tr, new_fitted2 + lite_tren)
+            lite_improves = (lite_test < (new_best_after_exo * (1.0 - 0.01))) & (lite_test < ols_test)
+
+            if ses_mode_code == 1:
+                use_ses = lite_improves
+                chosen = lax.cond(use_ses, lambda: lite_tren, lambda: ols_tren)
+                chosen_test = lax.cond(use_ses, lambda: lite_test, lambda: ols_test)
+                chosen_improves = lax.cond(use_ses, lambda: lite_improves, lambda: ols_improves)
+                return chosen, chosen_improves, chosen_test, use_ses
+
+            full_tren = _ses_ensemble_via_utils(detrended, config.ses_alphas, True, 1) * (config.rs_lr * 0.2)
+            full_test = _mse(config.y_tr, new_fitted2 + full_tren)
+            full_improves = (full_test < (new_best_after_exo * (1.0 - 0.01))) & (full_test < ols_test)
+
+            if ses_mode_code == 2:
+                use_ses = full_improves
+                chosen = lax.cond(use_ses, lambda: full_tren, lambda: ols_tren)
+                chosen_test = lax.cond(use_ses, lambda: full_test, lambda: ols_test)
+                chosen_improves = lax.cond(use_ses, lambda: full_improves, lambda: ols_improves)
+                return chosen, chosen_improves, chosen_test, use_ses
+
+            # Adaptive: start with lite; use full only if it clearly outperforms lite.
+            use_full = lite_improves & full_improves & (full_test < (lite_test * (1.0 - 0.002)))
+            ses_tren = lax.cond(use_full, lambda: full_tren, lambda: lite_tren)
+            ses_test = lax.cond(use_full, lambda: full_test, lambda: lite_test)
+            ses_improves = lax.cond(use_full, lambda: full_improves, lambda: lite_improves)
+            use_ses = ses_improves
+            chosen = lax.cond(use_ses, lambda: ses_tren, lambda: ols_tren)
+            chosen_test = lax.cond(use_ses, lambda: ses_test, lambda: ols_test)
+            chosen_improves = lax.cond(use_ses, lambda: ses_improves, lambda: ols_improves)
+            return chosen, chosen_improves, chosen_test, use_ses
+
+        def no_ses():
+            return ols_tren, ols_improves, ols_test, jnp.bool_(False)
+
+        # Delay SES attempts; early rounds prioritize trend convergence.
+        if ses_mode_code == 0:
+            return no_ses()
+        return lax.cond(i >= jnp.int32(12), try_ses, no_ses)
+
+    tren, trend_improves, test_trend, used_ses = lax.cond(
+        is_odd,
+        odd_round_candidate,
+        even_round_candidate
+    )
 
     new_fitted3 = lax.cond(trend_improves, lambda: new_fitted2 + tren, lambda: new_fitted2)
-    new_linear = lax.cond(trend_improves, lambda: state.linear_component + tren, lambda: state.linear_component)
     new_best_final = lax.cond(trend_improves, lambda: test_trend, lambda: new_best_after_exo)
-    new_ses = state.ses_component  # SES disabled
 
-    # Compute R² penalty on first trend iteration (i == 1 for LASSO branch)
+    # Update only the component that produced the accepted candidate.
+    new_linear = lax.cond(
+        trend_improves & (~used_ses),
+        lambda: state.linear_component + tren,
+        lambda: state.linear_component
+    )
+    new_ses = lax.cond(
+        trend_improves & used_ses,
+        lambda: state.ses_component + tren,
+        lambda: state.ses_component
+    )
+
+    # Compute R² penalty on first trend iteration.
     def compute_penalty():
         mu = jnp.mean(resids)
         ssres = jnp.sum((resids - tren) ** 2)
@@ -523,7 +586,7 @@ def _fit_body(
         return jnp.float32(1.0 - (ssres / sstot))
 
     new_penalty = lax.cond(
-        (i == 1) & trend_improves,
+        (i == 1) & trend_improves & (~used_ses),
         compute_penalty,
         lambda: state.penalty
     )
@@ -586,6 +649,7 @@ def _make_fit_loop(
     use_changepoints: bool,
     gradient_strategy: bool,
     smoother: bool,
+    ses_mode_code: int,
     init_robust: bool,
     max_rounds: int,
 ):
@@ -604,6 +668,7 @@ def _make_fit_loop(
             use_changepoints=use_changepoints,
             gradient_strategy=gradient_strategy,
             smoother=smoother,
+            ses_mode_code=ses_mode_code,
             init_robust=init_robust,
         )
         return (new_state, config)
@@ -660,6 +725,7 @@ class MFLES(BaseForecaster):
         multiplicative=None,
         changepoints=True,
         smoother=False,
+        ses_mode: str = "adaptive",
         seasonality_weights=False,
         gradient_strategy=False,
     ):
@@ -736,6 +802,10 @@ class MFLES(BaseForecaster):
         use_seasonality_weights = bool(seasonality_weights)
         use_changepoints = bool(changepoints)
         init_robust = self.robust is None  # Need auto-detection
+        ses_mode_norm = str(ses_mode).lower()
+        if ses_mode_norm not in ("off", "lite", "full", "adaptive"):
+            raise ValueError("ses_mode must be one of: 'off', 'lite', 'full', 'adaptive'")
+        ses_mode_code = {"off": 0, "lite": 1, "full": 2, "adaptive": 3}[ses_mode_norm]
         
         # Stack Fourier series into 3D array (num_periods, n, max_cols)
         if has_seasonality:
@@ -853,6 +923,7 @@ class MFLES(BaseForecaster):
             use_changepoints=use_changepoints,
             gradient_strategy=bool(gradient_strategy),
             smoother=bool(smoother),
+            ses_mode_code=ses_mode_code,
             init_robust=init_robust,
             max_rounds=int(max_rounds),
         )
