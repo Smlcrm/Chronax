@@ -1,43 +1,40 @@
-# ets_srcv2.py — Logic matched to NumPy/SciPy's Nelder–Mead optimizer
+# ets_srcv2.py — ETS core simulation and optax-based parameter optimization.
+#
+# This module provides the low-level building blocks for Exponential Smoothing
+# (ETS) models.  It is consumed by ets_functions.py (model selection) and
+# auto_ets.py (public API).
+#
+# Optimizer architecture (inside optimize_bfgs_smoothing):
+#   Phase 1 — Adam warm-up   (first-order, ~15-30 steps, Python loop)
+#   Phase 2 — L-BFGS refine  (second-order, 30 steps via lax.scan → one XLA kernel)
+#
+# Only optax is used for optimization — no jaxopt or scipy dependency.
 from __future__ import annotations
 """
-ETS core simulation and a SciPy-like Nelder–Mead optimizer in JAX.
-
-This module implements the state evolution, forecasting, loss rollout, and an
-in-module Nelder–Mead optimizer for Exponential Smoothing / ETS models using
-JAX arrays and control flow. The numerical update/forecast logic mirrors
-canonical NumPy-style implementations (e.g., statsmodels conventions), while
-the optimizer strives to match SciPy's Nelder–Mead behavior as closely as
-practical in pure Python/JAX without calling SciPy.
-
-Key pieces:
-- `update`   : single-timestep ETS state update (level/trend/season).
-- `forecast` : h-step-ahead forecast given current states.
-- `_calc_roll` / `calc_full` / `calc` : loss (likelihood/MSE/etc.) rollout
-  across a time series, with rolling-horizon MSE tracking.
-- `optimize` : a SciPy-like Nelder–Mead implementation (reflection/expansion/
-  contraction/shrink) with the same initial simplex rule and a box-penalty for
-  bounds.
-
-Design notes:
-- JIT: Computational kernels (`update`, `forecast`, `_calc_roll`, `calc_full`,
-  `calc`) are `@jax.jit`-compiled with static arguments for model structure.
-- Parity: The logic follows NumPy/SciPy conventions for multiplicative corner
-  cases (e.g., phi≈1.0, division-by-near-zero guards, multiplicative-season
-  positivity checks, and seasonal balancing slots).
-
-Limitations of `optimize` vs SciPy are documented in its docstring.
+ETS core simulation and an optax-based optimizer in JAX.
 """
 
 from enum import Enum
+from functools import lru_cache, partial
 from typing import NamedTuple, Tuple
-from functools import partial
+import os
 
 import jax
-jax.config.update("jax_enable_x64", True)
+jax.config.update("jax_enable_x64", True)  # ETS needs float64 precision
 import jax.numpy as jnp
 from jax import lax
-#import optimistix as optx
+import optax  # Adam + L-BFGS optimizers and zoom line-search
+
+
+def _init_jax_compilation_cache() -> None:
+    """Set up a local on-disk XLA compilation cache to avoid redundant recompiles."""
+    cache_dir = os.environ.get("JAX_COMPILATION_CACHE_DIR")
+    if not cache_dir:
+        cache_dir = os.path.join(os.path.dirname(__file__), ".jax_cache")
+        os.environ["JAX_COMPILATION_CACHE_DIR"] = cache_dir
+
+
+_init_jax_compilation_cache()
 
 # ---------------------------
 # Constants
@@ -48,8 +45,12 @@ HUGE_N: float = 1e10
 NA: float = -99999.0
 """Legacy sentinel value; retained for parity with upstream behavior."""
 
-TOL: float = 1e-10
-"""Small tolerance used for near-zero/near-one checks (e.g., phi≈1.0)."""
+TOL: float = 1e-10    # near-zero guard for conditional branches (e.g. phi ≈ 1)
+EPS: float = 1e-3     # clipping margin for legacy sigmoid param transform
+EPS_PURE: float = 2e-2  # clipping margin for pure-sigmoid param transform
+
+PHI_LOWER: float = 0.8   # default lower bound for trend-damping φ
+PHI_UPPER: float = 0.98  # default upper bound for trend-damping φ
 
 
 class Component(Enum):
@@ -88,14 +89,14 @@ class Criterion(Enum):
 
 class OptimResult(NamedTuple):
     """
-    Result of the Nelder–Mead optimization.
+    Result of the Optax-based optimization.
 
     Attributes
     ----------
     success : bool
         Whether termination was successful under the convergence test.
     status : int
-        0 for success; 2 if maximum iterations exceeded (SciPy-style codes).
+        0 for success; 2 for non-finite parameters.
     message : str
         Human-readable status message.
     x : jnp.ndarray
@@ -116,10 +117,116 @@ class OptimResult(NamedTuple):
     nfev: int
 
 
+# Cached closure factory — JAX only traces/compiles the objective once per
+# unique model structure (error/trend/season/which-params-are-free).
+@lru_cache(maxsize=128)
+def _get_objective_closure(
+    error: Component,
+    trend: Component,
+    season: Component,
+    opt_crit: Criterion,
+    n_mse: int,
+    m: int,
+    opt_alpha: bool,
+    opt_beta: bool,
+    opt_gamma: bool,
+    opt_phi: bool,
+    clip_multiplicative_errors: bool,
+    pure_sigmoid: bool,
+    opt_init_state: bool,
+    n_state: int,
+):
+    # Inner callable receives data-level arrays; all structure config is baked in.
+    def _obj(
+        p: jnp.ndarray,
+        y: jnp.ndarray,
+        init_state: jnp.ndarray,
+        n_obs: int,
+        alpha: float,
+        beta: float,
+        gamma: float,
+        phi: float,
+        lower: jnp.ndarray,
+        upper: jnp.ndarray,
+    ) -> jnp.float64:
+        return _objective_smoothing_only(
+            p,
+            y,
+            init_state,
+            error,
+            trend,
+            season,
+            opt_crit,
+            n_mse,
+            m,
+            n_obs,
+            opt_alpha,
+            opt_beta,
+            opt_gamma,
+            opt_phi,
+            alpha,
+            beta,
+            gamma,
+            phi,
+            lower,
+            upper,
+            clip_multiplicative_errors,
+            pure_sigmoid,
+            opt_init_state,
+            n_state,
+        )
+
+    return _obj
+
+
 # ---------------------------
 # Core state update (NumPy logic)
 # ---------------------------
-@partial(jax.jit, static_argnames=("trend", "season", "m"))
+_COMP_NOTHING = int(Component.Nothing.value)
+_COMP_ADD = int(Component.Additive.value)
+_COMP_MUL = int(Component.Multiplicative.value)
+
+
+@partial(jax.jit, static_argnames=("has_trend", "has_season", "m"))
+def _unpack_state(
+    state: jnp.ndarray,
+    has_trend: bool,
+    has_season: bool,
+    m: int,
+) -> Tuple[jnp.float64, jnp.float64, jnp.ndarray]:
+    """Unpack level/trend/season from packed ETS state."""
+    n_s = max(m, 24)
+    l = state[0]
+    b = state[1] if has_trend else jnp.asarray(0.0, dtype=state.dtype)
+    s_vec = jnp.zeros((n_s,), dtype=state.dtype)
+    if has_season:
+        start = 1 + int(has_trend)
+        s_vec = s_vec.at[:m].set(state[start:start + m])
+    return l, b, s_vec
+
+
+@partial(jax.jit, static_argnames=("has_trend", "has_season", "m"))
+def _pack_state_row(
+    l: jnp.float64,
+    b: jnp.float64,
+    s_vec: jnp.ndarray,
+    has_trend: bool,
+    has_season: bool,
+    m: int,
+) -> jnp.ndarray:
+    """Pack one ETS state row from level/trend/season."""
+    dtype = jnp.asarray(l).dtype
+    n_states = m * int(has_season) + int(has_trend) + 1
+    row = jnp.zeros((n_states,), dtype=dtype)
+    row = row.at[0].set(l)
+    if has_trend:
+        row = row.at[1].set(b)
+    if has_season:
+        start = 1 + int(has_trend)
+        row = row.at[start:start + m].set(s_vec[:m])
+    return row
+
+
 def update(
     s: jnp.ndarray,
     l: jnp.float64,
@@ -130,6 +237,7 @@ def update(
     m: int,
     trend: Component,
     season: Component,
+    error: int,
     alpha: jnp.float64,
     beta: jnp.float64,
     gamma: jnp.float64,
@@ -186,27 +294,51 @@ def update(
         denom = old_s[m - 1]
         p = jnp.where(jnp.abs(denom) < TOL, jnp.asarray(HUGE_N, jnp.float64), y / denom)
 
-    # new level
-    l = q + alpha * (p - q)
-
-    # new growth (if trend present) — NumPy uses (beta/alpha) without alpha guard
+    # Additive-error update path
+    e_add = p - q
+    l_add = q + alpha * e_add
+    b_add = b
     if trend != Component.Nothing:
         if trend == Component.Additive:
-            r = l - old_l
+            r_add = l_add - old_l
         else:
-            r = jnp.where(jnp.abs(old_l) < TOL, jnp.asarray(HUGE_N, jnp.float64), l / old_l)
-        b = phi_b + (beta / alpha) * (r - phi_b)
-
-    # new seasonal (if present)
+            r_add = jnp.where(jnp.abs(old_l) < TOL, jnp.asarray(HUGE_N, jnp.float64), l_add / old_l)
+        b_add = phi_b + (beta / alpha) * (r_add - phi_b)
+    s_add = s
     if season != Component.Nothing:
         if season == Component.Additive:
-            t = y - q
+            t_add = y - q
         else:
-            t = jnp.where(jnp.abs(q) < TOL, jnp.asarray(HUGE_N, jnp.float64), y / q)
-        s0 = old_s[m - 1] + gamma * (t - old_s[m - 1])
-        s = s.at[0].set(s0)
+            t_add = jnp.where(jnp.abs(q) < TOL, jnp.asarray(HUGE_N, jnp.float64), y / q)
+        s0_add = old_s[m - 1] + gamma * (t_add - old_s[m - 1])
+        s_add = s_add.at[0].set(s0_add)
         if m > 1:
-            s = s.at[1:m].set(old_s[0:m - 1])
+            s_add = s_add.at[1:m].set(old_s[0:m - 1])
+
+    # Multiplicative-error update path
+    q_safe = jnp.where(jnp.abs(q) < TOL, jnp.asarray(HUGE_N, jnp.float64), q)
+    e_mul = p / q_safe - 1.0
+    l_mul = q * (1.0 + alpha * e_mul)
+    b_mul = b
+    if trend != Component.Nothing:
+        if trend == Component.Additive:
+            b_mul = phi_b + beta * q * e_mul
+        else:
+            b_mul = phi_b * (1.0 + beta * e_mul)
+    s_mul = s
+    if season != Component.Nothing:
+        if season == Component.Additive:
+            s0_mul = old_s[m - 1] + gamma * q * e_mul
+        else:
+            s0_mul = old_s[m - 1] * (1.0 + gamma * e_mul)
+        s_mul = s_mul.at[0].set(s0_mul)
+        if m > 1:
+            s_mul = s_mul.at[1:m].set(old_s[0:m - 1])
+
+    add_flag = error == _COMP_ADD
+    l = lax.select(add_flag, l_add, l_mul)
+    b = lax.select(add_flag, b_add, b_mul)
+    s = lax.select(add_flag, s_add, s_mul)
 
     return l, b, s
 
@@ -252,36 +384,37 @@ def forecast(
     f : jnp.ndarray
         Same buffer with indices [0..h-1] filled.
     """
-    def body(i, carry):
-        f, phistar = carry
+    steps = jnp.arange(f.shape[0], dtype=jnp.int32)
+    active = steps < h
+    k = steps + 1
+    phi_is_one = jnp.abs(phi - 1.0) < TOL
+    # phistar_k = sum_{i=1..k} phi^i
+    phistar = jnp.where(
+        phi_is_one,
+        k.astype(jnp.float64),
+        phi * (1.0 - phi ** k.astype(jnp.float64)) / (1.0 - phi),
+    )
 
-        # Update phistar to sum_{k=1}^{i+1} phi^k, with special case phi≈1
-        incr = jnp.where(jnp.abs(phi - 1.0) < TOL, 1.0, phi ** (i + 1))
-        phistar = phistar + incr
-
-        # Trend contribution
-        def fi_mul():
-            # NumPy behavior: if b < 0 => NaN, else l * (b ** phistar)
-            return jnp.where(b < 0.0, jnp.asarray(jnp.nan, jnp.float64), l * (b ** phistar))
-
-        fi = jnp.where(
-            trend == Component.Nothing, l,
-            jnp.where(trend == Component.Additive, l + phistar * b, fi_mul())
+    if trend == Component.Nothing:
+        base = jnp.full((f.shape[0],), l, dtype=jnp.float64)
+    elif trend == Component.Additive:
+        base = l + phistar * b
+    else:
+        base = jnp.where(
+            b < 0.0,
+            jnp.full((f.shape[0],), jnp.nan, dtype=jnp.float64),
+            l * (b ** phistar),
         )
 
-        # Seasonal contribution, j = (m - 1 - i) % m
-        j_idx = (m - 1 - i) % m
-        fi = jnp.where(
-            season == Component.Additive, fi + s[j_idx],
-            jnp.where(season == Component.Multiplicative, fi * s[j_idx], fi)
-        )
+    if season != Component.Nothing:
+        j_idx = (m - 1 - steps) % m
+        seas = s[j_idx]
+        if season == Component.Additive:
+            base = base + seas
+        else:
+            base = base * seas
 
-        f = f.at[i].set(fi)
-        return (f, phistar)
-
-    phistar0 = jnp.asarray(0.0, jnp.float64)
-    f, _ = lax.fori_loop(0, h, body, (f, phistar0))
-    return f
+    return jnp.where(active, base, f)
 
 
 # ---------------------------
@@ -333,7 +466,7 @@ def _calc_roll(
     -------
     x_local : jnp.ndarray
         Updated state buffer with (n+1) snapshots packed.
-    e_local : jnp.ndarray
+    e_out : jnp.ndarray
         Residuals for each time step.
     a_local : jnp.ndarray
         Rolling horizon MSE estimates.
@@ -345,36 +478,37 @@ def _calc_roll(
     m_eff = max(m, 1)
     n_mse_eff = min(n_mse, 30)
 
-    n_states = m_eff * int(season != Component.Nothing) + int(trend != Component.Nothing) + 1
+    err_val = int(error.value)
+    has_trend = trend != Component.Nothing
+    has_season = season != Component.Nothing
+    n_states = m_eff * int(has_season) + int(has_trend) + 1
 
     # Unpack initial states from x
-    l = x[0]
-    b = jnp.array(0.0, jnp.float64)
-    if trend != Component.Nothing:
-        b = x[1]
-
-    s_vec = jnp.zeros(n_s, dtype=jnp.float64)
-    if season != Component.Nothing:
-        start0 = 1 + int(trend != Component.Nothing)
-        s_vec = s_vec.at[:m_eff].set(x[start0:start0 + m_eff])
+    l, b, s_vec = _unpack_state(
+        x[:n_states], has_trend=has_trend, has_season=has_season, m=m_eff
+    )
 
     # Work buffers
     x_local = x
-    e_local = e.at[:].set(0.0)
-    a_local = a_mse.at[:].set(0.0)
+    a_local = jnp.zeros_like(a_mse)
     denom = jnp.zeros(30, dtype=jnp.float64)
     lik = jnp.array(0.0, jnp.float64)
     lik2 = jnp.array(0.0, jnp.float64)
 
     # f-buffer of fixed max size 30; we only use first n_mse_eff entries
     f_buf = jnp.zeros(30, dtype=jnp.float64)
+    # Maintain a compact (n+1, n_states) view for cheaper per-step updates
+    x_states = x_local[: (n + 1) * n_states].reshape((n + 1, n_states))
 
     def step(carry, y_i):
-        (i, x_local, e_local, a_local, denom, l, b, s_vec, lik, lik2, f_buf) = carry
+        (i, x_states, a_local, denom, l, b, s_vec, lik, lik2, f_buf) = carry
 
         old_l = l
-        old_b = jnp.where(trend != Component.Nothing, b, jnp.asarray(0.0, jnp.float64))
-        old_s = jnp.zeros_like(s_vec).at[:m_eff].set(s_vec[:m_eff])
+        if has_trend:
+            old_b = b
+        else:
+            old_b = jnp.asarray(0.0, jnp.float64)
+        old_s = s_vec
 
         # forecasts up to n_mse_eff
         f_buf = forecast(
@@ -383,48 +517,40 @@ def _calc_roll(
 
         # residual for this step
         f0 = f_buf[0]
-        if error == Component.Additive:
-            ei = y_i - f0
-        else:
-            f0_denom = jnp.where(jnp.abs(f0) >= TOL, f0, f0 + TOL)
-            ei = (y_i - f0) / f0_denom
+        ei_add = y_i - f0
+        f0_denom = jnp.where(jnp.abs(f0) >= TOL, f0, f0 + TOL)
+        ei_mul = (y_i - f0) / f0_denom
+        ei = jnp.where(error == Component.Additive, ei_add, ei_mul)
 
-        e_local = e_local.at[i].set(ei)
-
-        # rolling MSEs over horizon (bounded by sequence end)
-        def mse_body(j, a_denom):
-            a_local, denom = a_denom
-            ij = i + j
+        # Vectorized rolling MSE update over horizons [0, n_mse_eff)
+        if n_mse_eff > 0:
+            js = jnp.arange(n_mse_eff, dtype=jnp.int32)
+            ij = i + js
             cond = ij < n
-            denom_j_new = denom[j] + jnp.where(cond, 1.0, 0.0)
-            tmp = jnp.where(cond, y[ij] - f_buf[j], 0.0)
-            a_num = a_local[j] * (denom[j] - 1.0) + tmp * tmp
-            a_new = jnp.where(denom_j_new > 0.0, a_num / denom_j_new, a_local[j])
-            a_local = a_local.at[j].set(a_new)
-            denom = denom.at[j].set(denom_j_new)
-            return (a_local, denom)
+            ij_safe = jnp.minimum(ij, n - 1)
+            y_fut = y[ij_safe]
+            tmp = jnp.where(cond, y_fut - f_buf[:n_mse_eff], 0.0)
 
-        a_local, denom = lax.fori_loop(0, n_mse_eff, mse_body, (a_local, denom))
+            denom_slice = denom[:n_mse_eff]
+            a_slice = a_local[:n_mse_eff]
+            denom_new = denom_slice + cond.astype(jnp.float64)
+            a_num = a_slice * (denom_slice - 1.0) + tmp * tmp
+            a_new = jnp.where(denom_new > 0.0, a_num / denom_new, a_slice)
+
+            denom = denom.at[:n_mse_eff].set(denom_new)
+            a_local = a_local.at[:n_mse_eff].set(a_new)
 
         # state update with current observation
         l, b, s_vec = update(
             s_vec, l, b, old_l, old_b, old_s, m_eff,
-            trend, season, alpha, beta, gamma, phi, y_i
+            trend, season, err_val, alpha, beta, gamma, phi, y_i
         )
 
         # store back states for time i+1
-        base = n_states * (i + 1)
-
-        # l at base
-        x_local = lax.dynamic_update_slice(x_local, jnp.asarray([l]), (base,))
-        # b at base+1 if trend present
-        if trend != Component.Nothing:
-            x_local = lax.dynamic_update_slice(x_local, jnp.asarray([b]), (base + 1,))
-
-        # seasonal block at dynamic start if season present
-        if season != Component.Nothing:
-            start = base + 1 + int(trend != Component.Nothing)
-            x_local = lax.dynamic_update_slice(x_local, s_vec[:m_eff], (start,))
+        row = _pack_state_row(
+            l, b, s_vec, has_trend=has_trend, has_season=has_season, m=m_eff
+        )
+        x_states = x_states.at[i + 1].set(row)
 
         # accumulate likelihood bits
         lik = lik + ei * ei
@@ -433,19 +559,164 @@ def _calc_roll(
         lik2 = lik2 + jnp.log(log_arg)
 
         i = i + 1
-        return (i, x_local, e_local, a_local, denom, l, b, s_vec, lik, lik2, f_buf), None
+        return (i, x_states, a_local, denom, l, b, s_vec, lik, lik2, f_buf), ei
 
-    init_carry = (jnp.array(0, jnp.int32), x_local, e_local, a_local, denom, l, b, s_vec, lik, lik2, f_buf)
-    (i_out, x_local, e_local, a_local, denom, l, b, s_vec, lik, lik2, f_buf), _ = lax.scan(
+    init_carry = (jnp.array(0, jnp.int32), x_states, a_local, denom, l, b, s_vec, lik, lik2, f_buf)
+    (i_out, x_states, a_local, denom, l, b, s_vec, lik, lik2, f_buf), e_out = lax.scan(
+        step, init_carry, y
+    )
+    x_local = x_local.at[: (n + 1) * n_states].set(x_states.reshape(-1))
+
+    n_f64 = jnp.asarray(n, dtype=jnp.float64)
+    sse = jnp.where(lik > 0.0, lik, lik + 1e-8)
+    sigma2 = sse / n_f64
+    base = n_f64 * (jnp.log(2.0 * jnp.pi) + 1.0 + jnp.log(sigma2))
+    lik = jnp.where(error == Component.Multiplicative, base + 2.0 * lik2, base)
+
+    return x_local, e_out, a_local, lik
+
+
+@partial(jax.jit, static_argnames=("error", "trend", "season", "n_mse", "m", "clip_multiplicative_errors", "fcst_h"))
+def _calc_roll_nohist(
+    state0: jnp.ndarray,
+    e: jnp.ndarray,
+    a_mse: jnp.ndarray,
+    n_mse: int,
+    y: jnp.ndarray,
+    n_obs: jnp.ndarray,
+    error: Component,
+    trend: Component,
+    season: Component,
+    alpha: jnp.float64,
+    beta: jnp.float64,
+    gamma: jnp.float64,
+    phi: jnp.float64,
+    m: int,
+    clip_multiplicative_errors: bool = True,
+    fcst_h: int = 1,
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.float64]:
+    """
+    Rollout computing residuals/objective without storing state history.
+
+    This mirrors `_calc_roll` but skips all state history writes, returning
+    only residuals, rolling MSEs, and the likelihood-like scalar.
+    """
+    n = y.shape[0]
+    n_eff = jnp.minimum(n_obs, n)
+    n_s = max(m, 24)
+    m_eff = max(m, 1)
+    n_mse_eff = min(n_mse, 30)
+
+    err_val = int(error.value)
+    has_trend = trend != Component.Nothing
+    has_season = season != Component.Nothing
+    n_states = m_eff * int(has_season) + int(has_trend) + 1
+
+    # Unpack initial states
+    l, b, s_vec = _unpack_state(
+        state0[:n_states], has_trend=has_trend, has_season=has_season, m=m_eff
+    )
+
+    # Work buffers
+    a_local = jnp.zeros_like(a_mse)
+    denom = jnp.zeros(30, dtype=jnp.float64)
+    lik = jnp.array(0.0, jnp.float64)
+    lik2 = jnp.array(0.0, jnp.float64)
+    f_buf = jnp.zeros(30, dtype=jnp.float64)
+
+    def step(carry, y_i):
+        (i, a_local, denom, l, b, s_vec, lik, lik2, f_buf) = carry
+        active = i < n_eff
+
+        def do_active(args):
+            (i, a_local, denom, l, b, s_vec, lik, lik2, f_buf, y_i) = args
+            old_l = l
+            if has_trend:
+                old_b = b
+            else:
+                old_b = jnp.asarray(0.0, jnp.float64)
+            old_s = s_vec
+
+            # forecasts up to requested horizon
+            f_buf = forecast(
+                f_buf, old_l, old_b, old_s, m_eff, trend, season, phi, jnp.int64(fcst_h)
+            )
+
+            # residual for this step
+            f0_raw = f_buf[0]
+            f0 = jnp.where(
+                clip_multiplicative_errors and (error == Component.Multiplicative),
+                jnp.maximum(f0_raw, 1e-6),
+                f0_raw,
+            )
+            ei_add = y_i - f0
+            f0_denom = jnp.where(jnp.abs(f0) >= TOL, f0, f0 + TOL)
+            ei_mul = (y_i - f0) / f0_denom
+            ei_mul = jnp.where(
+                clip_multiplicative_errors,
+                jnp.clip(ei_mul, -2.0, 2.0),
+                ei_mul,
+            )
+            ei = jnp.where(error == Component.Additive, ei_add, ei_mul)
+
+            # Vectorized rolling MSE update over horizons [0, n_mse_eff)
+            if n_mse_eff > 0:
+                js = jnp.arange(n_mse_eff, dtype=jnp.int32)
+                ij = i + js
+                cond = ij < n_eff
+                ij_safe = jnp.minimum(ij, n - 1)
+                y_fut = y[ij_safe]
+                tmp = jnp.where(cond, y_fut - f_buf[:n_mse_eff], 0.0)
+
+                denom_slice = denom[:n_mse_eff]
+                a_slice = a_local[:n_mse_eff]
+                denom_new = denom_slice + cond.astype(jnp.float64)
+                a_num = a_slice * (denom_slice - 1.0) + tmp * tmp
+                a_new = jnp.where(denom_new > 0.0, a_num / denom_new, a_slice)
+
+                denom = denom.at[:n_mse_eff].set(denom_new)
+                a_local = a_local.at[:n_mse_eff].set(a_new)
+
+            # state update with current observation
+            l, b, s_vec = update(
+                s_vec, l, b, old_l, old_b, old_s, m_eff,
+                trend, season, err_val, alpha, beta, gamma, phi, y_i
+            )
+
+            # accumulate likelihood bits
+            lik = lik + ei * ei
+            val = jnp.abs(f0)
+            log_arg = jnp.where(val > 0.0, val, val + 1e-8)
+            lik2 = lik2 + jnp.log(log_arg)
+
+            i = i + 1
+            return (i, a_local, denom, l, b, s_vec, lik, lik2, f_buf), ei
+
+        def do_inactive(args):
+            (i, a_local, denom, l, b, s_vec, lik, lik2, f_buf, _) = args
+            i = i + 1
+            return (i, a_local, denom, l, b, s_vec, lik, lik2, f_buf), jnp.asarray(0.0, dtype=jnp.float64)
+
+        carry_out, e_out = lax.cond(
+            active,
+            do_active,
+            do_inactive,
+            (i, a_local, denom, l, b, s_vec, lik, lik2, f_buf, y_i),
+        )
+        return carry_out, e_out
+
+    init_carry = (jnp.array(0, jnp.int32), a_local, denom, l, b, s_vec, lik, lik2, f_buf)
+    (i_out, a_local, denom, l, b, s_vec, lik, lik2, f_buf), e_out = lax.scan(
         step, init_carry, y
     )
 
-    n_f64 = jnp.asarray(n, dtype=jnp.float64)
-    lik_log_arg = jnp.where(lik > 0.0, lik, lik + 1e-8)
-    lik = n_f64 * jnp.log(lik_log_arg)
-    lik = jnp.where(error == Component.Multiplicative, lik + 2.0 * lik2, lik)
+    n_f64 = jnp.asarray(n_eff, dtype=jnp.float64)
+    sse = jnp.where(lik > 0.0, lik, lik + 1e-8)
+    sigma2 = sse / n_f64
+    base = n_f64 * (jnp.log(2.0 * jnp.pi) + 1.0 + jnp.log(sigma2))
+    lik = jnp.where(error == Component.Multiplicative, base + 2.0 * lik2, base)
 
-    return x_local, e_local, a_local, lik
+    return e_out, a_local, lik
 
 
 @partial(jax.jit, static_argnames=("error", "trend", "season", "n_mse", "m"))
@@ -547,149 +818,8 @@ def calc(
     return lik
 
 
-# ---------------------------
-# Objective 
-# ---------------------------
-def _objective_from_params(
+def _transform_smoothing_params(
     p: jnp.ndarray,
-    y: jnp.ndarray,
-    n_state: int,
-    error: Component,
-    trend: Component,
-    season: Component,
-    opt_crit: Criterion,
-    n_mse: int,
-    m: int,
-    opt_alpha: bool,
-    opt_beta: bool,
-    opt_gamma: bool,
-    opt_phi: bool,
-    alpha: float,
-    beta: float,
-    gamma: float,
-    phi: float,
-) -> jnp.float64:
-    """
-    Assemble smoothing+state parameters from a flat vector and evaluate the objective.
-
-    This unpacks `(alpha, beta, gamma, phi)` (respecting which are being
-    optimized) and the initial state vector (the trailing `n_state` elements
-    of `p`), applies seasonal balancing (for multiplicative or additive cases
-    consistent with NumPy parity), runs `_calc_roll`, and computes the scalar
-    objective per `opt_crit`.
-
-    Parameters
-    ----------
-    p : jnp.ndarray
-        Concatenated parameter vector: first the free smoothing params (in the
-        order alpha, beta, gamma, phi for those flagged as `opt_*`), then the
-        `n_state` initial state entries.
-    y : jnp.ndarray
-        Observations.
-    n_state : int
-        Length of the initial state vector.
-    error, trend, season : Component
-        Model structure flags.
-    opt_crit : Criterion
-        Objective to minimize.
-    n_mse, m : int
-        Rolling-MSE horizon cap and season length.
-    opt_alpha, opt_beta, opt_gamma, opt_phi : bool
-        Which smoothing parameters are free in `p`.
-    alpha, beta, gamma, phi : float
-        Fixed values for smoothing parameters that are not optimized.
-
-    Returns
-    -------
-    obj_val : jnp.float64
-        Scalar objective value with +inf for invalid setups.
-    """
-    # Unpack smoothing parameters like NumPy
-    j = 0
-    a  = jnp.asarray(alpha, jnp.float64)
-    b  = jnp.asarray(beta,  jnp.float64)
-    g  = jnp.asarray(gamma, jnp.float64)
-    ph = jnp.asarray(phi,   jnp.float64)
-    if opt_alpha:
-        a = p[j]; j += 1
-    if opt_beta:
-        b = p[j]; j += 1
-    if opt_gamma:
-        g = p[j]; j += 1
-    if opt_phi:
-        ph = p[j]; j += 1
-
-    n_params = p.size
-    n = y.size
-
-    add_season_balancer = int(season != Component.Nothing)
-    P = n_state + add_season_balancer
-    state = jnp.zeros(P * (n + 1), dtype=jnp.float64)
-
-    # head states from tail of p
-    head = p[n_params - n_state : n_params]
-    state = state.at[:n_state].set(head)
-
-    # seasonal balancing term (NumPy parity)
-    if season != Component.Nothing:
-        start = 1 + int(trend != Component.Nothing)
-        s_sum = jnp.sum(state[start:n_state])
-        target = m * int(season == Component.Multiplicative)
-        state = state.at[n_state].set(jnp.asarray(target, jnp.float64) - s_sum)
-
-    # EXACT NumPy parity: multiplicative => check ALL seasonal entries INCLUDING balancing slot
-    if season != Component.Nothing:
-        start = 1 + int(trend != Component.Nothing)
-        seasonal_block_including_balance = state[start:]
-    else:
-        seasonal_block_including_balance = jnp.zeros(0, dtype=jnp.float64)
-
-    neg_any = jnp.any(seasonal_block_including_balance < 0.0) if season == Component.Multiplicative else jnp.array(False)
-    cond_neg = jnp.logical_and(jnp.array(season == Component.Multiplicative), neg_any)
-
-    # Compute rollout
-    a_mse = jnp.zeros(30, dtype=jnp.float64)
-    e     = jnp.zeros(n,  dtype=jnp.float64)
-    _, e, a_mse, lik = _calc_roll(state, e, a_mse, n_mse, y, error, trend, season, a, b, g, ph, m)
-
-    # NumPy post-processing
-    lik = jnp.maximum(lik, jnp.asarray(-1e10, jnp.float64))
-    bad = jnp.logical_or(jnp.isnan(lik), jnp.abs(lik + 99999.0) < 1e-7)
-
-    k = min(n_mse, 30)
-    obj_val = jnp.select(
-        [
-            opt_crit == Criterion.Likelihood,
-            opt_crit == Criterion.MSE,
-            opt_crit == Criterion.AMSE,
-            opt_crit == Criterion.Sigma,
-            opt_crit == Criterion.MAE,
-        ],
-        [lik, a_mse[0], jnp.mean(a_mse[:k]), jnp.mean(e * e), jnp.mean(jnp.abs(e))],
-        default=lik,
-    )
-
-    # IMPORTANT: invalids must be +inf for a minimizer
-    obj_val = jnp.where(bad, jnp.asarray(jnp.inf, jnp.float64), obj_val)
-    # keep multiplicative-season negativity as +inf (reject)
-    obj_val = jnp.where(cond_neg, jnp.asarray(jnp.inf, jnp.float64), obj_val)
-
-    return obj_val
-
-
-# ---------------------------
-# Optimizer (matches SciPy's Nelder-Mead behavior closely)
-# ---------------------------
-def optimize(
-    x0: jnp.ndarray,
-    y: jnp.ndarray,
-    n_state: int,
-    error: Component,
-    trend: Component,
-    season: Component,
-    opt_crit: Criterion,
-    n_mse: int,
-    m: int,
     opt_alpha: bool,
     opt_beta: bool,
     opt_gamma: bool,
@@ -700,213 +830,366 @@ def optimize(
     phi: float,
     lower: jnp.ndarray,
     upper: jnp.ndarray,
-    tol_std: float,
-    max_iter: int,
-    adaptive: bool,
-) -> OptimResult:
-    """
-    Nelder–Mead (SciPy-like) direct-search optimizer with box-penalty bounds.
-
-    This reimplements the core SciPy `method="Nelder-Mead"` loop:
-    - Initial simplex built with `nonzdelt=0.05` and `zdelt=0.00025`.
-    - Classic coefficients: rho=1 (reflect), chi=2 (expand), psi=0.5 (contract),
-      sigma=0.5 (shrink).
-    - Convergence test uses a simple "fatol"-style check: `max(f) - min(f) <= tol_std`.
-    - Bounds are enforced via a large quadratic penalty on violations.
-
-    Parameters
-    ----------
-    x0 : jnp.ndarray
-        Initial parameter vector (free smooth params + initial states).
-    y : jnp.ndarray
-        Observations.
-    n_state : int
-        Length of the initial state portion at the tail of `x0`.
-    error, trend, season : Component
-        Model structure flags.
-    opt_crit : Criterion
-        Objective to minimize.
-    n_mse, m : int
-        Rolling-MSE horizon cap and season length.
-    opt_alpha, opt_beta, opt_gamma, opt_phi : bool
-        Which smoothing parameters are free and included in `x0`.
-    alpha, beta, gamma, phi : float
-        Fixed smoothing parameters for those not optimized.
-    lower, upper : jnp.ndarray
-        Elementwise (soft) bounds. Violations incur a 1e6 * L2 penalty.
-    tol_std : float
-        Function-value range tolerance for termination (fatol-like).
-    max_iter : int
-        Maximum number of Nelder–Mead iterations.
-    adaptive : bool
-        Accepted for API parity; classic (non-adaptive) coefficients are used.
-
-    Returns
-    -------
-    OptimResult
-        Tuple-like result with fields: success, status (0 ok, 2 max iters),
-        message, x (best params), fun, nit, nfev.
-
-    Notes
-    -----
-    **Intended Parity with SciPy**
-    - Initial simplex construction and the reflection/expansion/contraction/
-      shrink decisions follow SciPy behavior closely for *deterministic* parity.
-    - We terminate on a fatol-style condition (`max(f)-min(f) <= tol_std`),
-      which typically aligns with using `fatol` in SciPy.
-
-    **Limitations vs SciPy's Nelder–Mead**
-    - No `xatol` (vertex spread) termination: only a function-range (fatol-like)
-      test is used.
-    - No `callback`, `return_all`, or `maxfev` controls; `nfev` is tracked but
-      stopping is by `max_iter` only.
-    - Bounds are *soft* via a quadratic penalty (1e6 * ||violation||^2); SciPy
-      NM itself is unconstrained, so exact projection/box-simplex logic is not used.
-    - `adaptive=True` is accepted but ignored; coefficients remain classic
-      (rho=1, chi=2, psi=0.5, sigma=0.5) to keep behavior predictable.
-    - The objective is JAX-based, but the NM loop uses Python control flow;
-      it is **not** `jit`-compiled end-to-end (the inner objective calculations
-      are JITed). This mirrors SciPy's imperative loop style.
-    - Numerical defensive guards (e.g., `TOL`, `HUGE_N`, multiplicative-season
-      positivity) follow NumPy/statsmodels parity; edge cases may still differ
-      slightly from SciPy due to floating-point ordering and JAX evaluation.
-
-    If you need *exact* SciPy semantics (adaptive coefficients, xatol/fatol,
-    callback, strict `maxfev`, etc.), use `scipy.optimize.minimize` directly.
-    """
-    x0    = jnp.asarray(x0, dtype=jnp.float64)
-    y     = jnp.asarray(y,  dtype=jnp.float64)
+    pure_sigmoid: bool = False,
+) -> Tuple[jnp.float64, jnp.float64, jnp.float64, jnp.float64]:
+    """Map unconstrained parameter vector → valid (α, β, γ, φ) via sigmoid."""
+    idx = 0
     lower = jnp.asarray(lower, dtype=jnp.float64)
     upper = jnp.asarray(upper, dtype=jnp.float64)
 
-    # Core objective (identical to before)
-    def _core_obj(p: jnp.ndarray) -> jnp.float64:
-        return _objective_from_params(
-            p, y, n_state, error, trend, season, opt_crit, n_mse, m,
-            opt_alpha, opt_beta, opt_gamma, opt_phi, alpha, beta, gamma, phi
+    # --- Pure-sigmoid mode: cleaner independent mapping per param ---
+    if pure_sigmoid:
+        if opt_alpha:
+            alpha = jax.nn.sigmoid(p[idx])
+            alpha = EPS_PURE + (1.0 - 2.0 * EPS_PURE) * alpha
+            idx += 1
+        if opt_beta:
+            beta = jax.nn.sigmoid(p[idx])
+            beta = alpha * beta
+            idx += 1
+        if opt_gamma:
+            gamma = jax.nn.sigmoid(p[idx])
+            gamma = (1.0 - alpha) * gamma
+            idx += 1
+        if opt_phi:
+            pphi = jax.nn.sigmoid(p[idx])
+            pphi = EPS_PURE + (1.0 - 2.0 * EPS_PURE) * pphi
+            phi = lower[3] + (upper[3] - lower[3]) * pphi
+        return (
+            jnp.asarray(alpha, jnp.float64),
+            jnp.asarray(beta, jnp.float64),
+            jnp.asarray(gamma, jnp.float64),
+            jnp.asarray(phi, jnp.float64),
         )
 
-    # Box penalty (identical to before)
-    def boxed_objective(p: jnp.ndarray) -> jnp.float64:
-        vio_low = jnp.maximum(0.0, lower - p)
-        vio_up  = jnp.maximum(0.0, p - upper)
-        vio = jnp.dot(vio_low, vio_low) + jnp.dot(vio_up, vio_up)
-        penalty = 1e6 * vio
-        core = _core_obj(p)
-        return jnp.where(vio > 0.0, penalty, core)
+    # --- Legacy sigmoid mode: scaled sigmoid + safety clipping ---
+    if opt_alpha:
+        a = jax.nn.sigmoid(p[idx] * 0.1)
+        alpha = lower[0] + (upper[0] - lower[0]) * a
+        idx += 1
+    if opt_beta:
+        b = jax.nn.sigmoid(p[idx])
+        beta = alpha * b
+        idx += 1
+    if opt_gamma:
+        g = jax.nn.sigmoid(p[idx])
+        gamma = (1.0 - alpha) * g
+        idx += 1
+    if opt_phi:
+        pphi = jax.nn.sigmoid(p[idx])
+        phi = lower[3] + (upper[3] - lower[3]) * pphi
+    eps = 1e-4
+    alpha = jnp.clip(alpha, eps, 1.0 - eps)
+    beta = jnp.clip(beta, eps, 1.0 - eps)
+    gamma = jnp.clip(gamma, eps, 1.0 - eps)
+    phi = jnp.clip(phi, PHI_LOWER, PHI_UPPER)
+    return (
+        jnp.asarray(alpha, jnp.float64),
+        jnp.asarray(beta, jnp.float64),
+        jnp.asarray(gamma, jnp.float64),
+        jnp.asarray(phi, jnp.float64),
+    )
 
-    # ------- Build initial simplex exactly like SciPy -------
-    N = int(x0.shape[0])
-    sim = jnp.zeros((N + 1, N), dtype=jnp.float64)
-    sim = sim.at[0].set(x0)
-    for k in range(N):
-        y_k = jnp.copy(x0)
-        if float(y_k[k]) != 0.0:
-            y_k = y_k.at[k].set((1.0 + 0.05) * y_k[k])  # nonzdelt=0.05
-        else:
-            y_k = y_k.at[k].set(0.00025)                # zdelt=0.00025
-        sim = sim.at[k + 1].set(y_k)
 
-    # Evaluate initial simplex
-    fsim = jnp.array([boxed_objective(sim[i]) for i in range(N + 1)], dtype=jnp.float64)
+@partial(jax.jit, static_argnames=("error", "trend", "season", "opt_crit", "n_mse", "m", "opt_alpha", "opt_beta", "opt_gamma", "opt_phi", "clip_multiplicative_errors", "pure_sigmoid", "opt_init_state", "n_state"))
+def _objective_smoothing_only(
+    p: jnp.ndarray,
+    y: jnp.ndarray,
+    init_state: jnp.ndarray,
+    error: Component,
+    trend: Component,
+    season: Component,
+    opt_crit: Criterion,
+    n_mse: int,
+    m: int,
+    n_obs: int,
+    opt_alpha: bool,
+    opt_beta: bool,
+    opt_gamma: bool,
+    opt_phi: bool,
+    alpha: float,
+    beta: float,
+    gamma: float,
+    phi: float,
+    lower: jnp.ndarray,
+    upper: jnp.ndarray,
+    clip_multiplicative_errors: bool = True,
+    pure_sigmoid: bool = False,
+    opt_init_state: bool = False,
+    n_state: int = 0,
+) -> jnp.float64:
+    """Innermost objective: transform params → run no-history rollout → return scalar loss."""
+    # Optionally split off initial-state params from the tail of p.
+    if opt_init_state and n_state > 0:
+        p_smooth = p[:-n_state]
+        init_state = p[-n_state:]
+    else:
+        p_smooth = p
+    alpha, beta, gamma, phi = _transform_smoothing_params(
+        p_smooth, opt_alpha, opt_beta, opt_gamma, opt_phi,
+        alpha, beta, gamma, phi, lower, upper, pure_sigmoid
+    )
 
-    # Sort by function value
-    order = jnp.argsort(fsim)
-    sim = sim[order]
-    fsim = fsim[order]
+    # Run the lightweight (no state-history) rollout to get residuals + likelihood.
+    e = jnp.zeros_like(y, dtype=jnp.float64)
+    a_mse = jnp.zeros((n_mse,), dtype=jnp.float64)
+    n_obs_arr = jnp.asarray(n_obs, dtype=jnp.int32)
+    e, a_mse, lik = _calc_roll_nohist(
+        init_state,
+        e,
+        a_mse,
+        n_mse,
+        y,
+        n_obs_arr,
+        error,
+        trend,
+        season,
+        alpha,
+        beta,
+        gamma,
+        phi,
+        m,
+        clip_multiplicative_errors=clip_multiplicative_errors,
+        fcst_h=1 if opt_crit == Criterion.Likelihood else n_mse,
+    )
 
-    # ------- NM hyperparameters (SciPy defaults) -------
-    rho = 1.0     # reflection
-    chi = 2.0     # expansion
-    psi = 0.5     # contraction
-    sigma = 0.5   # shrink
+    # Select the appropriate scalar objective from the rollout outputs.
+    is_lik = opt_crit == Criterion.Likelihood
+    is_mse = opt_crit == Criterion.MSE
+    is_amse = opt_crit == Criterion.AMSE
+    is_sigma = opt_crit == Criterion.Sigma
 
-    # Adaptive NM changes chi/psi/sigma; we keep classic constants for parity
-    # with SciPy's non-adaptive default. (Adaptive flag accepted but unused.)
+    objective = jnp.where(
+        is_lik,
+        lik,
+        jnp.where(
+            is_mse,
+            a_mse[0],
+            jnp.where(
+                is_amse,
+                jnp.mean(a_mse),
+                jnp.where(is_sigma, jnp.mean(e * e), jnp.mean(jnp.abs(e))),
+            ),
+        ),
+    )
 
-    # ------- Iterate -------
+    return objective
+
+
+
+
+# ---------------------------------------------------------------------------
+# Two-phase optax optimizer: Adam warm-up → L-BFGS refinement
+# ---------------------------------------------------------------------------
+def optimize_bfgs_smoothing(
+    x0: jnp.ndarray,        # initial unconstrained parameter vector
+    y: jnp.ndarray,          # observed time series (float64)
+    init_state: jnp.ndarray, # initial ETS state (level, trend, seasonal)
+    error: Component,
+    trend: Component,
+    season: Component,
+    opt_crit: Criterion,     # which loss to minimize (lik, mse, amse, sigma, mae)
+    n_mse: int,              # horizon cap for rolling MSE (≤ 30)
+    m: int,                  # seasonal period
+    n_obs: int,              # active observation count (may be < len(y) if padded)
+    opt_alpha: bool,         # True → optimize alpha; False → keep fixed
+    opt_beta: bool,
+    opt_gamma: bool,
+    opt_phi: bool,
+    alpha: float,
+    beta: float,
+    gamma: float,
+    phi: float,
+    lower: jnp.ndarray,     # box-constraint lower bounds for smoothing params
+    upper: jnp.ndarray,     # box-constraint upper bounds for smoothing params
+    steps: int,              # total iteration budget (Adam uses a fraction)
+    lr: float,               # base learning rate for Adam warm-up
+    clip_norm: float,        # (unused — kept for caller API compatibility)
+    early_stop_patience: int = 20,   # (unused — kept for API compat; lax.scan is fixed-length)
+    early_stop_min_delta: float = 1e-6,  # (unused — kept for API compat)
+    adaptive_tol: bool = True,       # (unused — kept for API compat)
+    is_final_model: bool = False,    # (unused — kept for API compat)
+    clip_multiplicative_errors: bool = True,  # clamp multiplicative residuals to [-2,2]
+    pure_sigmoid: bool = False,      # use cleaner sigmoid parameterization
+    opt_init_state: bool = False,    # if True, tail of x0 holds optimizable init states
+    n_state: int = 0,                # number of init-state params appended to x0
+) -> OptimResult:
+    # ── Input normalisation ───────────────────────────────────────────
+    x0 = jnp.asarray(x0, dtype=jnp.float64)
+    y = jnp.asarray(y, dtype=jnp.float64)
+    init_state = jnp.asarray(init_state, dtype=jnp.float64)
+    lower = jnp.asarray(lower, dtype=jnp.float64)
+    upper = jnp.asarray(upper, dtype=jnp.float64)
+
+    # Build objective closure — cached per model structure so JAX traces once.
+    core_obj = _get_objective_closure(
+        error,
+        trend,
+        season,
+        opt_crit,
+        int(n_mse),
+        int(m),
+        bool(opt_alpha),
+        bool(opt_beta),
+        bool(opt_gamma),
+        bool(opt_phi),
+        bool(clip_multiplicative_errors),
+        bool(pure_sigmoid),
+        bool(opt_init_state),
+        int(n_state),
+    )
+
+    # Thin wrapper capturing data arrays so optax only passes/differentiates p.
+    def _core_obj(p: jnp.ndarray) -> jnp.float64:
+        return core_obj(
+            p,
+            y,
+            init_state,
+            n_obs,
+            alpha,
+            beta,
+            gamma,
+            phi,
+            lower,
+            upper,
+        )
+
+    # JIT-compile value-and-grad for the Adam phase (called from Python loop).
+    _jit_val_and_grad = jax.jit(jax.value_and_grad(_core_obj))
+
+    best_loss = float("inf")
+    best_params = jnp.array(x0)
     nit = 0
-    nfev = int(N + 1)
 
-    def eval_point(p):
-        nonlocal nfev
-        nfev += 1
-        return float(boxed_objective(p))
+    # ══════════════════════════════════════════════════════════════════
+    # Phase 1: Adam warm-up (Python loop, ~15-30 steps)
+    # ──────────────────────────────────────────────────────────────────
+    # Adam is a momentum-based first-order optimizer that handles noisy
+    # gradients well.  A short burst moves x0 into a reasonable basin
+    # before handing off to L-BFGS.
+    # Step counts are inversely scaled with series length because each
+    # grad eval is O(n) in the ETS rollout.
+    # ══════════════════════════════════════════════════════════════════
+    if int(n_obs) <= 200:
+        adam_steps = min(int(steps), 30)
+        adam_lr = float(lr) if lr is not None else 5e-2
+    elif int(n_obs) <= 1000:
+        adam_steps = min(int(steps), 25)
+        adam_lr = float(lr) if lr is not None else 3e-2
+    else:
+        adam_steps = min(int(steps), 15)
+        adam_lr = float(lr) if lr is not None else 2e-2
 
-    while nit < max_iter:
-        # Convergence test on function range (fatol-like)
-        fmax = float(fsim[-1])
-        fmin = float(fsim[0])
-        if (fmax - fmin) <= tol_std:
-            break
+    try:
+        adam_opt = optax.adam(adam_lr)
+        adam_state = adam_opt.init(x0)
 
-        # Centroid of all but worst
-        x_bar = jnp.mean(sim[:-1], axis=0)
+        for _ in range(int(adam_steps)):
+            loss, grads = _jit_val_and_grad(x0)
+            grads = jnp.where(jnp.isfinite(grads), grads, 0.0)  # sanitise NaN/Inf grads
+            updates, adam_state = adam_opt.update(grads, adam_state, x0)
+            x0 = optax.apply_updates(x0, updates)
+            nit += 1
 
-        # Reflection
-        xr = x_bar + rho * (x_bar - sim[-1])
-        fr = eval_point(xr)
+            # Track best point seen (Adam can overshoot).
+            loss_val = float(jax.device_get(loss))
+            if loss_val < best_loss:
+                best_loss = loss_val
+                best_params = jnp.array(x0)
+    except Exception:
+        pass  # AD or numerical issue — keep best point found so far
 
-        if fr < float(fsim[0]):
-            # Expansion
-            xe = x_bar + chi * (xr - x_bar)
-            fe = eval_point(xe)
-            if fe < fr:
-                sim = sim.at[-1].set(xe); fsim = fsim.at[-1].set(fe)
-            else:
-                sim = sim.at[-1].set(xr); fsim = fsim.at[-1].set(fr)
-        else:
-            if fr < float(fsim[-2]):
-                # Accept reflection between best and second-worst
-                sim = sim.at[-1].set(xr); fsim = fsim.at[-1].set(fr)
-            else:
-                # Contraction
-                if fr < float(fsim[-1]):
-                    # Outside contraction
-                    xc = x_bar + psi * (xr - x_bar)
-                else:
-                    # Inside contraction
-                    xc = x_bar - psi * (x_bar - sim[-1])
-                fc = eval_point(xc)
-                if fc <= min(fr, float(fsim[-1])):
-                    sim = sim.at[-1].set(xc); fsim = fsim.at[-1].set(fc)
-                else:
-                    # Shrink
-                    x0_best = sim[0]
-                    new_rows = [x0_best + sigma * (sim[i] - x0_best) for i in range(1, N + 1)]
-                    new_rows = jnp.stack(new_rows, axis=0)
-                    # Evaluate shrunk points
-                    new_vals = jnp.array([eval_point(new_rows[i]) for i in range(N)], dtype=jnp.float64)
-                    sim = sim.at[1:].set(new_rows)
-                    fsim = fsim.at[1:].set(new_vals)
+    # Seed L-BFGS from the best Adam iterate.
+    x0 = best_params
 
-        # Re-sort
-        order = jnp.argsort(fsim)
-        sim = sim[order]
-        fsim = fsim[order]
+    # ══════════════════════════════════════════════════════════════════
+    # Phase 2: L-BFGS refinement (lax.scan — single XLA kernel)
+    # ──────────────────────────────────────────────────────────────────
+    # L-BFGS is a quasi-Newton method with super-linear convergence near
+    # a minimum.  30 steps is typically more than enough.
+    #
+    # The loop is implemented via lax.scan so that JAX compiles the full
+    # iteration (including the zoom line-search inside each step) into
+    # one fused XLA kernel.  This eliminates Python dispatch overhead and
+    # is critical for cold-start performance where many candidate models
+    # must each be optimized during model selection.
+    #
+    # Best-parameter tracking is done purely in JAX arrays inside the
+    # scan carry — no Python side-effects are needed.
+    # ══════════════════════════════════════════════════════════════════
+    _LBFGS_STEPS = 30
 
-        nit += 1
+    try:
+        lbfgs_solver = optax.lbfgs(
+            memory_size=8,       # number of past (s, y) pairs for Hessian approx
+            linesearch=optax.scale_by_zoom_linesearch(
+                max_linesearch_steps=15,     # cap per-step line-search evals
+                initial_guess_strategy="one",
+            ),
+        )
 
-    p_star = jnp.asarray(sim[0], dtype=jnp.float64)
-    f_star = float(fsim[0])
-    success = bool((f_star == f_star) and jnp.isfinite(p_star).all().item())  # finite & not NaN
+        def _run_lbfgs(x0_in):
+            """Run the full L-BFGS loop inside lax.scan (JIT-friendly)."""
+            lbfgs_state = lbfgs_solver.init(x0_in)
+            vg_fn = jax.value_and_grad(_core_obj)
 
-    # SciPy status mapping: 0=ok, 2=max iter
-    status = 0 if success and (nit < max_iter) else 2
-    msg = "ok" if status == 0 else "Maximum number of iterations has been exceeded."
+            def _step(carry, _):
+                p, state, best_p, best_loss = carry
+                loss, grads = vg_fn(p)
+                grads = jnp.where(jnp.isfinite(grads), grads, 0.0)  # sanitise grads
+                updates, new_state = lbfgs_solver.update(
+                    grads, state, p,
+                    value=loss, grad=grads, value_fn=_core_obj,
+                )
+                new_p = optax.apply_updates(p, updates)
+                # Track best point purely in JAX arrays (no Python side-effects).
+                improved = jnp.isfinite(loss) & (loss < best_loss)
+                best_p = jnp.where(improved, p, best_p)
+                best_loss = jnp.where(improved, loss, best_loss)
+                return (new_p, new_state, best_p, best_loss), None
 
+            init_loss = _core_obj(x0_in)
+            init_carry = (x0_in, lbfgs_state, x0_in, init_loss)
+            (_, _, best_p, best_l), _ = lax.scan(
+                _step, init_carry, jnp.arange(_LBFGS_STEPS),
+            )
+            return best_p, best_l
+
+        # JIT the entire L-BFGS loop — one compilation per unique array shape.
+        lbfgs_p, lbfgs_l = jax.jit(_run_lbfgs)(x0)
+        lbfgs_loss_val = float(jax.device_get(lbfgs_l))
+        if lbfgs_loss_val < best_loss:
+            best_loss = lbfgs_loss_val
+            best_params = lbfgs_p
+        nit += _LBFGS_STEPS
+    except Exception:
+        # If L-BFGS fails (e.g. line-search divergence), keep Adam's best.
+        pass
+
+    # ── Assemble result ───────────────────────────────────────────────
+    params = best_params
+    fun = best_loss
+
+    success = bool(jnp.isfinite(jnp.asarray(params)).all())
+    status = 0 if success else 2
+    msg = "ok" if status == 0 else "Non-finite parameters encountered."
+    fun_out = fun if isinstance(fun, jax.core.Tracer) else float(jax.device_get(fun))
     return OptimResult(
         success=success,
         status=status,
         message=msg,
-        x=p_star,
-        fun=f_star,
-        nit=nit,
-        nfev=nfev,
+        x=jnp.asarray(params, dtype=jnp.float64),
+        fun=fun_out,
+        nit=int(nit),
+        nfev=int(nit),
     )
 
 
+# Public API surface
 __all__ = [
-    "HUGE_N","NA","TOL","Component","Criterion","OptimResult",
-    "update","forecast","calc_full","calc","optimize",
+    "HUGE_N", "NA", "TOL",                    # constants
+    "Component", "Criterion", "OptimResult",   # enums / result type
+    "update", "forecast",                      # ETS recursion primitives
+    "calc_full", "calc",                       # rollout helpers
+    "optimize_bfgs_smoothing",                 # optimizer entry-point
 ]
