@@ -2612,7 +2612,6 @@ jax.config.update("jax_enable_x64", True)
 # Small helpers
 # ---------------------------
 
-@partial(jax.jit, static_argnames=['h'])
 def _repeat_val_(val: float, h: int) -> jnp.ndarray:
     return jnp.full((h,), jnp.asarray(val, dtype=val.dtype))
 
@@ -2623,7 +2622,6 @@ def _intervals(x: jnp.ndarray) -> jnp.ndarray:
     diffs = jnp.diff(padded)
     return diffs.astype(x.dtype)
 
-@partial(jax.jit, static_argnames=['chunk_size'])
 def _chunk_sums(array: jnp.ndarray, chunk_size: int) -> jnp.ndarray:
     """Split into equal chunks and sum each chunk. Incomplete tail discarded."""
     n = array.size
@@ -2632,8 +2630,8 @@ def _chunk_sums(array: jnp.ndarray, chunk_size: int) -> jnp.ndarray:
     trimmed = array[:n_elems]
     if n_chunks == 0:
         return jnp.zeros((0,), dtype=array.dtype)
-    reshaped = trimmed.reshape((n_chunks, chunk_size))
-    return reshaped.sum(axis=1)
+    idx = jnp.arange(0, n_elems, chunk_size)
+    return jnp.add.reduceat(trimmed, idx)
 
 
 # ---------------------------
@@ -2681,6 +2679,49 @@ def _ses_forecast(x: jnp.ndarray, alpha: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.
     fitted = fitted.at[0].set(jnp.asarray(jnp.nan, dtype=dtype))
     return forecast, fitted
 
+@jax.jit
+def _ses_sse_masked(alpha: jnp.ndarray, x: jnp.ndarray, n_eff: jnp.ndarray) -> jnp.ndarray:
+    """SSE for SES over the first n_eff elements of a padded array."""
+    x = ensure_float(x)
+    dtype = x.dtype
+    alpha = jnp.asarray(alpha, dtype=dtype)
+    complement = jnp.asarray(1.0, dtype=dtype) - alpha
+    n = x.shape[0]
+
+    def body_fun(i, state):
+        forecast, sse = state
+
+        def do_update():
+            forecast_new = alpha * x[i - 1] + complement * forecast
+            err = x[i] - forecast_new
+            return (forecast_new, sse + err * err)
+
+        return lax.cond(i < n_eff, do_update, lambda: (forecast, sse))
+
+    init_state = (x[0], jnp.asarray(0.0, dtype=dtype))
+    forecast, sse = lax.fori_loop(1, n, body_fun, init_state)
+    return sse
+
+@jax.jit
+def _ses_forecast_last_masked(
+    x: jnp.ndarray, alpha: jnp.ndarray, n_eff: jnp.ndarray
+) -> jnp.ndarray:
+    """One-step SES forecast over the first n_eff elements of a padded array."""
+    x = ensure_float(x)
+    dtype = x.dtype
+    alpha = jnp.asarray(alpha, dtype=dtype)
+    complement = jnp.asarray(1.0, dtype=dtype) - alpha
+    n = x.shape[0]
+
+    def body_fun(i, forecast):
+        def do_update():
+            return alpha * x[i - 1] + complement * forecast
+        return lax.cond(i < n_eff, do_update, lambda: forecast)
+
+    init_forecast = x[0]
+    forecast = lax.fori_loop(1, n, body_fun, init_forecast)
+    return forecast
+
 
 # ---------------------------
 # Golden-section (SciPy "bounded") optimizer
@@ -2693,6 +2734,8 @@ def _golden_bounded_minimize(
     dtype=jnp.float64,
     xatol: float | None = None,
     maxiter: int = 1000,
+    early_stop_eps: float | None = None,
+    early_stop_patience: int = 50,
 ):
     """
     Deterministic golden-section search matching SciPy's "bounded" behavior.
@@ -2703,46 +2746,71 @@ def _golden_bounded_minimize(
         # SciPy's bounded uses absolute tolerance; we use a tight default in float64
         xatol = 1e-12 if dtype == jnp.float64 else 1e-7
 
-    a = jnp.asarray(a, dtype=dtype).item()
-    b = jnp.asarray(b, dtype=dtype).item()
-    if not (a < b):
-        raise ValueError("Bounds must satisfy a < b.")
+    a = jnp.asarray(a, dtype=dtype)
+    b = jnp.asarray(b, dtype=dtype)
+    # Bounds are assumed valid in JIT contexts.
 
     invphi = (jnp.sqrt(jnp.asarray(5.0, dtype=dtype)) - 1.0) / 2.0   # ~0.6180339887
     invphi2 = 1.0 - invphi                                           # ~0.3819660113
 
+    xatol_arr = jnp.asarray(xatol, dtype=dtype)
+    if early_stop_eps is None:
+        early_stop_eps = xatol
+    early_eps_arr = jnp.asarray(early_stop_eps, dtype=dtype)
+
     # Initial interior points
     h = b - a
-    if h <= xatol:
-        x = (a + b) / 2.0
-        return jnp.asarray(x, dtype=dtype), jnp.asarray(f(jnp.asarray(x, dtype=dtype)), dtype=dtype)
-
-    n = int(jnp.ceil(jnp.log(xatol / h) / jnp.log(invphi))) if h > 0 else 1
     c = a + invphi2 * h
     d = a + invphi * h
-    fc = float(f(jnp.asarray(c, dtype=dtype)))
-    fd = float(f(jnp.asarray(d, dtype=dtype)))
+    fc = jnp.asarray(f(c), dtype=dtype)
+    fd = jnp.asarray(f(d), dtype=dtype)
+    it0 = jnp.asarray(0, dtype=jnp.int32)
+    no_improve0 = jnp.asarray(0, dtype=jnp.int32)
+    best0 = jnp.minimum(fc, fd)
 
-    it = 0
-    while it < maxiter and (d - c) > xatol:
-        it += 1
-        if fc < fd:
-            b, d, fd = d, c, fc
-            h = invphi * h
-            c = a + invphi2 * h
-            fc = float(f(jnp.asarray(c, dtype=dtype)))
-        else:
-            a, c, fc = c, d, fd
-            h = invphi * h
-            d = a + invphi * h
-            fd = float(f(jnp.asarray(d, dtype=dtype)))
+    def cond_fun(state):
+        a_, b_, c_, d_, fc_, fd_, it_, best_, no_improve_ = state
+        return (
+            (it_ < maxiter)
+            & ((d_ - c_) > xatol_arr)
+            & (no_improve_ < early_stop_patience)
+        )
 
-    # Best point is the smaller of c,d (or their function values)
-    if fc < fd:
-        xstar, fstar = c, fc
-    else:
-        xstar, fstar = d, fd
+    def body_fun(state):
+        a_, b_, c_, d_, fc_, fd_, it_, best_, no_improve_ = state
 
+        def step_left():
+            b_new = d_
+            d_new = c_
+            fd_new = fc_
+            h_new = b_new - a_
+            c_new = a_ + invphi2 * h_new
+            fc_new = jnp.asarray(f(c_new), dtype=dtype)
+            return a_, b_new, c_new, d_new, fc_new, fd_new, it_ + 1
+
+        def step_right():
+            a_new = c_
+            c_new = d_
+            fc_new = fd_
+            h_new = b_ - a_new
+            d_new = a_new + invphi * h_new
+            fd_new = jnp.asarray(f(d_new), dtype=dtype)
+            return a_new, b_, c_new, d_new, fc_new, fd_new, it_ + 1
+
+        a_new, b_new, c_new, d_new, fc_new, fd_new, it_new = lax.cond(
+            fc_ < fd_, step_left, step_right
+        )
+        new_best = jnp.minimum(fc_new, fd_new)
+        improved = jnp.abs(best_ - new_best) > (early_eps_arr * (1.0 + jnp.abs(best_)))
+        no_improve_new = jnp.where(improved, 0, no_improve_ + 1)
+        return a_new, b_new, c_new, d_new, fc_new, fd_new, it_new, new_best, no_improve_new
+
+    a, b, c, d, fc, fd, _, _, _ = lax.while_loop(
+        cond_fun, body_fun, (a, b, c, d, fc, fd, it0, best0, no_improve0)
+    )
+
+    xstar = jnp.where(fc < fd, c, d)
+    fstar = jnp.where(fc < fd, fc, fd)
     return jnp.asarray(xstar, dtype=dtype), jnp.asarray(fstar, dtype=dtype)
 
 
@@ -2789,11 +2857,74 @@ def _optimized_ses_forecast(
     fitted = fitted_run.astype(out_dtype)
     return forecast, fitted
 
+def _optimized_ses_forecast_masked(
+    x: jnp.ndarray,
+    n_eff: jnp.ndarray,
+    bounds: Tuple[float, float] = (0.1, 0.3),
+) -> jnp.ndarray:
+    """SES forecast over the first n_eff elements of a padded array."""
+    x = ensure_float(x)
+    out_dtype = x.dtype
+
+    nonzero_cnt = jnp.sum(x != 0)
+    has_neg = jnp.any(x < 0)
+    prefer_fp32 = (out_dtype == jnp.float32) & ((nonzero_cnt <= 2) | has_neg)
+
+    def run(dtype, xatol):
+        x_run = x.astype(dtype)
+
+        def obj(a):
+            return _ses_sse_masked(a, x_run, n_eff)
+
+        alpha_star, _ = _golden_bounded_minimize(
+            obj, bounds[0], bounds[1], dtype=dtype, xatol=xatol, maxiter=5000
+        )
+        forecast_run = _ses_forecast_last_masked(x_run, alpha_star, n_eff)
+        return forecast_run.astype(out_dtype)
+
+    return lax.cond(
+        prefer_fp32,
+        lambda: run(jnp.float32, 1e-8),
+        lambda: run(jnp.float64, 1e-13),
+    )
+
 
 
 # ---------------------------
 # IMAPA
 # ---------------------------
+
+@partial(jax.jit, static_argnames=("max_k",))
+def _imapa_aggregate_jit(y: jnp.ndarray, max_k: int) -> jnp.ndarray:
+    """JIT-friendly aggregation loop with padded sums and masked SES."""
+    dtype = y.dtype
+    n = y.shape[0]
+    forecasts = jnp.full((max_k,), jnp.asarray(jnp.nan, dtype=dtype))
+
+    def body(k, forecasts_arr):
+        n_chunks = n // k
+        lost = n - (n_chunks * k)
+        idx = jnp.arange(n)
+        valid = idx >= lost
+        y_masked = jnp.where(valid, y, jnp.asarray(0.0, dtype=dtype))
+        seg_ids = (idx - lost) // k
+        seg_ids = jnp.maximum(seg_ids, 0)
+        padded = jnp.zeros((n,), dtype=dtype)
+        padded = padded.at[seg_ids].add(y_masked)
+
+        def compute_forecast():
+            f = _optimized_ses_forecast_masked(padded, n_chunks)
+            return f / jnp.asarray(k, dtype=dtype)
+
+        fcast = lax.cond(
+            n_chunks == 0,
+            lambda: jnp.asarray(jnp.nan, dtype=dtype),
+            compute_forecast,
+        )
+        forecasts_arr = forecasts_arr.at[k - 1].set(fcast)
+        return forecasts_arr
+
+    return lax.fori_loop(1, max_k + 1, body, forecasts)
 
 def _imapa(
     y: jnp.ndarray,
@@ -2865,20 +2996,7 @@ def _imapa(
     if max_aggregation_level < 1:
         max_aggregation_level = 1
 
-    forecasts = jnp.empty((max_aggregation_level,), dtype=dtype)
-
-    for aggregation_level in range(1, max_aggregation_level + 1):
-        lost_remainder_data = int(y.shape[0] % aggregation_level)
-        y_cut = y[lost_remainder_data:]
-        aggregation_sums = _chunk_sums(y_cut, aggregation_level)
-        if aggregation_sums.size == 0:
-            # If no chunks, set NaN to skip in mean
-            forecasts = forecasts.at[aggregation_level - 1].set(jnp.asarray(jnp.nan, dtype=dtype))
-            continue
-        fcast, _ = _optimized_ses_forecast(aggregation_sums)
-        forecasts = forecasts.at[aggregation_level - 1].set(
-            fcast / jnp.asarray(aggregation_level, dtype=dtype)
-        )
+    forecasts = _imapa_aggregate_jit(y, max_aggregation_level)
 
     # Mean of finite forecasts (there shouldn't be NaNs normally, but guard anyway)
     finite_mask = jnp.isfinite(forecasts)

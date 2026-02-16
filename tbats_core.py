@@ -1,37 +1,59 @@
-# tbats_core.py
-# Pure-JAX TBATS core with COMPLETE ARMA support
-# CORRECTED VERSION with ARMA identification and proper parameter handling
+"""
+tbats_core.py — TBATS (Trigonometric, Box-Cox, ARMA, Trend, Seasonal) core.
+
+Pure-JAX implementation with optax L-BFGS optimisation.  All heavy paths are
+JIT-compiled and the module-level solver constant enables XLA cache reuse
+across warm calls.
+
+Public API
+----------
+- find_harmonics        : AIC-based harmonic count selection
+- tbats_model_generator : fit a single TBATS specification
+- tbats_model           : convenience wrapper (no ARMA)
+- tbats_selection       : auto-select the best TBATS configuration
+- tbats_forecast        : multi-step mean forecast
+- compute_sigmah        : parametric forecast standard deviations
+- tbats_forecast_batch  : vectorised forecast over a batch of states
+- compute_sigmah_batch  : vectorised sigmah over a batch
+"""
 
 from __future__ import annotations
 
-from typing import Optional, Sequence, Tuple, List
+import math
+import os
+import time
+import warnings
+from functools import lru_cache, partial
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import jax
 import jax.numpy as jnp
-from jax import lax
-from jax import config
+import optax
+from jax import config, lax, vmap
+
 config.update("jax_enable_x64", True)
 
 
-"""
-TBATS (Trigonometric, Box–Cox, ARMA, Trend, Seasonal) — Pure JAX core
+# ═══════════════════════════════════════════════════════════════════════
+# Configuration & Debug
+# ═══════════════════════════════════════════════════════════════════════
 
-Key additions in this version:
-- Full ARMA error support with automatic order selection
-- ARMA coefficient initialization using Hannan-Rissanen method
-- Proper ARMA state handling throughout the state-space system
-- Fixed optimizer scaling (no more double-scaling)
-- Safer Box–Cox (positivity guard)
-"""
+_TBATS_DEBUG = os.environ.get("CHRONAX_TBATS_DEBUG") == "1"
 
-# -----------------------
-# Small utilities
-# -----------------------
+
+def _tbats_debug(msg: str) -> None:
+    """Print *msg* when ``CHRONAX_TBATS_DEBUG=1``."""
+    if _TBATS_DEBUG:
+        print(msg)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Box-Cox Utilities
+# ═══════════════════════════════════════════════════════════════════════
+
 def _ensure_pos(y: jnp.ndarray, eps: float = 1e-8) -> jnp.ndarray:
-    """Ensure strictly-positive values (for Box–Cox/log)."""
+    """Shift *y* so every element is strictly positive (JAX-safe)."""
     y = jnp.asarray(y)
-    if jnp.any(y <= 0):
-        raise ValueError("Box–Cox requires strictly positive values (y > 0).")
     finite = jnp.isfinite(y)
     y_min_pos = jnp.min(jnp.where((y > 0) & finite, y, jnp.inf))
     base = jnp.where(jnp.isfinite(y_min_pos), jnp.minimum(y_min_pos, 1.0), 1.0)
@@ -39,230 +61,297 @@ def _ensure_pos(y: jnp.ndarray, eps: float = 1e-8) -> jnp.ndarray:
     return jnp.where(y <= 0, y + tiny - jnp.minimum(y, 0.0), y)
 
 
-# -----------------------
-# Small Box–Cox utilities
-# -----------------------
+def _ensure_pos_strict(y: jnp.ndarray) -> jnp.ndarray:
+    """Raise if *y* contains non-positive values (for user-facing checks)."""
+    y = jnp.asarray(y)
+    if bool(jnp.any(y <= 0)):
+        raise ValueError("Box–Cox requires strictly positive values (y > 0).")
+    return y
+
 
 def _boxcox(y: jnp.ndarray, lam: Optional[float]) -> jnp.ndarray:
-    """Apply Box–Cox transform to `y`."""
+    """Box-Cox transform (applies ``_ensure_pos`` first)."""
     if lam is None:
         return y
-    y = _ensure_pos(y)  # guard positivity inside too
+    y = _ensure_pos(y)
     lam = jnp.asarray(lam, dtype=y.dtype)
     return jnp.where(jnp.abs(lam) < 1e-8, jnp.log(y), (jnp.power(y, lam) - 1.0) / lam)
 
+
+def _boxcox_raw(y: jnp.ndarray, lam: jnp.ndarray) -> jnp.ndarray:
+    """Box-Cox transform **without** ``_ensure_pos`` — use when *y* is already positive."""
+    lam = jnp.asarray(lam, dtype=y.dtype)
+    return jnp.where(jnp.abs(lam) < 1e-8, jnp.log(y), (jnp.power(y, lam) - 1.0) / lam)
+
+
 def _inv_boxcox(y: jnp.ndarray, lam: Optional[float]) -> jnp.ndarray:
-    """Inverse Box–Cox transform."""
+    """Inverse Box-Cox transform."""
     if lam is None:
         return y
     lam = jnp.asarray(lam, dtype=y.dtype)
     return jnp.where(jnp.abs(lam) < 1e-8, jnp.exp(y), jnp.power(y * lam + 1.0, 1.0 / lam))
 
+
+# ── Guerrero lambda selection ──────────────────────────────────────────
+
 def _guerrero_lambda(y: jnp.ndarray, season_length: int, lower: float, upper: float) -> float:
-    """Select λ using a Guerrero-style criterion (grid search)."""
+    """Select Box-Cox lambda via the Guerrero CV method."""
+    y = jnp.asarray(y)
     n = y.shape[0]
     n_periods = n // season_length
     if n_periods < 2:
-        # fallback: moderate transform
-        return 0.5
+        return 1.0
 
     y_trim = y[: n_periods * season_length].reshape(n_periods, season_length)
-    lambdas = jnp.linspace(lower, upper, 25)
+    lambdas = jnp.linspace(lower, upper, 41)
+    lambdas = jnp.unique(jnp.concatenate([lambdas, jnp.asarray([1.0], dtype=lambdas.dtype)]))
 
-    def cv_for_lambda(lam):
-        yt = _boxcox(y_trim.ravel(), lam).reshape(n_periods, season_length)
+    def cv_for_lambda(lam: jnp.ndarray) -> jnp.ndarray:
+        # _boxcox_raw is safe here: caller passes already-positive y_pos
+        yt = _boxcox_raw(y_trim.ravel(), lam).reshape(n_periods, season_length)
         stds = jnp.std(yt, axis=1)
         means = jnp.abs(jnp.mean(yt, axis=1)) + 1e-10
         return jnp.std(stds / means)
 
-    cvs = jnp.stack([cv_for_lambda(l) for l in lambdas])
+    cvs = vmap(cv_for_lambda)(lambdas)
     best_idx = jnp.argmin(cvs)
     return float(jnp.clip(lambdas[best_idx], lower, upper))
 
 
-# -------------------------------------
-# Harmonics finder (simple JAX version)
-# -------------------------------------
+_GUERRERO_CACHE_MAXSIZE = 32
+_GUERRERO_CACHE: Dict[Tuple[int, int, float, float, float, float], float] = {}
+
+
+def _guerrero_lambda_cached(y: jnp.ndarray, season_length: int, lower: float, upper: float) -> float:
+    """Cached wrapper around ``_guerrero_lambda``."""
+    y = jnp.asarray(y)
+    key = (int(y.shape[0]), int(season_length), float(lower), float(upper),
+           float(jnp.sum(y)), float(jnp.mean(y)))
+    hit = _GUERRERO_CACHE.get(key)
+    if hit is not None:
+        return hit
+    val = _guerrero_lambda(y, season_length, lower, upper)
+    if len(_GUERRERO_CACHE) >= _GUERRERO_CACHE_MAXSIZE:
+        _GUERRERO_CACHE.pop(next(iter(_GUERRERO_CACHE)))
+    _GUERRERO_CACHE[key] = val
+    return val
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Numeric Utilities
+# ═══════════════════════════════════════════════════════════════════════
 
 def _ridge_solve(X: jnp.ndarray, y: jnp.ndarray, ridge: float = 1e-8) -> jnp.ndarray:
-    """Tiny ridge-regularized normal-equation solver for stability."""
+    """Ridge-regularised least-squares solve: ``(X^T X + ridge·I)^{-1} X^T y``."""
     XT = jnp.transpose(X)
     d = X.shape[1]
     return jnp.linalg.solve(XT @ X + ridge * jnp.eye(d, dtype=X.dtype), XT @ y)
 
+
+# ═══════════════════════════════════════════════════════════════════════
+# Harmonic Selection
+# ═══════════════════════════════════════════════════════════════════════
+
+@partial(jax.jit, static_argnames=("max_h", "tol_no_improv"))
+def _select_harmonics_fast(
+    z: jnp.ndarray, X_full: jnp.ndarray, max_h: int, tol_no_improv: int,
+) -> jnp.ndarray:
+    """JIT-compiled AIC-based harmonic count selector with early stopping."""
+    n = z.shape[0]
+    dtype = X_full.dtype
+    best_aic = jnp.asarray(jnp.inf, dtype=dtype)
+    k_best = jnp.asarray(1, dtype=jnp.int32)
+    aic_prev = jnp.asarray(jnp.inf, dtype=dtype)
+    wout = jnp.asarray(0, dtype=jnp.int32)
+    stopped = jnp.asarray(False)
+
+    def body(h, state):
+        best_aic, k_best, aic_prev, wout, stopped = state
+
+        def do_step(state_in):
+            best_aic_in, k_best_in, aic_prev_in, wout_in, stopped_in = state_in
+            mask = (jnp.arange(2 * max_h) < (2 * h)).astype(X_full.dtype)
+            X = X_full * mask
+            beta = _ridge_solve(X, z, ridge=1e-8)
+            resid = z - X @ beta
+            k = 2 * h
+            aic = n * jnp.log(jnp.sum(resid * resid) / n + 1e-12) + 2.0 * k
+            better = aic < best_aic_in - 1e-12
+            best_aic_out = jnp.where(better, aic, best_aic_in)
+            k_best_out = jnp.where(better, h, k_best_in)
+
+            no_improv = ~(aic < aic_prev_in - 1e-9)
+            wout_next = jnp.where(no_improv, wout_in + 1, 0)
+            will_stop = wout_next >= tol_no_improv
+            aic_prev_next = jnp.where(will_stop, aic_prev_in, aic)
+            stopped_next = stopped_in | will_stop
+            return best_aic_out, k_best_out, aic_prev_next, wout_next, stopped_next
+
+        return lax.cond(stopped, lambda s: s, do_step, (best_aic, k_best, aic_prev, wout, stopped))
+
+    state = lax.fori_loop(1, max_h + 1, body, (best_aic, k_best, aic_prev, wout, stopped))
+    return state[1]  # k_best
+
+
+_HARMONICS_CACHE: Dict[Tuple, Tuple[int, jnp.ndarray]] = {}
+_HARMONICS_CACHE_MAXSIZE = 32
+
+
 def find_harmonics(y: jnp.ndarray, m: int) -> Tuple[int, jnp.ndarray]:
-    """Estimate number of Fourier harmonics for period `m`."""
-    y = jnp.asarray(y)
-    n = y.shape[0]
-    dtype = y.dtype
+    """Find optimal number of harmonics for period *m* using AIC.
 
-    window = max(2, 2 * m)
-    kernel = jnp.ones((window,), dtype=dtype) / float(window)
-    y_pad = jnp.pad(y, (window - 1, 0), mode="edge")
-    f_t = jnp.convolve(y_pad, kernel, mode="valid").astype(dtype)
+    Results are cached by ``(n, m, sum, std)`` so warm runs are free.
 
-    z = y - f_t
-
-    max_h = (m // 2) if (m % 2 == 0) else ((m - 1) // 2)
-    # Minimal fix set: conservative cap to improve conditioning
-    max_h = int(min(max_h, max(1, n // 20), 10))
-
-    if max_h <= 0:
-        return 1, y
-
-    t = jnp.arange(n, dtype=dtype)
-
-    def design(h):
-        cols = []
-        for i in range(1, h + 1):
-            ang = 2.0 * jnp.pi * i * t / jnp.asarray(m, dtype=dtype)
-            cols.append(jnp.cos(ang))
-            cols.append(jnp.sin(ang))
-        return jnp.stack(cols, axis=1)
-
-    best_aic = jnp.inf
-    k_best = 1
-    aic_prev = jnp.inf
-    wout = 0
-    tol_no_improv = 2
-
-    for h in range(1, max_h + 1):
-        X = design(h)
-        beta = _ridge_solve(X, z, ridge=1e-8)
-        resid = z - X @ beta
-        k = beta.shape[0]
-        aic = n * jnp.log(jnp.sum(resid * resid) / n + 1e-12) + 2.0 * k
-        better = bool(aic < best_aic - 1e-12)
-        best_aic = jnp.where(better, aic, best_aic)
-        k_best = int(jnp.where(better, h, k_best))
-        if not bool(aic < aic_prev - 1e-9):
-            wout += 1
-            if wout >= tol_no_improv:
-                break
-        else:
-            wout = 0
-        aic_prev = aic
-
-    X_best = design(k_best)
-    beta_best = _ridge_solve(X_best, z, ridge=1e-8)
-    z_res = z - X_best @ beta_best
-    return k_best, z_res
-
-
-# -------------------------------------
-# ARMA identification and initialization
-# -------------------------------------
-
-def _estimate_arma_orders(residuals: jnp.ndarray, max_p: int = 3, max_q: int = 3) -> Tuple[int, int]:
+    Returns
+    -------
+    (k, z_deseasonalised) : int, jnp.ndarray
     """
-    Estimate ARMA orders using a crude AIC criterion.
-    """
-    n = residuals.shape[0]
-    best_aic = jnp.inf
-    best_p, best_q = 0, 0
+    y = jnp.asarray(y, dtype=jnp.float64)
+    n = len(y)
+    
+    # Cache lookup
+    cache_key = (n, int(m), float(jnp.sum(y)), float(jnp.std(y)))
+    cached = _HARMONICS_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
 
-    for p in range(0, max_p + 1):
-        for q in range(0, max_q + 1):
-            if p == 0 and q == 0:
-                continue
-            k = p + q
-            if n <= k + 2:
-                continue
-            sigma2 = jnp.var(residuals) + 1e-10
-            aic = n * jnp.log(sigma2) + 2 * k
-            if aic < best_aic:
-                best_aic = aic
-                best_p, best_q = p, q
-    return best_p, best_q
+    # Rolling mean via cumsum (replaces pandas)
+    window_size = 2 * m
+    if n < window_size:
+        f_t = jnp.full(n, jnp.mean(y), dtype=jnp.float64)
+    else:
+        cumsum = jnp.cumsum(jnp.concatenate([jnp.zeros(1, dtype=jnp.float64), y]))
+        indices = jnp.arange(n)
+        lo = jnp.maximum(0, indices + 1 - window_size)
+        hi = indices + 1
+        f_t = (cumsum[hi] - cumsum[lo]) / (hi - lo)
 
+    z = y - f_t  # detrend
+    
+    # Determine max harmonics
+    max_harmonics = m // 2 if m % 2 == 0 else (m - 1) // 2
+    max_harmonics = min(max_harmonics, n)
 
-def _initialize_arma_coeffs(residuals: jnp.ndarray, p: int, q: int, dtype) -> Tuple[Optional[jnp.ndarray], Optional[jnp.ndarray]]:
-    """
-    Initialize ARMA coefficients using a simplified Hannan-Rissanen idea.
-    """
-    if p == 0 and q == 0:
-        return None, None
+    if max_harmonics == 0:
+        result = (1, y)
+        _harmonics_cache_put(cache_key, result)
+        return result
+    
+    # Vectorised Fourier terms
+    t = jnp.arange(n, dtype=jnp.float64)
+    harmonics = jnp.arange(1, max_harmonics + 1, dtype=jnp.float64)
+    angles = 2.0 * jnp.pi * jnp.outer(t, harmonics) / m
+    fourier = jnp.zeros((n, 2 * max_harmonics), dtype=jnp.float64)
+    fourier = fourier.at[:, 0::2].set(jnp.cos(angles))
+    fourier = fourier.at[:, 1::2].set(jnp.sin(angles))
 
-    n = residuals.shape[0]
+    # AIC selection (JIT-compiled)
+    num_harmonics = max(1, int(_select_harmonics_fast(z, fourier, max_harmonics, 2)))
 
-    # AR coefficients
-    ar_coeffs = None
-    if p > 0:
-        ar_coeffs = jnp.full((p,), 0.1, dtype=dtype) / jnp.arange(1, p + 1, dtype=dtype)
-        if n > 2 * p:
-            r_mean = jnp.mean(residuals)
-            r_centered = residuals - r_mean
-            r_var = jnp.var(r_centered) + 1e-10
-            acf = jnp.array([
-                jnp.correlate(r_centered[i:], r_centered[:-i] if i > 0 else r_centered, mode='valid')[0]
-                for i in range(p + 1)
-            ]) / (n * r_var)
+    # Deseasonalise with the chosen harmonics
+    X_best = fourier[:, : 2 * num_harmonics]
+    z_deseasonalised = z - X_best @ _ridge_solve(X_best, z, ridge=1e-8)
 
-            R = jnp.array([[acf[abs(i - j)] for j in range(p)] for i in range(p)])
-            r = acf[1:p+1]
-            try:
-                ar_coeffs_yw = jnp.linalg.solve(R + 1e-6 * jnp.eye(p), r)
-                ar_coeffs = jnp.clip(ar_coeffs_yw, -0.95, 0.95)
-            except Exception:
-                pass  # keep default init
-
-    # MA coefficients
-    ma_coeffs = None
-    if q > 0:
-        ma_coeffs = jnp.full((q,), -0.1, dtype=dtype) / jnp.arange(1, q + 1, dtype=dtype)
-
-    return ar_coeffs, ma_coeffs
+    result = (num_harmonics, z_deseasonalised)
+    _harmonics_cache_put(cache_key, result)
+    return result
 
 
-# ---------------------------------------
-# Builders for w, g, F with consistent d
-# ---------------------------------------
+def _harmonics_cache_put(key: Tuple, value: Tuple[int, jnp.ndarray]) -> None:
+    """Bounded LRU-style insert into the harmonics cache."""
+    if len(_HARMONICS_CACHE) >= _HARMONICS_CACHE_MAXSIZE:
+        _HARMONICS_CACHE.pop(next(iter(_HARMONICS_CACHE)))
+    _HARMONICS_CACHE[key] = value
 
-def _pq(ar_coeffs: Optional[jnp.ndarray], ma_coeffs: Optional[jnp.ndarray]) -> Tuple[int, int]:
-    """Utility: return (p, q) from possibly-None AR/MA arrays."""
+
+# ═══════════════════════════════════════════════════════════════════════
+# Seasonal Block Construction
+# ═══════════════════════════════════════════════════════════════════════
+
+@lru_cache(maxsize=32)
+def _build_seasonal_blocks_cached(
+    seasonal_periods: Tuple[int, ...],
+    k_vector: Tuple[int, ...],
+    dtype_str: str,
+) -> jnp.ndarray:
+    """Build and cache the block-diagonal trigonometric rotation matrix."""
+    dtype = jnp.float64 if dtype_str == "float64" else jnp.float32
+    tau = int(2 * sum(k_vector))
+    A = jnp.zeros((tau, tau), dtype=dtype)
+    pos = 0
+    for k, period in zip(k_vector, seasonal_periods):
+        t = 2.0 * jnp.pi * (jnp.arange(1, k + 1, dtype=dtype) / period)
+        ck = jnp.diag(jnp.cos(t))
+        sk = jnp.diag(jnp.sin(t))
+        Ak = jnp.vstack([jnp.hstack([ck, sk]), jnp.hstack([-sk, ck])])
+        A = A.at[pos: pos + 2 * k, pos: pos + 2 * k].set(Ak)
+        pos += 2 * k
+    return A
+
+
+def _build_seasonal_blocks(
+    seasonal_periods: jnp.ndarray, k_vector: jnp.ndarray, dtype,
+) -> jnp.ndarray:
+    """Public entry: converts arrays → tuples then delegates to the cached builder."""
+    sp = tuple(int(x) for x in list(seasonal_periods))
+    kv = tuple(int(x) for x in list(k_vector))
+    dtype_str = "float64" if dtype == jnp.float64 else "float32"
+    return _build_seasonal_blocks_cached(sp, kv, dtype_str)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# State-Space Matrix Builders
+# ═══════════════════════════════════════════════════════════════════════
+
+# ── Initial construction ───────────────────────────────────────────────
+
+def make_w(phi, k_vector, ar_coeffs, ma_coeffs, tau: int, beta, dtype) -> jnp.ndarray:
+    """Build the observation row-vector w^T  (shape ``(1, d)``)."""
+    adj_phi = 1 if beta is not None else 0
     p = 0 if ar_coeffs is None else int(ar_coeffs.shape[0])
     q = 0 if ma_coeffs is None else int(ma_coeffs.shape[0])
-    return p, q
-
-def make_w(phi, k_vector, ar_coeffs, ma_coeffs, tau, beta, dtype):
-    """Build the observation row vector `w^T` (shape 1×d)."""
-    adj_phi = 1 if beta is not None else 0
-    p, q = _pq(ar_coeffs, ma_coeffs)
     d = 1 + adj_phi + tau + p + q
+
     w = jnp.zeros((1, d), dtype=dtype).at[0, 0].set(1.0)
     if adj_phi:
         phi_eff = 0.0 if (beta is not None and phi is None) else (float(phi) if phi is not None else 1.0)
         w = w.at[0, 1].set(phi_eff)
-    pos = 0
+
     start = 1 + adj_phi
-    for k in k_vector:
-        k = int(k)
-        w = w.at[0, start + pos : start + pos + k].set(1.0)
-        pos += 2 * k
+    if tau > 0:
+        kv = jnp.asarray(k_vector, dtype=jnp.int32)
+        if kv.size > 0:
+            idx = jnp.arange(tau, dtype=jnp.int32)
+            starts = jnp.cumsum(jnp.concatenate([jnp.zeros(1, dtype=jnp.int32), 2 * kv[:-1]]))
+            mids = starts + kv
+            mask = jnp.sum((idx[None, :] >= starts[:, None]) & (idx[None, :] < mids[:, None]), axis=0)
+            w = w.at[0, start: start + tau].set(mask.astype(dtype))
     return w
 
-def make_g(k_vector, alpha, beta, p, q, tau, dtype):
-    """Build the gain vector `g` and seasonal weights `gamma_bold`."""
+
+def make_g(k_vector, alpha, beta, p: int, q: int, tau: int, dtype) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Build the gain vector g  (shape ``(d, 1)``) and the gamma-bold row."""
     adj_phi = 1 if beta is not None else 0
     d = 1 + adj_phi + tau + p + q
+
     g = jnp.zeros((d, 1), dtype=dtype).at[0, 0].set(alpha)
     if beta is not None:
         g = g.at[1, 0].set(beta)
 
-    # IMPORTANT: initialize seasonal gains to ZERO for stability (not ones)
     gamma_bold = jnp.zeros((1, 2 * int(jnp.sum(jnp.asarray(k_vector)))), dtype=dtype)
-    start = 1 + adj_phi
-    end = start + gamma_bold.shape[1]
-    # seasonal part of g remains zero; update_g will set it from gamma parameters
     return g, gamma_bold
 
-def make_F(phi, tau, alpha, beta, ar_coeffs, ma_coeffs,
-           gamma_bold, seasonal_periods, k_vector, dtype):
-    """Build the transition matrix `F` (shape d×d)."""
+
+def make_F(
+    phi, tau: int, alpha, beta, ar_coeffs, ma_coeffs,
+    gamma_bold, seasonal_periods, k_vector, dtype,
+    seasonal_blocks: Optional[jnp.ndarray] = None,
+) -> jnp.ndarray:
+    """Build the transition matrix F."""
     adj_phi = 1 if beta is not None else 0
     phi_eff = 0.0 if (beta is not None and phi is None) else (float(phi) if phi is not None else 1.0)
 
-    # alpha row
+    # Level row
     F = jnp.array([[1.0]], dtype=dtype)
     if adj_phi:
         F = jnp.hstack([F, jnp.array([[phi_eff]], dtype=dtype)])
@@ -272,7 +361,7 @@ def make_F(phi, tau, alpha, beta, ar_coeffs, ma_coeffs,
     if ma_coeffs is not None and ma_coeffs.size > 0:
         F = jnp.hstack([F, (alpha * jnp.asarray(ma_coeffs, dtype=dtype))[None, :]])
 
-    # beta row
+    # Trend row
     if beta is not None:
         row = jnp.array([[0.0, phi_eff]], dtype=dtype) if adj_phi else jnp.array([[0.0]], dtype=dtype)
         row = jnp.hstack([row, jnp.zeros((1, tau), dtype=dtype)])
@@ -282,37 +371,24 @@ def make_F(phi, tau, alpha, beta, ar_coeffs, ma_coeffs,
             row = jnp.hstack([row, (beta * jnp.asarray(ma_coeffs, dtype=dtype))[None, :]])
         F = jnp.vstack([F, row])
 
-    # seasonal block
+    # Seasonal block
     seasonal = jnp.zeros((tau, 1), dtype=dtype)
     if adj_phi:
         seasonal = jnp.hstack([seasonal, jnp.zeros((tau, 1), dtype=dtype)])
-    A = jnp.zeros((tau, tau), dtype=dtype)
-    pos = 0
-    for k, period in zip(k_vector, seasonal_periods):
-        k = int(k)
-        t = 2.0 * jnp.pi * (jnp.arange(1, k + 1, dtype=dtype) / jnp.asarray(period, dtype=dtype))
-        ck = jnp.diag(jnp.cos(t))
-        sk = jnp.diag(jnp.sin(t))
-        top = jnp.hstack([ck, sk])
-        bot = jnp.hstack([-sk, ck])
-        Ak = jnp.vstack([top, bot])
-        A = A.at[pos : pos + 2 * k, pos : pos + 2 * k].set(Ak)
-        pos += 2 * k
+    
+    A = seasonal_blocks if seasonal_blocks is not None else _build_seasonal_blocks(seasonal_periods, k_vector, dtype)
     seasonal = jnp.hstack([seasonal, A])
 
     if ar_coeffs is not None and ar_coeffs.size > 0:
-        varphi = jnp.asarray(ar_coeffs, dtype=dtype)[None, :]
-        B = jnp.dot(jnp.transpose(gamma_bold), varphi)
+        B = jnp.dot(jnp.transpose(gamma_bold), jnp.asarray(ar_coeffs, dtype=dtype)[None, :])
         seasonal = jnp.hstack([seasonal, B])
-
     if ma_coeffs is not None and ma_coeffs.size > 0:
-        theta = jnp.asarray(ma_coeffs, dtype=dtype)[None, :]
-        C = jnp.dot(jnp.transpose(gamma_bold), theta)
+        C = jnp.dot(jnp.transpose(gamma_bold), jnp.asarray(ma_coeffs, dtype=dtype)[None, :])
         seasonal = jnp.hstack([seasonal, C])
 
     F = jnp.vstack([F, seasonal])
 
-    # AR companion
+    # AR companion rows
     if ar_coeffs is not None and ar_coeffs.size > 0:
         p = int(ar_coeffs.size)
         ar_rows = jnp.zeros((p, 1), dtype=dtype)
@@ -320,8 +396,7 @@ def make_F(phi, tau, alpha, beta, ar_coeffs, ma_coeffs,
             ar_rows = jnp.hstack([ar_rows, jnp.zeros((p, 1), dtype=dtype)])
         ar_rows = jnp.hstack([ar_rows, jnp.zeros((p, tau), dtype=dtype)])
         if p > 1:
-            ident = jnp.eye(p - 1, dtype=dtype)
-            ident = jnp.hstack([ident, jnp.zeros(((p - 1), 1), dtype=dtype)])
+            ident = jnp.hstack([jnp.eye(p - 1, dtype=dtype), jnp.zeros((p - 1, 1), dtype=dtype)])
         else:
             ident = jnp.zeros((0, p), dtype=dtype)
         ar_part = jnp.vstack([jnp.asarray(ar_coeffs, dtype=dtype)[None, :], ident])
@@ -332,7 +407,7 @@ def make_F(phi, tau, alpha, beta, ar_coeffs, ma_coeffs,
             ar_rows = jnp.hstack([ar_rows, ma_in_ar])
         F = jnp.vstack([F, ar_rows])
 
-    # MA companion
+    # MA companion rows
     if ma_coeffs is not None and ma_coeffs.size > 0:
         q = int(ma_coeffs.size)
         ma_rows = jnp.zeros((q, 1), dtype=dtype)
@@ -340,253 +415,239 @@ def make_F(phi, tau, alpha, beta, ar_coeffs, ma_coeffs,
             ma_rows = jnp.hstack([ma_rows, jnp.zeros((q, 1), dtype=dtype)])
         ma_rows = jnp.hstack([ma_rows, jnp.zeros((q, tau), dtype=dtype)])
         if ar_coeffs is not None and ar_coeffs.size > 0:
-            p = int(ar_coeffs.size)
-            ar_in_ma = jnp.zeros((q, p), dtype=dtype)
-            ma_rows = jnp.hstack([ma_rows, ar_in_ma])
+            ma_rows = jnp.hstack([ma_rows, jnp.zeros((q, int(ar_coeffs.size)), dtype=dtype)])
         if q > 1:
-            ident = jnp.eye(q - 1, dtype=dtype)
-            ident = jnp.hstack([ident, jnp.zeros(((q - 1), 1), dtype=dtype)])
+            ident = jnp.hstack([jnp.eye(q - 1, dtype=dtype), jnp.zeros((q - 1, 1), dtype=dtype)])
             ma_part = jnp.vstack([jnp.zeros((1, q), dtype=dtype), ident])
         else:
-            ma_part = jnp.vstack([jnp.zeros((1, q), dtype=dtype)])
+            ma_part = jnp.zeros((1, q), dtype=dtype)
         ma_rows = jnp.hstack([ma_rows, ma_part])
         F = jnp.vstack([F, ma_rows])
 
     return F
 
 
-# ----------------------------
-# Update helpers
-# ----------------------------
+# ── In-place updates (used during optimisation) ───────────────────────
 
-def update_w(w, phi, tau, ar_coeffs, ma_coeffs, p, q, beta, dtype):
-    """Update `w` with the current `phi`."""
+def update_w(w, phi, tau: int, ar_coeffs, ma_coeffs, p: int, q: int, beta, dtype) -> jnp.ndarray:
+    """Return *w* with the phi entry updated."""
     adj_phi = 1 if beta is not None else 0
     if adj_phi:
-        phi_eff = 0.0 if (beta is not None and phi is None) else (float(phi) if phi is not None else 1.0)
+        phi_eff = jnp.asarray(0.0 if phi is None else phi, dtype=dtype)
         w = w.at[0, 1].set(phi_eff)
     return w
 
-def update_g(g, gamma_bold, alpha, beta, k_vector, gamma_one_v, gamma_two_v, dtype):
-    """Update `g` and `gamma_bold`."""
+
+def update_g(g, gamma_bold, alpha, beta, k_vector, gamma_one_v, gamma_two_v, dtype) -> jnp.ndarray:
+    """Return *g* with alpha, beta and seasonal gains updated."""
     adj_phi = 1 if beta is not None else 0
     g = g.at[0, 0].set(alpha)
     if beta is not None:
         g = g.at[1, 0].set(beta)
 
     gb = jnp.zeros_like(gamma_bold)
-    endPos = 0
-    for k, g1, g2 in zip(k_vector, gamma_one_v, gamma_two_v):
-        k = int(k)
-        gb = gb.at[0, endPos : endPos + k].set(g1)
-        gb = gb.at[0, endPos + k : endPos + 2 * k].set(g2)
-        endPos += 2 * k
+    if gamma_bold.shape[1] > 0:
+        kv = jnp.asarray(k_vector, dtype=jnp.int32)
+        g1 = jnp.asarray(gamma_one_v, dtype=dtype)
+        g2 = jnp.asarray(gamma_two_v, dtype=dtype)
+        if kv.size > 0:
+            tau = gamma_bold.shape[1]
+            idx = jnp.arange(tau, dtype=jnp.int32)
+            starts = jnp.cumsum(jnp.concatenate([jnp.zeros(1, dtype=jnp.int32), 2 * kv[:-1]]))
+            mids = starts + kv
+            mask1 = (idx[None, :] >= starts[:, None]) & (idx[None, :] < mids[:, None])
+            mask2 = (idx[None, :] >= mids[:, None]) & (idx[None, :] < (mids + kv)[:, None])
+            gb_row = jnp.sum(mask1 * g1[:, None] + mask2 * g2[:, None], axis=0)
+            gb = gb.at[0, :].set(gb_row)
 
     start = 1 + adj_phi
-    g = g.at[start : start + gb.shape[1], 0].set(gb.ravel())
-    return g, gb
+    g = g.at[start: start + gb.shape[1], 0].set(gb.ravel())
+    return g
 
-def update_F(F, phi, alpha, beta, gamma_bold, ar_coeffs, ma_coeffs, p, q, tau, dtype):
-    """Update `F` entries dependent on current params."""
-    adj_phi = 1 if beta is not None else 0
-    phi_eff = 0.0 if (beta is not None and phi is None) else (float(phi) if phi is not None else 1.0)
-    if adj_phi:
+
+def update_F(F, phi, alpha, beta, gamma_bold, ar_coeffs, ma_coeffs, p: int, q: int, tau: int, dtype) -> jnp.ndarray:
+    """Return *F* with phi, alpha, beta and ARMA entries updated."""
+    phi_eff = jnp.asarray(0.0 if phi is None else phi, dtype=dtype)
+    adj = 1 if beta is not None else 0
+
+    if adj:
         F = F.at[0, 1].set(phi_eff)
         F = F.at[1, 1].set(phi_eff)
 
-    betaAdjust = 1 if beta is not None else 0
-
     if ar_coeffs is not None and p > 0:
         ar = jnp.asarray(ar_coeffs, dtype=dtype)
-        F = F.at[0, (betaAdjust + tau + 1) : (betaAdjust + tau + p + 1)].set(alpha * ar)
-        if betaAdjust == 1:
-            F = F.at[1, (betaAdjust + tau + 1) : (betaAdjust + tau + p + 1)].set(beta * ar)
+        F = F.at[0, adj + tau + 1: adj + tau + p + 1].set(alpha * ar)
+        if adj:
+            F = F.at[1, adj + tau + 1: adj + tau + p + 1].set(beta * ar)
         if tau > 0:
             B = jnp.dot(gamma_bold.reshape(-1, 1), ar.reshape(1, -1))
-            F = F.at[(1 + betaAdjust) : (betaAdjust + tau + 1),
-                     (betaAdjust + tau + 1) : (betaAdjust + tau + p + 1)].set(B)
-        F = F.at[betaAdjust + tau + 1, (betaAdjust + tau + 1) : (betaAdjust + tau + p + 1)].set(ar)
+            F = F.at[1 + adj: adj + tau + 1, adj + tau + 1: adj + tau + p + 1].set(B)
+        F = F.at[adj + tau + 1, adj + tau + 1: adj + tau + p + 1].set(ar)
 
     if ma_coeffs is not None and q > 0:
         ma = jnp.asarray(ma_coeffs, dtype=dtype)
-        F = F.at[0, (betaAdjust + tau + p + 1) : (betaAdjust + tau + p + q + 1)].set(alpha * ma)
-        if betaAdjust == 1:
-            F = F.at[1, (betaAdjust + tau + p + 1) : (betaAdjust + tau + p + q + 1)].set(beta * ma)
+        F = F.at[0, adj + tau + p + 1: adj + tau + p + q + 1].set(alpha * ma)
+        if adj:
+            F = F.at[1, adj + tau + p + 1: adj + tau + p + q + 1].set(beta * ma)
         if tau > 0:
             C = jnp.dot(gamma_bold.reshape(-1, 1), ma.reshape(1, -1))
-            F = F.at[(1 + betaAdjust) : (betaAdjust + tau + 1),
-                     (betaAdjust + tau + p + 1) : (betaAdjust + tau + p + q + 1)].set(C)
+            F = F.at[1 + adj: adj + tau + 1, adj + tau + p + 1: adj + tau + p + q + 1].set(C)
         if ar_coeffs is not None and p > 0:
-            F = F.at[betaAdjust + tau + 1,
-                     (betaAdjust + tau + p + 1) : (betaAdjust + tau + p + q + 1)].set(ma)
+            F = F.at[adj + tau + 1, adj + tau + p + 1: adj + tau + p + q + 1].set(ma)
     return F
 
 
-# -------------------------
-# Kalman-like simple filter
-# -------------------------
+# ═══════════════════════════════════════════════════════════════════════
+# Innovations (Kalman) Filter
+# ═══════════════════════════════════════════════════════════════════════
 
-def _calc_filter(y: jnp.ndarray, w: jnp.ndarray, g: jnp.ndarray, F: jnp.ndarray, x0: jnp.ndarray
-                 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Run the simple innovations filter."""
-    dtype = y.dtype
-    y = jnp.asarray(y, dtype=dtype)
-    w = jnp.asarray(w, dtype=dtype)
-    g = jnp.asarray(g, dtype=dtype)
-    F = jnp.asarray(F, dtype=dtype)
-    x0 = jnp.asarray(x0, dtype=dtype)
+def _calc_filter_impl(
+    y: jnp.ndarray, w: jnp.ndarray, g: jnp.ndarray,
+    F: jnp.ndarray, x0: jnp.ndarray,
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Innovations filter (shared implementation).
+
+    Returns ``(fitted, errors, x_final)`` where ``x_final`` has shape ``(1, d)``.
+    """
+    w0 = w[0]
+    g0 = g[:, 0]
 
     def step(x_prev, y_t):
-        yhat_t = (w @ x_prev)[0]
+        yhat_t = jnp.dot(w0, x_prev)
         e_t = y_t - yhat_t
-        x_t = F @ x_prev + (g[:, 0] * e_t)
-        return x_t, (yhat_t, e_t, x_t)
+        x_t = F @ x_prev + g0 * e_t
+        return x_t, (yhat_t, e_t)
 
-    xT, (yhat_seq, e_seq, x_seq) = lax.scan(step, x0, y)
-    return yhat_seq, e_seq, x_seq
+    xT, (yhat_seq, e_seq) = lax.scan(step, x0, y)
+    return yhat_seq, e_seq, xT[None, :]
 
 
-# ------------------------
-# Likelihood & optimizer
-# ------------------------
+@jax.jit
+def _calc_filter(
+    y: jnp.ndarray, w: jnp.ndarray, g: jnp.ndarray,
+    F: jnp.ndarray, x0: jnp.ndarray,
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """JIT-compiled innovations filter (casts all inputs to float64)."""
+    dtype = jnp.float64
+    return _calc_filter_impl(
+        jnp.asarray(y, dtype=dtype), jnp.asarray(w, dtype=dtype),
+        jnp.asarray(g, dtype=dtype), jnp.asarray(F, dtype=dtype),
+        jnp.asarray(x0, dtype=dtype),
+    )
 
-def negative_loglikelihood(params: jnp.ndarray,
-                           use_boxcox: bool,
-                           use_trend: bool,
-                           use_damped_trend: bool,
-                           use_arma_errors: bool,
-                           y: jnp.ndarray,
-                           y_trans_init: jnp.ndarray,
-                           seasonal_periods: jnp.ndarray,
-                           k_vector: jnp.ndarray,
-                           tau: int,
-                           w_template: jnp.ndarray,
-                           F_template: jnp.ndarray,
-                           g_template: jnp.ndarray,
-                           gamma_template: jnp.ndarray,
-                           x0_template: jnp.ndarray,
-                           x0_untransformed: jnp.ndarray,
-                           bc_lower: float,
-                           bc_upper: float,
-                           p: int,
-                           q: int,
-                           scale: jnp.ndarray) -> jnp.ndarray:
-    """Negative log-likelihood for the TBATS state-space.
 
-    NOTE: `params` are ACTUAL (scaled) parameter values. Any scaling for
-    the optimizer is handled outside this function.
+# Alias: use inside an outer JIT context (avoids nested-jit overhead)
+_calc_filter_core = _calc_filter_impl
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# L-BFGS Parameter Optimisation
+# ═══════════════════════════════════════════════════════════════════════
+
+_N_OPTIM_STEPS = 30
+
+_TBATS_SOLVER = optax.lbfgs(
+    memory_size=5,
+    linesearch=optax.scale_by_zoom_linesearch(
+        max_linesearch_steps=10,
+        initial_guess_strategy="one",
+    ),
+)
+
+
+@partial(jax.jit, static_argnames=(
+    "use_boxcox", "use_trend", "use_damped_trend", "p", "q", "tau", "n_k",
+))
+def _run_lbfgs_optim(
+    u0: jnp.ndarray, scale_vec: jnp.ndarray,
+    w: jnp.ndarray, g: jnp.ndarray, F: jnp.ndarray,
+    gamma_bold: jnp.ndarray, k_vector_arr: jnp.ndarray,
+    x0_hat: jnp.ndarray, x0_utp: jnp.ndarray,
+    y_fit: jnp.ndarray, y_pos: jnp.ndarray, y_pos_log_sum: jnp.ndarray,
+    bc_lower: jnp.ndarray, bc_upper: jnp.ndarray,
+    # ── static args (hashed, not traced) ──
+    use_boxcox: bool, use_trend: bool, use_damped_trend: bool,
+    p: int, q: int, tau: int, n_k: int,
+) -> jnp.ndarray:
+    """Top-level JIT-cached L-BFGS optimisation of the TBATS log-likelihood.
+
+    Being a module-level function (not a closure) lets JAX cache the compiled
+    XLA kernel across warm runs when the static args and array shapes match.
     """
-    dtype = y.dtype
+    dtype = jnp.float64
 
-    idx = 0
-    if use_boxcox:
-        lam = params[idx]; idx += 1
-        alpha = params[idx]; idx += 1
-    else:
-        lam = None
-        alpha = params[idx]; idx += 1
+    def obj(u: jnp.ndarray) -> jnp.ndarray:
+        theta = jnp.where(jnp.isfinite(u * scale_vec), u * scale_vec, 0.0)
 
-    if use_trend:
-        beta = params[idx]; idx += 1
-        if use_damped_trend:
-            phi = params[idx]; idx += 1
+        idx = 0
+        if use_boxcox:
+            lam_opt = jnp.clip(theta[0], bc_lower, bc_upper)
+            alpha_opt = theta[1]
+            idx = 2
         else:
-            phi = 1.0
-    else:
-        beta = None
-        phi = None
+            lam_opt = None
+            alpha_opt = theta[0]
+            idx = 1
 
-    g1 = params[idx : idx + len(k_vector)]; idx += len(k_vector)
-    g2 = params[idx : idx + len(k_vector)]; idx += len(k_vector)
-    ar = None; ma = None
-    if use_arma_errors:
-        if p != 0 and q != 0:
-            ar = params[idx : idx + p]; ma = params[idx + p : idx + p + q]
-        elif p != 0:
-            ar = params[idx : idx + p]
-        elif q != 0:
-            ma = params[idx : idx + q]
-
-    w = update_w(w_template, phi, tau, ar, ma, p, q, beta, dtype)
-    g, gamma_bold = update_g(g_template, gamma_template, alpha, beta, k_vector, g1, g2, dtype)
-    F = update_F(F_template, phi, alpha, beta, gamma_bold, ar, ma, p, q, tau, dtype)
-
-    if use_boxcox:
-        # make sure inputs are positive before transform
-        x0 = _boxcox(_ensure_pos(x0_untransformed), lam)
-        y_fit = _boxcox(_ensure_pos(y), lam)
-        y_for_ll = y
-    else:
-        y64 = y.astype(jnp.float64)
-        mu64 = y64.mean()
-        sig64 = y64.std() + 1e-12
-        y_fit64 = (y64 - mu64) / sig64
-        x0 = x0_template
-        # keep float64 standardized series
-        y_fit = y_fit64
-        y_for_ll = y_fit
-
-    _, e, _ = _calc_filter(y_fit, w, g, F, x0)
-    n = y_fit.shape[0]
-    if use_boxcox:
-        ll = n * jnp.log(jnp.nansum(e * e) + 1e-12) - 2.0 * (lam - 1.0) * jnp.nansum(jnp.log(jnp.clip(_ensure_pos(y_for_ll), 1e-12)))
-    else:
-        ll = n * jnp.log(jnp.nansum(e * e) + 1e-12)
-    return ll
-
-
-def nelder_mead_minimize(f, x0, maxiter: int = 2000, tol: float = 1e-6, step: float = 0.1):
-    """Very small Nelder–Mead wrapper."""
-    import numpy as _np
-    x0 = _np.asarray(x0, dtype=float)
-    n = x0.size
-    simplex = _np.vstack([x0] + [x0 + step * _np.eye(n)[i] for i in range(n)])
-
-    # preserve dtype (no forced float32)
-    def f_np(x): return float(f(jnp.asarray(x)))
-    values = _np.array([f_np(v) for v in simplex], dtype=float)
-
-    def order():
-        idx = _np.argsort(values)
-        return simplex[idx], values[idx]
-
-    it = 0
-    alpha = 1.0; gamma = 2.0; rho = 0.5; sigma = 0.5
-    while it < maxiter:
-        simplex, values = order()
-        if _np.std(values) < tol:
-            break
-        best = simplex[0]
-        worst = simplex[-1]
-        centroid = simplex[:-1].mean(axis=0)
-        xr = centroid + alpha * (centroid - worst)
-        fr = f_np(xr)
-        if values[0] <= fr < values[-2]:
-            simplex[-1] = xr; values[-1] = fr
-        elif fr < values[0]:
-            xe = centroid + gamma * (xr - centroid)
-            fe = f_np(xe)
-            if fe < fr:
-                simplex[-1] = xe; values[-1] = fe
-            else:
-                simplex[-1] = xr; values[-1] = fr
+        if use_trend:
+            beta_opt = theta[idx]; idx += 1
+            phi_opt = (theta[idx] if use_damped_trend and idx < theta.size else 1.0)
+            if use_damped_trend and idx < theta.size:
+                idx += 1
         else:
-            xc = centroid + rho * (worst - centroid)
-            fc = f_np(xc)
-            if fc < values[-1]:
-                simplex[-1] = xc; values[-1] = fc
-            else:
-                for i in range(1, n + 1):
-                    simplex[i] = simplex[0] + sigma * (simplex[i] - simplex[0])
-                    values[i] = f_np(simplex[i])
-        it += 1
-    simplex, values = order()
-    return _np.asarray(simplex[0], dtype=float)
+            beta_opt = None
+            phi_opt = None
+
+        g1 = theta[idx: idx + n_k]; idx += n_k
+        g2 = theta[idx: idx + n_k]; idx += n_k
+        ar_opt = theta[idx: idx + p] if p > 0 else None
+        ma_opt = theta[idx + p: idx + p + q] if q > 0 else None
+
+        w_opt = update_w(w, phi_opt, tau, ar_opt, ma_opt, p, q, beta_opt, dtype)
+        g_opt = update_g(g, gamma_bold, alpha_opt, beta_opt, k_vector_arr, g1, g2, dtype)
+        F_opt = update_F(F, phi_opt, alpha_opt, beta_opt, gamma_bold, ar_opt, ma_opt, p, q, tau, dtype)
+
+        if use_boxcox:
+            x0_opt = _boxcox_raw(x0_utp, lam_opt)
+            y_opt = _boxcox_raw(y_pos, lam_opt)
+        else:
+            x0_opt = x0_hat
+            y_opt = y_fit
+
+        _, e, _ = _calc_filter_core(y_opt, w_opt, g_opt, F_opt, x0_opt)
+
+        n = y_opt.shape[0]
+        sse = jnp.sum(e * e)
+        ll = n * jnp.log(sse + 1e-12)
+        if use_boxcox:
+            ll = ll - 2.0 * (lam_opt - 1.0) * y_pos_log_sum
+        return jnp.where(jnp.isfinite(ll), ll, jnp.asarray(1e20, dtype=dtype))
+
+    opt_state0 = _TBATS_SOLVER.init(u0)
+    val_and_grad_fn = jax.value_and_grad(obj)
+
+    def _optim_step(carry, _):
+        u, opt_state, best_u, best_loss = carry
+        loss, grads = val_and_grad_fn(u)
+        grads = jnp.where(jnp.isfinite(grads), grads, 0.0)
+        updates, new_opt_state = _TBATS_SOLVER.update(
+            grads, opt_state, u, value=loss, grad=grads, value_fn=obj,
+        )
+        new_u = optax.apply_updates(u, updates)
+        improved = jnp.isfinite(loss) & (loss < best_loss)
+        best_u = jnp.where(improved, u, best_u)
+        best_loss = jnp.where(improved, loss, best_loss)
+        return (new_u, new_opt_state, best_u, best_loss), None
+
+    init_loss = obj(u0)
+    init_carry = (u0, opt_state0, u0, init_loss)
+    (_, _, best_u, _), _ = lax.scan(_optim_step, init_carry, jnp.arange(_N_OPTIM_STEPS))
+    return best_u
 
 
-# ---------------------------------------
-# Model generator, selection and forecast
-# ---------------------------------------
+# ═══════════════════════════════════════════════════════════════════════
+# Model Fitting
+# ═══════════════════════════════════════════════════════════════════════
 
 def tbats_model_generator(
     y: jnp.ndarray,
@@ -600,240 +661,183 @@ def tbats_model_generator(
     use_arma_errors: bool,
     ar_coeffs: Optional[jnp.ndarray],
     ma_coeffs: Optional[jnp.ndarray],
-):
-    """Fit a single TBATS specification (given k_vector and feature flags)."""
-    seasonal_periods = jnp.asarray(seasonal_periods, dtype=jnp.int32)
-
-    # Initialize ARMA coefficients if needed
-    if use_arma_errors and ar_coeffs is None and ma_coeffs is None:
-        # Get initial residuals from simple model
-        if use_boxcox:
-            lam_init = _guerrero_lambda(_ensure_pos(y), int(seasonal_periods.max()), bc_lower, bc_upper)
-            y_init = _boxcox(_ensure_pos(y), lam_init)
-        else:
-            y64 = y.astype(jnp.float64)
-            mu64 = y64.mean()
-            sig64 = y64.std() + 1e-12
-            y_init = (y64 - mu64) / sig64
-
-        residuals = y_init - jnp.mean(y_init)
-
-        p, q = _estimate_arma_orders(residuals, max_p=2, max_q=2)
-
-        if p > 0 or q > 0:
-            ar_coeffs, ma_coeffs = _initialize_arma_coeffs(residuals, p, q, y_init.dtype)
-
-    p, q = _pq(ar_coeffs, ma_coeffs)
-    tau = int(2 * int(jnp.sum(k_vector)))
-
-    # Standardization if no Box-Cox
+    seasonal_blocks: Optional[jnp.ndarray] = None,
+) -> Dict:
+    """Fit a single TBATS specification (Box-Cox + optimisation + filter)."""
+    dtype = jnp.float64
+    y = jnp.asarray(y, dtype=dtype)
+    
+    # ── Box-Cox lambda estimation (Guerrero method) ────────────────────
     if use_boxcox:
-        lam = 0.0
-        y_fit = _boxcox(_ensure_pos(y), lam)
-        y_mu = jnp.asarray(0.0, dtype=y_fit.dtype)
-        y_sigma = jnp.asarray(1.0, dtype=y_fit.dtype)
+        y_pos = _ensure_pos(y)
+        if jnp.any(y <= 0):
+            warnings.warn("Data contains zero/negative values; disabling Box-Cox.")
+            use_boxcox = False
+            lam = None
+            y_fit = y
+        else:
+            season_length = int(seasonal_periods[0]) if len(seasonal_periods) > 0 else 1
+            lam = _guerrero_lambda_cached(y_pos, season_length, bc_lower, bc_upper)
+            y_fit = _boxcox(y_pos, lam)
     else:
         lam = None
-        y64 = y.astype(jnp.float64)
-        mu64 = y64.mean()
-        sig64 = y64.std() + 1e-12
-        y_mu = jnp.asarray(mu64, dtype=jnp.float64)
-        y_sigma = jnp.asarray(sig64, dtype=jnp.float64)
-        y_fit = (y64 - mu64) / sig64
+        y_fit = y
 
-    # Use the standardized dtype everywhere
-    dtype = y_fit.dtype
+        y_mu = jnp.asarray(0.0, dtype=dtype)
+        y_sigma = jnp.asarray(1.0, dtype=dtype)
 
+    p = 0 if ar_coeffs is None else int(ar_coeffs.shape[0])
+    q = 0 if ma_coeffs is None else int(ma_coeffs.shape[0])
+    tau = int(2 * jnp.sum(k_vector))
+
+    # ── Initial parameters ─────────────────────────────────────────────
     alpha = jnp.asarray(0.09, dtype=dtype)
+    
     if use_trend:
+        adj_phi = 1
         beta = jnp.asarray(0.05, dtype=dtype)
         phi = jnp.asarray(0.999 if use_damped_trend else 1.0, dtype=dtype)
     else:
-        beta = None; phi = None
+        adj_phi = 0
+        beta = None
+        phi = None
 
-    gamma_one_v = jnp.zeros((len(k_vector),), dtype=dtype)
-    gamma_two_v = jnp.zeros((len(k_vector),), dtype=dtype)
+    gamma_one_v = jnp.zeros(len(k_vector), dtype=dtype)
+    gamma_two_v = jnp.zeros(len(k_vector), dtype=dtype)
 
-    adj_phi = 1 if beta is not None else 0
-    d = 1 + adj_phi + tau + p + q
-    x0 = jnp.zeros((d,), dtype=dtype)
+    # ── Build state-space matrices ─────────────────────────────────────
+    if seasonal_blocks is None:
+        seasonal_blocks = _build_seasonal_blocks(seasonal_periods, k_vector, dtype)
 
     w = make_w(phi, k_vector, ar_coeffs, ma_coeffs, tau, beta, dtype)
     g, gamma_bold = make_g(k_vector, alpha, beta, p, q, tau, dtype)
-    F = make_F(phi, tau, alpha, beta, ar_coeffs, ma_coeffs, gamma_bold,
-               seasonal_periods, k_vector, dtype)
+    F = make_F(phi, tau, alpha, beta, ar_coeffs, ma_coeffs,
+               gamma_bold, seasonal_periods, k_vector, dtype, seasonal_blocks)
 
-    D = F - jnp.dot(g, w)
-    steps = y.shape[0]
-    w_tilde = jnp.zeros((steps, w.shape[1]), dtype=dtype).at[0, :].set(w[0])
+    # ── Seed state (level + trend + seasonal + ARMA) ───────────────────
+    n = y_fit.shape[0]
+    level_init = float(jnp.mean(y_fit)) if n > 0 else 0.0
+    
+    x0_ls = jnp.zeros((1 + adj_phi + tau,), dtype=dtype)
+    x0_ls = x0_ls.at[0].set(level_init)
+    
+    if use_trend and beta is not None and n > 1:
+        trend_init = float((y_fit[-1] - y_fit[0]) / (n - 1))
+        x0_ls = x0_ls.at[1].set(trend_init)
+    
+    x0_hat = jnp.concatenate([x0_ls, jnp.zeros(p + q, dtype=dtype)]) if (p or q) else x0_ls
 
-    def step_w(prev, _):
-        nxt = jnp.dot(prev, D)
-        return nxt, nxt
-
-    _, w_seq = lax.scan(step_w, w[0], jnp.arange(steps - 1))
-    w_tilde = w_tilde.at[1:, :].set(w_seq)
-
-    if p != 0 or q != 0:
-        end_cut = w_tilde.shape[1]
-        start_cut = end_cut - (p + q)
-        cols = jnp.arange(0, start_cut)
-        w_tilde = w_tilde[:, cols]
-
-    _, e0, _ = _calc_filter(y_fit, w, g, F, jnp.zeros_like(x0))
-    E = e0.reshape((e0.shape[0], 1))
-    x0_ls = _ridge_solve(w_tilde, E, ridge=1e-8)
-    x0_ls = x0_ls.ravel()
-
-    expected_dim = 1 + adj_phi + tau
-    if x0_ls.shape[0] < expected_dim:
-        x0_ls = jnp.pad(x0_ls, (0, expected_dim - x0_ls.shape[0]))
-
-    if (p != 0) or (q != 0):
-        arma_seed = jnp.zeros((p + q,), dtype=dtype)
-        x0_hat = jnp.concatenate([x0_ls, arma_seed], axis=0)
-    else:
-        x0_hat = x0_ls
-
-    # ---- Build parameter vector (ACTUAL values) and scale for optimizer ----
-    params = []
-    scale  = []
+    # ── Pack initial parameter vector + scales ─────────────────────────
+    params: list = []
+    scale: list = []
     if use_boxcox:
-        params += [jnp.asarray(lam, dtype=dtype), alpha]
-        scale  += [1.0, 0.1]
+        params.extend([lam, alpha]); scale.extend([0.001, 0.01])
     else:
-        params += [alpha]
-        scale  += [0.1]
+        params.append(alpha); scale.append(0.01)
     if beta is not None:
-        params += [beta]
-        scale  += [0.1]
-        if use_damped_trend and phi is not None and float(phi) != 1.0:
-            params += [phi]
-            scale  += [0.05]
-    params += [gamma_one_v, gamma_two_v]
-    scale  += ([1e-2] * (gamma_one_v.size + gamma_two_v.size))
-    if ar_coeffs is not None and p > 0:
-        params += [ar_coeffs.astype(dtype)]
-        scale  += ([0.1] * p)
-    if ma_coeffs is not None and q > 0:
-        params += [ma_coeffs.astype(dtype)]
-        scale  += ([0.1] * q)
+        params.append(beta); scale.append(0.01)
+    if phi is not None and float(phi) != 1.0:
+        params.append(phi); scale.append(0.01)
+    params.extend([gamma_one_v, gamma_two_v])
+    scale.extend([1e-5] * (len(gamma_one_v) + len(gamma_two_v)))
+    if ar_coeffs is not None:
+        params.append(ar_coeffs); scale.extend([0.1] * len(ar_coeffs))
+    if ma_coeffs is not None:
+        params.append(ma_coeffs); scale.extend([0.1] * len(ma_coeffs))
 
-    params = jnp.concatenate([
-        p_.ravel() if isinstance(p_, jnp.ndarray) else jnp.asarray([p_], dtype=dtype)
-        for p_ in params
+    params_vec = jnp.concatenate([
+        _p.ravel() if isinstance(_p, jnp.ndarray) else jnp.asarray([_p], dtype=dtype)
+        for _p in params
     ]).astype(dtype)
-    scale = jnp.asarray(scale, dtype=dtype)
-    x0_untransformed = x0_hat if lam is None else _inv_boxcox(x0_hat, lam)
+    scale_vec = jnp.asarray(scale, dtype=dtype)
 
-    def obj(u):
-        theta = u * scale
-        return negative_loglikelihood(
-            theta,
-            use_boxcox=use_boxcox,
-            use_trend=use_trend,
+    # ── Pre-compute quantities for optimiser ───────────────────────────
+    if use_boxcox:
+        x0_untransformed_pos = _ensure_pos(_inv_boxcox(x0_hat, lam))
+        y_pos_log_sum = jnp.sum(jnp.log(jnp.clip(y_pos, 1e-12, jnp.inf)))
+    else:
+        x0_untransformed_pos = x0_hat
+        y_pos_log_sum = jnp.asarray(0.0, dtype=dtype)
+
+    u0 = jnp.asarray(params_vec / scale_vec, dtype=dtype)
+    n_k = len(k_vector)
+
+    # Dummies keep JIT signatures consistent regardless of Box-Cox branch
+    _y_pos = y_pos if use_boxcox else y_fit
+    _y_fit = y_fit if not use_boxcox else y_pos
+
+    try:
+        uhat = _run_lbfgs_optim(
+            u0, scale_vec, w, g, F, gamma_bold, k_vector,
+            x0_hat, x0_untransformed_pos, _y_fit, _y_pos, y_pos_log_sum,
+            jnp.asarray(bc_lower, dtype=dtype), jnp.asarray(bc_upper, dtype=dtype),
+            use_boxcox=use_boxcox, use_trend=use_trend,
             use_damped_trend=use_damped_trend,
-            use_arma_errors=use_arma_errors,
-            y=y,
-            y_trans_init=y_fit,
-            seasonal_periods=seasonal_periods,
-            k_vector=jnp.asarray(k_vector),
-            tau=tau,
-            w_template=w,
-            F_template=F,
-            g_template=g,
-            gamma_template=gamma_bold,
-            x0_template=x0_hat,
-            x0_untransformed=x0_untransformed,
-            bc_lower=bc_lower,
-            bc_upper=bc_upper,
-            p=p, q=q, scale=scale,
+            p=p, q=q, tau=tau, n_k=n_k,
         )
+    except Exception as exc:
+        warnings.warn(f"Optimisation failed ({exc}); using initial parameters")
+        uhat = u0
 
-    u0 = params / scale
-    uhat = nelder_mead_minimize(obj, u0, maxiter=400 * (params.size + 1), tol=1e-6, step=0.1)
-    optim_params = jnp.asarray(uhat, dtype=dtype) * scale
+    # ── Unpack optimised parameters ────────────────────────────────────
+    optim_params = jnp.asarray(uhat, dtype=dtype) * scale_vec
+    if use_boxcox:
+        optim_params = optim_params.at[0].set(jnp.clip(optim_params[0], bc_lower, bc_upper))
 
-    # Unpack optimized parameters
     idx = 0
     if use_boxcox:
         optim_lambda = float(optim_params[idx]); idx += 1
-        optim_alpha  = float(optim_params[idx]); idx += 1
+        optim_alpha = float(optim_params[idx]); idx += 1
     else:
         optim_lambda = None
-        optim_alpha  = float(optim_params[idx]); idx += 1
+        optim_alpha = float(optim_params[idx]); idx += 1
 
     if use_trend:
         optim_beta = float(optim_params[idx]); idx += 1
-        if use_damped_trend:
-            optim_phi = float(optim_params[idx]) if idx < optim_params.size else 1.0; idx += (1 if idx < optim_params.size else 0)
+        if use_damped_trend and idx < optim_params.size:
+            optim_phi = float(optim_params[idx]); idx += 1
         else:
             optim_phi = 1.0
     else:
-        optim_beta = None; optim_phi = None
+        optim_beta = None
+        optim_phi = None
 
-    g1 = optim_params[idx : idx + len(k_vector)]; idx += len(k_vector)
-    g2 = optim_params[idx : idx + len(k_vector)]; idx += len(k_vector)
-    optim_ar = None; optim_ma = None
-    if use_arma_errors:
-        p_int = int(p); q_int = int(q)
-        if p_int != 0 and q_int != 0:
-            optim_ar = optim_params[idx : idx + p_int]; optim_ma = optim_params[idx + p_int : idx + p_int + q_int]
-        elif p_int != 0:
-            optim_ar = optim_params[idx : idx + p_int]
-        elif q_int != 0:
-            optim_ma = optim_params[idx : idx + q_int]
+    g1 = optim_params[idx: idx + len(k_vector)]; idx += len(k_vector)
+    g2 = optim_params[idx: idx + len(k_vector)]; idx += len(k_vector)
+    optim_ar = optim_params[idx: idx + p] if p > 0 else None
+    optim_ma = optim_params[idx + p: idx + p + q] if q > 0 else None
 
-    w_final = update_w(w, optim_phi, tau, optim_ar, optim_ma, int(p), int(q), optim_beta, dtype)
-    g_final, gamma_bold_final = update_g(g, gamma_bold, optim_alpha, optim_beta, k_vector, g1, g2, dtype)
-    F_final = update_F(F, optim_phi, optim_alpha, optim_beta, gamma_bold_final, optim_ar, optim_ma, int(p), int(q), tau, dtype)
+    # ── Rebuild final matrices & run filter ────────────────────────────
+    w_final = update_w(w, optim_phi, tau, optim_ar, optim_ma, p, q, optim_beta, dtype)
+    g_final = update_g(g, gamma_bold, optim_alpha, optim_beta, k_vector, g1, g2, dtype)
+    F_final = update_F(F, optim_phi, optim_alpha, optim_beta, gamma_bold,
+                       optim_ar, optim_ma, p, q, tau, dtype)
 
     if use_boxcox:
-        x0_final = _boxcox(_ensure_pos(x0_untransformed), optim_lambda)
-        y_fit_final = _boxcox(_ensure_pos(y), optim_lambda)
+        x0_final = _boxcox_raw(x0_untransformed_pos, optim_lambda)
+        y_fit_final = _boxcox_raw(y_pos, optim_lambda)
     else:
         x0_final = x0_hat
         y_fit_final = y_fit
 
     fitted, errors, x_seq = _calc_filter(y_fit_final, w_final, g_final, F_final, x0_final)
+    sigma2 = jnp.mean(errors * errors)
 
-    if not use_boxcox:
-        fitted = y_mu + y_sigma * fitted
-
-    def obj_from_theta(theta):
-        return negative_loglikelihood(
-            theta,
-            use_boxcox=use_boxcox,
-            use_trend=use_trend,
-            use_damped_trend=use_damped_trend,
-            use_arma_errors=use_arma_errors,
-            y=y,
-            y_trans_init=y_fit,
-            seasonal_periods=seasonal_periods,
-            k_vector=jnp.asarray(k_vector),
-            tau=tau,
-            w_template=w,
-            F_template=F,
-            g_template=g,
-            gamma_template=gamma_bold,
-            x0_template=x0_hat,
-            x0_untransformed=x0_untransformed,
-            bc_lower=bc_lower,
-            bc_upper=bc_upper,
-            p=p, q=q, scale=scale,
-        )
-    loglike = obj_from_theta(optim_params)
-
-    sigma2 = jnp.sum(errors * errors) / y_fit_final.shape[0]
+    # ── Log-likelihood & AIC ───────────────────────────────────────────
+    n_eff = errors.shape[0]
+    log_likelihood = float(n_eff * jnp.log(sigma2 + 1e-12))
+    if use_boxcox and lam is not None:
+        log_likelihood -= 2.0 * (lam - 1.0) * float(y_pos_log_sum)
 
     kval = int(optim_params.size + x0_final.shape[0])
     if optim_lambda == 1:
         kval -= 1
     if optim_beta is not None and abs(optim_beta) < 1e-8:
         kval -= 1
-    if (optim_phi is not None) and (optim_phi == 1.0):
+    if optim_phi is not None and optim_phi == 1:
         kval -= 1
-    aic = float(loglike) + 2 * kval
+
+    aic = float(log_likelihood) + 2 * kval
 
     return {
         "fitted": fitted,
@@ -844,7 +848,7 @@ def tbats_model_generator(
         "F": F_final,
         "w_transpose": w_final,
         "g": g_final,
-        "x": x_seq,
+        "x": x_seq,             # shape (1, d) — final state only
         "k_vector": jnp.asarray(k_vector),
         "BoxCox_lambda": optim_lambda,
         "p": int(p),
@@ -859,22 +863,16 @@ def tbats_model_generator(
 
 
 def tbats_model(
-    y: jnp.ndarray,
-    seasonal_periods: Sequence[int],
-    k_vector: jnp.ndarray,
-    use_boxcox: bool,
-    bc_lower: float,
-    bc_upper: float,
-    use_trend: bool,
-    use_damped_trend: bool,
-    use_arma_errors: bool,
-):
-    """Fit a **single** TBATS configuration with the provided k_vector."""
-    ar_coeffs = None
-    ma_coeffs = None
+    y, seasonal_periods, k_vector,
+    use_boxcox, bc_lower, bc_upper,
+    use_trend, use_damped_trend, use_arma_errors,
+) -> Dict:
+    """Convenience wrapper: fit a single TBATS spec with no ARMA."""
     best = tbats_model_generator(
-        y, seasonal_periods, k_vector, use_boxcox, bc_lower, bc_upper,
-        use_trend, use_damped_trend, use_arma_errors, ar_coeffs, ma_coeffs
+        y, seasonal_periods, k_vector,
+        use_boxcox, bc_lower, bc_upper,
+        use_trend, use_damped_trend, use_arma_errors,
+        ar_coeffs=None, ma_coeffs=None,
     )
     best["description"] = {
         "use_boxcox": use_boxcox,
@@ -885,6 +883,10 @@ def tbats_model(
     return best
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# Model Selection
+# ═══════════════════════════════════════════════════════════════════════
+
 def tbats_selection(
     y: jnp.ndarray,
     seasonal_periods: Sequence[int],
@@ -894,114 +896,187 @@ def tbats_selection(
     use_trend: Optional[bool],
     use_damped_trend: Optional[bool],
     use_arma_errors: bool,
-):
-    """Auto-select core TBATS options over a small grid, including harmonics."""
-    if (use_trend is False) and (use_damped_trend is True):
-        raise ValueError("Can't use damped trend without trend")
+    early_stop_patience: Optional[int] = None,
+    early_stop_tol: float = 0.5,
+) -> Dict:
+    """Auto-select the best TBATS configuration via AIC comparison."""
+    if use_trend is False and use_damped_trend is True:
+        raise ValueError("Cannot use damped trend without trend")
 
+    t_sel0 = time.perf_counter()
     seasonal_periods = jnp.sort(jnp.asarray(seasonal_periods))
 
+    # ── Harmonic search per season ─────────────────────────────────────
     ks: List[int] = []
     z = y
     for period in list(seasonal_periods):
         k, z = find_harmonics(z, int(period))
         ks.append(int(k))
     k_vector = jnp.asarray(ks, dtype=jnp.int32)
+    _tbats_debug(f"[TBATS][select] k_vector={list(k_vector)} "
+                 f"time={time.perf_counter() - t_sel0:.4f}s")
 
-    B = [True, False] if use_boxcox is None else [use_boxcox]
+    # ── Candidate grid ─────────────────────────────────────────────────
+    if use_boxcox is None:
+        B = [False]
+    elif use_boxcox:
+        B = [False, True]  # try simpler first; selection keeps best AIC
+    else:
+        B = [False]
 
-    # --- revised grid: only include damped trend if explicitly requested ---
     if use_trend is None:
-        if use_damped_trend is None:
-            # match the test's two candidates
-            T = [(True, False), (False, False)]
-        elif use_damped_trend:
-            T = [(True, True)]
-        else:
-            T = [(True, False), (False, False)]
+        T = ([(False, False), (True, False)] if use_damped_trend is None
+             else ([(True, True)] if use_damped_trend else [(True, False), (False, False)]))
     elif use_trend:
-        if use_damped_trend is None:
-            T = [(True, False)]
-        elif use_damped_trend:
-            T = [(True, True)]
-        else:
-            T = [(True, False)]
+        T = ([(True, False), (True, True)] if use_damped_trend is None
+             else ([(True, True)] if use_damped_trend else [(True, False)]))
     else:
         T = [(False, False)]
-    # ----------------------------------------------------------------------
 
     combos = [(bcx, t, use_arma_errors) for bcx in B for t in T]
 
-    best = {"aic": jnp.inf}
-    for bcx, (trend, damped), arma in combos:
-        cand = tbats_model(
+    # Pre-build seasonal blocks (shared across all candidates)
+    seasonal_blocks = _build_seasonal_blocks(seasonal_periods, k_vector, y.dtype)
+
+    # ── Evaluate candidates ────────────────────────────────────────────
+    if early_stop_patience is None:
+        early_stop_patience = 0
+    if early_stop_tol is None:
+        early_stop_tol = 0.1
+
+    best: Dict = {"aic": jnp.inf}
+    best_aic = float("inf")
+    last_valid = None
+    no_improve = 0
+    
+    for ci, (bcx, (trend, damped), arma) in enumerate(combos):
+        # Fast exit: patience-0 and we already have a valid model
+        if ci > 0 and early_stop_patience == 0 and math.isfinite(best_aic):
+            _tbats_debug(f"[TBATS][select] patience-0 fast exit after {ci} candidate(s)")
+            break
+
+        t_cand = time.perf_counter()
+        cand = tbats_model_generator(
             y, seasonal_periods, k_vector,
             bcx, bc_lower, bc_upper,
-            trend, damped, arma
+            trend, damped, arma,
+            None, None,  # ar_coeffs, ma_coeffs
+            seasonal_blocks,
         )
-        if cand["aic"] < best.get("aic", jnp.inf):
-            best = cand
+        _tbats_debug(
+            f"[TBATS][select] bcx={bcx} trend={trend} damped={damped} arma={arma} "
+            f"aic={float(cand.get('aic', jnp.inf)):.4f} "
+            f"time={time.perf_counter() - t_cand:.4f}s"
+        )
 
+        if "w_transpose" in cand:
+            last_valid = cand
+
+        cand_aic = float(cand["aic"])
+        if math.isfinite(cand_aic) and cand_aic < best_aic - float(early_stop_tol):
+            best = cand
+            best_aic = cand_aic
+            no_improve = 0
+        else:
+            no_improve += 1
+            if early_stop_patience is not None and no_improve > early_stop_patience:
+                _tbats_debug(f"[TBATS][select] early stopping after {no_improve} non-improving models")
+                break
+
+    if "w_transpose" not in best and last_valid is not None:
+        best = last_valid
+
+    _tbats_debug(f"[TBATS][select] done aic={float(best.get('aic', jnp.inf)):.4f} "
+                 f"time={time.perf_counter() - t_sel0:.4f}s")
     return best
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# Forecasting
+# ═══════════════════════════════════════════════════════════════════════
 
-def tbats_forecast(mod, h: int):
-    """Multi-step mean forecast from a fitted TBATS model."""
-    dtype = mod["F"].dtype
+@partial(jax.jit, static_argnames=("h",))
+def _tbats_forecast_core(F: jnp.ndarray, w: jnp.ndarray, x0: jnp.ndarray, h: int) -> jnp.ndarray:
+    """JIT-compiled multi-step forecast for a single initial state."""
+    def step(x, _):
+        y_next = jnp.dot(w, x)
+        x_next = F @ x
+        return x_next, y_next
+    _, fcst = lax.scan(step, x0, jnp.arange(h))
+    return fcst
+
+
+def tbats_forecast(mod: Dict, h: int) -> Dict[str, jnp.ndarray]:
+    """Multi-step mean forecast from a fitted model dictionary."""
     h = int(h)
-    fcst = jnp.zeros((h,), dtype=dtype)
-    xx = jnp.zeros((h, mod["x"].shape[1]), dtype=dtype)
     w = mod["w_transpose"][0]
+    F = mod["F"]
+    x_last = mod["x"][-1]
 
-    fcst = fcst.at[0].set(jnp.dot(w, mod["x"][-1]))
-    xx = xx.at[0].set(jnp.dot(mod["F"], mod["x"][-1]))
+    fcst = _tbats_forecast_core(F, w, x_last, h)
 
-    def step(prev_x, _):
-        nxt_x = jnp.dot(mod["F"], prev_x)
-        yhat = jnp.dot(w, prev_x)
-        return nxt_x, (nxt_x, yhat)
-
-    if h > 1:
-        _, (xx_tail, yhat_tail) = lax.scan(step, xx[0], jnp.arange(h - 1))
-        xx = xx.at[1:].set(xx_tail)
-        fcst = fcst.at[1:].set(yhat_tail)
-
-    # Return forecasts on original data scale
     if mod["BoxCox_lambda"] is None:
-        fcst_orig = mod["y_mu"] + mod["y_sigma"] * fcst
-    else:
-        fcst_orig = _inv_boxcox(fcst, mod["BoxCox_lambda"])
+        return {"mean": mod["y_mu"] + mod["y_sigma"] * fcst, "mean_bc": None}
 
-    return {"mean": fcst_orig}
+    return {"mean": _inv_boxcox(fcst, mod["BoxCox_lambda"]), "mean_bc": fcst}
 
 
-def compute_sigmah(mod, h: int) -> jnp.ndarray:
-    """Parametric forecast std-devs σ_h for horizons 1..h."""
-    F = mod["F"]; w = mod["w_transpose"][0]; g = mod["g"][:, 0]
-    dtype = F.dtype
-    h = int(h)
+# ── Prediction intervals ──────────────────────────────────────────────
 
-    var0 = jnp.asarray(1.0, dtype=dtype)
-
-    if h == 1:
-        sigma2h = mod["sigma2"] * var0
-        if mod["BoxCox_lambda"] is None:
-            sigma2h = (mod["y_sigma"] ** 2) * sigma2h
-        return jnp.sqrt(jnp.maximum(sigma2h, 0.0))
+@partial(jax.jit, static_argnames=("h", "use_boxcox"))
+def _compute_sigmah_core(
+    F: jnp.ndarray, w: jnp.ndarray, g: jnp.ndarray,
+    sigma2: jnp.ndarray, y_sigma: jnp.ndarray,
+    h: int, use_boxcox: bool,
+) -> jnp.ndarray:
+    """JIT-compiled parametric forecast standard deviations."""
+    var0 = jnp.asarray(1.0, dtype=F.dtype)
 
     def body(carry, _):
-        Fpow, var_acc, j = carry
-        Fpow_next = jnp.dot(Fpow, F)
+        Fpow, var_acc = carry
+        Fpow_next = F @ Fpow
         cj = jnp.dot(jnp.dot(w, Fpow_next), g)
         var_next = var_acc + cj * cj
-        return (Fpow_next, var_next, j + 1), var_next
+        return (Fpow_next, var_next), var_next
 
-    init = (jnp.eye(F.shape[1], dtype=dtype), var0, jnp.asarray(0, dtype=jnp.int32))
+    init = (jnp.eye(F.shape[1], dtype=F.dtype), var0)
     _, var_tail = lax.scan(body, init, jnp.arange(h - 1))
     var_mult = jnp.concatenate([var0[None], var_tail], axis=0)
 
-    sigma2h = mod["sigma2"] * var_mult
-    if mod["BoxCox_lambda"] is None:
-        sigma2h = (mod["y_sigma"] ** 2) * sigma2h
+    sigma2h = sigma2 * var_mult
+    if not use_boxcox:
+        sigma2h = (y_sigma ** 2) * sigma2h
     return jnp.sqrt(jnp.maximum(sigma2h, 0.0))
+
+
+def compute_sigmah(mod: Dict, h: int) -> jnp.ndarray:
+    """Parametric forecast standard deviations from a fitted model dictionary."""
+    F = mod["F"]
+    w = mod["w_transpose"][0]
+    g = mod["g"][:, 0]
+    sigma2 = jnp.asarray(mod["sigma2"], dtype=F.dtype)
+    y_sigma = jnp.asarray(mod["y_sigma"], dtype=F.dtype)
+    use_boxcox = mod["BoxCox_lambda"] is not None
+    return _compute_sigmah_core(F, w, g, sigma2, y_sigma, int(h), use_boxcox)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Batch Operations (for multi-series workloads)
+# ═══════════════════════════════════════════════════════════════════════
+
+def tbats_forecast_batch(
+    F: jnp.ndarray, w: jnp.ndarray, x_last: jnp.ndarray, h: int,
+) -> jnp.ndarray:
+    """Vectorised forecasts: ``x_last`` has shape ``(B, d)``."""
+    h = int(h)
+    return vmap(lambda x0: _tbats_forecast_core(F, w, x0, h))(x_last)
+
+
+def compute_sigmah_batch(
+    F: jnp.ndarray, w: jnp.ndarray, g: jnp.ndarray,
+    sigma2: jnp.ndarray, y_sigma: jnp.ndarray,
+    h: int, use_boxcox: bool,
+) -> jnp.ndarray:
+    """Vectorised sigmah: ``sigma2`` and ``y_sigma`` have shape ``(B,)``."""
+    h = int(h)
+    return vmap(lambda s2, ys: _compute_sigmah_core(F, w, g, s2, ys, h, use_boxcox))(sigma2, y_sigma)
