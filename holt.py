@@ -22,7 +22,9 @@ Instance Attributes:
 4. phi: float | None - Damping parameter (0.8-0.98), used only if damped=True
 5. alias: str - Custom name for the model
 6. conformal_params: ConformalIntervals | None - Parameters for conformal prediction intervals
-7. model_: dict - Fitted model parameters (created after fit())
+7. allow_extended_iterations: bool - Whether to allow extended iteration counts for difficult series
+8. iteration_scaling: str - Scaling method for adaptive iterations ("quadratic" or "cubic")
+9. model_: dict - Fitted model parameters (created after fit())
    - fitted: In-sample fitted values
    - level: Final level state
    - trend: Final trend state
@@ -48,6 +50,7 @@ Helper Methods:
 - _validate_level() - Validate prediction interval levels
 - _initialize_states() - Initialize level and trend via linear regression
 - _get_phi() - Get damping factor
+- _estimate_iterations() - Estimate optimal iteration count based on data complexity
 - _fit_parameters() - Core optimization routine using JAX/optax
 - _generate_forecasts() - Compute h-step ahead point forecasts
 - _calculate_native_intervals() - Analytical prediction interval formulas
@@ -55,7 +58,8 @@ Helper Methods:
 
 Implementation Notes:
 - Uses optax.adam optimizer with exponential learning rate decay
-- Default 1000 iterations for parameter optimization
+- Adaptive iteration count based on data complexity (30-400 iterations)
+- Module-level JIT functions for efficient compilation caching
 - Supports both native (analytical) and conformal prediction intervals
 - Level and trend initialized via linear regression on first 10 observations
 - Analytical interval formulas from Hyndman et al. (2008)
@@ -76,13 +80,131 @@ _PHI_UPPER = 0.98
 _INIT_ALPHA = 0.3
 _INIT_BETA = 0.1
 _N_PARAMS = 2  # alpha and beta
-_N_ITER = 1000
 _LEARNING_RATE = 0.01
 _LR_DECAY_STEPS = 500
 _LR_DECAY_RATE = 0.9
 _EPSILON = 1e-10  # For numerical stability
 
+# Adaptive iteration constants
+_MIN_ITER = 30
+_MAX_ITER = 200
+_MAX_ITER_EXTENDED = 400
+
 __all__ = ['Holt']
+
+
+# =============================================================================
+# Module-level JIT-compiled optimization functions
+# =============================================================================
+
+def _run_holt_optimization(y, l0, b0, phi, is_additive, n_iters):
+    """Module-level JIT-compiled optimization loop for Holt.
+
+    Parameters
+    ----------
+    y : jnp.ndarray
+        Time series data
+    l0 : float
+        Initial level
+    b0 : float
+        Initial trend
+    phi : float
+        Damping factor (1.0 for non-damped)
+    is_additive : bool
+        True for additive error, False for multiplicative
+    n_iters : int
+        Number of optimization iterations
+
+    Returns
+    -------
+    tuple
+        (best_params, raw_fit_result) where best_params is [alpha, beta]
+        and raw_fit_result is dict with fitted values, level, trend, residuals
+    """
+    scheduler = optax.exponential_decay(
+        init_value=_LEARNING_RATE,
+        transition_steps=_LR_DECAY_STEPS,
+        decay_rate=_LR_DECAY_RATE
+    )
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adam(learning_rate=scheduler)
+    )
+
+    n = len(y)
+
+    def step_additive(carry, y_t):
+        level_prev, trend_prev, alpha, beta = carry
+        y_hat = level_prev + phi * trend_prev
+        level = alpha * y_t + (1 - alpha) * y_hat
+        trend = beta * (level - level_prev) + (1 - beta) * phi * trend_prev
+        return (level, trend, alpha, beta), y_hat
+
+    def step_multiplicative(carry, y_t):
+        level_prev, trend_prev, alpha, beta = carry
+        y_hat = level_prev + phi * trend_prev
+        epsilon = (y_t - y_hat) / jnp.maximum(jnp.abs(y_hat), _EPSILON)
+        level = y_hat * (1 + alpha * epsilon)
+        trend = phi * trend_prev + beta * y_hat * epsilon
+        return (level, trend, alpha, beta), y_hat
+
+    step_fn = step_additive if is_additive else step_multiplicative
+
+    def raw_fit(params_ab):
+        alpha, beta = params_ab
+        init_carry = (l0, b0, alpha, beta)
+        final_carry, fitted_vals = lax.scan(step_fn, init_carry, y)
+        return fitted_vals, final_carry[0], final_carry[1], y - fitted_vals
+
+    def loss_fn(params_ab):
+        fitted, _, _, residuals = raw_fit(params_ab)
+        sse = jnp.sum(residuals ** 2)
+        if is_additive:
+            return n * jnp.log(jnp.maximum(sse, _EPSILON))
+        else:
+            log_det = 2 * jnp.sum(jnp.log(jnp.maximum(jnp.abs(fitted), _EPSILON)))
+            return n * jnp.log(jnp.maximum(sse, _EPSILON)) + log_det
+
+    value_and_grad_fn = jax.value_and_grad(loss_fn)
+
+    # Track best params during optimization (prevents overshoot)
+    def opt_step(carry, _):
+        params, opt_state, best_params, best_loss = carry
+        loss, grads = value_and_grad_fn(params)
+        loss = jnp.float32(loss)
+
+        updates, opt_state = optimizer.update(grads, opt_state, params)
+        new_params = optax.apply_updates(params, updates)
+        new_params = jnp.clip(new_params, 0.0001, 0.9999)
+
+        # Track best parameters (minimum loss)
+        improved = loss < best_loss
+        new_best_params = jnp.where(improved, params, best_params)
+        new_best_loss = jnp.where(improved, loss, best_loss)
+
+        return (new_params, opt_state, new_best_params, new_best_loss), loss
+
+    init_params = jnp.array([_INIT_ALPHA, _INIT_BETA])
+    opt_state = optimizer.init(init_params)
+    init_carry = (init_params, opt_state, init_params, jnp.float32(jnp.inf))
+    (_, _, best_params, _), _ = lax.scan(opt_step, init_carry, None, length=n_iters)
+
+    # Get final results with best parameters
+    fitted, final_level, final_trend, residuals = raw_fit(best_params)
+
+    return best_params, {
+        'fitted': fitted,
+        'level': final_level,
+        'trend': final_trend,
+        'residuals': residuals,
+        'alpha': best_params[0],
+        'beta': best_params[1],
+    }
+
+
+# JIT with static args: is_additive and n_iters
+_run_holt_optimization_jit = jax.jit(_run_holt_optimization, static_argnums=(4, 5))
+
 
 class Holt(BaseForecaster):
     # Helper methods
@@ -102,16 +224,29 @@ class Holt(BaseForecaster):
                 raise ValueError("All level values must be numbers between 0 and 100")
 
     def _initialize_states(self, y: jnp.ndarray) -> tuple[float, float]:
-        """Initialize level and trend via linear regression."""
-        n_init = min(10, len(y) // 2)
+        """Initialize level and trend via linear regression using JAX."""
+        n = len(y)
+        n_init = min(10, n // 2)
+
         if n_init >= 2:
-            import numpy as np
-            X_init = np.column_stack([np.ones(n_init), np.arange(n_init)])
-            coef = np.linalg.lstsq(X_init, np.array(y[:n_init]), rcond=None)[0]
-            l0, b0 = float(coef[0]), float(coef[1])
+            # Linear regression: y = l0 + b0 * t
+            t = jnp.arange(n_init, dtype=jnp.float32)
+            y_init = y[:n_init]
+
+            t_mean = jnp.mean(t)
+            y_mean = jnp.mean(y_init)
+
+            # Slope: cov(t, y) / var(t)
+            cov_ty = jnp.sum((t - t_mean) * (y_init - y_mean))
+            var_t = jnp.sum((t - t_mean) ** 2)
+            b0 = cov_ty / jnp.maximum(var_t, _EPSILON)
+
+            # Intercept
+            l0 = y_mean - b0 * t_mean
+
+            return float(l0), float(b0)
         else:
-            l0, b0 = float(y[0]), 0.0
-        return l0, b0
+            return float(y[0]), 0.0
 
     def _get_phi(self) -> float:
         """Get damping factor phi."""
@@ -120,80 +255,53 @@ class Holt(BaseForecaster):
         else:
             return 1.0
 
+    def _estimate_iterations(self, y: jnp.ndarray) -> int:
+        """Estimate iterations based on noise and trend clarity."""
+        n = len(y)
+
+        # 1. Noise: CV of first differences
+        diffs = y[1:] - y[:-1]
+        cv_diffs = jnp.std(diffs) / jnp.maximum(jnp.abs(jnp.mean(diffs)), _EPSILON)
+        noise_score = float(jnp.clip(cv_diffs / 5.0, 0.0, 1.0))
+
+        # 2. Trend clarity: 1 - R^2 of linear fit
+        t = jnp.arange(n, dtype=jnp.float32)
+        y_mean, t_mean = jnp.mean(y), jnp.mean(t)
+        slope = jnp.sum((t - t_mean) * (y - y_mean)) / jnp.maximum(jnp.sum((t - t_mean)**2), _EPSILON)
+        y_pred = y_mean + slope * (t - t_mean)
+        ss_res = jnp.sum((y - y_pred)**2)
+        ss_tot = jnp.sum((y - y_mean)**2)
+        r_sq = 1 - ss_res / jnp.maximum(ss_tot, _EPSILON)
+        trend_difficulty = float(1.0 - jnp.clip(r_sq, 0.0, 1.0))
+
+        # 3. Length penalty for short series
+        length_score = float(jnp.clip((50 - n) / 50, 0.0, 1.0)) if n < 50 else 0.0
+
+        # Weighted combination
+        complexity = 0.50 * noise_score + 0.35 * trend_difficulty + 0.15 * length_score
+
+        # Scale to range
+        min_iters = _MIN_ITER
+        max_iters = _MAX_ITER_EXTENDED if self.allow_extended_iterations else _MAX_ITER
+        exponent = {"cubic": 3.0, "quadratic": 2.0}[self.iteration_scaling]
+
+        return int(min_iters + (complexity ** exponent) * (max_iters - min_iters))
+
     def _fit_parameters(self, y: jnp.ndarray) -> dict:
         """Fit model parameters and return results dictionary."""
         l0, b0 = self._initialize_states(y)
         phi = self._get_phi()
+        n_iters = self._estimate_iterations(y)
+        is_additive = self.error_type == 'A'
 
-        def step_update(carry, y_t):
-            level_prev, trend_prev, alpha, beta = carry
-            y_hat = level_prev + phi * trend_prev
-            if self.error_type == 'A':
-                level = alpha * y_t + (1 - alpha) * (level_prev + phi * trend_prev)
-                trend = beta * (level - level_prev) + (1 - beta) * phi * trend_prev
-            else:
-                epsilon = (y_t - y_hat) / jnp.maximum(jnp.abs(y_hat), _EPSILON)
-                level = (level_prev + phi * trend_prev) * (1 + alpha * epsilon)
-                trend = phi * trend_prev + beta * (level_prev + phi * trend_prev) * epsilon
-            return (level, trend, alpha, beta), y_hat
-
-        l0_fixed, b0_fixed = l0, b0
-
-        @jax.jit
-        def raw_fit(params_ab):
-            alpha, beta = params_ab
-            init_carry = (l0_fixed, b0_fixed, alpha, beta)
-            final_carry, fitted_vals = lax.scan(step_update, init_carry, y)
-            final_level, final_trend, _, _ = final_carry
-            residuals = y - fitted_vals
-            return {
-                'fitted': fitted_vals,
-                'level': final_level,
-                'trend': final_trend,
-                'residuals': residuals,
-                'alpha': alpha,
-                'beta': beta,
-            }
-
-        @jax.jit
-        def _likelihood_loss(params_ab):
-            result = raw_fit(params_ab)
-            residuals = result['residuals']
-            sse = jnp.sum(residuals ** 2)
-            if self.error_type == 'M':
-                fitted_vals = result['fitted']
-                log_det = 2 * jnp.sum(jnp.log(jnp.maximum(jnp.abs(fitted_vals), _EPSILON)))
-                return len(y) * jnp.log(jnp.maximum(sse, _EPSILON)) + log_det
-            else:
-                return len(y) * jnp.log(jnp.maximum(sse, _EPSILON))
-
-        init_params = jnp.array([_INIT_ALPHA, _INIT_BETA])
-        scheduler = optax.exponential_decay(
-            init_value=_LEARNING_RATE,
-            transition_steps=_LR_DECAY_STEPS,
-            decay_rate=_LR_DECAY_RATE
+        # Use module-level JIT function
+        best_params, result = _run_holt_optimization_jit(
+            y, l0, b0, phi, is_additive, n_iters
         )
-        optimizer = optax.chain(
-            optax.clip_by_global_norm(1.0),
-            optax.adam(learning_rate=scheduler)
-        )
-        opt_state = optimizer.init(init_params)
-        params = init_params
 
-        @jax.jit
-        def step(carry, _):
-            params, opt_state = carry
-            loss, grads = jax.value_and_grad(_likelihood_loss)(params)
-            updates, opt_state = optimizer.update(grads, opt_state, params)
-            params = optax.apply_updates(params, updates)
-            params = params.at[:_N_PARAMS].set(jnp.clip(params[:_N_PARAMS], 0.0001, 0.9999))
-            return (params, opt_state), loss
-
-        (final_params, _), _ = jax.jit(lambda: lax.scan(step, (params, opt_state), jnp.arange(_N_ITER)))()
-
-        result = raw_fit(final_params)
-        result['alpha'] = float(final_params[0])
-        result['beta'] = float(final_params[1])
+        # Convert to Python floats for storage
+        result['alpha'] = float(best_params[0])
+        result['beta'] = float(best_params[1])
         result['sigma'] = utils.calculate_sigma(result['residuals'], len(y) - _N_PARAMS)
         return result
 
@@ -280,6 +388,8 @@ class Holt(BaseForecaster):
         phi: float | None = None,
         alias: str = "Holt",
         conformal_params: ConformalIntervals | None = None,
+        allow_extended_iterations: bool = False,
+        iteration_scaling: str = "quadratic",
     ):
         """
         Holt's linear exponential smoothing method.
@@ -302,6 +412,12 @@ class Holt(BaseForecaster):
         conformal_params : ConformalIntervals | None, default=None
             Parameters for conformal prediction intervals. If None, uses native
             analytical prediction intervals.
+        allow_extended_iterations : bool, default=False
+            Whether to allow extended iteration counts (up to 400) for difficult
+            series. Default max is 200.
+        iteration_scaling : str, default="quadratic"
+            Scaling method for adaptive iterations. "quadratic" (default) gives
+            moderate scaling, "cubic" gives more aggressive scaling for complex series.
 
         Raises
         ------
@@ -310,6 +426,7 @@ class Holt(BaseForecaster):
             If phi is not a float when provided.
             If phi is outside the valid range [0.8, 0.98].
             If conformal_params is not a ConformalIntervals instance.
+            If iteration_scaling is not 'quadratic' or 'cubic'.
         """
         # Validate error_type
         if error_type not in ('A', 'M'):
@@ -331,12 +448,18 @@ class Holt(BaseForecaster):
                 f"conformal_params must be a ConformalIntervals instance, got {type(conformal_params).__name__}"
             )
 
+        # Validate iteration_scaling
+        if iteration_scaling not in ("cubic", "quadratic"):
+            raise ValueError(f"iteration_scaling must be 'cubic' or 'quadratic', got '{iteration_scaling}'")
+
         self.season_length = season_length
         self.error_type = error_type
         self.damped = damped if damped is not None else False
         self.phi = phi
         self.alias = alias
         self.conformal_params = conformal_params
+        self.allow_extended_iterations = allow_extended_iterations
+        self.iteration_scaling = iteration_scaling
 
     def fit(
         self,
@@ -688,238 +811,3 @@ class Holt(BaseForecaster):
                 )
 
         return res
-
-
-# def test():
-#     """Comprehensive test suite for Holt model."""
-#     print("="*60)
-#     print("Running Holt model tests...")
-#     print("="*60)
-#     passed = 0
-#     failed = 0
-
-#     # Test 1: Basic fit/predict (Additive Error)
-#     try:
-#         print("\nTest 1: Basic fit/predict (Additive Error)")
-#         y = jnp.array([10.0, 12.0, 15.0, 18.0, 22.0, 27.0, 33.0, 40.0])
-#         model = Holt(error_type='A', damped=False)
-#         model.fit(y)
-#         result = model.predict(h=5)
-
-#         assert 'mean' in result, "Result should contain 'mean' key"
-#         assert len(result['mean']) == 5, "Forecast length should be 5"
-#         assert jnp.all(jnp.isfinite(result['mean'])), "Forecasts should be finite"
-
-#         print(f"  Fitted alpha: {model.model_['alpha']:.4f}")
-#         print(f"  Fitted beta: {model.model_['beta']:.4f}")
-#         print(f"  First 3 forecasts: {result['mean'][:3]}")
-#         print("  ✓ PASSED")
-#         passed += 1
-#     except Exception as e:
-#         print(f"  ✗ FAILED: {e}")
-#         failed += 1
-
-#     # Test 2: Multiplicative Error
-#     try:
-#         print("\nTest 2: Multiplicative Error")
-#         y = jnp.array([10.0, 12.0, 15.0, 18.0, 22.0, 27.0, 33.0, 40.0])
-#         model = Holt(error_type='M', damped=False)
-#         model.fit(y)
-#         result = model.predict(h=5)
-
-#         assert 'mean' in result, "Result should contain 'mean' key"
-#         assert len(result['mean']) == 5, "Forecast length should be 5"
-
-#         print(f"  Fitted alpha: {model.model_['alpha']:.4f}")
-#         print(f"  Fitted beta: {model.model_['beta']:.4f}")
-#         print("  ✓ PASSED")
-#         passed += 1
-#     except Exception as e:
-#         print(f"  ✗ FAILED: {e}")
-#         failed += 1
-
-#     # Test 3: Damped Trend
-#     try:
-#         print("\nTest 3: Damped Trend")
-#         y = jnp.array([10.0, 12.0, 15.0, 18.0, 22.0, 27.0, 33.0, 40.0])
-
-#         # Non-damped model
-#         model_nodamp = Holt(error_type='A', damped=False)
-#         model_nodamp.fit(y)
-#         result_nodamp = model_nodamp.predict(h=10)
-
-#         # Damped model
-#         model_damp = Holt(error_type='A', damped=True, phi=0.9)
-#         model_damp.fit(y)
-#         result_damp = model_damp.predict(h=10)
-
-#         # At longer horizons, damped should be less than non-damped
-#         last_forecast_damp = result_damp['mean'][-1]
-#         last_forecast_nodamp = result_nodamp['mean'][-1]
-
-#         assert last_forecast_damp < last_forecast_nodamp, \
-#             "Damped forecast should be lower at long horizons"
-
-#         print(f"  Non-damped h=10: {last_forecast_nodamp:.2f}")
-#         print(f"  Damped h=10: {last_forecast_damp:.2f}")
-#         print("  ✓ PASSED")
-#         passed += 1
-#     except Exception as e:
-#         print(f"  ✗ FAILED: {e}")
-#         failed += 1
-
-#     # Test 4: Prediction Intervals (Native)
-#     try:
-#         print("\nTest 4: Prediction Intervals (Native)")
-#         y = jnp.array([10.0, 12.0, 15.0, 18.0, 22.0, 27.0, 33.0, 40.0])
-#         model = Holt(error_type='A', damped=False)
-#         model.fit(y)
-#         result = model.predict(h=5, level=[80, 95])
-
-#         assert 'lo-80' in result, "Should have lo-80"
-#         assert 'hi-80' in result, "Should have hi-80"
-#         assert 'lo-95' in result, "Should have lo-95"
-#         assert 'hi-95' in result, "Should have hi-95"
-
-#         # Check ordering: lo-95 < lo-80 < mean < hi-80 < hi-95
-#         for i in range(5):
-#             assert result['lo-95'][i] < result['lo-80'][i], "lo-95 < lo-80"
-#             assert result['lo-80'][i] < result['mean'][i], "lo-80 < mean"
-#             assert result['mean'][i] < result['hi-80'][i], "mean < hi-80"
-#             assert result['hi-80'][i] < result['hi-95'][i], "hi-80 < hi-95"
-
-#         print(f"  h=1: [{result['lo-95'][0]:.2f}, {result['mean'][0]:.2f}, {result['hi-95'][0]:.2f}]")
-#         print(f"  h=5: [{result['lo-95'][4]:.2f}, {result['mean'][4]:.2f}, {result['hi-95'][4]:.2f}]")
-#         print("  ✓ PASSED")
-#         passed += 1
-#     except Exception as e:
-#         print(f"  ✗ FAILED: {e}")
-#         failed += 1
-
-#     # Test 5: Conformal Intervals
-#     try:
-#         print("\nTest 5: Conformal Intervals")
-#         y = jnp.array([10.0, 12.0, 15.0, 18.0, 22.0, 27.0, 33.0, 40.0, 48.0, 57.0])
-#         conformal = ConformalIntervals(n_windows=3, h=2)
-#         model = Holt(error_type='A', damped=False, conformal_params=conformal)
-#         model.fit(y)
-#         result = model.predict(h=2, level=[95])
-
-#         assert 'lo-95' in result, "Should have conformal lo-95"
-#         assert 'hi-95' in result, "Should have conformal hi-95"
-
-#         print(f"  Conformal interval h=1: [{result['lo-95'][0]:.2f}, {result['hi-95'][0]:.2f}]")
-#         print("  ✓ PASSED")
-#         passed += 1
-#     except Exception as e:
-#         print(f"  ✗ FAILED: {e}")
-#         failed += 1
-
-#     # Test 6: predict_in_sample()
-#     try:
-#         print("\nTest 6: predict_in_sample()")
-#         y = jnp.array([10.0, 12.0, 15.0, 18.0, 22.0, 27.0, 33.0, 40.0])
-#         model = Holt(error_type='A', damped=False)
-#         model.fit(y)
-#         result = model.predict_in_sample(level=[95])
-
-#         assert 'fitted' in result, "Should have fitted values"
-#         assert len(result['fitted']) == len(y), "Fitted should match training length"
-#         assert 'fitted-lo-95' in result, "Should have fitted intervals"
-#         assert 'fitted-hi-95' in result, "Should have fitted intervals"
-
-#         print(f"  Fitted length: {len(result['fitted'])}")
-#         print(f"  First fitted value: {result['fitted'][0]:.2f}")
-#         print("  ✓ PASSED")
-#         passed += 1
-#     except Exception as e:
-#         print(f"  ✗ FAILED: {e}")
-#         failed += 1
-
-#     # Test 7: forecast() Method
-#     try:
-#         print("\nTest 7: forecast() Method (Stateless)")
-#         y = jnp.array([10.0, 12.0, 15.0, 18.0, 22.0, 27.0, 33.0, 40.0])
-#         model = Holt(error_type='A', damped=False)
-#         # Don't call fit()
-#         result = model.forecast(y, h=5, fitted=True, level=[95])
-
-#         assert 'mean' in result, "Should have forecasts"
-#         assert 'fitted' in result, "Should have fitted values with fitted=True"
-#         assert len(result['mean']) == 5, "Forecast length should be 5"
-#         assert len(result['fitted']) == len(y), "Fitted length should match y"
-
-#         print(f"  Forecast h=1: {result['mean'][0]:.2f}")
-#         print(f"  Includes fitted values and intervals")
-#         print("  ✓ PASSED")
-#         passed += 1
-#     except Exception as e:
-#         print(f"  ✗ FAILED: {e}")
-#         failed += 1
-
-#     # Test 8: forward() Method
-#     try:
-#         print("\nTest 8: forward() Method")
-#         y1 = jnp.array([10.0, 12.0, 15.0, 18.0, 22.0, 27.0, 33.0, 40.0])
-#         y2 = jnp.array([100.0, 102.0, 105.0, 108.0, 112.0, 117.0, 123.0, 130.0])
-
-#         model = Holt(error_type='A', damped=False)
-#         model.fit(y1)
-
-#         # Apply to new series
-#         result = model.forward(y2, h=3)
-
-#         assert 'mean' in result, "Should have forecasts"
-#         assert len(result['mean']) == 3, "Forecast length should be 3"
-#         # Forecasts should be in range of y2, not y1
-#         assert result['mean'][0] > 100, "Forecast should follow y2 scale"
-
-#         print(f"  y1 range: [{float(y1.min()):.1f}, {float(y1.max()):.1f}]")
-#         print(f"  y2 range: [{float(y2.min()):.1f}, {float(y2.max()):.1f}]")
-#         print(f"  Forward forecast: {result['mean'][0]:.2f}")
-#         print("  ✓ PASSED")
-#         passed += 1
-#     except Exception as e:
-#         print(f"  ✗ FAILED: {e}")
-#         failed += 1
-
-#     # Test 9: Edge Cases
-#     try:
-#         print("\nTest 9: Edge Cases")
-
-#         # Test minimum data length (should work with 2 observations)
-#         y_min = jnp.array([10.0, 12.0])
-#         model = Holt(error_type='A', damped=False)
-#         model.fit(y_min)
-#         result = model.predict(h=2)
-#         assert len(result['mean']) == 2, "Should work with 2 observations"
-
-#         # Test that 1 observation fails
-#         y_fail = jnp.array([10.0])
-#         model2 = Holt(error_type='A', damped=False)
-#         try:
-#             model2.fit(y_fail)
-#             raise AssertionError("Should raise ValueError for len(y) < 2")
-#         except ValueError:
-#             pass  # Expected
-
-#         print(f"  Minimum length (2): {len(y_min)} ✓")
-#         print(f"  Rejects length 1 ✓")
-#         print("  ✓ PASSED")
-#         passed += 1
-#     except Exception as e:
-#         print(f"  ✗ FAILED: {e}")
-#         failed += 1
-
-#     # Summary
-#     print("\n" + "="*60)
-#     print(f"Tests passed: {passed}/{passed+failed}")
-#     if failed == 0:
-#         print("All tests passed! ✓")
-#     else:
-#         print(f"{failed} test(s) failed.")
-#     print("="*60)
-
-
-# if __name__ == '__main__':
-#     test()

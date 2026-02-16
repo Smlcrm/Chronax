@@ -24,7 +24,9 @@ Instance Attributes:
 5. phi: float | None - Damping parameter (0.8-0.98), used only if damped=True
 6. alias: str - Custom name for the model
 7. conformal_params: ConformalIntervals | None - Parameters for conformal prediction intervals
-8. model_: dict - Fitted model parameters (created after fit())
+8. allow_extended_iterations: bool - Whether to allow extended iteration counts for difficult series
+9. iteration_scaling: str - Scaling method for adaptive iterations ("quadratic" or "cubic")
+10. model_: dict - Fitted model parameters (created after fit())
    - fitted: In-sample fitted values
    - level: Final level state
    - trend: Final trend state
@@ -52,6 +54,7 @@ Helper Methods:
 - _validate_level() - Validate prediction interval levels
 - _initialize_states() - Initialize level, trend, and seasonal states via decomposition
 - _get_phi() - Get damping factor
+- _estimate_iterations() - Estimate optimal iteration count based on data complexity
 - _fit_parameters() - Core optimization routine using JAX/optax
 - _generate_forecasts() - Compute h-step ahead point forecasts with seasonality
 - _calculate_native_intervals() - Analytical prediction interval formulas with seasonality
@@ -62,7 +65,8 @@ Helper Methods:
 
 Implementation Notes:
 - Uses optax.adam optimizer with exponential learning rate decay
-- Default 1500 iterations for parameter optimization (more complex than Holt)
+- Adaptive iteration count based on data complexity (50-600 iterations)
+- Module-level JIT functions for efficient compilation caching
 - Supports 8 model variants: AAA, AAM, MAA, MAM (+ damped versions)
 - Requires at least season_length observations for fitting
 - States initialized via classical decomposition with trend estimation
@@ -86,13 +90,205 @@ _INIT_ALPHA = 0.3
 _INIT_BETA = 0.1
 _INIT_GAMMA = 0.1
 _N_PARAMS = 3  # alpha, beta, and gamma
-_N_ITER = 1500
 _LEARNING_RATE = 0.01
 _LR_DECAY_STEPS = 500
 _LR_DECAY_RATE = 0.9
 _EPSILON = 1e-10  # For numerical stability
 
+# Adaptive iteration constants
+_MIN_ITER = 50
+_MAX_ITER = 350
+_MAX_ITER_EXTENDED = 600
+
 __all__ = ['HoltWinters']
+
+
+# =============================================================================
+# Module-level JIT-compiled optimization functions
+# =============================================================================
+
+def _run_hw_optimization(y, l0, b0, s0, phi, is_additive_error, is_additive_season, season_length, n_iters):
+    """Module-level JIT-compiled optimization loop for Holt-Winters.
+
+    Parameters
+    ----------
+    y : jnp.ndarray
+        Time series data
+    l0 : float
+        Initial level
+    b0 : float
+        Initial trend
+    s0 : jnp.ndarray
+        Initial seasonal states (length season_length)
+    phi : float
+        Damping factor (1.0 for non-damped)
+    is_additive_error : bool
+        True for additive error, False for multiplicative
+    is_additive_season : bool
+        True for additive seasonality, False for multiplicative
+    season_length : int
+        Number of periods in a season
+    n_iters : int
+        Number of optimization iterations
+
+    Returns
+    -------
+    tuple
+        (best_params, raw_fit_result) where best_params is [alpha, beta, gamma]
+        and raw_fit_result is dict with fitted values, level, trend, seasonal, residuals
+    """
+    scheduler = optax.exponential_decay(
+        init_value=_LEARNING_RATE,
+        transition_steps=_LR_DECAY_STEPS,
+        decay_rate=_LR_DECAY_RATE
+    )
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adam(learning_rate=scheduler)
+    )
+
+    n = len(y)
+    m = season_length
+
+    # Define step functions for all 4 model variants
+    def step_AAA(carry, y_t):
+        """Additive error, Additive seasonality (AAA)."""
+        level_prev, trend_prev, seasonal_prev, alpha, beta, gamma = carry
+        phi_trend = phi * trend_prev
+        s_prev = seasonal_prev[m - 1]  # s_{t-m}
+
+        y_hat = level_prev + phi_trend + s_prev
+
+        level = alpha * (y_t - s_prev) + (1 - alpha) * (level_prev + phi_trend)
+        trend = beta * (level - level_prev) + (1 - beta) * phi_trend
+        new_seasonal = gamma * (y_t - level) + (1 - gamma) * s_prev
+
+        seasonal_new = jnp.roll(seasonal_prev, -1)
+        seasonal_new = seasonal_new.at[-1].set(jnp.float32(new_seasonal))
+
+        return (level, trend, seasonal_new, alpha, beta, gamma), y_hat
+
+    def step_AAM(carry, y_t):
+        """Additive error, Multiplicative seasonality (AAM)."""
+        level_prev, trend_prev, seasonal_prev, alpha, beta, gamma = carry
+        phi_trend = phi * trend_prev
+        s_prev = seasonal_prev[m - 1]  # s_{t-m}
+
+        y_hat = (level_prev + phi_trend) * s_prev
+
+        level = alpha * (y_t / jnp.maximum(s_prev, _EPSILON)) + (1 - alpha) * (level_prev + phi_trend)
+        trend = beta * (level - level_prev) + (1 - beta) * phi_trend
+        new_seasonal = gamma * (y_t / jnp.maximum(level, _EPSILON)) + (1 - gamma) * s_prev
+
+        seasonal_new = jnp.roll(seasonal_prev, -1)
+        seasonal_new = seasonal_new.at[-1].set(jnp.float32(new_seasonal))
+
+        return (level, trend, seasonal_new, alpha, beta, gamma), y_hat
+
+    def step_MAA(carry, y_t):
+        """Multiplicative error, Additive seasonality (MAA)."""
+        level_prev, trend_prev, seasonal_prev, alpha, beta, gamma = carry
+        phi_trend = phi * trend_prev
+        s_prev = seasonal_prev[m - 1]  # s_{t-m}
+
+        y_hat = level_prev + phi_trend + s_prev
+        epsilon = (y_t - y_hat) / jnp.maximum(jnp.abs(y_hat), _EPSILON)
+
+        level = (level_prev + phi_trend - s_prev) + (level_prev + phi_trend) * alpha * epsilon
+        trend = phi_trend + beta * (level_prev + phi_trend) * epsilon
+        new_seasonal = s_prev + gamma * (level_prev + phi_trend) * epsilon
+
+        seasonal_new = jnp.roll(seasonal_prev, -1)
+        seasonal_new = seasonal_new.at[-1].set(jnp.float32(new_seasonal))
+
+        return (level, trend, seasonal_new, alpha, beta, gamma), y_hat
+
+    def step_MAM(carry, y_t):
+        """Multiplicative error, Multiplicative seasonality (MAM)."""
+        level_prev, trend_prev, seasonal_prev, alpha, beta, gamma = carry
+        phi_trend = phi * trend_prev
+        s_prev = seasonal_prev[m - 1]  # s_{t-m}
+
+        y_hat = (level_prev + phi_trend) * s_prev
+        epsilon = (y_t - y_hat) / jnp.maximum(jnp.abs(y_hat), _EPSILON)
+
+        level = (level_prev + phi_trend) * (1 + alpha * epsilon)
+        trend = phi_trend + beta * (level_prev + phi_trend) * epsilon
+        new_seasonal = s_prev * (1 + gamma * epsilon)
+
+        seasonal_new = jnp.roll(seasonal_prev, -1)
+        seasonal_new = seasonal_new.at[-1].set(jnp.float32(new_seasonal))
+
+        return (level, trend, seasonal_new, alpha, beta, gamma), y_hat
+
+    # Select appropriate step function based on model type
+    if is_additive_error and is_additive_season:
+        step_fn = step_AAA
+    elif is_additive_error and not is_additive_season:
+        step_fn = step_AAM
+    elif not is_additive_error and is_additive_season:
+        step_fn = step_MAA
+    else:
+        step_fn = step_MAM
+
+    def raw_fit(params_abg):
+        alpha, beta, gamma = params_abg
+        init_carry = (l0, b0, s0, alpha, beta, gamma)
+        final_carry, fitted_vals = lax.scan(step_fn, init_carry, y)
+        final_level, final_trend, final_seasonal, _, _, _ = final_carry
+        return fitted_vals, final_level, final_trend, final_seasonal, y - fitted_vals
+
+    def loss_fn(params_abg):
+        fitted, _, _, _, residuals = raw_fit(params_abg)
+        sse = jnp.sum(residuals ** 2)
+        if is_additive_error:
+            return n * jnp.log(jnp.maximum(sse, _EPSILON))
+        else:
+            log_det = 2 * jnp.sum(jnp.log(jnp.maximum(jnp.abs(fitted), _EPSILON)))
+            return n * jnp.log(jnp.maximum(sse, _EPSILON)) + log_det
+
+    value_and_grad_fn = jax.value_and_grad(loss_fn)
+
+    # Track best params during optimization (prevents overshoot)
+    def opt_step(carry, _):
+        params, opt_state, best_params, best_loss = carry
+        loss, grads = value_and_grad_fn(params)
+        loss = jnp.float32(loss)
+
+        updates, opt_state = optimizer.update(grads, opt_state, params)
+        new_params = optax.apply_updates(params, updates)
+        new_params = jnp.clip(new_params, 0.0001, 0.9999)
+
+        # Track best parameters (minimum loss)
+        improved = loss < best_loss
+        new_best_params = jnp.where(improved, params, best_params)
+        new_best_loss = jnp.where(improved, loss, best_loss)
+
+        return (new_params, opt_state, new_best_params, new_best_loss), loss
+
+    init_params = jnp.array([_INIT_ALPHA, _INIT_BETA, _INIT_GAMMA])
+    opt_state = optimizer.init(init_params)
+    init_carry = (init_params, opt_state, init_params, jnp.float32(jnp.inf))
+    (_, _, best_params, _), _ = lax.scan(opt_step, init_carry, None, length=n_iters)
+
+    # Get final results with best parameters
+    fitted, final_level, final_trend, final_seasonal, residuals = raw_fit(best_params)
+
+    return best_params, {
+        'fitted': fitted,
+        'level': final_level,
+        'trend': final_trend,
+        'seasonal': final_seasonal,
+        'residuals': residuals,
+        'alpha': best_params[0],
+        'beta': best_params[1],
+        'gamma': best_params[2],
+    }
+
+
+# JIT with static args: is_additive_error, is_additive_season, season_length, n_iters
+_run_hw_optimization_jit = jax.jit(_run_hw_optimization, static_argnums=(5, 6, 7, 8))
+
 
 class HoltWinters(BaseForecaster):
     # Helper methods
@@ -112,73 +308,61 @@ class HoltWinters(BaseForecaster):
                 raise ValueError("All level values must be numbers between 0 and 100")
 
     def _initialize_states(self, y: jnp.ndarray) -> tuple[float, float, jnp.ndarray]:
-        """Initialize level, trend, and seasonal states.
+        """Initialize level, trend, and seasonal states using JAX.
 
         Uses classical decomposition approach:
         - Level: mean of first season
         - Trend: average slope across seasons
         - Seasonal: average seasonal pattern
         """
-        import numpy as np
-
         m = self.season_length
         n = len(y)
-        y_np = np.array(y)
-
-        # Need at least 2 full seasons for robust initialization
         n_seasons = n // m
 
         if n_seasons < 2:
-            # Fall back to simple initialization
-            l0 = float(np.mean(y_np[:m]) if n >= m else y_np[0])
+            # Simple fallback
+            l0 = float(jnp.mean(y[:m])) if n >= m else float(y[0])
             b0 = 0.0
             if n >= m:
-                s0 = np.array(y_np[:m]) - l0
+                s0 = y[:m] - l0 if self.season_type == 'A' else y[:m] / jnp.maximum(l0, _EPSILON)
             else:
-                s0 = np.zeros(m)
+                s0 = jnp.zeros(m, dtype=jnp.float32) if self.season_type == 'A' else jnp.ones(m, dtype=jnp.float32)
+            return l0, b0, s0.astype(jnp.float32)
+
+        # Compute seasonal averages via reshape (uniform shapes for JAX)
+        n_complete = n_seasons * m
+        y_reshaped = y[:n_complete].reshape(n_seasons, m)  # (n_seasons, m)
+        seasonal_avgs = jnp.mean(y_reshaped, axis=1)  # Mean of each season
+
+        # Linear regression on seasonal averages for trend
+        t = jnp.arange(n_seasons, dtype=jnp.float32)
+        t_mean = jnp.mean(t)
+        avg_mean = jnp.mean(seasonal_avgs)
+
+        cov_ta = jnp.sum((t - t_mean) * (seasonal_avgs - avg_mean))
+        var_t = jnp.sum((t - t_mean) ** 2)
+        b0 = float(cov_ta / jnp.maximum(var_t, _EPSILON))
+        l0 = float(avg_mean - b0 * t_mean)
+
+        # Detrend and compute seasonal pattern via reshape (avoids variable-length indexing)
+        trend_vals = l0 + b0 * jnp.repeat(jnp.arange(n_seasons, dtype=jnp.float32), m)
+        y_complete = y[:n_complete]
+        if self.season_type == 'A':
+            detrended = y_complete - trend_vals
         else:
-            # Compute seasonal averages
-            seasonal_avgs = []
-            for i in range(n_seasons):
-                start_idx = i * m
-                end_idx = min(start_idx + m, n)
-                if end_idx - start_idx == m:
-                    seasonal_avgs.append(np.mean(y_np[start_idx:end_idx]))
+            detrended = y_complete / jnp.maximum(trend_vals, _EPSILON)
 
-            # Estimate trend from seasonal averages
-            if len(seasonal_avgs) >= 2:
-                t_vals = np.arange(len(seasonal_avgs))
-                X_trend = np.column_stack([np.ones(len(seasonal_avgs)), t_vals])
-                coef = np.linalg.lstsq(X_trend, np.array(seasonal_avgs), rcond=None)[0]
-                l0, b0 = float(coef[0]), float(coef[1])
-            else:
-                l0 = seasonal_avgs[0] if seasonal_avgs else float(y_np[0])
-                b0 = 0.0
+        # Average by position within season using reshape (uniform shapes)
+        detrended_reshaped = detrended.reshape(n_seasons, m)  # (n_seasons, m)
+        s0 = jnp.mean(detrended_reshaped, axis=0)  # Average across seasons per position
 
-            # Compute seasonal components
-            # Detrend the series first
-            detrended = np.zeros(n)
-            for i in range(n):
-                trend_val = l0 + b0 * (i // m)
-                if self.season_type == 'A':
-                    detrended[i] = y_np[i] - trend_val
-                else:  # Multiplicative
-                    detrended[i] = y_np[i] / (trend_val + _EPSILON) if trend_val != 0 else 1.0
+        # Normalize
+        if self.season_type == 'A':
+            s0 = s0 - jnp.mean(s0)
+        else:
+            s0 = s0 / jnp.maximum(jnp.mean(s0), _EPSILON)
 
-            # Average seasonal indices
-            s0 = np.zeros(m)
-            for j in range(m):
-                indices = detrended[j::m]
-                s0[j] = np.mean(indices) if len(indices) > 0 else 0.0
-
-            # Normalize seasonal components
-            if self.season_type == 'A':
-                s0 = s0 - np.mean(s0)
-            else:  # Multiplicative
-                mean_s = np.mean(s0)
-                s0 = s0 / mean_s if mean_s != 0 else np.ones(m)
-
-        return l0, b0, jnp.array(s0, dtype=jnp.float32)
+        return l0, b0, s0.astype(jnp.float32)
 
     def _get_phi(self) -> float:
         """Get damping factor phi."""
@@ -186,6 +370,54 @@ class HoltWinters(BaseForecaster):
             return self.phi if self.phi is not None else 0.9
         else:
             return 1.0
+
+    def _estimate_iterations(self, y: jnp.ndarray) -> int:
+        """Estimate iterations based on noise, seasonality, and trend."""
+        n = len(y)
+        m = self.season_length
+
+        # 1. Noise: CV of first differences
+        diffs = y[1:] - y[:-1]
+        cv_diffs = jnp.std(diffs) / jnp.maximum(jnp.abs(jnp.mean(diffs)), _EPSILON)
+        noise_score = float(jnp.clip(cv_diffs / 5.0, 0.0, 1.0))
+
+        # 2. Seasonality difficulty: 1 - ACF(m)
+        y_c = y - jnp.mean(y)
+        var_y = jnp.var(y)
+        n_acf = n - m
+        if n_acf > 0:
+            acf_m = jnp.sum(y_c[:n_acf] * y_c[m:]) / (n_acf * jnp.maximum(var_y, _EPSILON))
+            seasonality_difficulty = float(1.0 - jnp.maximum(jnp.clip(acf_m, -1.0, 1.0), 0.0))
+        else:
+            seasonality_difficulty = 1.0
+
+        # 3. Trend clarity
+        t = jnp.arange(n, dtype=jnp.float32)
+        y_mean, t_mean = jnp.mean(y), jnp.mean(t)
+        slope = jnp.sum((t - t_mean) * (y - y_mean)) / jnp.maximum(jnp.sum((t - t_mean)**2), _EPSILON)
+        y_pred = y_mean + slope * (t - t_mean)
+        ss_res = jnp.sum((y - y_pred)**2)
+        ss_tot = jnp.sum((y - y_mean)**2)
+        r_sq = 1 - ss_res / jnp.maximum(ss_tot, _EPSILON)
+        trend_difficulty = float(1.0 - jnp.clip(r_sq, 0.0, 1.0))
+
+        # 4. Season length factor
+        season_length_score = float(jnp.clip((m - 4) / 48, 0.0, 1.0))
+
+        # 5. Coverage factor
+        n_seasons = n // m
+        coverage_score = float(jnp.clip((4 - n_seasons) / 4, 0.0, 1.0)) if n_seasons < 4 else 0.0
+
+        # Weighted combination
+        complexity = (0.30 * noise_score + 0.35 * seasonality_difficulty +
+                      0.15 * trend_difficulty + 0.10 * season_length_score + 0.10 * coverage_score)
+
+        # Scale to range
+        min_iters = _MIN_ITER
+        max_iters = _MAX_ITER_EXTENDED if self.allow_extended_iterations else _MAX_ITER
+        exponent = {"cubic": 3.0, "quadratic": 2.0}[self.iteration_scaling]
+
+        return int(min_iters + (complexity ** exponent) * (max_iters - min_iters))
 
     def _compute_base_variance(
         self,
@@ -269,113 +501,20 @@ class HoltWinters(BaseForecaster):
         """Fit model parameters and return results dictionary."""
         l0, b0, s0 = self._initialize_states(y)
         phi = self._get_phi()
-        m = self.season_length
+        n_iters = self._estimate_iterations(y)
+        is_additive_error = self.error_type == 'A'
+        is_additive_season = self.season_type == 'A'
 
-        def step_update(carry, y_t):
-            level_prev, trend_prev, seasonal_prev, alpha, beta, gamma = carry
-
-            # Compute forecast
-            phi_trend = phi * trend_prev
-            s_prev = seasonal_prev[m - 1]  # s_{t-m}
-
-            if self.season_type == 'A':
-                y_hat = level_prev + phi_trend + s_prev
-            else:  # Multiplicative
-                y_hat = (level_prev + phi_trend) * s_prev
-
-            # Update equations
-            if self.error_type == 'A':
-                # Additive error
-                if self.season_type == 'A':
-                    # AAA model
-                    level = alpha * (y_t - s_prev) + (1 - alpha) * (level_prev + phi_trend)
-                    trend = beta * (level - level_prev) + (1 - beta) * phi_trend
-                    new_seasonal = gamma * (y_t - level) + (1 - gamma) * s_prev
-                else:
-                    # AAM model
-                    level = alpha * (y_t / jnp.maximum(s_prev, _EPSILON)) + (1 - alpha) * (level_prev + phi_trend)
-                    trend = beta * (level - level_prev) + (1 - beta) * phi_trend
-                    new_seasonal = gamma * (y_t / jnp.maximum(level, _EPSILON)) + (1 - gamma) * s_prev
-            else:
-                # Multiplicative error
-                epsilon = (y_t - y_hat) / jnp.maximum(jnp.abs(y_hat), _EPSILON)
-                if self.season_type == 'A':
-                    # MAA model
-                    level = (level_prev + phi_trend - s_prev) + (level_prev + phi_trend) * alpha * epsilon
-                    trend = phi_trend + beta * (level_prev + phi_trend) * epsilon
-                    new_seasonal = s_prev + gamma * (level_prev + phi_trend) * epsilon
-                else:
-                    # MAM model
-                    level = (level_prev + phi_trend) * (1 + alpha * epsilon)
-                    trend = phi_trend + beta * (level_prev + phi_trend) * epsilon
-                    new_seasonal = s_prev * (1 + gamma * epsilon)
-
-            # Roll seasonal array
-            seasonal_new = jnp.roll(seasonal_prev, -1)
-            seasonal_new = seasonal_new.at[-1].set(new_seasonal)
-
-            return (level, trend, seasonal_new, alpha, beta, gamma), y_hat
-
-        l0_fixed, b0_fixed, s0_fixed = l0, b0, s0
-
-        @jax.jit
-        def raw_fit(params_abg):
-            alpha, beta, gamma = params_abg
-            init_carry = (l0_fixed, b0_fixed, s0_fixed, alpha, beta, gamma)
-            final_carry, fitted_vals = lax.scan(step_update, init_carry, y)
-            final_level, final_trend, final_seasonal, _, _, _ = final_carry
-            residuals = y - fitted_vals
-            return {
-                'fitted': fitted_vals,
-                'level': final_level,
-                'trend': final_trend,
-                'seasonal': final_seasonal,
-                'residuals': residuals,
-                'alpha': alpha,
-                'beta': beta,
-                'gamma': gamma,
-            }
-
-        @jax.jit
-        def _likelihood_loss(params_abg):
-            result = raw_fit(params_abg)
-            residuals = result['residuals']
-            sse = jnp.sum(residuals ** 2)
-            if self.error_type == 'M':
-                fitted_vals = result['fitted']
-                log_det = 2 * jnp.sum(jnp.log(jnp.maximum(jnp.abs(fitted_vals), _EPSILON)))
-                return len(y) * jnp.log(jnp.maximum(sse, _EPSILON)) + log_det
-            else:
-                return len(y) * jnp.log(jnp.maximum(sse, _EPSILON))
-
-        init_params = jnp.array([_INIT_ALPHA, _INIT_BETA, _INIT_GAMMA])
-        scheduler = optax.exponential_decay(
-            init_value=_LEARNING_RATE,
-            transition_steps=_LR_DECAY_STEPS,
-            decay_rate=_LR_DECAY_RATE
+        # Use module-level JIT function
+        best_params, result = _run_hw_optimization_jit(
+            y, l0, b0, s0, phi, is_additive_error, is_additive_season,
+            self.season_length, n_iters
         )
-        optimizer = optax.chain(
-            optax.clip_by_global_norm(1.0),
-            optax.adam(learning_rate=scheduler)
-        )
-        opt_state = optimizer.init(init_params)
-        params = init_params
 
-        @jax.jit
-        def step(carry, _):
-            params, opt_state = carry
-            loss, grads = jax.value_and_grad(_likelihood_loss)(params)
-            updates, opt_state = optimizer.update(grads, opt_state, params)
-            params = optax.apply_updates(params, updates)
-            params = params.at[:_N_PARAMS].set(jnp.clip(params[:_N_PARAMS], 0.0001, 0.9999))
-            return (params, opt_state), loss
-
-        (final_params, _), _ = jax.jit(lambda: lax.scan(step, (params, opt_state), jnp.arange(_N_ITER)))()
-
-        result = raw_fit(final_params)
-        result['alpha'] = float(final_params[0])
-        result['beta'] = float(final_params[1])
-        result['gamma'] = float(final_params[2])
+        # Convert to Python floats for storage
+        result['alpha'] = float(best_params[0])
+        result['beta'] = float(best_params[1])
+        result['gamma'] = float(best_params[2])
         result['sigma'] = utils.calculate_sigma(result['residuals'], len(y) - _N_PARAMS)
         return result
 
@@ -570,6 +709,8 @@ class HoltWinters(BaseForecaster):
         phi: float | None = None,
         alias: str = "HoltWinters",
         conformal_params: ConformalIntervals | None = None,
+        allow_extended_iterations: bool = False,
+        iteration_scaling: str = "quadratic",
     ):
         """
         Holt-Winters' seasonal exponential smoothing method.
@@ -595,6 +736,12 @@ class HoltWinters(BaseForecaster):
         conformal_params : ConformalIntervals | None, default=None
             Parameters for conformal prediction intervals. If None, uses native
             analytical prediction intervals.
+        allow_extended_iterations : bool, default=False
+            Whether to allow extended iteration counts (up to 600) for difficult
+            series. Default max is 350.
+        iteration_scaling : str, default="quadratic"
+            Scaling method for adaptive iterations. "quadratic" (default) gives
+            moderate scaling, "cubic" gives more aggressive scaling for complex series.
 
         Raises
         ------
@@ -605,6 +752,7 @@ class HoltWinters(BaseForecaster):
             If phi is not a float when provided.
             If phi is outside the valid range [0.8, 0.98].
             If conformal_params is not a ConformalIntervals instance.
+            If iteration_scaling is not 'quadratic' or 'cubic'.
         """
         # Validate season_length
         if not isinstance(season_length, int) or season_length < 2:
@@ -636,6 +784,10 @@ class HoltWinters(BaseForecaster):
                 f"conformal_params must be a ConformalIntervals instance, got {type(conformal_params).__name__}"
             )
 
+        # Validate iteration_scaling
+        if iteration_scaling not in ("cubic", "quadratic"):
+            raise ValueError(f"iteration_scaling must be 'cubic' or 'quadratic', got '{iteration_scaling}'")
+
         self.season_length = season_length
         self.error_type = error_type
         self.season_type = season_type
@@ -643,6 +795,8 @@ class HoltWinters(BaseForecaster):
         self.phi = phi
         self.alias = alias
         self.conformal_params = conformal_params
+        self.allow_extended_iterations = allow_extended_iterations
+        self.iteration_scaling = iteration_scaling
 
     def fit(
         self,
@@ -911,350 +1065,3 @@ class HoltWinters(BaseForecaster):
         result = self._fit_parameters(y)
         phi = self._get_phi()
         return self._compute_forecast_with_intervals(result, phi, h, level, fitted, y, X)
-
-
-# def test():
-#     """Comprehensive test suite for Holt-Winters model."""
-#     print("="*60)
-#     print("Running Holt-Winters model tests...")
-#     print("="*60)
-#     passed = 0
-#     failed = 0
-
-#     # Test 1: Basic fit/predict (AAA Model)
-#     try:
-#         print("\nTest 1: Basic fit/predict (AAA Model)")
-#         # Create seasonal data: 3 years of monthly data with trend and seasonality
-#         import numpy as np
-#         np.random.seed(42)
-#         t = np.arange(36)
-#         trend = 100 + 2 * t
-#         seasonal = 10 * np.sin(2 * np.pi * t / 12)
-#         y = jnp.array(trend + seasonal + np.random.normal(0, 2, 36), dtype=jnp.float32)
-
-#         model = HoltWinters(season_length=12, error_type='A', season_type='A', damped=False)
-#         model.fit(y)
-#         result = model.predict(h=12)
-
-#         assert 'mean' in result, "Result should contain 'mean' key"
-#         assert len(result['mean']) == 12, "Forecast length should be 12"
-#         assert jnp.all(jnp.isfinite(result['mean'])), "Forecasts should be finite"
-
-#         print(f"  Fitted alpha: {model.model_['alpha']:.4f}")
-#         print(f"  Fitted beta: {model.model_['beta']:.4f}")
-#         print(f"  Fitted gamma: {model.model_['gamma']:.4f}")
-#         print(f"  First 3 forecasts: {result['mean'][:3]}")
-#         print("  ✓ PASSED")
-#         passed += 1
-#     except Exception as e:
-#         print(f"  ✗ FAILED: {e}")
-#         failed += 1
-
-#     # Test 2: MAM Model (Multiplicative error, Additive trend, Multiplicative seasonality)
-#     try:
-#         print("\nTest 2: MAM Model")
-#         import numpy as np
-#         np.random.seed(42)
-#         t = np.arange(36)
-#         trend = 100 + 2 * t
-#         seasonal = 1 + 0.1 * np.sin(2 * np.pi * t / 12)
-#         y = jnp.array(trend * seasonal, dtype=jnp.float32)
-
-#         model = HoltWinters(season_length=12, error_type='M', season_type='M', damped=False)
-#         model.fit(y)
-#         result = model.predict(h=12)
-
-#         assert 'mean' in result, "Result should contain 'mean' key"
-#         assert len(result['mean']) == 12, "Forecast length should be 12"
-
-#         print(f"  Fitted alpha: {model.model_['alpha']:.4f}")
-#         print(f"  Fitted beta: {model.model_['beta']:.4f}")
-#         print(f"  Fitted gamma: {model.model_['gamma']:.4f}")
-#         print("  ✓ PASSED")
-#         passed += 1
-#     except Exception as e:
-#         print(f"  ✗ FAILED: {e}")
-#         failed += 1
-
-#     # Test 3: AAM Model (Additive error, Additive trend, Multiplicative seasonality)
-#     try:
-#         print("\nTest 3: AAM Model")
-#         import numpy as np
-#         np.random.seed(42)
-#         t = np.arange(36)
-#         trend = 100 + 2 * t
-#         seasonal = 1 + 0.1 * np.sin(2 * np.pi * t / 12)
-#         y = jnp.array(trend * seasonal, dtype=jnp.float32)
-
-#         model = HoltWinters(season_length=12, error_type='A', season_type='M', damped=False)
-#         model.fit(y)
-#         result = model.predict(h=12)
-
-#         assert 'mean' in result, "Should have forecasts"
-#         assert len(result['mean']) == 12, "Forecast length should be 12"
-
-#         print(f"  Model fitted successfully")
-#         print("  ✓ PASSED")
-#         passed += 1
-#     except Exception as e:
-#         print(f"  ✗ FAILED: {e}")
-#         failed += 1
-
-#     # Test 4: MAA Model (Multiplicative error, Additive trend, Additive seasonality)
-#     try:
-#         print("\nTest 4: MAA Model")
-#         import numpy as np
-#         np.random.seed(42)
-#         t = np.arange(36)
-#         trend = 100 + 2 * t
-#         seasonal = 10 * np.sin(2 * np.pi * t / 12)
-#         y = jnp.array(trend + seasonal, dtype=jnp.float32)
-
-#         model = HoltWinters(season_length=12, error_type='M', season_type='A', damped=False)
-#         model.fit(y)
-#         result = model.predict(h=12)
-
-#         assert 'mean' in result, "Should have forecasts"
-#         assert len(result['mean']) == 12, "Forecast length should be 12"
-
-#         print(f"  Model fitted successfully")
-#         print("  ✓ PASSED")
-#         passed += 1
-#     except Exception as e:
-#         print(f"  ✗ FAILED: {e}")
-#         failed += 1
-
-#     # Test 5: Damped Trend
-#     try:
-#         print("\nTest 5: Damped Trend")
-#         import numpy as np
-#         np.random.seed(42)
-#         t = np.arange(36)
-#         trend = 100 + 2 * t
-#         seasonal = 10 * np.sin(2 * np.pi * t / 12)
-#         y = jnp.array(trend + seasonal, dtype=jnp.float32)
-
-#         # Non-damped model
-#         model_nodamp = HoltWinters(season_length=12, error_type='A', season_type='A', damped=False)
-#         model_nodamp.fit(y)
-#         result_nodamp = model_nodamp.predict(h=24)
-
-#         # Damped model
-#         model_damp = HoltWinters(season_length=12, error_type='A', season_type='A', damped=True, phi=0.9)
-#         model_damp.fit(y)
-#         result_damp = model_damp.predict(h=24)
-
-#         # At long horizons, damped should be lower (due to dampening trend)
-#         last_forecast_damp = result_damp['mean'][-1]
-#         last_forecast_nodamp = result_nodamp['mean'][-1]
-
-#         assert last_forecast_damp < last_forecast_nodamp, \
-#             "Damped forecast should be lower at long horizons"
-
-#         print(f"  Non-damped h=24: {last_forecast_nodamp:.2f}")
-#         print(f"  Damped h=24: {last_forecast_damp:.2f}")
-#         print("  ✓ PASSED")
-#         passed += 1
-#     except Exception as e:
-#         print(f"  ✗ FAILED: {e}")
-#         failed += 1
-
-#     # Test 6: Prediction Intervals
-#     try:
-#         print("\nTest 6: Prediction Intervals")
-#         import numpy as np
-#         np.random.seed(42)
-#         t = np.arange(36)
-#         trend = 100 + 2 * t
-#         seasonal = 10 * np.sin(2 * np.pi * t / 12)
-#         y = jnp.array(trend + seasonal, dtype=jnp.float32)
-
-#         model = HoltWinters(season_length=12, error_type='A', season_type='A', damped=False)
-#         model.fit(y)
-#         result = model.predict(h=12, level=[80, 95])
-
-#         assert 'lo-80' in result, "Should have lo-80"
-#         assert 'hi-80' in result, "Should have hi-80"
-#         assert 'lo-95' in result, "Should have lo-95"
-#         assert 'hi-95' in result, "Should have hi-95"
-
-#         # Check ordering for first forecast
-#         assert result['lo-95'][0] < result['lo-80'][0], "lo-95 < lo-80"
-#         assert result['lo-80'][0] < result['mean'][0], "lo-80 < mean"
-#         assert result['mean'][0] < result['hi-80'][0], "mean < hi-80"
-#         assert result['hi-80'][0] < result['hi-95'][0], "hi-80 < hi-95"
-
-#         print(f"  h=1: [{result['lo-95'][0]:.2f}, {result['mean'][0]:.2f}, {result['hi-95'][0]:.2f}]")
-#         print(f"  h=12: [{result['lo-95'][11]:.2f}, {result['mean'][11]:.2f}, {result['hi-95'][11]:.2f}]")
-#         print("  ✓ PASSED")
-#         passed += 1
-#     except Exception as e:
-#         print(f"  ✗ FAILED: {e}")
-#         failed += 1
-
-#     # Test 7: Different Season Lengths
-#     try:
-#         print("\nTest 7: Different Season Lengths")
-
-#         # Quarterly data (season_length=4)
-#         import numpy as np
-#         np.random.seed(42)
-#         t = np.arange(28)  # 7 years quarterly
-#         trend = 100 + 2 * t
-#         seasonal = 5 * np.sin(2 * np.pi * t / 4)
-#         y_quarterly = jnp.array(trend + seasonal, dtype=jnp.float32)
-
-#         model_q = HoltWinters(season_length=4, error_type='A', season_type='A')
-#         model_q.fit(y_quarterly)
-#         result_q = model_q.predict(h=4)
-#         assert len(result_q['mean']) == 4, "Should forecast 4 quarters"
-
-#         # Weekly data (season_length=7)
-#         t = np.arange(35)  # 5 weeks
-#         trend = 100 + t
-#         seasonal = 3 * np.sin(2 * np.pi * t / 7)
-#         y_weekly = jnp.array(trend + seasonal, dtype=jnp.float32)
-
-#         model_w = HoltWinters(season_length=7, error_type='A', season_type='A')
-#         model_w.fit(y_weekly)
-#         result_w = model_w.predict(h=7)
-#         assert len(result_w['mean']) == 7, "Should forecast 7 days"
-
-#         print(f"  Quarterly (season=4): ✓")
-#         print(f"  Weekly (season=7): ✓")
-#         print("  ✓ PASSED")
-#         passed += 1
-#     except Exception as e:
-#         print(f"  ✗ FAILED: {e}")
-#         failed += 1
-
-#     # Test 8: predict_in_sample()
-#     try:
-#         print("\nTest 8: predict_in_sample()")
-#         import numpy as np
-#         np.random.seed(42)
-#         t = np.arange(36)
-#         trend = 100 + 2 * t
-#         seasonal = 10 * np.sin(2 * np.pi * t / 12)
-#         y = jnp.array(trend + seasonal, dtype=jnp.float32)
-
-#         model = HoltWinters(season_length=12, error_type='A', season_type='A', damped=False)
-#         model.fit(y)
-#         result = model.predict_in_sample(level=[95])
-
-#         assert 'fitted' in result, "Should have fitted values"
-#         assert len(result['fitted']) == len(y), "Fitted should match training length"
-#         assert 'fitted-lo-95' in result, "Should have fitted intervals"
-#         assert 'fitted-hi-95' in result, "Should have fitted intervals"
-
-#         print(f"  Fitted length: {len(result['fitted'])}")
-#         print(f"  First fitted value: {result['fitted'][0]:.2f}")
-#         print("  ✓ PASSED")
-#         passed += 1
-#     except Exception as e:
-#         print(f"  ✗ FAILED: {e}")
-#         failed += 1
-
-#     # Test 9: forecast() Method
-#     try:
-#         print("\nTest 9: forecast() Method (Stateless)")
-#         import numpy as np
-#         np.random.seed(42)
-#         t = np.arange(36)
-#         trend = 100 + 2 * t
-#         seasonal = 10 * np.sin(2 * np.pi * t / 12)
-#         y = jnp.array(trend + seasonal, dtype=jnp.float32)
-
-#         model = HoltWinters(season_length=12, error_type='A', season_type='A', damped=False)
-#         # Don't call fit()
-#         result = model.forecast(y, h=12, fitted=True, level=[95])
-
-#         assert 'mean' in result, "Should have forecasts"
-#         assert 'fitted' in result, "Should have fitted values with fitted=True"
-#         assert len(result['mean']) == 12, "Forecast length should be 12"
-#         assert len(result['fitted']) == len(y), "Fitted length should match y"
-
-#         print(f"  Forecast h=1: {result['mean'][0]:.2f}")
-#         print(f"  Includes fitted values and intervals")
-#         print("  ✓ PASSED")
-#         passed += 1
-#     except Exception as e:
-#         print(f"  ✗ FAILED: {e}")
-#         failed += 1
-
-#     # Test 10: forward() Method
-#     try:
-#         print("\nTest 10: forward() Method")
-#         import numpy as np
-#         np.random.seed(42)
-#         t = np.arange(36)
-#         trend = 100 + 2 * t
-#         seasonal = 10 * np.sin(2 * np.pi * t / 12)
-#         y1 = jnp.array(trend + seasonal, dtype=jnp.float32)
-
-#         # Different scale
-#         trend2 = 200 + 3 * t
-#         seasonal2 = 15 * np.sin(2 * np.pi * t / 12)
-#         y2 = jnp.array(trend2 + seasonal2, dtype=jnp.float32)
-
-#         model = HoltWinters(season_length=12, error_type='A', season_type='A', damped=False)
-#         model.fit(y1)
-
-#         # Apply to new series
-#         result = model.forward(y2, h=6)
-
-#         assert 'mean' in result, "Should have forecasts"
-#         assert len(result['mean']) == 6, "Forecast length should be 6"
-#         # Forecasts should follow y2 scale, not y1
-#         assert result['mean'][0] > 200, "Forecast should follow y2 scale"
-
-#         print(f"  y1 range: [{float(y1.min()):.1f}, {float(y1.max()):.1f}]")
-#         print(f"  y2 range: [{float(y2.min()):.1f}, {float(y2.max()):.1f}]")
-#         print(f"  Forward forecast: {result['mean'][0]:.2f}")
-#         print("  ✓ PASSED")
-#         passed += 1
-#     except Exception as e:
-#         print(f"  ✗ FAILED: {e}")
-#         failed += 1
-
-#     # Test 11: Edge Cases
-#     try:
-#         print("\nTest 11: Edge Cases")
-
-#         # Test minimum data length (should work with season_length observations)
-#         import numpy as np
-#         y_min = jnp.array(np.arange(12, dtype=np.float32) + 100)
-#         model = HoltWinters(season_length=12, error_type='A', season_type='A', damped=False)
-#         model.fit(y_min)
-#         result = model.predict(h=4)
-#         assert len(result['mean']) == 4, "Should work with season_length observations"
-
-#         # Test that insufficient data fails
-#         y_fail = jnp.array(np.arange(10, dtype=np.float32))
-#         model2 = HoltWinters(season_length=12, error_type='A', season_type='A', damped=False)
-#         try:
-#             model2.fit(y_fail)
-#             raise AssertionError("Should raise ValueError for len(y) < season_length")
-#         except ValueError:
-#             pass  # Expected
-
-#         print(f"  Minimum length (season_length=12): {len(y_min)} ✓")
-#         print(f"  Rejects insufficient data ✓")
-#         print("  ✓ PASSED")
-#         passed += 1
-#     except Exception as e:
-#         print(f"  ✗ FAILED: {e}")
-#         failed += 1
-
-#     # Summary
-#     print("\n" + "="*60)
-#     print(f"Tests passed: {passed}/{passed+failed}")
-#     if failed == 0:
-#         print("All tests passed! ✓")
-#     else:
-#         print(f"{failed} test(s) failed.")
-#     print("="*60)
-
-
-# if __name__ == '__main__':
-#     test()
