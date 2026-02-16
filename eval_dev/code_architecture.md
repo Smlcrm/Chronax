@@ -8,7 +8,7 @@ The codebase is a **Benchmarking Suite** designed to rigorously compare the perf
 2.  **StatsForecast**: A high-performance forecasting library based on Numba.
 
 **Key Goals**:
-*   Isolate library runtimes to avoid dependency conflicts (using subprocesses).
+*   Isolate model runs to avoid cross-run contamination (using subprocesses).
 *   Measure "Cold Start" (compilation+training) vs. "Warm" (inference) times.
 *   Measure overhead for generating prediction intervals.
 *   Evaluate accuracy using standard metrics (MAPE, MAE, etc.).
@@ -24,7 +24,7 @@ The codebase is a **Benchmarking Suite** designed to rigorously compare the perf
 
 ## 2. Execution Flow (Step-by-Step)
 
-The workflow consists of an **Orchestrator** (`run_benchmark.py`) that spawns isolated **Worker Processes** (`benchmark_suite.py`) for each experiment configurations.
+The workflow consists of an **Orchestrator** (`run_benchmark.py`) that spawns isolated **Worker Processes** (`benchmark_suite.py`) for each experiment configuration.
 
 ### A. Orchestrator Initialization (`run_benchmark.py`)
 
@@ -33,7 +33,7 @@ The workflow consists of an **Orchestrator** (`run_benchmark.py`) that spawns is
     *   **Action**: parses arguments and calls `run_benchmark()`.
 
 2.  **`run_benchmark(config_path, ...)`**:
-    *   **Step 1: Load Config**: Reads `config.yaml` to get experiment settings (scales, horizon, etc.), environments (python paths), datasets, and model lists.
+    *   **Step 1: Load Config**: Reads `config.yaml` to get experiment settings (scales, horizon, etc.), datasets, and model lists.
     *   **Step 2: Initialize Directories**: Creates `benchmark_results/` (and `forecast_results/` if needed).
     *   **Step 3: Main Execution Loops**:
         *   **Outer Loop**: Iterate through valid **Datasets**.
@@ -44,7 +44,7 @@ The workflow consists of an **Orchestrator** (`run_benchmark.py`) that spawns is
 3.  **Subprocess Spawning**:
     *   For each `{Dataset, Scale, Model}` combination:
     *   **Action**: Constructs a command line execution string.
-    *   **Logic**: Selects the appropriate Python interpreter (`chronax_python` vs `sf_python`) defined in config.
+    *   **Logic**: Uses the current Python interpreter (`sys.executable`) for both libraries.
     *   **Call**: `subprocess.run([python_exe, "eval_dev/benchmark_suite.py", ...])`
     *   **Wait**: Blocks until the subprocess completes.
     *   **Capture**: Reads `stdout` looking for the delimiter `RESULT_JSON:::`.

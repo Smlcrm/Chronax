@@ -257,67 +257,105 @@ class ModelRegistry:
     """Central registry with lazy model loading."""
     
     _MODELS = {
+        # Simple Baselines
+        "Naive": {"params": {}},
+        "SeasonalNaive": {"params": {}},
+        "HistoricAverage": {"params": {}},
+        "RandomWalkWithDrift": {"params": {}},
         "WindowAverage": {"params": {"window_size": 24}},
-        "ADIDA": {"params": {}},
-        "CrostonClassic": {"params": {}},
-        "AutoETS": {"params": {}},
-        "GARCH": {"params": {}},
-        "AutoCES": {"params": {}},
-        "Theta": {"params": {}},
-        "AutoTheta": {"params": {}},
+        "SeasonalWindowAverage": {"params": {"window_size": 24, "season_length": 24}},
+        # Smoothing Models
+        "SimpleExponentialSmoothing": {"params": {}},
+        "SeasonalExponentialSmoothing": {"params": {}},
         "Holt": {"params": {}},
         "HoltWinters": {"params": {}},
+        # Intermittent Demand Models
+        "ADIDA": {"params": {}},
+        "CrostonClassic": {"params": {}},
+        "TSB": {"params": {}},
+        "IMAPA": {"params": {}},
+        # Decomposition & Volatility
         "MSTL": {"params": {}},
+        "GARCH": {"params": {}},
+        # Auto Models (base + Auto pairs)
+        "AutoETS": {"params": {}},
+        "Theta": {"params": {}},
+        "AutoTheta": {"params": {}},
+        "AutoCES": {"params": {}},
+        "ARIMA": {"params": {"order": (1, 1, 1)}},
+        "AutoARIMA": {"params": {}},
         "MFLES": {"params": {}},
+        "AutoMFLES": {"params": {}},
         "TBATS": {"params": {}},
         "AutoTBATS": {"params": {}},
-        "HistoricAverage": {"params": {}},
-        "IMAPA": {"params": {}},
-        "Naive": {"params": {}},
-        "RandomWalkWithDrift": {"params": {}},
-        "ARIMA": {"params": {"order": (1, 1, 1)}},
-        "SeasonalExponentialSmoothing": {"params": {}},
-        "SeasonalNaive": {"params": {}},
-        "SeasonalWindowAverage": {"params": {"window_size": 24, "season_length": 24}},
-        "SimpleExponentialSmoothing": {"params": {}},
-        "TSB": {"params": {}},
     }
 
     @staticmethod
     def get_chronax_model(name: str):
         """Lazy loader for Chronax models."""
         try:
-            if name == "WindowAverage":
+            # Simple Baselines
+            if name == "Naive":
+                import naive; return naive.Naive
+            elif name == "SeasonalNaive":
+                import seasonal_naive; return seasonal_naive.SeasonalNaive
+            elif name == "HistoricAverage":
+                import historic_average; return historic_average.HistoricAverage
+            elif name == "RandomWalkWithDrift":
+                import randomWalkWithDrift; return randomWalkWithDrift.RandomWalkWithDrift
+            elif name == "WindowAverage":
                 import window_average; return window_average.WindowAverage
-            elif name == "ADIDA":
-                import adida; return adida.ADIDA
-            elif name == "CrostonClassic":
-                import croston_classic; return croston_classic.CrostonClassic
-            elif name == "AutoETS":
-                import auto_ets; return auto_ets.AutoETS
-            elif name == "GARCH":
-                try: import garch; return garch.GARCH
-                except ImportError: return None
-            elif name == "AutoCES":
-                try: import ces; return ces.AutoCES
-                except ImportError: return None
-            elif name == "Theta":
-                try: import theta_model; return theta_model.Theta
-                except ImportError: return None
-            elif name == "AutoTheta":
-                try: import theta_model; return theta_model.AutoTheta
-                except ImportError: return None
+            elif name == "SeasonalWindowAverage":
+                import seasonal_window_average; return seasonal_window_average.SeasonalWindowAverage
+            # Smoothing Models
+            elif name == "SimpleExponentialSmoothing":
+                import simple_exponential_smoothing; return simple_exponential_smoothing.SimpleExponentialSmoothing
+            elif name == "SeasonalExponentialSmoothing":
+                import seasonal_exponential_smoothing; return seasonal_exponential_smoothing.SeasonalExponentialSmoothing
             elif name == "Holt":
                 try: import holt; return holt.Holt
                 except ImportError: return None
             elif name == "HoltWinters":
                 try: import holt_winters; return holt_winters.HoltWinters
                 except ImportError: return None
+            # Intermittent Demand Models
+            elif name == "ADIDA":
+                import adida; return adida.ADIDA
+            elif name == "CrostonClassic":
+                import croston_classic; return croston_classic.CrostonClassic
+            elif name == "TSB":
+                import tsb; return tsb.TSB
+            elif name == "IMAPA":
+                import imapa; return imapa.IMAPA
+            # Decomposition & Volatility
             elif name == "MSTL":
                 try: import mstl; return mstl.MSTL
                 except ImportError: return None
+            elif name == "GARCH":
+                try: import garch; return garch.GARCH
+                except ImportError: return None
+            # Auto Models (base + Auto pairs)
+            elif name == "AutoETS":
+                import auto_ets; return auto_ets.AutoETS
+            elif name == "Theta":
+                try: import theta_model; return theta_model.Theta
+                except ImportError: return None
+            elif name == "AutoTheta":
+                try: import theta_model; return theta_model.AutoTheta
+                except ImportError: return None
+            elif name == "AutoCES":
+                try: import ces; return ces.AutoCES
+                except ImportError: return None
+            elif name == "ARIMA":
+                import auto_arima; return auto_arima.ARIMA
+            elif name == "AutoARIMA":
+                try: import auto_arima; return auto_arima.AutoARIMA
+                except ImportError: return None
             elif name == "MFLES":
                 try: import mfles; return mfles.MFLES
+                except ImportError: return None
+            elif name == "AutoMFLES":
+                try: import auto_mfles; return auto_mfles.AutoMFLES
                 except ImportError: return None
             elif name == "TBATS":
                 try: import tbats_model; return tbats_model.TBATS
@@ -325,26 +363,6 @@ class ModelRegistry:
             elif name == "AutoTBATS":
                 try: import tbats_model; return tbats_model.AutoTBATS
                 except ImportError: return None
-            elif name == "HistoricAverage":
-                import historic_average; return historic_average.HistoricAverage
-            elif name == "IMAPA":
-                import imapa; return imapa.IMAPA
-            elif name == "Naive":
-                import naive; return naive.Naive
-            elif name == "RandomWalkWithDrift":
-                import randomWalkWithDrift; return randomWalkWithDrift.RandomWalkWithDrift
-            elif name == "ARIMA":
-                import arima; return arima.ARIMA
-            elif name == "SeasonalExponentialSmoothing":
-                import seasonal_exponential_smoothing; return seasonal_exponential_smoothing.SeasonalExponentialSmoothing
-            elif name == "SeasonalNaive":
-                import seasonal_naive; return seasonal_naive.SeasonalNaive
-            elif name == "SeasonalWindowAverage":
-                import seasonal_window_average; return seasonal_window_average.SeasonalWindowAverage
-            elif name == "SimpleExponentialSmoothing":
-                import simple_exponential_smoothing; return simple_exponential_smoothing.SimpleExponentialSmoothing
-            elif name == "TSB":
-                import tsb; return tsb.TSB
         except (ImportError, AttributeError, NameError):
             pass 
         return None

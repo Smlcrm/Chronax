@@ -6,7 +6,7 @@ This document outlines how to run and configure the benchmarking suite for Chron
 
 The benchmark suite is designed to compare the performance and accuracy of time series forecasting models from **Chronax** (JAX-based) and **StatsForecast**. It supports:
 
-*   **Lazy Loading**: Libraries are imported only when needed to prevent conflicts.
+*   **Lazy Loading**: Libraries are imported only when needed.
 *   **Performance Metrics**: Cold start time, warm execution time, interval overhead.
 *   **Accuracy Metrics**: MAPE, MAE, RMSE, MASE.
 *   **Datasets**: Synthetic (Trend, Seasonality, Stochastic) and External (CSV).
@@ -14,6 +14,7 @@ The benchmark suite is designed to compare the performance and accuracy of time 
 ## Running the Benchmark
 
 The main entry point is `eval_dev/run_benchmark.py`. It orchestrates the execution of individual model runs.
+It now runs both libraries using a **single Python environment** (the interpreter used to launch the script).
 
 ### Basic Usage
 
@@ -61,10 +62,6 @@ experiment:
   seasonality: 24           # Seasonality period
   n_iterations: 5           # Number of warm runs for averaging
 
-environments:
-  chronax_python: "python"  # Path to python with chronax
-  sf_python: "python"       # Path to python with statsforecast
-
 datasets:
   - name: "Trend"           # Synthetic dataset type
   - name: "my-data"
@@ -77,6 +74,8 @@ models:
     library: "chronax"      # or "statsforecast"
     params: { season_length: 24 }
 ```
+
+> Note: `run_benchmark.py` ignores the `environments` block if present in `config.yaml`.
 
 ## Benchmarking Methodology
 

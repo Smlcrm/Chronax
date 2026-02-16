@@ -1,10 +1,12 @@
 """
-Run Benchmark Orchestrator
-==========================
-Orchestrates benchmark runs by spawning benchmark_suite.py with appropriate
-Python interpreters for each library (chronax or statsforecast).
+Run Benchmark Orchestrator (Single Environment)
+=================================================
+Same as run_benchmark.py but runs ALL models (chronax + statsforecast)
+using the current Python environment instead of separate interpreters.
 
-No separate worker files needed - benchmark_suite.py handles everything.
+Fairness is preserved via subprocess isolation: each model still runs
+in its own fresh process so there's no shared state, warm caches, or
+memory pressure from previously loaded libraries.
 """
 
 import sys
@@ -21,28 +23,31 @@ from datetime import datetime
 def run_benchmark(config_path, model_filter=None, dataset_filter=None, forecast_mode=False):
     """
     Main benchmark orchestrator.
-    Spawns benchmark_suite.py for each model/library combination.
+    Spawns benchmark_suite.py for each model/library combination
+    using the CURRENT Python interpreter for both libraries.
     """
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     
     experiment_cfg = config['experiment']
-    envs_cfg = config['environments']
     models_cfg = config['models']
     datasets_cfg = config['datasets']
     
     scales = experiment_cfg['scales']
     results_records = []
     
+    # Single Python interpreter for everything
+    python_exe = sys.executable
+    
     # Define output directory
     script_dir = os.path.dirname(os.path.abspath(__file__))
     
     if forecast_mode:
         results_dir = os.path.join(script_dir, "forecast_results")
-        print(f"🚀 Starting Forecast Generation (Lazy Import Mode)")
+        print(f"🚀 Starting Forecast Generation (Single Env Mode)")
     else:
         results_dir = os.path.join(script_dir, "benchmark_results")
-        print(f"🚀 Starting Benchmark (Lazy Import Mode)")
+        print(f"🚀 Starting Benchmark (Single Env Mode)")
 
     # Ensure output directories exist
     os.makedirs(results_dir, exist_ok=True)
@@ -50,8 +55,7 @@ def run_benchmark(config_path, model_filter=None, dataset_filter=None, forecast_
          os.makedirs(os.path.join(results_dir, "plots"), exist_ok=True)
          os.makedirs(os.path.join(results_dir, "data"), exist_ok=True)
 
-    print(f"   Chronax Env: {envs_cfg['chronax_python']}")
-    print(f"   StatsForecast Env: {envs_cfg['sf_python']}")
+    print(f"   Python: {python_exe}")
     
     if model_filter:
         print(f"   🎯 Model Filter: {model_filter}")
@@ -98,12 +102,9 @@ def run_benchmark(config_path, model_filter=None, dataset_filter=None, forecast_
                 
                 library = model['library']
                 
-                # Select Python interpreter based on library
-                python_exe = envs_cfg['chronax_python'] if library == 'chronax' else envs_cfg['sf_python']
-                
                 print(f"   > Running {library.capitalize()} {model_name}...")
                 
-                # Build command - calls benchmark_suite.py directly with --library flag
+                # Build command - uses CURRENT Python for both libraries
                 cmd = [
                     python_exe,
                     os.path.join(script_dir, "benchmark_suite.py"),
@@ -179,15 +180,9 @@ def run_benchmark(config_path, model_filter=None, dataset_filter=None, forecast_
         # Also save as latest
         latest_csv = os.path.join(results_dir, "benchmark_results.csv")
         df.to_csv(latest_csv, index=False)
-        
-        # Generate plots
-        # print("\n📊 Generating Plots...")
-        # try:
-        #     plot_results(latest_csv)
-        # except Exception as e:
-        #     print(f"⚠️ Error generating plots: {e}")
     elif not forecast_mode:
         print("\n⚠️ No results collected.")
+
 
 def process_forecast_result(record, output_dir, dataset_name, library, model_name):
     """
@@ -204,19 +199,15 @@ def process_forecast_result(record, output_dir, dataset_name, library, model_nam
     # 1. Save Data CSV
     data_csv_path = os.path.join(output_dir, "data", f"{dataset_name}_{library}_{model_name}.csv")
     
-    # Pad predictions to match Full Data length (train + test)
-    # We create a dataframe where indices match time steps
     max_len = len(y_train) + len(y_test)
     df_data = pd.DataFrame(index=range(max_len))
     df_data['y_true'] = np.concatenate([y_train, y_test])
     df_data['split'] = ['train'] * len(y_train) + ['test'] * len(y_test)
     
-    # Place predictions aligned with test set
     pred_col = np.full(max_len, np.nan)
     pred_col[len(y_train):] = preds
     df_data['y_pred'] = pred_col
     
-    # Metadata for filtering if merged
     df_data['library'] = library
     df_data['model'] = model_name
     
@@ -239,11 +230,10 @@ def process_forecast_result(record, output_dir, dataset_name, library, model_nam
     
     print(f"     ✅ Forecast saved: {os.path.basename(plot_path)}")
 
+
 def plot_results(csv_path):
-    """Generate benchmark visualization plots."""
+    """Generate benchmark visualization plots using matplotlib only."""
     import matplotlib.pyplot as plt
-    import seaborn as sns
-    sns.set_theme(style="whitegrid")
     
     if not os.path.exists(csv_path):
         print(f"❌ No results file found at {csv_path}")
@@ -251,15 +241,38 @@ def plot_results(csv_path):
     
     df = pd.read_csv(csv_path)
     results_dir = os.path.dirname(csv_path)
+    datasets = df['Dataset'].unique()
+    models = df['Model'].unique()
+    
+    # Color cycle for models
+    cmap = plt.cm.get_cmap('tab20', len(models))
+    color_map = {m: cmap(i) for i, m in enumerate(models)}
     
     # Scalability Plot
     if 'Length' in df.columns and 'Time_Warm_Sec' in df.columns:
-        g = sns.FacetGrid(df, col="Dataset", col_wrap=3, height=5, sharey=False)
-        g.map_dataframe(sns.lineplot, x='Length', y='Time_Warm_Sec', hue='Model', marker='o', linewidth=2.5)
-        g.add_legend()
-        g.set(xscale="log", yscale="log")
-        g.set_axis_labels("Series Length (Log)", "Execution Time (Sec - Log)")
-        g.fig.suptitle('Algorithmic Scalability by Dataset', fontsize=16, y=1.05)
+        n_datasets = len(datasets)
+        fig, axes = plt.subplots(1, n_datasets, figsize=(6 * n_datasets, 5), squeeze=False)
+        
+        for idx, ds in enumerate(datasets):
+            ax = axes[0, idx]
+            ds_df = df[df['Dataset'] == ds]
+            for model in models:
+                m_df = ds_df[ds_df['Model'] == model].sort_values('Length')
+                if not m_df.empty:
+                    ax.plot(m_df['Length'], m_df['Time_Warm_Sec'], marker='o',
+                            linewidth=2.5, label=model, color=color_map[model])
+            ax.set_xscale('log')
+            ax.set_yscale('log')
+            ax.set_xlabel('Series Length (Log)')
+            ax.set_ylabel('Execution Time (Sec - Log)')
+            ax.set_title(ds)
+            ax.grid(True, alpha=0.3)
+        
+        handles, labels = axes[0, 0].get_legend_handles_labels()
+        fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, -0.02),
+                   ncol=min(len(models), 5), fontsize=8)
+        fig.suptitle('Algorithmic Scalability by Dataset', fontsize=16)
+        fig.tight_layout(rect=[0, 0.05, 1, 0.95])
         
         output_path = os.path.join(results_dir, "scalability_plot.png")
         plt.savefig(output_path, dpi=300, bbox_inches='tight')
@@ -268,12 +281,28 @@ def plot_results(csv_path):
     
     # Accuracy Plot
     if 'MAPE' in df.columns and df['MAPE'].notna().any():
-        g = sns.FacetGrid(df, col="Dataset", col_wrap=3, height=5, sharey=False)
-        g.map_dataframe(sns.lineplot, x='Length', y='MAPE', hue='Model', marker='o', linewidth=2.5)
-        g.add_legend()
-        g.set(xscale="log")
-        g.set_axis_labels("Series Length (Log)", "MAPE (%)")
-        g.fig.suptitle('Forecasting Accuracy (MAPE) by Dataset', fontsize=16, y=1.05)
+        n_datasets = len(datasets)
+        fig, axes = plt.subplots(1, n_datasets, figsize=(6 * n_datasets, 5), squeeze=False)
+        
+        for idx, ds in enumerate(datasets):
+            ax = axes[0, idx]
+            ds_df = df[df['Dataset'] == ds]
+            for model in models:
+                m_df = ds_df[ds_df['Model'] == model].sort_values('Length')
+                if not m_df.empty and m_df['MAPE'].notna().any():
+                    ax.plot(m_df['Length'], m_df['MAPE'], marker='o',
+                            linewidth=2.5, label=model, color=color_map[model])
+            ax.set_xscale('log')
+            ax.set_xlabel('Series Length (Log)')
+            ax.set_ylabel('MAPE (%)')
+            ax.set_title(ds)
+            ax.grid(True, alpha=0.3)
+        
+        handles, labels = axes[0, 0].get_legend_handles_labels()
+        fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, -0.02),
+                   ncol=min(len(models), 5), fontsize=8)
+        fig.suptitle('Forecasting Accuracy (MAPE) by Dataset', fontsize=16)
+        fig.tight_layout(rect=[0, 0.05, 1, 0.95])
         
         output_path = os.path.join(results_dir, "accuracy_plot.png")
         plt.savefig(output_path, dpi=300, bbox_inches='tight')
@@ -282,7 +311,7 @@ def plot_results(csv_path):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Benchmark Orchestrator (No Workers)")
+    parser = argparse.ArgumentParser(description="Benchmark Orchestrator (Single Environment)")
     parser.add_argument("--config", type=str, default="config.yaml", help="Path to config.yaml")
     parser.add_argument("--model", type=str, default=None, help="Filter by model name")
     parser.add_argument("--dataset", type=str, default=None, help="Filter by dataset name or path")
