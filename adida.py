@@ -1,61 +1,199 @@
+
 import jax
 import jax.numpy as jnp
-from jax import jit
+from jax import jit, lax
+from functools import lru_cache
 from utils import (
     ensure_float,
     calculate_sigma,
     _add_fitted_pi,
     _add_conformal_intervals,
-    _repeat_val,
     _add_predict_conformal_intervals,
     _intervals,
-    _chunk_forecast,
     _expand_fitted_intervals,
-    _store_cs
+    _store_cs,
 )
 from base_forecaster import BaseForecaster
 from typing import Optional, List
 from conformal_intervals import ConformalIntervals
 import warnings
 
+_ALPHA_LOWER = 0.1
+_ALPHA_UPPER = 0.3
+_GOLDEN_RATIO = 0.6180339887498949
+_ALPHA_SEARCH_ITERS = 8
+
+# Prefer compiled execution for warm-path throughput; keep tiny inputs eager.
+_JIT_MIN_CHUNKS = 128
+
+
+def _interval_mean(y: jnp.ndarray) -> jnp.ndarray:
+    nonzero_mask = y != 0
+    nonzero_count = jnp.count_nonzero(nonzero_mask)
+    if nonzero_count == 0:
+        return jnp.array(1.0, dtype=y.dtype)
+
+    # mean(diff(nonzero_idxs + 1, prepend=0)) == (last_nonzero_idx + 1) / count_nonzero
+    last_nonzero_idx = jnp.max(
+        jnp.where(nonzero_mask, jnp.arange(y.shape[0], dtype=jnp.int32), 0)
+    )
+    return (last_nonzero_idx.astype(y.dtype) + 1.0) / nonzero_count.astype(y.dtype)
+
+
+def _ses_sse(alpha: jnp.ndarray, x: jnp.ndarray) -> jnp.ndarray:
+    complement = 1.0 - alpha
+    init_carry = (x[0], jnp.array(0.0, dtype=x.dtype))
+
+    def body(i: int, carry):
+        forecast, sse = carry
+        forecast = alpha * x[i - 1] + complement * forecast
+        err = x[i] - forecast
+        return forecast, sse + err * err
+
+    _, sse = lax.fori_loop(1, x.shape[0], body, init_carry)
+    return sse
+
+
+def _ses_forecast(alpha: jnp.ndarray, x: jnp.ndarray) -> jnp.ndarray:
+    complement = 1.0 - alpha
+
+    def body(i: int, forecast: jnp.ndarray):
+        return alpha * x[i - 1] + complement * forecast
+
+    fitted_last = lax.fori_loop(1, x.shape[0], body, x[0])
+    return alpha * x[-1] + complement * fitted_last
+
+
+def _optimized_ses_forecast(x: jnp.ndarray) -> jnp.ndarray:
+    left = jnp.array(_ALPHA_LOWER, dtype=x.dtype)
+    right = jnp.array(_ALPHA_UPPER, dtype=x.dtype)
+    ratio = jnp.array(_GOLDEN_RATIO, dtype=x.dtype)
+    c = right - ratio * (right - left)
+    d = left + ratio * (right - left)
+    fc = _ses_sse(c, x)
+    fd = _ses_sse(d, x)
+
+    def step(_: int, state):
+        left, right, c, d, fc, fd = state
+
+        def keep_left(curr):
+            left, right, c, d, fc, fd = curr
+            right = d
+            d = c
+            fd = fc
+            c = right - ratio * (right - left)
+            fc = _ses_sse(c, x)
+            return left, right, c, d, fc, fd
+
+        def keep_right(curr):
+            left, right, c, d, fc, fd = curr
+            left = c
+            c = d
+            fc = fd
+            d = left + ratio * (right - left)
+            fd = _ses_sse(d, x)
+            return left, right, c, d, fc, fd
+
+        return lax.cond(fc <= fd, keep_left, keep_right, state)
+
+    left, right, _, _, _, _ = lax.fori_loop(
+        0, _ALPHA_SEARCH_ITERS, step, (left, right, c, d, fc, fd)
+    )
+    alpha = 0.5 * (left + right)
+    return _ses_forecast(alpha, x)
+
+
+def _chunk_forecast_impl(series: jnp.ndarray, aggregation_level: int):
+    lost_remainder_data = series.shape[0] % aggregation_level
+    y_cut = series[lost_remainder_data:]
+    n_chunks = y_cut.shape[0] // aggregation_level
+
+    if n_chunks == 0:
+        return jnp.array(0.0, dtype=series.dtype)
+
+    aggregation_sums = y_cut[: n_chunks * aggregation_level].reshape(
+        (n_chunks, aggregation_level)
+    ).sum(axis=1)
+
+    if n_chunks == 1:
+        return aggregation_sums[0]
+
+    return _optimized_ses_forecast(aggregation_sums)
+
+
+@lru_cache(maxsize=256)
+def _get_chunk_forecast_runner(aggregation_level: int):
+    aggregation_level = max(1, int(aggregation_level))
+
+    @jit
+    def _run(series: jnp.ndarray):
+        return _chunk_forecast_impl(series, aggregation_level)
+
+    return _run
+
+
+def _chunk_forecast_fast(y: jnp.ndarray, aggregation_level: int):
+    aggregation_level = max(1, int(aggregation_level))
+    n_chunks = y.shape[0] // aggregation_level
+
+    # Tiny inputs stay eager; otherwise compiled path is materially faster on warm calls.
+    if n_chunks < _JIT_MIN_CHUNKS:
+        # Avoid tracing overhead from lax control flow on very small arrays.
+        with jax.disable_jit():
+            return _chunk_forecast_impl(y, aggregation_level)
+
+    return _get_chunk_forecast_runner(aggregation_level)(y)
+
+
+def _repeat_val_jax(val: jnp.ndarray, h: int):
+    return jnp.full((h,), val)
+
+
+def _adida_point(
+    y: jnp.ndarray,  # time series
+    h: int,  # forecasting horizon
+):
+    mean_interval = _interval_mean(y)
+    aggregation_level = max(1, int(jnp.round(mean_interval).item()))
+    sums_forecast = _chunk_forecast_fast(y, aggregation_level)
+    forecast = sums_forecast / aggregation_level
+    return {"mean": _repeat_val_jax(val=forecast, h=h)}
+
+
 def _adida(
     y: jnp.ndarray,  # time series
     h: int,  # forecasting horizon
     fitted: bool,  # fitted values
 ):
+    if not fitted:
+        return _adida_point(y=y, h=h)
+
     if (y == 0).all():
         res = {"mean": jnp.zeros(h, dtype=y.dtype)}
-        if fitted:
-            res["fitted"] = jnp.zeros_like(y)
-            res["fitted"][0] = jnp.nan
+        fitted_vals = jnp.zeros_like(y)
+        if fitted_vals.size > 0:
+            fitted_vals = fitted_vals.at[0].set(jnp.nan)
+        res["fitted"] = fitted_vals
         return res
-    y = ensure_float(y)
-    y_intervals = _intervals(y)                         # shape (n,), padded with zeros
-    valid_count = jnp.count_nonzero(y_intervals)        # number of valid intervals (k)
-    # avoid division by zero: if no valid intervals, set mean_interval to 0.0
-    mean_interval = jnp.where(
-    valid_count > 0,
-    jnp.sum(y_intervals) / valid_count,
-    0.0,)
-    aggregation_level = int(jnp.round(mean_interval).item())  # keep Python int for later use
 
-    sums_forecast = _chunk_forecast(y, aggregation_level)
-    forecast = sums_forecast / aggregation_level
-    res = {"mean": _repeat_val(val=forecast, h=h)}
-    if fitted:
-        warnings.warn("Computing fitted values for ADIDA is very expensive")
-        fitted_aggregation_levels = jnp.round(
-            y_intervals.cumsum() / jnp.arange(1, y_intervals.size + 1)
-        )
-        fitted_aggregation_levels = _expand_fitted_intervals(
-            jnp.append(jnp.nan, fitted_aggregation_levels), y
-        )[1:].astype(jnp.int32)
+    res = _adida_point(y=y, h=h)
+    warnings.warn("Computing fitted values for ADIDA is very expensive")
 
-        sums_fitted = jnp.empty(y.size - 1, dtype=y.dtype)
-        for i, agg_lvl in enumerate(fitted_aggregation_levels):
-            sums_fitted[i] = _chunk_forecast(y[: i + 1], agg_lvl)
+    y_intervals = _intervals(y)
+    fitted_aggregation_levels = jnp.round(
+        y_intervals.cumsum() / jnp.arange(1, y_intervals.size + 1)
+    )
+    fitted_aggregation_levels = _expand_fitted_intervals(
+        jnp.append(jnp.nan, fitted_aggregation_levels), y
+    )[1:].astype(jnp.int32)
 
-        res["fitted"] = jnp.append(jnp.nan, sums_fitted / fitted_aggregation_levels)
+    sums_fitted = []
+    for i, agg_lvl in enumerate(fitted_aggregation_levels):
+        agg_lvl_int = max(1, int(agg_lvl))
+        sums_fitted.append(_chunk_forecast_fast(y[: i + 1], agg_lvl_int))
+    sums_fitted = jnp.asarray(sums_fitted, dtype=y.dtype)
+
+    res["fitted"] = jnp.append(jnp.nan, sums_fitted / fitted_aggregation_levels)
     return res
 
 
@@ -106,9 +244,10 @@ class ADIDA(BaseForecaster):
             ADIDA: ADIDA fitted model.
         """
         y = ensure_float(y)
-        self.model_ = _adida(y=y, h=1, fitted=False)
         self._y = y
-        _store_cs(self, y=y, X=X)
+        self.model_ = _adida_point(y=y, h=1)
+        if self.prediction_intervals is not None:
+            _store_cs(self, y=y, X=X)
         return self
 
     def predict(
@@ -127,18 +266,12 @@ class ADIDA(BaseForecaster):
         Returns:
             dict: Dictionary with entries `mean` for point predictions and `level_*` for probabilistic predictions.
         """
-        mean = _repeat_val(val=self.model_["mean"][0], h=h)
+        mean = _repeat_val_jax(val=self.model_["mean"][0], h=h)
         res = {"mean": mean}
-        if level is None:
+        if level is None or self.prediction_intervals is None:
             return res
         level = sorted(level)
-        if self.prediction_intervals is not None:
-            res = _add_predict_conformal_intervals(self, res, level)
-        else:
-            raise Exception(
-                "You have to instantiate the class with `prediction_intervals`"
-                "to calculate them"
-            )
+        res = _add_predict_conformal_intervals(self, res, level)
         return res
 
     def predict_in_sample(self, level: Optional[List[int]] = None):
@@ -184,17 +317,14 @@ class ADIDA(BaseForecaster):
             dict: Dictionary with entries `mean` for point predictions and `level_*` for probabilistic predictions.
         """
         y = ensure_float(y)
-        res = _adida(y=y, h=h, fitted=fitted)
-        if level is None:
+        if fitted:
+            res = _adida(y=y, h=h, fitted=True)
+        else:
+            res = _adida_point(y=y, h=h)
+        if level is None or self.prediction_intervals is None:
             return res
         level = sorted(level)
-        if self.prediction_intervals is not None:
-            res = _add_conformal_intervals(self, fcst=res, y=y, X=X, level=level)
-        else:
-            raise Exception(
-                "You have to instantiate the class with `prediction_intervals`"
-                "to calculate them"
-            )
+        res = _add_conformal_intervals(self, fcst=res, y=y, X=X, level=level)
         if fitted:
             sigma = calculate_sigma(y - res["fitted"], y.size)
             res = _add_fitted_pi(res=res, se=sigma, level=level)

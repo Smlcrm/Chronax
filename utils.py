@@ -1069,7 +1069,6 @@ def compute_pi_samples(n, h, states, sigma, alpha, theta, mean_y, seed=0, n_samp
     Compute forecast samples for conformal intervals in JAX.
     """
     samples = jnp.full((h, n_samples), jnp.nan, dtype=jnp.float32)
-
     # Unpack last state: level, meany, An, Bn
     level, meany, A, B = states[-1, :4]
     smoothed = level
@@ -1090,17 +1089,23 @@ def compute_pi_samples(n, h, states, sigma, alpha, theta, mean_y, seed=0, n_samp
         s = mu + eps
 
         # update smoothed, mean, A, B
-        smoothed_new = alpha * jnp.mean(s) + (1 - alpha) * smoothed
-        mean_y_new = (i * mean_y + jnp.mean(s)) / (i + 1)
-        B_new = ((i - 1) * B + 6 * (jnp.mean(s) - mean_y_new) / (i + 1)) / (i + 2)
-        A_new = mean_y_new - B_new * (i + 2) / 2
+        smoothed_new = (alpha * jnp.mean(s) + (1 - alpha) * smoothed).astype(jnp.float32)
+        mean_y_new = ((i * mean_y + jnp.mean(s)) / (i + 1)).astype(jnp.float32)
+        B_new = (((i - 1) * B + 6 * (jnp.mean(s) - mean_y_new) / (i + 1)) / (i + 2)).astype(jnp.float32)
+        A_new = (mean_y_new - B_new * (i + 2) / 2).astype(jnp.float32)
 
         samples = samples.at[i - n].set(s)
         return smoothed_new, mean_y_new, A_new, B_new, samples, key
 
     # Loop over forecast horizon
     smoothed, mean_y, A, B, samples, key = jax.lax.fori_loop(
-        n, n + h, body_fun, (smoothed, mean_y, A, B, samples, key)
+        n, 
+        n + h, 
+        body_fun, 
+        (jnp.array(smoothed, dtype=jnp.float32), 
+         jnp.array(mean_y, dtype=jnp.float32), 
+         jnp.array(A, dtype=jnp.float32), 
+         jnp.array(B, dtype=jnp.float32), samples, key)
     )
 
     return samples
@@ -1368,7 +1373,7 @@ def seasonal_decompose(y: jnp.ndarray, model: str = "additive", period: int = 1)
 def acf(x: jnp.ndarray, nlags: int) -> jnp.ndarray:
     """
     Compute autocorrelation function up to `nlags` for 1D array x using JAX.
-    Equivalent to statsmodels.tsa.stattools.acf(x, nlags=nlags, fft=False).
+    Equivalent to statsmodels.tsa.stattools.acf(x, nlags=nlags).
     """
     x = x - jnp.mean(x)
     n = x.shape[0]
@@ -1411,7 +1416,7 @@ def auto_theta(
     decompose = False
     # seasonal test
     if m >= 4 and len(y) >= 2 * m:
-        r = acf(y, nlags=m, fft=False)[1:]
+        r = acf(y, nlags=m)[1:]
         stat = jnp.sqrt((1 + 2 * jnp.sum(r[:-1] ** 2)) / len(y))
         decompose = jnp.abs(r[-1]) / stat > norm.ppf(0.95)
 
@@ -1420,10 +1425,10 @@ def auto_theta(
         # change decomposition type if data is not positive
         if decomposition_type == "multiplicative" and not data_positive:
             decomposition_type = "additive"
-        y_decompose = seasonal_decompose(y, model=decomposition_type, period=m).seasonal
+        y_decompose = seasonal_decompose(y, model=decomposition_type, period=m)['seasonal']
         if decomposition_type == "multiplicative" and any(y_decompose < 0.01):
             decomposition_type = "additive"
-            y_decompose = seasonal_decompose(y, model="additive", period=m).seasonal
+            y_decompose = seasonal_decompose(y, model="additive", period=m)['seasonal']
         if decomposition_type == "additive":
             y = y - y_decompose
         else:
@@ -1602,47 +1607,6 @@ def switch_theta(model: str) -> _theta.ModelType:
         return _theta.ModelType.DOTM
     raise ValueError(f"Invalid model type: {model}.")
 
-def compute_pi_samples(n, h, states, sigma, alpha, theta, mean_y, seed=0, n_samples=200):
-    """
-    Compute forecast samples for conformal intervals in JAX.
-    """
-    samples = jnp.full((h, n_samples), jnp.nan, dtype=jnp.float32)
-
-    # Unpack last state: level, meany, An, Bn
-    level, meany, A, B = states[-1, :4]
-    smoothed = level
-
-    # Initialize PRNG key
-    key = jrandom.PRNGKey(seed)
-
-    def body_fun(i, val):
-        smoothed, mean_y, A, B, samples, key = val
-        # deterministic part
-        mu = smoothed + (1 - 1 / theta) * (A * ((1 - alpha) ** i) + B * (1 - (1 - alpha) ** (i + 1)) / alpha)
-
-        # random noise
-        key, subkey = jrandom.split(key)
-        eps = jrandom.normal(subkey, shape=(n_samples,), dtype=jnp.float32) * sigma
-
-        # sample for this step
-        s = mu + eps
-
-        # update smoothed, mean, A, B
-        smoothed_new = alpha * jnp.mean(s) + (1 - alpha) * smoothed
-        mean_y_new = (i * mean_y + jnp.mean(s)) / (i + 1)
-        B_new = ((i - 1) * B + 6 * (jnp.mean(s) - mean_y_new) / (i + 1)) / (i + 2)
-        A_new = mean_y_new - B_new * (i + 2) / 2
-
-        samples = samples.at[i - n].set(s)
-        return smoothed_new, mean_y_new, A_new, B_new, samples, key
-
-    # Loop over forecast horizon
-    smoothed, mean_y, A, B, samples, key = jax.lax.fori_loop(
-        n, n + h, body_fun, (smoothed, mean_y, A, B, samples, key)
-    )
-
-    return samples
-
 def initparamtheta(
     initial_smoothed: float,
     alpha: float,
@@ -1906,7 +1870,7 @@ def seasonal_decompose(y: jnp.ndarray, model: str = "additive", period: int = 1)
 def acf(x: jnp.ndarray, nlags: int) -> jnp.ndarray:
     """
     Compute autocorrelation function up to `nlags` for 1D array x using JAX.
-    Equivalent to statsmodels.tsa.stattools.acf(x, nlags=nlags, fft=False).
+    Equivalent to statsmodels.tsa.stattools.acf(x, nlags=nlags).
     """
     x = x - jnp.mean(x)
     n = x.shape[0]
@@ -1949,7 +1913,7 @@ def auto_theta(
     decompose = False
     # seasonal test
     if m >= 4 and len(y) >= 2 * m:
-        r = acf(y, nlags=m, fft=False)[1:]
+        r = acf(y, nlags=m)[1:]
         stat = jnp.sqrt((1 + 2 * jnp.sum(r[:-1] ** 2)) / len(y))
         decompose = jnp.abs(r[-1]) / stat > norm.ppf(0.95)
 
@@ -1958,10 +1922,10 @@ def auto_theta(
         # change decomposition type if data is not positive
         if decomposition_type == "multiplicative" and not data_positive:
             decomposition_type = "additive"
-        y_decompose = seasonal_decompose(y, model=decomposition_type, period=m).seasonal
+        y_decompose = seasonal_decompose(y, model=decomposition_type, period=m)['seasonal']
         if decomposition_type == "multiplicative" and any(y_decompose < 0.01):
             decomposition_type = "additive"
-            y_decompose = seasonal_decompose(y, model="additive", period=m).seasonal
+            y_decompose = seasonal_decompose(y, model="additive", period=m)['seasonal']
         if decomposition_type == "additive":
             y = y - y_decompose
         else:
@@ -2140,47 +2104,6 @@ def switch_theta(model: str) -> _theta.ModelType:
         return _theta.ModelType.DOTM
     raise ValueError(f"Invalid model type: {model}.")
 
-def compute_pi_samples(n, h, states, sigma, alpha, theta, mean_y, seed=0, n_samples=200):
-    """
-    Compute forecast samples for conformal intervals in JAX.
-    """
-    samples = jnp.full((h, n_samples), jnp.nan, dtype=jnp.float32)
-
-    # Unpack last state: level, meany, An, Bn
-    level, meany, A, B = states[-1, :4]
-    smoothed = level
-
-    # Initialize PRNG key
-    key = jrandom.PRNGKey(seed)
-
-    def body_fun(i, val):
-        smoothed, mean_y, A, B, samples, key = val
-        # deterministic part
-        mu = smoothed + (1 - 1 / theta) * (A * ((1 - alpha) ** i) + B * (1 - (1 - alpha) ** (i + 1)) / alpha)
-
-        # random noise
-        key, subkey = jrandom.split(key)
-        eps = jrandom.normal(subkey, shape=(n_samples,), dtype=jnp.float32) * sigma
-
-        # sample for this step
-        s = mu + eps
-
-        # update smoothed, mean, A, B
-        smoothed_new = alpha * jnp.mean(s) + (1 - alpha) * smoothed
-        mean_y_new = (i * mean_y + jnp.mean(s)) / (i + 1)
-        B_new = ((i - 1) * B + 6 * (jnp.mean(s) - mean_y_new) / (i + 1)) / (i + 2)
-        A_new = mean_y_new - B_new * (i + 2) / 2
-
-        samples = samples.at[i - n].set(s)
-        return smoothed_new, mean_y_new, A_new, B_new, samples, key
-
-    # Loop over forecast horizon
-    smoothed, mean_y, A, B, samples, key = jax.lax.fori_loop(
-        n, n + h, body_fun, (smoothed, mean_y, A, B, samples, key)
-    )
-
-    return samples
-
 def initparamtheta(
     initial_smoothed: float,
     alpha: float,
@@ -2444,7 +2367,7 @@ def seasonal_decompose(y: jnp.ndarray, model: str = "additive", period: int = 1)
 def acf(x: jnp.ndarray, nlags: int) -> jnp.ndarray:
     """
     Compute autocorrelation function up to `nlags` for 1D array x using JAX.
-    Equivalent to statsmodels.tsa.stattools.acf(x, nlags=nlags, fft=False).
+    Equivalent to statsmodels.tsa.stattools.acf(x, nlags=nlags).
     """
     x = x - jnp.mean(x)
     n = x.shape[0]
@@ -2487,7 +2410,7 @@ def auto_theta(
     decompose = False
     # seasonal test
     if m >= 4 and len(y) >= 2 * m:
-        r = acf(y, nlags=m, fft=False)[1:]
+        r = acf(y, nlags=m)[1:]
         stat = jnp.sqrt((1 + 2 * jnp.sum(r[:-1] ** 2)) / len(y))
         decompose = jnp.abs(r[-1]) / stat > norm.ppf(0.95)
 
@@ -2496,10 +2419,10 @@ def auto_theta(
         # change decomposition type if data is not positive
         if decomposition_type == "multiplicative" and not data_positive:
             decomposition_type = "additive"
-        y_decompose = seasonal_decompose(y, model=decomposition_type, period=m).seasonal
+        y_decompose = seasonal_decompose(y, model=decomposition_type, period=m)['seasonal']
         if decomposition_type == "multiplicative" and any(y_decompose < 0.01):
             decomposition_type = "additive"
-            y_decompose = seasonal_decompose(y, model="additive", period=m).seasonal
+            y_decompose = seasonal_decompose(y, model="additive", period=m)['seasonal']
         if decomposition_type == "additive":
             y = y - y_decompose
         else:
