@@ -333,6 +333,7 @@ class _FitConfig(NamedTuple):
     n_exo_features: int            # number of exogenous features
     convergence_tol: float         # absolute tolerance for early stopping
     min_iter: int                  # minimum iterations before allowing early stop (n-dependent)
+    lasso_maxiter: int             # ISTA iterations for changepoint trend fit
 
 
 def _fit_body(
@@ -405,13 +406,14 @@ def _fit_body(
         new_seasonal = lax.cond(seas_improves, lambda: state.seasonal_component + seas, lambda: state.seasonal_component)
         new_best_after_seas = lax.cond(seas_improves, lambda: test_seas, lambda: new_best)
         
-        # Update seas_tail (last p values of seasonal)
+        # Update seas_tail from the cumulative seasonal component.
+        # Using only the incremental `seas` update underestimates forecast seasonality.
         p = config.sp_array[k]
         max_p = state.seas_tail.shape[0]  # This is static (known at trace time)
         
         # Always copy last max_p elements (static slice size), track actual period in seas_tail_len
         # The actual period values are in the last p positions, but we copy max_p for JIT compat
-        last_max_p = lax.dynamic_slice(seas, (n - max_p,), (max_p,))
+        last_max_p = lax.dynamic_slice(new_seasonal, (n - max_p,), (max_p,))
         
         # Rearrange so that the last p values are at the start
         # We need seas[-p:] at positions [0:p], but we have seas[-max_p:] in last_max_p
@@ -482,7 +484,7 @@ def _fit_body(
 
     def trend_piecewise():
         Xb = config.hinge_basis
-        beta = _lasso_ista_with_step(Xb, resids, config.alpha, config.lasso_step, 50)
+        beta = _lasso_ista_with_step(Xb, resids, config.alpha, config.lasso_step, config.lasso_maxiter)
         return (Xb @ beta) * config.linear_lr
 
     def trend_robust():
@@ -789,6 +791,24 @@ class MFLES(BaseForecaster):
         else:
             n_cps = 0
 
+        # Adaptive changepoint policy:
+        # For long series, the default dense changepoint setting (0.25*n) can
+        # overfit and degrade out-of-sample accuracy. Keep changepoints enabled
+        # only when the caller explicitly requests a non-default setting.
+        default_cp_density = isinstance(n_changepoints, float) and abs(n_changepoints - 0.25) < 1e-12
+        auto_disable_changepoints = bool(changepoints) and default_cp_density and (n >= 5000)
+        effective_changepoints = bool(changepoints) and (not auto_disable_changepoints)
+
+        # Large-n speed guardrail: cap changepoints to keep trend step near-linear.
+        # The default 0.25*n becomes very expensive above 5k and hurts warm latency.
+        if n_cps > 0:
+            if n >= 10000:
+                n_cps = min(n_cps, 160)
+            elif n >= 5000:
+                n_cps = min(n_cps, 224)
+            elif n >= 2000:
+                n_cps = min(n_cps, 256)
+
         # Fixed max_rounds for all series lengths to maximize JIT cache reuse
         # Note: StatsForecast MFLES runs all iterations without early stopping
         if max_rounds == 50:  # Default value, keep it
@@ -800,7 +820,7 @@ class MFLES(BaseForecaster):
         has_seasonality = sp_list is not None
         has_exogenous = X is not None
         use_seasonality_weights = bool(seasonality_weights)
-        use_changepoints = bool(changepoints)
+        use_changepoints = bool(effective_changepoints)
         init_robust = self.robust is None  # Need auto-detection
         ses_mode_norm = str(ses_mode).lower()
         if ses_mode_norm not in ("off", "lite", "full", "adaptive"):
@@ -838,28 +858,46 @@ class MFLES(BaseForecaster):
         # Pre-compute alphas for SES ensemble (static shape)
         ses_alphas = jnp.arange(float(min_alpha), float(max_alpha) + 1e-9, 0.05, dtype=y.dtype)
 
-        # Adaptive linear_lr: at large n, the slope per timestep is tiny (0.0003-0.0007)
-        # requiring higher lr to accumulate enough over 25 trend updates (50 iters / 2)
-        # Formula: scale by min(2.0, 1 + 0.00025*(n-2000)) for n >= 2000
+        # Adaptive linear_lr: boost slope updates for larger n but avoid overshoot.
+        # Keep the cap moderate so trend doesn't explode on long series.
         if n >= 2000:
-            scale_factor = min(2.0, 1.0 + 0.00025 * (n - 2000))
+            scale_factor = min(1.35, 1.0 + 0.00010 * (n - 2000))
             effective_linear_lr = linear_lr * scale_factor
         else:
             effective_linear_lr = linear_lr
 
-        # Adaptive min_iter: balance speed vs accuracy based on series length
-        # Smaller n converges faster, larger n needs more iterations for trend
+        # Adaptive min_iter: keep enough rounds at large n for stable trend/seasonality.
         if n < 1000:
             min_iter = 10
         elif n < 2000:
-            min_iter = 15
+            min_iter = 14
         elif n < 5000:
-            min_iter = 20
+            min_iter = 18
+        elif n < 10000:
+            min_iter = 22
         else:
-            min_iter = 25
+            min_iter = 24
+
+        # Large-n trend step budget: trimmed vs baseline, but not aggressively.
+        if n < 2000:
+            lasso_maxiter = 50
+        elif n < 5000:
+            lasso_maxiter = 42
+        elif n < 10000:
+            lasso_maxiter = 34
+        else:
+            lasso_maxiter = 28
+
+        # Slightly looser convergence threshold at large n to reduce tail rounds.
+        if n >= 10000:
+            convergence_tol = 2e-4
+        elif n >= 5000:
+            convergence_tol = 1.5e-4
+        else:
+            convergence_tol = 1e-4
 
         # Pre-compute hinge basis + spectral step ONCE (avoid redundant SVD per iteration)
-        if bool(changepoints) and n_cps > 0 and not bool(gradient_strategy):
+        if bool(effective_changepoints) and n_cps > 0 and not bool(gradient_strategy):
             knots = _uniform_knots(n, n_cps)
             hinge_basis = _hinge_basis_from_knots(n, knots)
             lasso_step = jnp.array(_spectral_step(hinge_basis), dtype=y.dtype)
@@ -890,8 +928,9 @@ class MFLES(BaseForecaster):
             n_cps=n_cps,
             max_period=max_period,
             n_exo_features=n_exo_features,
-            convergence_tol=1e-4,  # Early stopping tolerance
+            convergence_tol=float(convergence_tol),  # Early stopping tolerance
             min_iter=min_iter,  # n-dependent minimum iterations
+            lasso_maxiter=int(lasso_maxiter),
         )
         
         # Initialize loop state
