@@ -1,43 +1,53 @@
 """
 MFLES (Multi-Feature Locally Exponential Smoothing) in JAX
 
-This module implements an advanced forecasting model that combines multiple components:
-- Linear trend with optional changepoints (piecewise linear via LASSO)
-- Multiple seasonal patterns (Fourier series representation)
-- Residual smoothing (Simple Exponential Smoothing ensemble)
-- Exogenous variables support
-- Robust estimation options (Siegel repeated medians)
+Implements a StatsForecast-compatible MFLES model that combines multiple
+additive components fitted iteratively to residuals, fully JIT-compiled
+via lax.while_loop for performance.
+
+**Components:**
+- Piecewise linear trend with adaptive changepoints (LASSO, fraction-based knot selection)
+- Multiple seasonal patterns via Fourier series (OLS or weighted OLS)
+- Residual smoothing via SES ensemble ("lite" mode) or rolling means ("full" mode)
+- Optional exogenous variables via OLS
+- Robust estimation via Siegel repeated medians (auto-detected or user-specified)
 
 **Algorithm:**
-MFLES iteratively fits components to residuals:
-1. Initial median-based estimates
-2. Seasonal components via Fourier series + (weighted) OLS
-3. Linear trend via OLS, robust regression, or piecewise LASSO
-4. Residual smoothing via SES ensemble or rolling means
-5. Exogenous variables via OLS
-6. Iterates until convergence or max rounds
+Each iteration fits components sequentially to the current residuals:
+1. Median-based initialization
+2. Seasonal update: Fourier OLS/WLS on residuals, cycling through periods each round
+3. Trend update: OLS, robust (Siegel), or piecewise LASSO with adaptive knots
+4. Residual smoothing: SES ensemble or rolling mean
+5. Exogenous update: OLS on remaining residuals
+6. Convergence check: stops after 6 consecutive non-improving rounds or max_rounds
 
 **Formulas:**
 - Seasonal: y_t = Σ [a_k cos(2πkt/T) + b_k sin(2πkt/T)] for k=1..K
-- Trend: y_t = β₀ + β₁t + Σ β_k max(0, t-τ_k) (piecewise linear)
+- Trend: y_t = β₀ + β₁t + Σ β_k max(0, t-τ_k) (piecewise linear, LASSO-regularized)
 - SES: ŷ_t = α·y_t + (1-α)·ŷ_{t-1}
 
 **Implementation:**
-- JIT-compiled components for performance
-- Automatic robustness detection via coefficient of variation
-- Supports additive and multiplicative modes
-- Automatic hyperparameter selection via `optimize` method
-- Conforms to `BaseForecaster` interface
+- Entire fitting loop JIT-compiled via lax.while_loop with a _LoopState NamedTuple
+- Static boolean flags (has_seasonality, use_changepoints, etc.) baked into the loop
+  at compile time via _make_fit_loop, avoiding runtime branching overhead
+- Adaptive changepoint count: n_changepoints as a float (e.g. 0.25) sets knots
+  proportional to series length, capped at 50
+- Multiplicative mode: automatic when seasonal_period is provided and series is positive;
+  uses log-transform internally, reverted at predict time
+- Seasonal tail fix: last full period stored in _LoopState for correct multi-step forecasting
+- Conformal prediction intervals via BaseForecaster.conformity_scores
 
 **Attributes:**
-- `robust`: Use robust regression (Siegel) vs OLS
-- `multiplicative`: Log-transform for multiplicative seasonality
-- `penalty`: Trend dampening factor based on R² (optional)
+- `robust`: Siegel repeated medians (True), OLS (False), or auto-detect (None)
+- `multiplicative`: Log-space fitting for multiplicative seasonality (set during fit)
+- `penalty`: R²-based trend dampening scalar (set during fit, optional)
+- `verbose`: Verbosity level (currently unused, reserved for future logging)
 
 **Methods:**
-- `fit(y, seasonal_period, X, ...)`: Fit all components to series
-- `predict(h, X, level)`: Forecast h steps ahead with optional intervals
-- `optimize(y, ...)`: Auto-tune hyperparameters via cross-validation
+- `fit(y, seasonal_period, X, ...)`: Fit all components; extensive hyperparameter control
+- `predict(h, X, level)`: Forecast h steps from fitted state; optional conformal intervals
+- `forecast(y, h, ...)`: Stateless fit+predict (inherits base class default)
+- `optimize(y, ...)`: Auto-tune hyperparameters via rolling cross-validation
 """
 # mfles.py
 from __future__ import annotations
@@ -832,7 +842,16 @@ class MFLES(BaseForecaster):
             sp_array = jnp.array(sp_list, dtype=jnp.int32)
             max_period = int(max(sp_list))
             forced_order = max(1, int(fourier_order)) if fourier_order is not None else -1
-            max_fourier_order = forced_order if forced_order > 0 else 15
+            # IMPORTANT: avoid padding Fourier matrices with extra all-zero columns.
+            # Rank-deficient X can perturb pinv-based OLS (vs StatsForecast which
+            # builds an exact-width Fourier design).
+            if forced_order > 0:
+                max_fourier_order = forced_order
+            else:
+                # Mirror StatsForecast's set_fourier(period) rule in Python.
+                def _sf_fourier(p: int) -> int:
+                    return 5 if p < 10 else (10 if p < 70 else 15)
+                max_fourier_order = int(max(_sf_fourier(int(p)) for p in sp_list))
             fourier_stack, weights_stack = _build_fourier_and_weights_stack(
                 n=n,
                 sp_array=sp_array,
