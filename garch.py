@@ -29,8 +29,6 @@ and q for GARCH order (lagged variances). This is reversed from Bollerslev (1986
 but internally consistent within this codebase.
 """
 
-import warnings
-
 import jax
 import jax.numpy as jnp
 import optax
@@ -540,10 +538,9 @@ class GARCH(BaseForecaster):
                 "and forecasts will diverge."
             )
         elif persistence > 0.99:
-            warnings.warn(
+            raise RuntimeError(
                 f"GARCH persistence {persistence:.4f} is near the stationarity boundary. "
-                "Consider using an integrated GARCH (IGARCH) model for highly persistent volatility.",
-                RuntimeWarning
+                "Consider using an integrated GARCH (IGARCH) model for highly persistent volatility."
             )
 
         # Compute sigma2 on full array (including padding if present)
@@ -866,20 +863,12 @@ class GARCH(BaseForecaster):
             MIN_SIMS_FOR_PERCENTILE = 30
 
             if n_sims < MIN_SIMS_FOR_PERCENTILE:
-                # Fall back to analytical intervals using mean variance forecast
-                warnings.warn(
+                raise ValueError(
                     f"n_sims={n_sims} is too small for reliable percentile-based intervals. "
-                    f"Falling back to analytical intervals using mean variance forecast. "
-                    f"Use n_sims >= {MIN_SIMS_FOR_PERCENTILE} for empirical intervals.",
-                    RuntimeWarning
+                    f"Use n_sims >= {MIN_SIMS_FOR_PERCENTILE}."
                 )
-                sigma_forecast = jnp.sqrt(res['sigma2_mean'])
-                for lv in level:
-                    z = utils._jax_norm_ppf((100 + lv) / 200)
-                    res[f'lo-{lv}'] = res['mean'] - z * sigma_forecast
-                    res[f'hi-{lv}'] = res['mean'] + z * sigma_forecast
-            else:
-                for lv in level:
+
+            for lv in level:
                     lower_q = (100 - lv) / 2
                     upper_q = 100 - lower_q
                     res[f'lo-{lv}'] = jnp.percentile(paths, lower_q, axis=0)
@@ -1423,39 +1412,21 @@ if __name__ == '__main__':
         print(f"  [FAIL] Failed: {e}")
         failed += 1
 
-    # Test 20: Small n_sims fallback to analytical intervals
-    print("[Test 20] Small n_sims fallback to analytical intervals")
+    # Test 20: Small n_sims raises ValueError
+    print("[Test 20] Small n_sims raises ValueError")
     try:
         model = GARCH(p=1, q=1)
         model.fit(y_test)
 
         # Test with n_sims=1 (below MIN_SIMS_FOR_PERCENTILE)
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
+        try:
             result = model.predict_simulate(h=10, n_sims=1, seed=42, level=[95])
-
-            # Check warning was issued
-            assert len(w) >= 1, "Expected warning for small n_sims"
-            assert "too small for reliable percentile-based intervals" in str(w[-1].message), \
-                f"Wrong warning: {w[-1].message}"
-
-        # Check intervals are computed and non-zero
-        assert 'lo-95' in result and 'hi-95' in result, "Missing intervals"
-        interval_width = result['hi-95'] - result['lo-95']
-        assert jnp.all(interval_width > 0), f"Interval width should be positive, got {interval_width}"
-
-        # Verify analytical intervals match expected z-score computation
-        sigma_forecast = jnp.sqrt(result['sigma2_mean'])
-        z = utils._jax_norm_ppf((100 + 95) / 200)
-        expected_lo = result['mean'] - z * sigma_forecast
-        expected_hi = result['mean'] + z * sigma_forecast
-        assert jnp.allclose(result['lo-95'], expected_lo), "lo-95 doesn't match analytical"
-        assert jnp.allclose(result['hi-95'], expected_hi), "hi-95 doesn't match analytical"
-
-        print(f"  [PASS] Warning issued for n_sims=1")
-        print(f"  [PASS] Intervals computed with non-zero width: {interval_width[0]:.3f}")
-        print(f"  [PASS] Analytical fallback matches expected computation")
-        passed += 1
+            print("  [FAIL] Should have raised ValueError for small n_sims with level")
+            failed += 1
+        except ValueError as e:
+            assert "too small for reliable percentile-based intervals" in str(e), f"Wrong error: {e}"
+            print(f"  [PASS] Correctly rejected n_sims=1 with level")
+            passed += 1
     except Exception as e:
         print(f"  [FAIL] Failed: {e}")
         failed += 1
