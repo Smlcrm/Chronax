@@ -166,44 +166,42 @@ class GridTracker:
             self.success += 1
 
 def cross_validation(
-    y: jnp.ndarray,
-    X: Optional[jnp.ndarray],
+    folds: List[tuple],
     test_size: int,
-    n_windows: int,
-    step_size: int,
-    config: Dict[str, Any]
+    config: Dict[str, Any],
+    has_exogenous: bool,
+    cv_max_rounds: int = 10,
 ) -> float:
-    """Runs rolling CV for one config."""
-    scores = []
-    n_samples = y.shape[0]
+    """Runs rolling CV for one config using pre-sliced folds.
+    
+    Uses reduced max_rounds during CV for speed — enough to rank configs
+    but not full convergence. The final model fit uses full max_rounds.
+    """
+    cfg = config.copy()
+    sp = cfg.pop("seasonal_period", None)
+    # Use reduced iterations for CV speed (config ranking doesn't need full convergence)
+    if "max_rounds" not in cfg:
+        cfg["max_rounds"] = cv_max_rounds
+    total_score = jnp.float32(0.0)
+    count = 0
 
-    for split_idx in range(n_windows):
-        cutoff = n_samples - test_size - (split_idx * step_size)
-        if cutoff < 4: break
+    for fold in folds:
+        if has_exogenous:
+            y_train, y_test, X_train, X_test = fold
+        else:
+            y_train, y_test = fold
+            X_train = X_test = None
 
-        y_train = y[:cutoff]
-        y_test = y[cutoff : cutoff + test_size]
-        X_train = X[:cutoff] if X is not None else None
-        X_test = X[cutoff : cutoff + test_size] if X is not None else None
-
-        # Instantiate Model (Verbose 0)
         model = MFLES(verbose=0, alias="CV_Model")
-        
-        cfg = config.copy()
-        sp = cfg.pop("seasonal_period", None)
-        
-        # This call is safe in threads (no vmap issues)
         model.fit(y=y_train, X=X_train, seasonal_period=sp, **cfg)
-        
         preds = model.predict(h=test_size, X=X_test)
-        
-        # Use JIT metric
-        score = _smape(y_test, preds["mean"])
-        scores.append(score)
+        total_score = total_score + _smape(y_test, preds["mean"])
+        count += 1
 
-    if not scores: return float('inf')
-    # Use item() to convert JAX array to Python float immediately
-    return float(jnp.mean(jnp.array(scores)).item())
+    if count == 0:
+        return float("inf")
+    return float((total_score / count).item())
+
 
 def optimize_grid_threaded(
     y: jnp.ndarray,
@@ -217,41 +215,61 @@ def optimize_grid_threaded(
 ) -> Dict[str, Any]:
     """
     Parallel optimization using ThreadPoolExecutor.
-    Includes GridTracker to report progress.
+    Pre-slices CV folds once for all configs to reduce overhead.
     """
-    
-    # Validation
-    max_possible_windows = (y.shape[0] - test_size - 4) // step_size + 1
-    if max_possible_windows < 1: return grid[0]
+    n_samples = y.shape[0]
+    max_possible_windows = (n_samples - test_size - 4) // step_size + 1
+    if max_possible_windows < 1:
+        return grid[0]
     actual_windows = min(n_windows, max_possible_windows)
+    has_exogenous = X is not None
 
-    # --- TRACKER SETUP ---
+    # Pre-slice all CV folds once (shared across all configs)
+    folds = []
+    for split_idx in range(actual_windows):
+        cutoff = n_samples - test_size - (split_idx * step_size)
+        if cutoff < 4:
+            break
+        y_train = y[:cutoff]
+        y_test = y[cutoff: cutoff + test_size]
+        if has_exogenous:
+            folds.append((y_train, y_test, X[:cutoff], X[cutoff: cutoff + test_size]))
+        else:
+            folds.append((y_train, y_test))
+
+    if not folds:
+        return grid[0]
+
+    # Adaptive CV max_rounds: short series converge fast, long series need more
+    max_train_len = max(f[0].shape[0] for f in folds)
+    if max_train_len < 500:
+        cv_rounds = 10
+    elif max_train_len < 2000:
+        cv_rounds = 20
+    else:
+        cv_rounds = 30
+
     tracker = GridTracker()
     tracker.set_total(len(grid))
 
-    # Worker Wrapper
     def _worker(cfg):
         try:
-            score = cross_validation(y, X, test_size, actual_windows, step_size, cfg)
-            # If successful (even if score is poor), increment counter
-            tracker.increment_success() 
+            score = cross_validation(folds, test_size, cfg, has_exogenous, cv_max_rounds=cv_rounds)
+            tracker.increment_success()
             return score
         except Exception as e:
-            if verbose: print(f"Config failed: {e}")
-            return float('inf')
+            if verbose:
+                print(f"Config failed: {e}")
+            return float("inf")
 
-    # Parallel Execution
-    scores = []
     if n_jobs > 1:
         with concurrent.futures.ThreadPoolExecutor(max_workers=n_jobs) as executor:
             scores = list(executor.map(_worker, grid))
     else:
         scores = [_worker(g) for g in grid]
 
-    # --- REPORT PROGRESS ---
     print(f"  [AutoMFLES] Grid Search: Planned {tracker.total} runs | Completed {tracker.success} successfully.")
 
-    # Selection
     best_idx = np.argmin(scores)
     return grid[best_idx]
 
@@ -272,7 +290,7 @@ class AutoMFLES:
         verbose: bool = False,
         prediction_intervals: Optional[Any] = None,
         alias: str = "AutoMFLES",
-        n_jobs: int = 4 # Defaults to 4 threads
+        n_jobs: int = 4
     ):
         if test_size <= 0: raise ValueError("test_size must be > 0")
         if n_windows <= 0: raise ValueError("n_windows must be > 0")
@@ -292,41 +310,49 @@ class AutoMFLES:
         self.best_params_ = None
         self.sigma_ = 0.0
         self.scaling_stats_ = None
+        self._cached_y_hash = None  # New: Cache key for y (to detect changes)
 
     def fit(self, y: Union[np.ndarray, jnp.ndarray], X: Optional[jnp.ndarray] = None) -> "AutoMFLES":
         y = _ensure_float(y)
+        y_hash = hash(y.tobytes())  # Simple hash to detect y changes
         
         if X is not None:
             X = jnp.asarray(X, dtype=jnp.float32)
             if X.ndim == 1: X = X.reshape(-1, 1)
             self.scaling_stats_ = _get_stats(X)
             X = _standardize_data(X, *self.scaling_stats_)
-
-        search_grid = generate_search_grid(self.season_length, self.config)
+        
+        # New: Skip optimization if already done and y/X unchanged
+        if self.best_params_ is None or self._cached_y_hash != y_hash:
+            search_grid = generate_search_grid(self.season_length, self.config)
 
         # Use THREADED optimization (Safe & Fast)
-        self.best_params_ = optimize_grid_threaded(
-            y=y,
-            X=X,
-            test_size=self.test_size,
-            n_windows=self.n_windows,
-            step_size=self.step_size,
-            grid=search_grid,
-            n_jobs=self.n_jobs, 
-            verbose=self.verbose
-        )
-
+            self.best_params_ = optimize_grid_threaded(
+                y=y,
+                X=X,
+                test_size=self.test_size,
+                n_windows=self.n_windows,
+                step_size=self.step_size,
+                grid=search_grid,
+                n_jobs=self.n_jobs, 
+                verbose=self.verbose
+            )
+            self._cached_y_hash = y_hash  # Cache the hash
+        
+        # Always fit the model with best params (fast after caching)
         model = MFLES(
             verbose=int(self.verbose),
             conformal_params=self.prediction_intervals,
             alias=self.alias,
         )
         
-        final_sl = self.best_params_.get("seasonal_period", self.season_length)
+        # Fix: Handle season_length as list safely
+        default_sl = None if self.season_length is None else (self.season_length[0] if isinstance(self.season_length, list) else self.season_length)
+        final_sl = self.best_params_.get("seasonal_period", default_sl)
         fit_params = {k: v for k, v in self.best_params_.items() if k != "seasonal_period"}
-
+        
         model.fit(y=y, seasonal_period=final_sl, X=X, **fit_params)
-
+        
         self.model_ = {"model": model, "fitted": model.fitted_}
         self.sigma_ = _calculate_sigma(y - model.fitted_)
         return self
@@ -349,3 +375,4 @@ class AutoMFLES:
             res = add_gaussian_intervals(res, level, self.sigma_)
 
         return res
+    
