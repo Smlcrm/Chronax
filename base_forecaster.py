@@ -10,7 +10,7 @@ Class Attributes:
 1. uses_exog; boolean representing model's exogenous variable handling
 
 Methods:
-1. new() returns a shallow copy of the object, used internally by forecast() to avoid mutating state.
+1. new() returns a shallow copy of the object, used internally to clone a model without mutating state.
 
 2. __repr__ returns the model's alias for easy identification.
 
@@ -23,9 +23,10 @@ Methods:
    returning a dict with at least {"mean": jnp.ndarray}. Optionally adds
    confidence intervals when level is provided.
 
-5. forecast(y, h, X=None, X_future=None, level=None, fitted=False) [concrete, overridable]
-   Stateless fit+predict: clones the model, fits on y, and calls predict for h steps.
-   Subclasses may override for efficiency (e.g. avoiding state storage) or custom behavior.
+5. forecast(y, h, X=None, X_future=None, level=None, fitted=False) [abstractmethod]
+   Must be implemented by every subclass. Stateless fit+predict on y, forecasting h steps ahead.
+   Implementations differ significantly across models (fitted values, model-specific kwargs, etc.).
+   Subclasses may extend the signature with additional optional parameters.
 
 6. forward(y, h, X=None, X_future=None, level=None, fitted=False) [concrete, overridable]
    Updates the model on new data y and forecasts h steps ahead. Default delegates to forecast().
@@ -94,6 +95,7 @@ class BaseForecaster(ABC):
         Returns a dict with at least {"mean": jnp.ndarray}.
         """
 
+    @abstractmethod
     def forecast(
         self,
         y: jnp.ndarray,
@@ -105,10 +107,9 @@ class BaseForecaster(ABC):
     ) -> dict:
         """
         Stateless fit+predict on y, forecasting h steps ahead.
-        Clones the model, fits on y, and calls predict.
-        Subclasses may override for efficiency or custom behavior.
+        Must return a dict with at least {"mean": jnp.ndarray}.
+        Subclasses may extend the signature with model-specific optional parameters.
         """
-        return self.new().fit(y, X=X).predict(h, X=X_future, level=level)
 
     def forward(
         self,
