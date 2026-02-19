@@ -16,6 +16,82 @@ Array = jnp.ndarray
 from base_forecaster import BaseForecaster 
 
 from utils import _quantiles
+
+
+# =============================================================================
+# AUTOMATIC PERIOD DETECTION
+# =============================================================================
+
+def detect_period(y: np.ndarray, max_period: Optional[int] = None) -> int:
+    """
+    Detect the dominant seasonal period from a time series using ACF peaks.
+    Returns 1 if no significant seasonality is found.
+    
+    Uses a strict validation: the candidate period must have strong ACF,
+    and harmonics (2*period, 3*period) should also show elevated ACF.
+    """
+    y = np.asarray(y, dtype=np.float64)
+    n = len(y)
+    if max_period is None:
+        max_period = min(n // 4, 200)
+    if max_period < 2:
+        return 1
+    
+    # Detrend via first differencing
+    dy = np.diff(y)
+    
+    # Compute ACF via FFT
+    dy_centered = dy - dy.mean()
+    fft_len = 1
+    while fft_len < 2 * len(dy_centered):
+        fft_len *= 2
+    fft_vals = np.fft.rfft(dy_centered, n=fft_len)
+    acf_full = np.fft.irfft(fft_vals * np.conj(fft_vals), n=fft_len)
+    acf_full = acf_full[:len(dy_centered)]
+    if acf_full[0] > 0:
+        acf_full = acf_full / acf_full[0]
+    
+    # Strict threshold: require correlation above noise floor
+    threshold = max(0.1, 3.0 / np.sqrt(n))
+    
+    # Find candidate peaks
+    candidates = []
+    for lag in range(2, min(max_period + 1, len(acf_full) - 1)):
+        val = acf_full[lag]
+        if val > threshold:
+            left = acf_full[lag - 1]
+            right = acf_full[lag + 1]
+            if val >= left and val >= right:
+                candidates.append((lag, val))
+    
+    if not candidates:
+        return 1
+    
+    # Score candidates: check harmonic consistency
+    best_lag = 1
+    best_score = 0.0
+    
+    for lag, acf_val in candidates:
+        score = acf_val
+        # Check harmonics (2x, 3x period)
+        for mult in [2, 3]:
+            harm_lag = lag * mult
+            if harm_lag < len(acf_full):
+                harm_val = acf_full[harm_lag]
+                if harm_val > threshold * 0.5:
+                    score += harm_val * 0.3
+        
+        if score > best_score:
+            best_score = score
+            best_lag = lag
+    
+    # Final check: reject if the peak is too weak
+    if best_score < threshold * 1.5:
+        return 1
+    
+    return best_lag
+
+
 # =============================================================================
 # LOW-LEVEL TRANSFORMS (from arima.cpp)
 # =============================================================================
@@ -378,21 +454,16 @@ def arima_css(y: Array, arma: Tuple[int, ...], phi: Array, theta: Array) -> Tupl
         w = w.at[m:].add(-w[:-m])
         w = w.at[:m].set(0.0) # The first m elements become invalid
 
-    # 3. Compute AR Part (Vectorized)
-    # The AR component is: Sum(phi[j] * w[t-j-1])
-    # Since 'w' is fully known, we can compute the AR contribution for all 't' at once.
-    resid = w # Start with the differenced series
+    # 3. Compute AR Part (Vectorized via Convolution)
+    # The AR component is: resid[t] = w[t] - phi[0]*w[t-1] - phi[1]*w[t-2] - ...
+    # This is equivalent to convolving w with the AR filter [1, -phi_0, -phi_1, ...]
+    resid = w  # Start with the differenced series
     
     if p > 0:
-        # Subtract AR terms
-        # We loop over lags. Since p is usually small (<100), unrolling this is efficient.
-        for j in range(p):
-            # Shift w right by j+1
-            w_shifted = jnp.roll(w, j + 1)
-            # Zero out the wrapped-around elements (though ncond masking handles this later,
-            # it's safer to be explicit)
-            w_shifted = w_shifted.at[:j+1].set(0.0)
-            resid = resid - phi[j] * w_shifted
+        # Build AR filter polynomial: [1, -phi_0, -phi_1, ..., -phi_{p-1}]
+        ar_filter = jnp.concatenate([jnp.array([1.0], dtype=jnp.float64), -phi])
+        # Convolve and take only the first n elements (causal filter)
+        resid = jnp.convolve(w, ar_filter)[:n]
 
     # 4. Compute MA Part (Recursive via Scan)
     # This part MUST be sequential because resid[t] depends on resid[t-1]
@@ -545,16 +616,22 @@ def make_arima(phi: Array, theta: Array, delta: Array, arma: Tuple[int, ...], ka
 # -----------------------------------------------------------------------------
 @partial(jax.jit, static_argnames=['arma'])
 def arima_like(y: Array, mod: StateSpaceModel, arma: Tuple[int, ...]) -> Tuple[float, float, int, Array]:
-    """Optimized Kalman Filter using jax.lax.scan."""
-    T, Z, V, a0, P0 = mod.T, mod.Z, mod.V, mod.a0, mod.P0
-    n = y.shape[0]
+    """Optimized Kalman Filter using jax.lax.scan. Returns (ssq, sumlog, nu, residuals)."""
+    (a_final, P_final, ssq, sumlog, nu), residuals, _ = _kalman_filter_core(y, mod)
+    return ssq, sumlog, nu, residuals
 
-    # The Scan Step: "Update Current -> Predict Next"
-    # Carry is (a_prior, P_prior, ssq, sumlog, nu)
+
+def _kalman_filter_core(y: Array, mod: StateSpaceModel):
+    """
+    Core Kalman filter. Returns full final carry, standardized residuals,
+    and raw innovations. Used by arima_like (for metrics) and for
+    innovation correction in forecasting.
+    """
+    T, Z, V, a0, P0 = mod.T, mod.Z, mod.V, mod.a0, mod.P0
+
     def step_prior_carry(carry, y_t):
         a_prior, P_prior, ssq, sumlog, nu = carry
         
-        # --- Update Step ---
         v = y_t - jnp.dot(Z, a_prior)
         F = jnp.dot(Z, P_prior @ Z)
         
@@ -562,35 +639,23 @@ def arima_like(y: Array, mod: StateSpaceModel, arma: Tuple[int, ...]) -> Tuple[f
         M = P_prior @ Z
         K = M / safe_F
         
-        # Posterior
         a_post = a_prior + K * v
         P_post = P_prior - jnp.outer(K, M)
         
-        # --- Predict Step (Next Prior) ---
         a_next_prior = T @ a_post
         P_next_prior = T @ P_post @ T.T + V
         
-        # --- Stats Accumulation ---
-        # Accumulate only if variance is reasonable
         valid = F < 1e4
         nu_inc = jnp.where(valid, 1, 0)
         ssq_inc = jnp.where(valid, (v**2)/safe_F, 0.0)
         sumlog_inc = jnp.where(valid, jnp.log(safe_F), 0.0)
         std_resid = jnp.where(valid, v / jnp.sqrt(safe_F), 0.0)
         
-        # JAX requires float return for ssq/sumlog to avoid type errors in scan
-        return (a_next_prior, P_next_prior, ssq + ssq_inc, sumlog + sumlog_inc, nu + nu_inc), std_resid
+        return (a_next_prior, P_next_prior, ssq + ssq_inc, sumlog + sumlog_inc, nu + nu_inc), (std_resid, v)
 
-    # Initial State (Prior at t=0)
-    # mod.a0 is a_{1|0} (usually 0)
-    # mod.P0 is P_{1|0} (from getQ0)
     init_carry = (mod.a0, mod.P0, 0.0, 0.0, 0)
-    
-    # Run the fast loop
-    final_carry, residuals = jax.lax.scan(step_prior_carry, init_carry, y)
-    
-    _, _, final_ssq, final_sumlog, final_nu = final_carry
-    return final_ssq, final_sumlog, final_nu, residuals
+    final_carry, (std_resids, innovations) = jax.lax.scan(step_prior_carry, init_carry, y)
+    return final_carry, std_resids, innovations
 
 
 # -----------------------------------------------------------------------------
@@ -819,35 +884,17 @@ def arima_fit(
     if include_mean and (d + D) == 0:
         init_params = init_params.at[narma + n_exog].set(jnp.nanmean(x))
 
-    # B. Drift (d+D == 1) - WITH T-TEST
-    # This logic decides if the "Trend" is real or just noise.
+    # B. Drift (d+D == 1)
+    # Always initialize drift with the mean of the differenced series.
+    # The optimizer will shrink it toward zero if the trend is not significant.
     if use_drift:
-        # Calculate the differenced series (the "slope" at each step)
         if D == 1 and period > 1:
             dx = x[period:] - x[:-period]
         else:
             dx = x[1:] - x[:-1]
-            
-        # Calculate statistics
+        
         mean_dx = jnp.nanmean(dx)
-        std_dx = jnp.nanstd(dx) + 1e-10
-        n_dx = dx.shape[0]
-        
-        # T-statistic: |mean| / standard_error
-        # This tells us: "Is the mean significantly different from 0?"
-        t_stat = jnp.abs(mean_dx / (std_dx / jnp.sqrt(n_dx)))
-        
-        # GATING LOGIC:
-        # If t > 1.5, we assume there is a real trend -> Initialize with mean.
-        # If t <= 1.5, we assume it's random noise -> Initialize with 0.0.
-        # This prevents the model from forcing a trend on stationary data (Daily Births).
-        drift_guess = jnp.where(t_stat > 1.5, mean_dx, 0.0)
-        
-        # Save the guess for metadata
-        drift_coef = float(drift_guess)
-        
-        # Set the initialization
-        init_params = init_params.at[narma + n_exog].set(drift_guess)
+        init_params = init_params.at[narma + n_exog].set(mean_dx)
 
     # Optimization Settings
     if optim_control is None: optim_control = {}
@@ -877,7 +924,7 @@ def arima_fit(
     # 4. POST-PROCESSING
     y_adj, phi, theta = _unpack_and_adjust(current_params, x, xreg, arma, ncxreg, n_exog, include_mean)
     mod = make_arima(phi, theta, delta, arma)
-    ssq, sumlog, nu, resid = arima_like(y_adj, mod, arma)
+    (_, _, ssq, sumlog, nu), resid, innovations = _kalman_filter_core(y_adj, mod)
     
     sigma2 = jnp.where(nu > 0, ssq / nu, jnp.inf)
     
@@ -888,16 +935,23 @@ def arima_fit(
     metrics = _compute_metrics(loglik, sigma2, nu, n_params_total)
     success = jnp.isfinite(loglik) & (sigma2 > 0)
     
+    # Extract the optimized drift from fitted params (not the initial guess)
+    if use_drift:
+        drift_coef = float(current_params[narma + n_exog])
+    
     return {
         "coef": current_params,
         **metrics, 
         "model": mod,
         "residuals": resid,
+        "innovations": innovations,
+        "y_adj": y_adj,
+        "delta": delta,
         "arma": arma,
         "nobs": nu,
-        "n_obs_train": n_obs,      # Required for wrapper
-        "use_drift": use_drift,    # Required for wrapper
-        "drift_coef": drift_coef,  # Metadata
+        "n_obs_train": n_obs,
+        "use_drift": use_drift,
+        "drift_coef": drift_coef,
         "success": success 
     }
 # =============================================================================
@@ -954,6 +1008,214 @@ _predict_batch_kernel = jax.vmap(
 )
 
 # =============================================================================
+# SHARED RECONSTRUCTION: Undo differencing using the delta polynomial
+# =============================================================================
+
+def _reconstruct_forecast(
+    raw_pred: Array,
+    y_train: Array,
+    arma: Tuple[int, ...],
+    h: int,
+) -> Array:
+    """
+    Undo all differencing (ordinary + seasonal) using the delta polynomial
+    as an inverse filter. This correctly handles d>0, D>0, and combined cases.
+    
+    The delta polynomial encodes the combined differencing:
+        delta = convolve([1,-1]^d, [1,0,...,-1]^D)
+    stored as -delta[1:] in make_arima. We use the *positive* differencing
+    coefficients for the inverse filter.
+    
+    Inverse filter: y[n+k] = raw[k] + sum(diffc[j] * y[n+k-1-j])
+    where diffc are the positive differencing coefficients excluding the
+    leading 1.
+    """
+    p, q, P, Q, m, d, D = arma
+    
+    if d + D == 0:
+        return raw_pred
+    
+    # Rebuild the positive differencing polynomial coefficients
+    # diffc = coefficients of (1-B)^d * (1-B^m)^D, excluding the leading 1
+    poly = np.array([1.0])
+    for _ in range(d):
+        poly = np.convolve(poly, [1.0, -1.0])
+    for _ in range(D):
+        seas = np.zeros(m + 1)
+        seas[0] = 1.0
+        seas[m] = -1.0
+        poly = np.convolve(poly, seas)
+    
+    # diffc = -poly[1:] (positive form for inverse filter)
+    diffc = -poly[1:]
+    nd = len(diffc)
+    
+    # Build extended series: last nd values of training + h forecast slots
+    tail = np.array(y_train[-nd:], dtype=np.float64) if nd <= len(y_train) else np.array(y_train, dtype=np.float64)
+    raw_np = np.array(raw_pred, dtype=np.float64)
+    
+    # Extend with forecast values
+    extended = np.concatenate([tail, np.zeros(h)])
+    offset = len(tail)
+    
+    for k in range(h):
+        val = raw_np[k]
+        for j in range(min(nd, offset + k)):
+            val += diffc[j] * extended[offset + k - 1 - j]
+        extended[offset + k] = val
+    
+    return jnp.array(extended[offset:])
+
+
+# =============================================================================
+# FUSED FORECAST KERNEL (Single XLA Dispatch: BFGS params -> forecasts)
+# =============================================================================
+
+@partial(jax.jit, static_argnames=['arma', 'ncxreg', 'n_exog', 'include_mean', 'n_ahead'])
+def _fused_forecast_kernel(
+    params: Array,
+    y: Array,
+    delta: Array,
+    arma: Tuple[int, ...],
+    ncxreg: int,
+    n_exog: int,
+    include_mean: bool,
+    n_ahead: int,
+) -> Array:
+    """
+    Fused kernel: params -> phi/theta -> state-space -> forecast.
+    Skips all metric computation (AIC, BIC, sigma2, loglik, residuals).
+    Single XLA dispatch eliminates multiple Python-to-XLA roundtrips.
+    """
+    # 1. Unpack params to phi, theta
+    y_adj, phi, theta = _unpack_and_adjust(params, y, None, arma, ncxreg, n_exog, include_mean)
+
+    # 2. Build state-space model (fresh initial state a0, P0)
+    mod = make_arima(phi, theta, delta, arma)
+
+    # 3. Structural Kalman forecast from initial state
+    forecasts, _ = kalman_forecast(n_ahead, mod)
+
+    # 4. Add deterministic component (intercept/drift)
+    narma_total = sum(arma[:4])
+    if ncxreg > 0:
+        reg_matrix = jnp.ones((n_ahead, ncxreg), dtype=jnp.float64)
+        exog_coefs = lax.dynamic_slice(params, (narma_total,), (ncxreg,))
+        xm = jnp.dot(reg_matrix, exog_coefs)
+        forecasts = forecasts + xm
+
+    return forecasts
+
+
+@partial(jax.jit, static_argnames=['arma', 'ncxreg', 'n_exog', 'include_mean', 'n_ahead'])
+def _forecast_from_params(
+    params: Array,
+    y: Array,
+    delta: Array,
+    arma: Tuple[int, ...],
+    ncxreg: int,
+    n_exog: int,
+    include_mean: bool,
+    n_ahead: int,
+) -> Array:
+    """
+    Fully fused forecast kernel: params → forecast in a single XLA dispatch.
+    
+    Combines all post-BFGS steps:
+    1. Unpack params → phi, theta (once)
+    2. Build state-space model (once)  
+    3. Run Kalman filter on training data → innovations
+    4. Kalman forecast from trained state
+    5. MA innovation correction
+    6. Deterministic component (intercept/drift)
+    
+    This replaces 5+ separate function calls that previously required
+    multiple XLA dispatches and redundant computation.
+    """
+    narma_total = sum(arma[:4])
+    
+    # 1. Unpack params to phi, theta, adjusted y (ONCE)
+    y_adj, phi, theta = _unpack_and_adjust(params, y, None, arma, ncxreg, n_exog, include_mean)
+    
+    # 2. Build state-space model (ONCE)
+    mod = make_arima(phi, theta, delta, arma)
+    
+    # 3. Structural Kalman forecast from initial state (fresh a0, P0)
+    # This matches the original approach: forecast from a0=zeros, not trained state
+    forecasts, _ = kalman_forecast(n_ahead, mod)
+    
+    # 4. Run Kalman filter on training data ONLY to extract innovations
+    # for MA correction (the filter state itself is not used for forecasting)
+    _, _, innovations = _kalman_filter_core(y_adj, mod)
+    
+    # 5. MA innovation correction (inline vectorized)
+    q_total = theta.shape[0]
+    n_train = innovations.shape[0]
+    # Apply MA correction if model has MA terms (q_total is static, known at trace time)
+    if q_total > 0:
+        # q_total (from arma) is always << n_train for valid models
+        rev_tail = jax.lax.dynamic_slice(innovations, (n_train - q_total,), (q_total,))[::-1]
+        corr_vals = jnp.zeros(n_ahead, dtype=jnp.float64)
+        for k in range(min(n_ahead, q_total)):
+            corr_vals = corr_vals.at[k].set(
+                jnp.dot(theta[k:], rev_tail[:q_total - k])
+            )
+        forecasts = forecasts + corr_vals
+    
+    # 6. Deterministic component (intercept/drift)
+    if ncxreg > 0:
+        reg_matrix = jnp.ones((n_ahead, ncxreg), dtype=jnp.float64)
+        exog_coefs = lax.dynamic_slice(params, (narma_total,), (ncxreg,))
+        xm = jnp.dot(reg_matrix, exog_coefs)
+        forecasts = forecasts + xm
+    
+    return forecasts
+
+
+def _ma_innovation_correction(
+    raw_pred: Array,
+    theta_expanded: Array,
+    innovations: Array,
+    n_ahead: int,
+) -> Array:
+    """
+    Add MA innovation correction to structural Kalman forecast.
+    The Kalman forecast from a0=zeros misses the decaying MA contribution
+    from recent innovations. For forecast step k, past innovations weighted
+    by the expanded MA polynomial are added.
+    
+    Vectorized: for step k, corr[k] = sum_{j=k}^{q-1} theta[j] * innov[n-1-(j-k)]
+    which equals dot(theta[k:], innov[n-1:n-1-(q-k):-1]) = dot(theta[k:], reversed tail)
+    """
+    q_total = theta_expanded.shape[0]
+    if q_total == 0:
+        return raw_pred
+    
+    n_train = innovations.shape[0]
+    # Reverse the last q_total innovations: [innov[n-1], innov[n-2], ..., innov[n-q]]
+    tail_len = min(q_total, n_train)
+    rev_tail = innovations[n_train - tail_len:][::-1]  # shape (tail_len,)
+    # Pad if needed (when n_train < q_total)
+    if tail_len < q_total:
+        rev_tail = jnp.concatenate([rev_tail, jnp.zeros(q_total - tail_len, dtype=jnp.float64)])
+    
+    # For step k: corr[k] = dot(theta[k:], rev_tail[:q_total-k])
+    # This is a correlation/convolution operation
+    corr = jnp.correlate(rev_tail, theta_expanded, mode='full')
+    # The correlation output at index q_total-1+k gives sum_{j} theta[j] * rev_tail[j+k]
+    # We want sum_{j=k}^{q-1} theta[j] * rev_tail[j-k] = correlate result at offset 0..n_ahead-1
+    # Actually: corr[k] = sum_j theta[j] * rev_tail[j+k] isn't right. Let me do it directly.
+    # For k=0: dot(theta[0:], rev_tail[0:]) = dot(theta, rev_tail)
+    # For k=1: dot(theta[1:], rev_tail[0:q-1]) 
+    # This is a simple loop but vectorized per-step with slicing
+    steps = min(n_ahead, q_total)
+    corr_vals = jnp.zeros(n_ahead, dtype=jnp.float64)
+    for k in range(steps):
+        corr_vals = corr_vals.at[k].set(jnp.dot(theta_expanded[k:], rev_tail[:q_total - k]))
+    return raw_pred + corr_vals
+
+
+# =============================================================================
 # PREDICTION FUNCTIONS
 # =============================================================================
 
@@ -978,9 +1240,9 @@ def predict_arima(
     
     # CASE 1: SINGLE MODEL (1D Params)
     if params.ndim == 1:
-        # Prepare Inputs
         mod = model["model"]
-        narma = sum(model["arma"][:4])
+        arma = model["arma"]
+        narma = sum(arma[:4])
         n_exog = params.shape[0] - narma
         
         # Prepare Exogenous (Single) - now drift is NOT in xreg
@@ -998,13 +1260,14 @@ def predict_arima(
         else:
             reg_matrix = jnp.zeros((n_ahead, 0), dtype=jnp.float64)
             
-        # Call Fast Single Kernel
+        # Call Fast Single Kernel (structural forecast from a0=zeros)
         pred, se = _predict_core(mod, params, n_ahead, reg_matrix, narma, n_exog, model["sigma2"])
         
-        # ADD DRIFT CUMULATIVELY: forecast[h] += drift_coef * (h+1) for h=0..n_ahead-1
-        if use_drift and drift_coef != 0.0:
-            drift_contribution = drift_coef * jnp.arange(1, n_ahead + 1, dtype=jnp.float64)
-            pred = pred + drift_contribution
+        # MA innovation correction from training data
+        innovations = model.get("innovations", None)
+        if innovations is not None:
+            _, theta_expanded = arima_transpar(params[:narma], arma, trans=True)
+            pred = _ma_innovation_correction(pred, theta_expanded, innovations, n_ahead)
         
         return (pred, se) if se_fit else pred
 
@@ -1065,8 +1328,9 @@ def is_constant(x: Array, tol: float = 1e-10) -> Array:
     return is_flat
 
 
+@jax.jit
 def kpss_test(x: jax.Array) -> float:
-    """KPSS Test (JAX Optimized). Match statsmodels logic."""
+    """KPSS Test (JAX Optimized, JIT-compiled). Match statsmodels logic."""
     x = jnp.asarray(x)
     n = x.shape[0]
     
@@ -1114,9 +1378,10 @@ def kpss_test(x: jax.Array) -> float:
     return pval
 
 
+@partial(jax.jit, static_argnames=['max_d'])
 def ndiffs(x: Array, alpha: float = 0.05, max_d: int = 2) -> int:
     """
-    Determine number of differences needed for stationarity (JIT Optimized).
+    Determine number of differences needed for stationarity (JIT-compiled).
     
     Strategy: Unrolls the loop for d=0 and d=1 since max_d is small.
     Executes checks in parallel and selects the lowest d that satisfies condition.
@@ -1361,7 +1626,7 @@ def search_arima(
     allow_drift: bool = True,
     allow_mean: bool = True,
     period: int = 1,
-    method: str = "CSS"
+    method: str = "CSS-ML"
 ) -> Dict:
     """
     Optimized Hybrid Search. 
@@ -1424,6 +1689,22 @@ def search_arima(
         
     return best_res
 
+def _aa_standardize(y: jnp.ndarray, eps: float = 1e-10) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """
+    Standardize series to zero mean and unit variance.
+    Returns (y_norm, mean, std_safe). Used internally by AutoARIMA.
+    """
+    mean = jnp.nanmean(y)
+    std = jnp.nanstd(y)
+    std_safe = jnp.where(std > eps, std, 1.0)
+    return (y - mean) / std_safe, mean, std_safe
+
+
+def _aa_denormalize(y_norm: jnp.ndarray, mean: jnp.ndarray, std: jnp.ndarray) -> jnp.ndarray:
+    """Inverse of _aa_standardize: y = y_norm * std + mean."""
+    return y_norm * std + mean
+
+
 def auto_arima_f(
     x: Array,
     d: Optional[int] = None,
@@ -1444,7 +1725,7 @@ def auto_arima_f(
     ic: str = "aicc",
     stepwise: bool = True,
     nmodels: int = 94,
-    method: str = "CSS",
+    method: str = "CSS-ML",
     xreg: Optional[Array] = None,
     allowdrift: bool = True,
     allowmean: bool = True,
@@ -1491,6 +1772,8 @@ def auto_arima_f(
         eff_max_Q = max_Q
     
     # --- Phase 3: Model Search ---
+    # Use CSS-only for fast candidate evaluation; final refit uses full method
+    search_method = "CSS"
     
     # Helper to convert ARIMAResult to dict
     def _to_dict(res: ARIMAResult, p_: int, q_: int, P_: int, Q_: int) -> Dict:
@@ -1505,7 +1788,7 @@ def auto_arima_f(
         bestfit = search_arima(
             x, d=d_val, D=D_val, period=m,
             max_p=max_p, max_q=max_q, max_P=eff_max_P, max_Q=eff_max_Q,
-            max_order=max_order, ic=ic, method=method, xreg=xreg,
+            max_order=max_order, ic=ic, method=search_method, xreg=xreg,
             allow_drift=allowdrift, allow_mean=allowmean
         )
     # Stepwise Search
@@ -1519,14 +1802,14 @@ def auto_arima_f(
         
         res = myarima(
             x, order=(p, d_val, q), seasonal_order=(P, D_val, Q), period=m,
-            constant=constant, ic=ic, method=method, xreg=xreg
+            constant=constant, ic=ic, method=search_method, xreg=xreg
         )
         bestfit = _to_dict(res, p, q, P, Q)
         
         # Try null model
         res = myarima(
             x, order=(0, d_val, 0), seasonal_order=(0, D_val, 0), period=m,
-            constant=constant, ic=ic, method=method, xreg=xreg
+            constant=constant, ic=ic, method=search_method, xreg=xreg
         )
         fit = _to_dict(res, 0, 0, 0, 0)
         if fit["ic"] < bestfit["ic"]:
@@ -1551,7 +1834,7 @@ def auto_arima_f(
                     
                     res = myarima(
                         x, order=(new_p, d_val, new_q), seasonal_order=(new_P, D_val, new_Q), period=m,
-                        constant=constant, ic=ic, method=method, xreg=xreg
+                        constant=constant, ic=ic, method=search_method, xreg=xreg
                     )
                     fit = _to_dict(res, new_p, new_q, new_P, new_Q)
                     k += 1
@@ -1591,7 +1874,8 @@ def auto_arima_f(
 
 class AutoARIMA(BaseForecaster):
     """
-    Automatic ARIMA model selection with Automatic Scaling.
+    Automatic ARIMA model selection. Internally standardizes the series
+    (zero mean, unit variance) by default for faster and more stable optimization.
     """
     uses_exog = True
     
@@ -1615,10 +1899,10 @@ class AutoARIMA(BaseForecaster):
         ic: str = "aicc",
         stepwise: bool = True,
         nmodels: int = 94,
-        method: str = "CSS",
+        method: str = "CSS-ML",
         allowdrift: bool = True,
         allowmean: bool = True,
-        period: int = 1,
+        period: Optional[int] = None,
     ):
         self.d = d
         self.D = D
@@ -1641,32 +1925,46 @@ class AutoARIMA(BaseForecaster):
         self.method = method
         self.allowdrift = allowdrift
         self.allowmean = allowmean
-        self.period = period
+        self._user_period = period  # None = auto-detect
         self.model_ = None
-        
-        # Scaling params
-        self.mean_y = 0.0
-        self.std_y = 1.0
+        self.standardize = True
+        self._y_mean = None
+        self._y_std = None
+        # Cached state for fast forecast() path
+        self._cached_order = None
+        self._cached_seasonal_order = None
+        self._cached_include_mean = None
+        self._cached_delta = None
+        self._cached_arma = None
+        self._cached_narma = None
+        self._cached_ncxreg = None
+        self._cached_n_exog = None
     
     def fit(self, y: jnp.ndarray, X: Optional[jnp.ndarray] = None) -> "AutoARIMA":
-        # 1. SCALING LOGIC
         y_np = np.array(y)
-        self.mean_y = np.mean(y_np)
-        self.std_y = np.std(y_np) + 1e-6 # Safety buffer
-        
-        # Normalize: (y - mean) / std
-        y_scaled = (y_np - self.mean_y) / self.std_y
-        y_jax = jnp.asarray(y_scaled, dtype=jnp.float64)
+        y_jax = jnp.asarray(y_np, dtype=jnp.float64)
         
         if X is not None:
-             X = jnp.asarray(X, dtype=jnp.float64)
+            X = jnp.asarray(X, dtype=jnp.float64)
 
-        # --- CRITICAL CHANGE 1: SAVE HISTORY ---
-        # We need the scaled history to reconstruct trends in predict()
-        self.y_train_ = y_jax
+        if self.standardize:
+            y_fit, self._y_mean, self._y_std = _aa_standardize(y_jax)
+        else:
+            y_fit = y_jax
+            self._y_mean = jnp.array(0.0, dtype=jnp.float64)
+            self._y_std = jnp.array(1.0, dtype=jnp.float64)
+
+        self.y_train_ = y_fit
+
+        # Auto-detect period if not specified
+        if self._user_period is None:
+            detected = detect_period(y_np, max_period=min(len(y_np) // 4, 24))
+            self.period = detected
+        else:
+            self.period = self._user_period
 
         self.model_ = auto_arima_f(
-            x=y_jax,
+            x=y_fit,
             d=self.d,
             D=self.D,
             max_p=self.max_p,
@@ -1691,7 +1989,81 @@ class AutoARIMA(BaseForecaster):
             allowmean=self.allowmean,
             period=self.period,
         )
+        
+        # Cache the selected order for fast forecast() reuse
+        p, q, P, Q, m, d, D = self.model_["arma"]
+        self._cached_order = (p, d, q)
+        self._cached_seasonal_order = (P, D, Q)
+        self._cached_include_mean = self.model_.get("use_drift", False) or (d + D == 0 and self.allowmean)
+        self._cached_arma = (p, q, P, Q, m, d, D)
+        self._cached_narma = p + q + P + Q
+        n_exog = 0
+        self._cached_ncxreg = n_exog + (1 if self._cached_include_mean else 0)
+        self._cached_n_exog = n_exog
+        
+        # Cache delta polynomial
+        delta = jnp.array([1.0], dtype=jnp.float64)
+        for _ in range(d):
+            delta = jnp.convolve(delta, jnp.array([1.0, -1.0]))
+        for _ in range(D):
+            seas_diff = jnp.concatenate([jnp.array([1.0]), jnp.zeros(m - 1), jnp.array([-1.0])])
+            delta = jnp.convolve(delta, seas_diff)
+        self._cached_delta = -delta[1:]
+        
         return self
+    
+    def forecast(self, h: int, y: jnp.ndarray, X: Optional[jnp.ndarray] = None) -> Dict[str, jnp.ndarray]:
+        """
+        Fast fit-and-predict. On first call, runs full model search. On subsequent
+        calls, reuses the cached best order and runs only BFGS + fused kernel.
+        """
+        y_jax = jnp.asarray(np.array(y), dtype=jnp.float64)
+        
+        # First call: run full search to find best order, then reuse predict()
+        if self._cached_order is None:
+            self.fit(y_jax, X)
+            return self.predict(h, X=None)
+
+        # Subsequent calls: fast path with cached order (CSS-only for speed)
+        arma = self._cached_arma
+        p, q, P, Q, m, d, D = arma
+        include_mean = self._cached_include_mean
+        use_drift = include_mean and (d + D) == 1
+        
+        # Standardize current series for fast refit
+        if self.standardize:
+            y_fit, f_mean, f_std = _aa_standardize(y_jax)
+        else:
+            y_fit = y_jax
+            f_mean = jnp.array(0.0, dtype=jnp.float64)
+            f_std = jnp.array(1.0, dtype=jnp.float64)
+
+        init_params = jnp.zeros(self._cached_narma + self._cached_ncxreg, dtype=jnp.float64) + 1e-3
+
+        if include_mean and (d + D) == 0:
+            init_params = init_params.at[self._cached_narma + self._cached_n_exog].set(jnp.nanmean(y_fit))
+        
+        if use_drift:
+            if D == 1 and m > 1:
+                dx = y_fit[m:] - y_fit[:-m]
+            else:
+                dx = y_fit[1:] - y_fit[:-1]
+            init_params = init_params.at[self._cached_narma + self._cached_n_exog].set(jnp.nanmean(dx))
+        
+        current_params = _fit_model_bfgs(
+            init_params, y_fit, None, self._cached_delta, _objective_css,
+            self._cached_arma, self._cached_ncxreg, self._cached_n_exog, include_mean, 50
+        )
+        
+        # Fused forecast: single XLA dispatch for params → forecast
+        raw_fc = _forecast_from_params(
+            current_params, y_fit, self._cached_delta,
+            self._cached_arma, self._cached_ncxreg, self._cached_n_exog, include_mean, h
+        )
+        
+        fc_norm = _reconstruct_forecast(raw_fc, y_fit, self._cached_arma, h)
+        fc = _aa_denormalize(fc_norm, f_mean, f_std)
+        return {"mean": fc}
     
     def predict(
         self,
@@ -1705,63 +2077,35 @@ class AutoARIMA(BaseForecaster):
         if X is not None:
             X = jnp.asarray(X, dtype=jnp.float64)
 
-        # 1. Get Scaled Predictions (Differenced Scale)
         preds = predict_arima(self.model_, n_ahead=h, newxreg=X, se_fit=(level is not None))
         
-        # Unpack
         if isinstance(preds, tuple):
             mean_pred, se_pred = preds
         else:
             mean_pred, se_pred = preds, None
 
-        # --- CRITICAL CHANGE 2: RECONSTRUCTION (Integration) ---
-        p, q, P, Q, m, d, D = self.model_["arma"]
-        
-        # We reconstruct on CPU (numpy) because it's sequential and fast enough for h steps
-        fc_reconstructed = mean_pred
-        y_hist = self.y_train_ 
+        fc_norm = _reconstruct_forecast(mean_pred, self.y_train_, self.model_["arma"], h)
+        mean_orig = _aa_denormalize(fc_norm, self._y_mean, self._y_std)
 
-        # A. Undo Ordinary Differencing (Trend)
-        # If d=1, the model predicts changes. We cumsum them + last value.
-        for _ in range(d):
-            last_val = y_hist[-1]
-            fc_reconstructed = jnp.cumsum(fc_reconstructed) + last_val
-            # Update history for next loop (if d=2)
-            y_hist = jnp.concatenate([y_hist, fc_reconstructed])
-
-        # B. Undo Seasonal Differencing (Seasonality)
-        # If D=1, forecast[t] = forecast[t-m] + prediction[t]
-        for _ in range(D):
-            history_buffer = list(y_hist)
-            new_forecast = []
-            for k in range(h):
-                prev = history_buffer[-m] # Value m steps ago
-                val = prev + fc_reconstructed[k]
-                new_forecast.append(val)
-                history_buffer.append(val)
-            fc_reconstructed = jnp.array(new_forecast)
-            y_hist = jnp.concatenate([y_hist, fc_reconstructed])
-
-        # C. Scale Standard Errors (Approximate)
-        # If we integrated, uncertainty grows.
+        # Standard Errors
         if se_pred is not None:
+            p, q, P, Q, m, d, D = self.model_["arma"]
             if d + D > 0:
                 se_scaled = jnp.sqrt(jnp.cumsum(se_pred**2))
             else:
                 se_scaled = se_pred
+            se_orig = se_scaled * self._y_std
         
-        # 3. INVERSE TRANSFORM (Unscale)
         result = {}
-        result["mean"] = fc_reconstructed * self.std_y + self.mean_y
+        result["mean"] = mean_orig
         
         if level is not None:
             if isinstance(level, int): level = (level,)
             z_scores = _quantiles(level)
             for i, lv in enumerate(level):
                 q = z_scores[i]
-                std_dev = se_scaled * self.std_y
-                result[f"lo-{lv}"] = result["mean"] - q * std_dev
-                result[f"hi-{lv}"] = result["mean"] + q * std_dev
+                result[f"lo-{lv}"] = result["mean"] - q * se_orig
+                result[f"hi-{lv}"] = result["mean"] + q * se_orig
 
         return result
 
@@ -1772,7 +2116,11 @@ class AutoARIMA(BaseForecaster):
 
 class ARIMA(BaseForecaster):
     """
-    Fixed ARIMA model wrapper with Automatic Scaling.
+    Fixed ARIMA model wrapper.
+
+    Internally standardizes the series (zero mean, unit variance)
+    for faster and more stable optimization, and always returns
+    forecasts in the original scale.
     """
     uses_exog = True
     
@@ -1784,6 +2132,7 @@ class ARIMA(BaseForecaster):
         include_mean: bool = True,
         method: str = "CSS",
         alias: str = "ARIMA",
+        standardize: bool = True,
     ):
         self.order = order
         self.seasonal_order = seasonal_order
@@ -1792,38 +2141,121 @@ class ARIMA(BaseForecaster):
         self.method = method
         self.alias = alias
         self.model_ = None
-        
-        # Scaling
-        self.mean_y = 0.0
-        self.std_y = 1.0
+        self.standardize = standardize
+        self._y_mean = None
+        self._y_std = None
+
+        # Pre-compute and cache the delta polynomial (depends only on order/period)
+        p, d, q = order
+        P, D, Q = seasonal_order
+        delta = jnp.array([1.0], dtype=jnp.float64)
+        for _ in range(d):
+            delta = jnp.convolve(delta, jnp.array([1.0, -1.0]))
+        for _ in range(D):
+            seas_diff = jnp.concatenate([jnp.array([1.0]), jnp.zeros(period - 1), jnp.array([-1.0])])
+            delta = jnp.convolve(delta, seas_diff)
+        self._delta = -delta[1:]
+        self._arma = (p, q, P, Q, period, d, D)
+        self._narma = p + q + P + Q
+        n_exog = 0
+        self._ncxreg = n_exog + (1 if include_mean else 0)
+        self._n_exog = n_exog
 
     def fit(self, y: jnp.ndarray, X: Optional[jnp.ndarray] = None) -> "ARIMA":
-        # 1. SCALING LOGIC
-        y_np = np.array(y)
-        self.mean_y = np.mean(y_np)
-        self.std_y = np.std(y_np) + 1e-6
-        
-        y_scaled = (y_np - self.mean_y) / self.std_y
-        y_jax = jnp.asarray(y_scaled, dtype=jnp.float64)
-        
-        if X is not None: X = jnp.asarray(X, dtype=jnp.float64)
+        y_jax = jnp.asarray(np.array(y), dtype=jnp.float64)
+        if X is not None:
+            X = jnp.asarray(X, dtype=jnp.float64)
 
-        # --- SAVE HISTORY ---
-        self.y_train_ = y_jax
+        # Standardize training series if enabled
+        if self.standardize:
+            y_fit, self._y_mean, self._y_std = _aa_standardize(y_jax)
+        else:
+            y_fit = y_jax
+            self._y_mean = jnp.array(0.0, dtype=jnp.float64)
+            self._y_std = jnp.array(1.0, dtype=jnp.float64)
+
+        self.y_train_ = y_fit
 
         seasonal = {'order': self.seasonal_order, 'period': self.period}
         
         self.model_ = arima_fit(
-            y_jax, order=self.order, seasonal=seasonal,
+            y_fit, order=self.order, seasonal=seasonal,
             include_mean=self.include_mean, method=self.method, xreg=X
         )
         
-        # Inject arma tuple
         p, d, q = self.order
         P, D, Q = self.seasonal_order
         self.model_['arma'] = (p, q, P, Q, self.period, d, D)
         
         return self
+
+    def forecast(self, h: int, y: jnp.ndarray, X: Optional[jnp.ndarray] = None) -> Dict[str, jnp.ndarray]:
+        """
+        Fast fit-and-predict in one shot. Uses fused JIT kernel to minimize
+        Python-to-XLA dispatch overhead. No metric computation (AIC, BIC, etc.).
+        
+        Args:
+            h: Forecast horizon
+            y: Training series
+            X: Exogenous regressors (not supported in fast path)
+            
+        Returns:
+            Dict with 'mean' key containing forecast array
+        """
+        y_jax = jnp.asarray(np.array(y), dtype=jnp.float64)
+
+        # Standardize input series for fast one-shot fit if enabled
+        if self.standardize:
+            y_fit, f_mean, f_std = _aa_standardize(y_jax)
+        else:
+            y_fit = y_jax
+            f_mean = jnp.array(0.0, dtype=jnp.float64)
+            f_std = jnp.array(1.0, dtype=jnp.float64)
+        p, d, q = self.order
+        P, D, Q = self.seasonal_order
+        
+        # --- BFGS optimization (same as arima_fit, but uses cached delta) ---
+        use_drift = self.include_mean and (d + D) == 1
+        init_params = jnp.zeros(self._narma + self._ncxreg, dtype=jnp.float64) + 1e-3
+        
+        if self.include_mean and (d + D) == 0:
+            init_params = init_params.at[self._narma + self._n_exog].set(jnp.nanmean(y_fit))
+        
+        if use_drift:
+            if D == 1 and self.period > 1:
+                dx = y_fit[self.period:] - y_fit[:-self.period]
+            else:
+                dx = y_fit[1:] - y_fit[:-1]
+            init_params = init_params.at[self._narma + self._n_exog].set(jnp.nanmean(dx))
+
+        method = self.method.upper()
+        current_params = init_params
+        maxiter = 50  # Reduced: CSS converges fast for low-order models
+        
+        if "CSS" in method:
+            css_iter = maxiter // 2 if method == "CSS-ML" else maxiter
+            current_params = _fit_model_bfgs(
+                current_params, y_fit, None, self._delta, _objective_css,
+                self._arma, self._ncxreg, self._n_exog, self.include_mean, css_iter
+            )
+        if "ML" in method:
+            ml_iter = maxiter // 2 if method == "CSS-ML" else maxiter
+            current_params = _fit_model_bfgs(
+                current_params, y_fit, None, self._delta, _objective_ml,
+                self._arma, self._ncxreg, self._n_exog, self.include_mean, ml_iter
+            )
+
+        # --- Fused forecast: single XLA dispatch for params → forecast ---
+        raw_fc = _forecast_from_params(
+            current_params, y_fit, self._delta,
+            self._arma, self._ncxreg, self._n_exog, self.include_mean, h
+        )
+
+        # --- Reconstruction using delta polynomial inverse filter ---
+        fc_norm = _reconstruct_forecast(raw_fc, y_fit, self._arma, h)
+        fc = _aa_denormalize(fc_norm, f_mean, f_std)
+
+        return {"mean": fc}
 
     def predict(self, h: int, X: Optional[jnp.ndarray] = None, level=None) -> Dict[str, jnp.ndarray]:
         if self.model_ is None: raise RuntimeError("Model not fitted.")
@@ -1836,43 +2268,33 @@ class ARIMA(BaseForecaster):
         else:
             mean_pred, se_pred = preds, None
 
-        # --- RECONSTRUCTION (Copy of AutoARIMA logic) ---
-        p, q, P, Q, m, d, D = self.model_["arma"]
-        fc_reconstructed = mean_pred
-        y_hist = self.y_train_ 
-
-        for _ in range(d):
-            last_val = y_hist[-1]
-            fc_reconstructed = jnp.cumsum(fc_reconstructed) + last_val
-            y_hist = jnp.concatenate([y_hist, fc_reconstructed])
-
-        for _ in range(D):
-            history_buffer = list(y_hist)
-            new_forecast = []
-            for k in range(h):
-                prev = history_buffer[-m]
-                val = prev + fc_reconstructed[k]
-                new_forecast.append(val)
-                history_buffer.append(val)
-            fc_reconstructed = jnp.array(new_forecast)
-            y_hist = jnp.concatenate([y_hist, fc_reconstructed])
+        # Reconstruct in standardized space
+        fc_norm = _reconstruct_forecast(mean_pred, self.y_train_, self.model_["arma"], h)
+        # Map back to original scale if standardization was used
+        if self.standardize:
+            mean_orig = _aa_denormalize(fc_norm, self._y_mean, self._y_std)
+        else:
+            mean_orig = fc_norm
 
         if se_pred is not None:
+            p, q, P, Q, m, d, D = self.model_["arma"]
             if d + D > 0:
                 se_scaled = jnp.sqrt(jnp.cumsum(se_pred**2))
             else:
                 se_scaled = se_pred
+            se_orig = se_scaled * (self._y_std if self.standardize else 1.0)
+        else:
+            se_orig = None
 
         result = {}
-        result["mean"] = fc_reconstructed * self.std_y + self.mean_y
+        result["mean"] = mean_orig
             
-        if level is not None:
+        if level is not None and se_orig is not None:
             if isinstance(level, int): level = (level,)
             z_scores = _quantiles(level)
             for i, lv in enumerate(level):
                 q = z_scores[i]
-                std_dev = se_scaled * self.std_y
-                result[f"lo-{lv}"] = result["mean"] - q * std_dev
-                result[f"hi-{lv}"] = result["mean"] + q * std_dev
+                result[f"lo-{lv}"] = result["mean"] - q * se_orig
+                result[f"hi-{lv}"] = result["mean"] + q * se_orig
             
         return result
