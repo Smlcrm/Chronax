@@ -1,5 +1,3 @@
-
-import jax
 import jax.numpy as jnp
 from jax import jit, lax
 from functools import lru_cache
@@ -23,8 +21,7 @@ _ALPHA_UPPER = 0.3
 _GOLDEN_RATIO = 0.6180339887498949
 _ALPHA_SEARCH_ITERS = 8
 
-# Prefer compiled execution for warm-path throughput; keep tiny inputs eager.
-_JIT_MIN_CHUNKS = 128
+_JIT_MIN_CHUNKS = 2
 
 
 def _interval_mean(y: jnp.ndarray) -> jnp.ndarray:
@@ -131,16 +128,13 @@ def _get_chunk_forecast_runner(aggregation_level: int):
 
     return _run
 
-
 def _chunk_forecast_fast(y: jnp.ndarray, aggregation_level: int):
     aggregation_level = max(1, int(aggregation_level))
     n_chunks = y.shape[0] // aggregation_level
 
-    # Tiny inputs stay eager; otherwise compiled path is materially faster on warm calls.
+    # Only the degenerate case stays eager; warm path should hit cached JIT.
     if n_chunks < _JIT_MIN_CHUNKS:
-        # Avoid tracing overhead from lax control flow on very small arrays.
-        with jax.disable_jit():
-            return _chunk_forecast_impl(y, aggregation_level)
+        return _chunk_forecast_impl(y, aggregation_level)
 
     return _get_chunk_forecast_runner(aggregation_level)(y)
 
@@ -197,6 +191,92 @@ def _adida(
     return res
 
 
+def _fit_adida(model: "ADIDA", y: jnp.ndarray, X: Optional[jnp.ndarray]):
+    y = ensure_float(y)
+    model._y = y
+    model.model_ = _adida_point(y=y, h=1)
+    if model.prediction_intervals is not None:
+        _store_cs(model, y=y, X=X)
+    return model
+
+
+def _point_predict(model: "ADIDA", h: int):
+    return {"mean": _repeat_val_jax(val=model.model_["mean"][0], h=h)}
+
+
+def _predict_without_intervals(
+    model: "ADIDA",
+    h: int,
+    X: Optional[jnp.ndarray],
+    level: Optional[List[int]],
+):
+    del X, level
+    return _point_predict(model, h)
+
+
+def _predict_with_intervals(
+    model: "ADIDA",
+    h: int,
+    X: Optional[jnp.ndarray],
+    level: Optional[List[int]],
+):
+    del X
+    res = _point_predict(model, h)
+    if level is None:
+        return res
+    return _add_predict_conformal_intervals(model, res, sorted(level))
+
+
+def _forecast_core(y: jnp.ndarray, h: int, fitted: bool):
+    y = ensure_float(y)
+    res = _adida(y=y, h=h, fitted=True) if fitted else _adida_point(y=y, h=h)
+    return y, res
+
+
+def _forecast_without_intervals(
+    model: "ADIDA",
+    y: jnp.ndarray,
+    h: int,
+    X: Optional[jnp.ndarray],
+    X_future: Optional[jnp.ndarray],
+    level: Optional[List[int]],
+    fitted: bool,
+):
+    del model, X, X_future, level
+    _, res = _forecast_core(y=y, h=h, fitted=fitted)
+    return res
+
+
+def _forecast_with_intervals(
+    model: "ADIDA",
+    y: jnp.ndarray,
+    h: int,
+    X: Optional[jnp.ndarray],
+    X_future: Optional[jnp.ndarray],
+    level: Optional[List[int]],
+    fitted: bool,
+):
+    del X_future
+    y, res = _forecast_core(y=y, h=h, fitted=fitted)
+    if level is None:
+        return res
+    level = sorted(level)
+    res = _add_conformal_intervals(model, fcst=res, y=y, X=X, level=level)
+    if fitted:
+        sigma = calculate_sigma(y - res["fitted"], y.size)
+        res = _add_fitted_pi(res=res, se=sigma, level=level)
+    return res
+
+
+def _predict_in_sample_adida(model: "ADIDA", level: Optional[List[int]] = None):
+    fitted = _adida(y=model._y, h=1, fitted=True)["fitted"]
+    res = {"fitted": fitted}
+    if level is not None:
+        sigma = calculate_sigma(model._y - fitted, model._y.size)
+        res = _add_fitted_pi(res=res, se=sigma, level=level)
+    return res
+
+
 class ADIDA(BaseForecaster):
     def __init__(
         self,
@@ -226,6 +306,16 @@ class ADIDA(BaseForecaster):
         self.prediction_intervals = prediction_intervals
         self.only_conformal_intervals = True
         self.conformal_params = prediction_intervals
+        self._predict_impl = (
+            _predict_with_intervals
+            if prediction_intervals is not None
+            else _predict_without_intervals
+        )
+        self._forecast_impl = (
+            _forecast_with_intervals
+            if prediction_intervals is not None
+            else _forecast_without_intervals
+        )
 
     def fit(
         self,
@@ -243,12 +333,7 @@ class ADIDA(BaseForecaster):
         Returns:
             ADIDA: ADIDA fitted model.
         """
-        y = ensure_float(y)
-        self._y = y
-        self.model_ = _adida_point(y=y, h=1)
-        if self.prediction_intervals is not None:
-            _store_cs(self, y=y, X=X)
-        return self
+        return _fit_adida(self, y, X)
 
     def predict(
         self,
@@ -266,13 +351,7 @@ class ADIDA(BaseForecaster):
         Returns:
             dict: Dictionary with entries `mean` for point predictions and `level_*` for probabilistic predictions.
         """
-        mean = _repeat_val_jax(val=self.model_["mean"][0], h=h)
-        res = {"mean": mean}
-        if level is None or self.prediction_intervals is None:
-            return res
-        level = sorted(level)
-        res = _add_predict_conformal_intervals(self, res, level)
-        return res
+        return self._predict_impl(self, h, X, level)
 
     def predict_in_sample(self, level: Optional[List[int]] = None):
         """Access fitted ADIDA insample predictions.
@@ -283,12 +362,7 @@ class ADIDA(BaseForecaster):
         Returns:
             dict: Dictionary with entries `fitted` for point predictions and `level_*` for probabilistic predictions.
         """
-        fitted = _adida(y=self._y, h=1, fitted=True)["fitted"]
-        res = {"fitted": fitted}
-        if level is not None:
-            sigma = calculate_sigma(self._y - fitted, self._y.size)
-            res = _add_fitted_pi(res=res, se=sigma, level=level)
-        return res
+        return _predict_in_sample_adida(self, level)
 
     def forecast(
         self,
@@ -316,19 +390,7 @@ class ADIDA(BaseForecaster):
         Returns:
             dict: Dictionary with entries `mean` for point predictions and `level_*` for probabilistic predictions.
         """
-        y = ensure_float(y)
-        if fitted:
-            res = _adida(y=y, h=h, fitted=True)
-        else:
-            res = _adida_point(y=y, h=h)
-        if level is None or self.prediction_intervals is None:
-            return res
-        level = sorted(level)
-        res = _add_conformal_intervals(self, fcst=res, y=y, X=X, level=level)
-        if fitted:
-            sigma = calculate_sigma(y - res["fitted"], y.size)
-            res = _add_fitted_pi(res=res, se=sigma, level=level)
-        return res
+        return self._forecast_impl(self, y, h, X, X_future, level, fitted)
     
 # # Test Cases
 # def test():
