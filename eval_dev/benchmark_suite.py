@@ -347,7 +347,7 @@ class ModelRegistry:
                 try: import ces; return ces.AutoCES
                 except ImportError: return None
             elif name == "ARIMA":
-                import auto_arima; return auto_arima.ARIMA
+                import arima; return arima.ARIMA
             elif name == "AutoARIMA":
                 try: import auto_arima; return auto_arima.AutoARIMA
                 except ImportError: return None
