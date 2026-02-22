@@ -1,12 +1,53 @@
 """
-Run Benchmark Orchestrator (Single Environment)
-=================================================
-Same as run_benchmark.py but runs ALL models (chronax + statsforecast)
-using the current Python environment instead of separate interpreters.
+File: run_benchmark.py
 
-Fairness is preserved via subprocess isolation: each model still runs
-in its own fresh process so there's no shared state, warm caches, or
-memory pressure from previously loaded libraries.
+High-level Purpose:
+    Coordinates end-to-end benchmark execution by iterating configured datasets
+    and model/library pairs, spawning isolated worker subprocesses, and
+    aggregating outputs into benchmark artifacts.
+
+Problem Solved:
+    Provides a single orchestration entry point for repeatable runtime and
+    accuracy evaluations without requiring manual execution of each model.
+
+Architectural Role:
+    Acts as the benchmark controller layer above `benchmark_suite.py`, handling
+    config parsing, filtering, subprocess lifecycle management, and final result
+    reporting/visualization.
+
+Major Classes/Functions:
+    - `run_benchmark`: Main orchestration routine.
+    - `process_forecast_result`: Persists forecast-mode data and plots.
+    - `plot_results`: Generates benchmark aggregate plots.
+
+External Dependencies:
+    - `yaml`, `pandas`, `numpy`
+    - Standard library: `argparse`, `subprocess`, `json`, `datetime`, `os`, `sys`
+    - Optional plotting dependency: `matplotlib`
+
+Expected Inputs and Outputs:
+    - Input: path to benchmark config and optional model/dataset filters.
+    - Output: CSV benchmark summaries, optional forecast plot/data artifacts, and
+      console logs for execution progress.
+
+Example:
+    >>> # python eval_dev/run_benchmark.py --config eval_dev/config.yaml
+    >>> # python eval_dev/run_benchmark.py --model ARIMA --dataset AirlinePassengers
+
+Assumptions:
+    - Config file schema matches expected keys (`experiment`, `datasets`,
+      `models`).
+    - Worker module `benchmark_suite.py` is available in the same directory.
+
+Side Effects:
+    - Creates result directories and files.
+    - Executes subprocesses for each benchmark task.
+    - Emits status and error messages to stdout.
+
+Author:
+    Auto-documented
+Date:
+    2026-02-21
 """
 
 import sys
@@ -18,13 +59,45 @@ import json
 import pandas as pd
 import numpy as np
 from datetime import datetime
+from typing import Any, Dict, Optional
 
 
-def run_benchmark(config_path, model_filter=None, dataset_filter=None, forecast_mode=False):
+def run_benchmark(
+    config_path: str,
+    model_filter: Optional[str] = None,
+    dataset_filter: Optional[str] = None,
+    forecast_mode: bool = False,
+) -> None:
     """
-    Main benchmark orchestrator.
-    Spawns benchmark_suite.py for each model/library combination
-    using the CURRENT Python interpreter for both libraries.
+    Execute benchmark orchestration over configured datasets and models.
+
+    Detailed Description:
+        Loads benchmark configuration, applies optional dataset/model filters,
+        dispatches per-model jobs to `benchmark_suite.py` subprocesses, and
+        aggregates returned JSON metrics into benchmark result artifacts.
+
+    Args:
+        config_path (str): Absolute or relative path to configuration YAML.
+        model_filter (str | None, optional): Restrict run to a single model.
+        dataset_filter (str | None, optional): Restrict run to one dataset name
+            or external dataset path.
+        forecast_mode (bool, optional): Enable forecast artifact mode instead of
+            benchmark aggregation mode.
+
+    Returns:
+        None: Writes artifacts and prints progress to stdout.
+
+    Raises:
+        subprocess.CalledProcessError: Captured and logged per worker run.
+
+    Side Effects:
+        Creates result directories/files and launches subprocesses.
+
+    Example:
+        >>> run_benchmark("config.yaml", model_filter="ARIMA")
+
+    Notes:
+        Subprocess isolation keeps model execution environments independent.
     """
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
@@ -184,11 +257,55 @@ def run_benchmark(config_path, model_filter=None, dataset_filter=None, forecast_
         print("\n⚠️ No results collected.")
 
 
-def process_forecast_result(record, output_dir, dataset_name, library, model_name):
+def process_forecast_result(
+    record: Dict[str, Any],
+    output_dir: str,
+    dataset_name: str,
+    library: str,
+    model_name: str,
+) -> None:
     """
-    Handles a single forecast result:
-    1. Saves data to CSV
-    2. Generates plot
+    Persist a single forecast result to CSV and PNG for inspection and reporting.
+
+    Detailed Description:
+        Consumes a forecast-mode result record from the benchmark worker
+        (containing y_train, y_test, predictions, and optionally MAPE). Writes
+        a CSV file under output_dir/data with columns y_true, split (train/test),
+        y_pred (forecast aligned to test period), library, and model. Then
+        generates a matplotlib figure plotting training series, test actuals,
+        and forecast series with a title including dataset, library, model, and
+        MAPE; saves the figure as a PNG under output_dir/plots. Used by
+        run_benchmark when forecast_mode is True to produce per-model artifacts
+        without changing the worker's JSON contract.
+
+    Args:
+        record (Dict[str, Any]): Must contain "y_train", "y_test", "predictions"
+            (lists or array-like), and optionally "MAPE". Keys are as returned
+            by run_single_model in forecast mode.
+        output_dir (str): Base directory for results; data and plots are written
+            to output_dir/data and output_dir/plots.
+        dataset_name (str): Human-readable dataset name for filenames and plot title.
+        library (str): "chronax" or "statsforecast" for filenames and title.
+        model_name (str): Model name for filenames and title.
+
+    Returns:
+        None. Writes one CSV and one PNG; prints the saved plot basename to stdout.
+
+    Raises:
+        KeyError: If record is missing "y_train", "y_test", or "predictions".
+        IOError: If writing the CSV or PNG fails.
+
+    Side Effects:
+        Creates output_dir/data and output_dir/plots if needed; writes
+        {dataset_name}_{library}_{model_name}.csv and .png; imports
+        matplotlib; prints one line to stdout.
+
+    Example:
+        >>> process_forecast_result(record, "forecast_results", "Airline", "chronax", "ARIMA")
+
+    Notes:
+        Role: Bridges forecast-mode JSON output from the worker to
+        human-inspectable data and plots for analysis and reporting.
     """
     import matplotlib.pyplot as plt
     
@@ -231,8 +348,44 @@ def process_forecast_result(record, output_dir, dataset_name, library, model_nam
     print(f"     ✅ Forecast saved: {os.path.basename(plot_path)}")
 
 
-def plot_results(csv_path):
-    """Generate benchmark visualization plots using matplotlib only."""
+def plot_results(csv_path: str) -> None:
+    """
+    Generate benchmark summary visualizations from an aggregated results CSV.
+
+    Detailed Description:
+        Loads the benchmark CSV (with columns Dataset, Model, Length,
+        Time_Warm_Sec, MAPE, etc.) and produces two types of plots in the
+        same directory as the CSV. (1) Scalability plot: for each dataset, a
+        subplot of Time_Warm_Sec vs Length (log-log) per model, to compare
+        runtime scaling. (2) Accuracy plot: for each dataset, a subplot of
+        MAPE vs Length (log x) per model, to compare forecast accuracy. Uses
+        a fixed color map across models for consistency. Saves scalability_plot.png
+        and accuracy_plot.png and prints their paths. If the CSV is missing,
+        prints an error and returns without writing. Designed for post-run
+        analysis and reporting; uses only matplotlib for portability.
+
+    Args:
+        csv_path (str): Absolute or relative path to the benchmark results
+            CSV (e.g. benchmark_results.csv or benchmark_YYYYMMDD_HHMMSS.csv).
+
+    Returns:
+        None. Writes up to two PNG files and prints their paths to stdout.
+
+    Raises:
+        None. Missing file is handled with a message and early return.
+
+    Side Effects:
+        Reads csv_path; creates scalability_plot.png and accuracy_plot.png
+        in the same directory; imports matplotlib; prints save locations.
+
+    Example:
+        >>> plot_results(os.path.join("eval_dev", "benchmark_results", "benchmark_results.csv"))
+
+    Notes:
+        Role: Post-processing visualization for benchmark runs; enables
+        quick comparison of models across datasets and scales without
+        external tooling.
+    """
     import matplotlib.pyplot as plt
     
     if not os.path.exists(csv_path):
