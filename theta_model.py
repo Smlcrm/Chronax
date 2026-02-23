@@ -281,15 +281,15 @@ def _pegels_resid(y: jnp.ndarray, model_type: int, initial_smoothed: jnp.ndarray
     # Run lax.scan over y[1:]
     final_carry, (residuals_rest, mus_rest) = lax.scan(step_fn, init_carry, y[1:])
 
-    # Concatenate first step
+    # Concatenate first residual with scan output
     residuals = jnp.concatenate([e0[None], residuals_rest])
-    mus = jnp.concatenate([mu0[None], mus_rest])
 
-    # Final state vector (only the last state is used downstream)
-    final_level, final_mean_y, final_An, final_Bn, _, _, final_i = final_carry
-    final_state = jnp.stack([final_level, final_mean_y, final_An, final_Bn, mus[-1]])
+    # Final state: only last fitted value is needed (for forecasting init)
+    final_level, final_mean_y, final_An, final_Bn, _, _, _ = final_carry
+    final_state = jnp.stack([final_level, final_mean_y, final_An, final_Bn, mus_rest[-1]])
 
-    # MSE: sum(e[3:]^2) / max(mean(|y|), eps) — matches statsforecast
+    # MSE objective: skip first 3 residuals (initialization transient),
+    # normalize by mean(|y|) for scale-invariant optimization.
     mean_abs_y = jnp.maximum(jnp.mean(jnp.abs(y)), _EPSILON)
     mse = jnp.sum(residuals[3:] ** 2) / mean_abs_y
 
@@ -403,7 +403,10 @@ def _jit_optimize_theta(y: jnp.ndarray, model_type: int, x0: jnp.ndarray,
         _, _, mse = _pegels_resid(y, model_type, level, alpha, theta)
         return mse
 
-    # Phase 1: ADAM warm-up
+    # Phase 1: ADAM warm-up — essential for navigating the flat, ridged
+    # MSE landscape where level/alpha/theta trade off.  L-BFGS alone
+    # (including jaxopt.LBFGSB) gets trapped in local minima; Adam's
+    # momentum-based exploration finds the basin, then L-BFGS refines.
     vg_fn = jax.value_and_grad(loss_fn)
     adam_opt = optax.adam(_ADAM_LR)
     adam_state = adam_opt.init(x0)
