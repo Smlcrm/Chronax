@@ -134,8 +134,7 @@ class HistoricAverage(BaseForecaster):
         
         if level is not None:
             sigmah = self.model_["sigma"] * jnp.sqrt(1.0 + (1.0 / self.model_["n"]))
-            # res = {**res, **utils._add_fitted_pi(res["fitted"], sigmah, sorted(level))}
-            res = {**res, **utils._add_fitted_pi_1(res["fitted"], sigmah, sorted(level))}
+            res = utils._add_fitted_pi(res, sigmah, sorted(level))
         
         return res
 
@@ -165,8 +164,7 @@ class HistoricAverage(BaseForecaster):
                 res = {**res, **utils._calculate_intervals(out,level, h, sigmah)}
             
             if fitted:
-                # res = {**res, **utils._add_fitted_pi(out["fitted"], sigmah, level)}
-                res = {**res, **utils._add_fitted_pi_1(out["fitted"], sigmah, level)}
+                res = utils._add_fitted_pi(res, sigmah, level)
         
         return res
 
