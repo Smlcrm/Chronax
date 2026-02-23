@@ -1,3 +1,13 @@
+r"""WindowAverage forecasting model using JAX.
+
+This module implements a WindowAverage forecasting model that predicts future values
+as the mean of the last k observations, where k is the window_size parameter.
+Supports conformal prediction intervals via BaseForecaster.
+
+The WindowAverage method is a simple but effective forecasting technique that computes
+the average of the most recent observations within a specified window. Wider windows
+capture global trends, while narrower windows reveal local trends.
+"""
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
@@ -19,32 +29,31 @@ from utils import _repeat_val, _window_average, ensure_float
 
 
 class WindowAverage(BaseForecaster):
-    def __init__(self, window_size: str, alias: str = "WindowAverage",
-        conformal_params: Optional[ConformalIntervals] = None):
-        
-        r"""WindowAverage model.
+    r"""WindowAverage model.
 
-        Uses the average of the last $k$ observations, with $k$ the length of the window.
-        Wider windows will capture global trends, while narrow windows will reveal local trends.
-        The length of the window selected should take into account the importance of past
-        observations and how fast the series changes.
+    Uses the average of the last $k$ observations, with $k$ the length of the window.
+    Wider windows will capture global trends, while narrow windows will reveal local trends.
+    The length of the window selected should take into account the importance of past
+    observations and how fast the series changes.
 
-        References:
-            - [Rob J. Hyndman and George Athanasopoulos (2018). "forecasting principles and practice, Simple Methods"](https://otexts.com/fpp3/simple-methods.html).
+    References:
+        - [Rob J. Hyndman and George Athanasopoulos (2018). "forecasting principles and practice, Simple Methods"](https://otexts.com/fpp3/simple-methods.html).
 
-        Args:
-            window_size (int): Size of truncated series on which average is estimated.
-            alias (str): Custom name of the model.
-            conformal_params (Optional[ConformalIntervals]): Information to compute conformal prediction intervals.
-                This is required for generating future prediction intervals.
-        r"""
+    Args:
+        window_size (int): Size of truncated series on which average is estimated.
+        alias (str): Custom name of the model.
+        conformal_params (Optional[ConformalIntervals]): Information to compute conformal prediction intervals.
+            This is required for generating future prediction intervals.
+    """
 
+    def __init__(self, window_size: int, alias: str = "WindowAverage",
+        conformal_params: Optional[ConformalIntervals] = None) -> None:
         self.window_size = window_size
         self.alias = alias
         self.conformal_params = conformal_params
         self.only_conformal_intervals = True
 
-    def fit(self, y: jnp.ndarray, X: Optional[jnp.ndarray] = None):
+    def fit(self, y: jnp.ndarray, X: Optional[jnp.ndarray] = None) -> "WindowAverage":
         r"""Fit the WindowAverage model.
 
         Fit an WindowAverage to a time series (numpy array) `y`
@@ -75,7 +84,7 @@ class WindowAverage(BaseForecaster):
         h: int,
         X: Optional[jnp.ndarray] = None,
         level: Optional[List[int]] = None,
-    ):
+    ) -> Dict[str, jnp.ndarray]:
         r"""Predict with fitted WindowAverage.
 
         Args:
@@ -118,7 +127,7 @@ class WindowAverage(BaseForecaster):
         X_future: Optional[jnp.ndarray] = None,
         level: Optional[List[int]] = None,
         fitted: bool = False,
-    ):
+    ) -> Dict[str, jnp.ndarray]:
         r"""Memory Efficient WindowAverage predictions.
 
         This method avoids memory burden due from object storage.

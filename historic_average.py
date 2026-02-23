@@ -86,12 +86,26 @@ class HistoricAverage(BaseForecaster):
     
     uses_exog = False
 
-    def __init__(self, alias: str = "HistoricAverage", conformal_params: ConformalIntervals | None = None):
+    def __init__(self, alias: str = "HistoricAverage", conformal_params: ConformalIntervals | None = None) -> None:
         self.alias = alias
         self.conformal_params = conformal_params
         self.model_ = {}
 
     def fit(self, y: jnp.ndarray, X: jnp.ndarray | None = None) -> "HistoricAverage":
+        r"""Fit the HistoricAverage model.
+
+        Computes the historical mean of the series, stores fitted values,
+        residual standard deviation, and series length for use in predict().
+        If `conformal_params` is configured, conformity scores are cached.
+
+        Args:
+            y (jnp.ndarray): Clean time series of shape (t,).
+            X (jnp.ndarray | None): Exogenous variables (unused; included for
+                API compatibility). Default is None.
+
+        Returns:
+            HistoricAverage: Self (fitted model instance).
+        """
         y = utils.ensure_float(y)
         mod = _historic_average(y, h=1, fitted=True)
         residuals = y - mod["fitted"]
@@ -112,6 +126,24 @@ class HistoricAverage(BaseForecaster):
         return self
 
     def predict(self, h: int, X: jnp.ndarray | None = None, level: list[int] | None = None) -> dict:
+        r"""Generate h-step ahead forecasts using the fitted model.
+
+        All h forecasts equal the historical mean. Optionally adds prediction
+        intervals using either native normal approximation or conformal method.
+
+        Args:
+            h (int): Forecast horizon (number of steps ahead).
+            X (jnp.ndarray | None): Exogenous variables (unused; included for
+                API compatibility). Default is None.
+            level (list[int] | None): Confidence levels (0–100) for prediction
+                intervals, e.g. [80, 95]. If None, only point forecasts are returned.
+
+        Returns:
+            dict: Dictionary containing:
+                - "mean": Point forecasts of shape (h,), all equal to the historical mean.
+                - "lo-{l}" / "hi-{l}": Interval bounds for each level l
+                  (only present when level is not None).
+        """
         mean = jnp.full((h,), self.model_["mean"][0], dtype=jnp.float32)
         res = {"mean": mean}
         
@@ -130,12 +162,27 @@ class HistoricAverage(BaseForecaster):
         return res
 
     def predict_in_sample(self, level: list[int] | None = None) -> dict:
+        r"""Return in-sample fitted values from the last fit() call.
+
+        All fitted values equal the historical mean. Optionally adds prediction
+        intervals around each fitted point using the normal approximation
+        σ_h = σ · √(1 + 1/n).
+
+        Args:
+            level (list[int] | None): Confidence levels (0–100) for fitted
+                prediction intervals, e.g. [80, 95]. Default is None.
+
+        Returns:
+            dict: Dictionary containing:
+                - "fitted": In-sample predictions of shape (t,).
+                - "fitted-lo-{l}" / "fitted-hi-{l}": Fitted interval bounds for
+                  each level l (only present when level is not None).
+        """
         res = {"fitted": self.model_["fitted"]}
         
         if level is not None:
             sigmah = self.model_["sigma"] * jnp.sqrt(1.0 + (1.0 / self.model_["n"]))
-            # res = {**res, **utils._add_fitted_pi(res["fitted"], sigmah, sorted(level))}
-            res = {**res, **utils._add_fitted_pi_1(res["fitted"], sigmah, sorted(level))}
+            res = utils._add_fitted_pi(res, sigmah, sorted(level))
         
         return res
 
@@ -143,6 +190,33 @@ class HistoricAverage(BaseForecaster):
         self, y: jnp.ndarray, h: int, X: jnp.ndarray | None = None,
         X_future: jnp.ndarray | None = None, level: list[int] | None = None, fitted: bool = False
     ) -> dict:
+        r"""Memory-efficient stateless fit+predict in one call.
+
+        Computes the historical mean of `y` and generates h-step ahead forecasts
+        without storing any model state. Optionally returns in-sample fitted values
+        and prediction intervals.
+
+        Args:
+            y (jnp.ndarray): Clean time series of shape (t,).
+            h (int): Forecast horizon (number of steps ahead).
+            X (jnp.ndarray | None): In-sample exogenous variables (unused;
+                included for API compatibility). Default is None.
+            X_future (jnp.ndarray | None): Future exogenous variables (unused;
+                included for API compatibility). Default is None.
+            level (list[int] | None): Confidence levels (0–100) for prediction
+                intervals, e.g. [80, 95]. Default is None.
+            fitted (bool): Whether to include in-sample fitted values in the output.
+                Default is False.
+
+        Returns:
+            dict: Dictionary containing:
+                - "mean": Point forecasts of shape (h,), all equal to the historical mean.
+                - "fitted": In-sample fitted values of shape (t,) (only if fitted=True).
+                - "lo-{l}" / "hi-{l}": Forecast interval bounds for each level l
+                  (only present when level is not None).
+                - "fitted-lo-{l}" / "fitted-hi-{l}": Fitted interval bounds
+                  (only present when both fitted=True and level is not None).
+        """
         y = utils.ensure_float(y)
         out = _historic_average(y, h, fitted or (level is not None))
         res = {"mean": out["mean"]}
@@ -165,8 +239,7 @@ class HistoricAverage(BaseForecaster):
                 res = {**res, **utils._calculate_intervals(out,level, h, sigmah)}
             
             if fitted:
-                # res = {**res, **utils._add_fitted_pi(out["fitted"], sigmah, level)}
-                res = {**res, **utils._add_fitted_pi_1(out["fitted"], sigmah, level)}
+                res = utils._add_fitted_pi(res, sigmah, level)
         
         return res
 

@@ -41,12 +41,30 @@ import utils
 
 @_partial(jax.jit, static_argnums=(1,))
 def _edge_pad_1d(y: jnp.ndarray, pad: int) -> jnp.ndarray:
-    # Symmetric edge padding for centered windows
+    """
+    Symmetric edge padding for centered windows.
+
+    Args:
+        y (jnp.ndarray): Input 1D array to pad.
+        pad (int): Number of elements to pad on each edge.
+
+    Returns:
+        jnp.ndarray: Padded array of shape (n + 2*pad,).
+    """
     return jnp.pad(y, (pad, pad), mode="edge")
 
 @_partial(jax.jit, static_argnums=(1,))
 def _sliding_windows_1d(y: jnp.ndarray, window: int) -> jnp.ndarray:
-    # Return (n, window) centered windows with edge padding
+    """
+    Create centered sliding windows with edge padding.
+
+    Args:
+        y (jnp.ndarray): Input 1D array.
+        window (int): Window size (typically odd).
+
+    Returns:
+        jnp.ndarray: Array of shape (n, window) containing centered windows.
+    """
     n = y.shape[0]
     half = window // 2
     ypad = _edge_pad_1d(y, half)
@@ -58,7 +76,17 @@ def _sliding_windows_1d(y: jnp.ndarray, window: int) -> jnp.ndarray:
 
 @_partial(jax.jit, static_argnums=(0,))
 def _tricube_weights(window: int) -> tuple[jnp.ndarray, jnp.ndarray]:
-    # Tricube kernel weights and integer offsets for a given odd window
+    """
+    Compute tricube kernel weights and offsets for a given window size.
+
+    Args:
+        window (int): Window size (typically odd).
+
+    Returns:
+        tuple[jnp.ndarray, jnp.ndarray]: A tuple containing:
+            - offsets of shape (window,): Integer offsets from center.
+            - weights of shape (window,): Tricube weights w(u) = (1 - |u|^3)^3.
+    """
     half = window // 2
     offsets = jnp.arange(-half, half + 1)
     u = jnp.abs(offsets) / (half + 1e-8)
@@ -82,6 +110,16 @@ def loess_window_jump(
     - deg ∈ {0,1}: local constant or local linear (value at center).
     - robust_outer: bisquare outer reweighting count.
     - jump: compute only at anchor points and linearly interpolate in-between (STL-like speedup).
+
+    Args:
+        y (jnp.ndarray): Input 1D array to smooth.
+        window (int): Window size (will be forced to odd).
+        deg (int): Polynomial degree, 0 (local constant) or 1 (local linear). Default: 1.
+        robust_outer (int): Number of robust reweighting iterations using bisquare weights. Default: 0.
+        jump (int): Evaluate only at anchor points (0, jump, 2*jump, ...) and interpolate. Default: 1.
+
+    Returns:
+        jnp.ndarray: Smoothed values of shape (n,).
     """
     y = utils.ensure_float(jnp.asarray(y).reshape(-1))
     n = y.shape[0]
@@ -161,6 +199,15 @@ def lowess_frac(
     - Tricube kernel; robust outer iterations via bisquare.
     - Returns yhat aligned to x (input order).
     Note: 'delta' skip optimization is omitted for JAX-purity.
+
+    Args:
+        y (jnp.ndarray): Input 1D array of values to smooth.
+        x (jnp.ndarray): Input 1D array of x-coordinates (arbitrary order).
+        frac (float): Fraction of data used for neighborhood (0 < frac <= 1). Default: 2/3.
+        it (int): Number of robust reweighting iterations. Default: 0.
+
+    Returns:
+        jnp.ndarray: Smoothed values of shape (n,) aligned to input order.
     """
     y = utils.ensure_float(jnp.asarray(y).reshape(-1))
     x = utils.ensure_float(jnp.asarray(x).reshape(-1))
@@ -233,6 +280,21 @@ def loess_smooth(
     Convenience wrapper. Choose one mode:
       - Fixed-window: pass window (odd). Uses loess_window_jump (supports jump, deg, robust_outer).
       - Frac-based: pass frac and x. Uses lowess_frac (supports robust iterations).
+
+    Args:
+        y (jnp.ndarray): Input 1D array to smooth.
+        window (int | None): Window size for fixed-window LOESS. Default: None.
+        frac (float | None): Fraction of data for neighborhood in LOWESS mode. Default: None.
+        deg (int): Polynomial degree (0 or 1) for fixed-window mode. Default: 1.
+        robust_outer (int): Number of robust reweighting iterations. Default: 0.
+        jump (int): Jump size for anchor points in fixed-window mode. Default: 1.
+        x (jnp.ndarray | None): X-coordinates for LOWESS mode. Default: None.
+
+    Returns:
+        jnp.ndarray: Smoothed values of shape (n,).
+
+    Raises:
+        ValueError: If neither window nor (frac, x) are provided.
     """
     if window is not None:
         return loess_window_jump(y, int(window), int(deg), int(robust_outer), int(jump))
