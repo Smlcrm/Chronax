@@ -1,7 +1,15 @@
+"""
+AutoMFLES (Automated Multi-Feature Locally Exponential Smoothing)
+
+This module provides an automated, parallelized grid-search wrapper for the MFLES 
+forecasting engine. It automatically identifies the optimal hyperparameters 
+using time-series cross-validation.
+"""
+
 import jax
 import jax.numpy as jnp
 from jax.scipy.stats import norm
-from typing import Dict, Any, Optional, List, Union, Tuple
+from typing import Dict, Any, Optional, List, Union, Tuple, Iterable
 import numpy as np
 import itertools
 import concurrent.futures
@@ -16,52 +24,128 @@ from mfles import MFLES
 
 @jax.jit
 def _standardize_data(x: jnp.ndarray, mean: jnp.ndarray, std: jnp.ndarray) -> jnp.ndarray:
-    """Standardizes data using pre-computed stats (Fused GPU Kernel)."""
+    """Standardizes data using pre-computed stats (Fused GPU Kernel).
+    
+    Args:
+        x (jnp.ndarray): The input data array to standardize.
+        mean (jnp.ndarray): The pre-computed mean values.
+        std (jnp.ndarray): The pre-computed standard deviation values.
+        
+    Returns:
+        jnp.ndarray: The standardized data array.
+    """
     safe_std = jnp.where(std < 1e-6, 1.0, std)
     return (x - mean) / safe_std
 
 @jax.jit
-def _get_stats(x: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Computes mean/std on GPU to avoid CPU-sync."""
+def _get_stats(x: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Computes mean/std on GPU to avoid CPU-sync.
+    
+    Args:
+        x (jnp.ndarray): The input array (usually exogenous regressors).
+        
+    Returns:
+        Tuple[jnp.ndarray, jnp.ndarray]: A tuple containing the column-wise mean and standard deviation.
+    """
     return jnp.mean(x, axis=0), jnp.std(x, axis=0)
 
 @jax.jit
 def _calculate_sigma(residuals: jnp.ndarray, eps: float = 1e-8) -> jnp.ndarray:
-    """Calculates residual standard deviation on device."""
+    """Calculates residual standard deviation on device.
+    
+    Args:
+        residuals (jnp.ndarray): The array of model error residuals.
+        eps (float, optional): A minimum epsilon floor to prevent exactly zero std. Defaults to 1e-8.
+        
+    Returns:
+        jnp.ndarray: The bounded standard deviation of the residuals.
+    """
     return jnp.maximum(jnp.std(residuals), eps)
 
 @jax.jit
-def _gaussian_bounds(mean: jnp.ndarray, sigma: jnp.ndarray, z: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Vectorized prediction interval bounds."""
+def _gaussian_bounds(mean: jnp.ndarray, sigma: jnp.ndarray, z: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Vectorized prediction interval bounds.
+    
+    Args:
+        mean (jnp.ndarray): The array of predicted mean values.
+        sigma (jnp.ndarray): The calculated residual standard deviation.
+        z (jnp.ndarray): An array of Z-scores corresponding to desired confidence levels.
+        
+    Returns:
+        Tuple[jnp.ndarray, jnp.ndarray]: Lower bounds and upper bounds arrays.
+    """
     margin = z[:, None] * sigma
     return mean[None, :] - margin, mean[None, :] + margin
 
 @jax.jit
 def _z_from_levels(levels_float: jnp.ndarray) -> jnp.ndarray:
-    """Computes Z-scores from confidence levels."""
+    """Computes Z-scores from confidence levels.
+    
+    Args:
+        levels_float (jnp.ndarray): An array of confidence levels in percentage (e.g., 90.0, 95.0).
+        
+    Returns:
+        jnp.ndarray: The corresponding normal distribution quantiles (Z-scores).
+    """
     alpha = (100.0 - levels_float) / 100.0
     return norm.ppf(1.0 - alpha / 2.0)
 
 # --- Metrics ---
 @jax.jit
 def _mse(y: jnp.ndarray, yhat: jnp.ndarray) -> jnp.ndarray:
+    """Calculates Mean Squared Error.
+    
+    Args:
+        y (jnp.ndarray): Ground truth values.
+        yhat (jnp.ndarray): Predicted values.
+        
+    Returns:
+        jnp.ndarray: The scalar MSE value.
+    """
     return jnp.mean((y - yhat) ** 2)
 
 @jax.jit
 def _mae(y: jnp.ndarray, yhat: jnp.ndarray) -> jnp.ndarray:
+    """Calculates Mean Absolute Error.
+    
+    Args:
+        y (jnp.ndarray): Ground truth values.
+        yhat (jnp.ndarray): Predicted values.
+        
+    Returns:
+        jnp.ndarray: The scalar MAE value.
+    """
     return jnp.mean(jnp.abs(y - yhat))
 
 @jax.jit
 def _mape(y: jnp.ndarray, yhat: jnp.ndarray) -> jnp.ndarray:
+    """Calculates Mean Absolute Percentage Error.
+    
+    Args:
+        y (jnp.ndarray): Ground truth values.
+        yhat (jnp.ndarray): Predicted values.
+        
+    Returns:
+        jnp.ndarray: The scalar MAPE value.
+    """
     mask = jnp.abs(y) > 1e-6
     return jnp.mean(jnp.where(mask, jnp.abs((y - yhat) / y), 0.0))
 
 @jax.jit
 def _smape(y: jnp.ndarray, yhat: jnp.ndarray) -> jnp.ndarray:
+    """Calculates Symmetric Mean Absolute Percentage Error.
+    
+    Args:
+        y (jnp.ndarray): Ground truth values.
+        yhat (jnp.ndarray): Predicted values.
+        
+    Returns:
+        jnp.ndarray: The scalar sMAPE value.
+    """
     denominator = jnp.abs(y) + jnp.abs(yhat)
     return jnp.mean(2.0 * jnp.abs(y - yhat) / (denominator + 1e-6))
 
-_METRIC_MAP = {
+_METRIC_MAP: Dict[str, Any] = {
     "mse": _mse,
     "mae": _mae,
     "mape": _mape,
@@ -72,12 +156,29 @@ _METRIC_MAP = {
 # 2. PURE LOGIC HANDLERS (Validation & Grid Search)
 # =============================================================================
 
-def _ensure_float(x):
-    """Flattens and casts to float32 for JAX."""
+def _ensure_float(x: Any) -> jnp.ndarray:
+    """Flattens and casts to float32 for JAX.
+    
+    Args:
+        x (Any): The input data structure containing time series values.
+        
+    Returns:
+        jnp.ndarray: A flattened, 1-dimensional array of 32-bit floats.
+    """
     return jnp.asarray(x, dtype=jnp.float32).ravel()
 
 def _validate_levels(level: Optional[Union[List[int], Tuple[int, ...]]]) -> Optional[List[int]]:
-    """Sanitizes prediction interval levels."""
+    """Sanitizes prediction interval levels.
+    
+    Args:
+        level (Optional[Union[List[int], Tuple[int, ...]]]): The list of confidence levels to sanitize.
+        
+    Returns:
+        Optional[List[int]]: A sorted list of unique, valid integer levels.
+        
+    Raises:
+        ValueError: If levels are empty or fall outside the valid (0, 100) range.
+    """
     if level is None: return None
     if not level: raise ValueError("Level must be non-empty.")
     clean = sorted(list(set(int(l) for l in level)))
@@ -85,11 +186,27 @@ def _validate_levels(level: Optional[Union[List[int], Tuple[int, ...]]]) -> Opti
         raise ValueError("Levels must be between 0 and 100.")
     return clean
 
-def _logic_check(keys_to_check, keys):
+def _logic_check(keys_to_check: Iterable[str], keys: Iterable[str]) -> bool:
+    """Checks if a subset of keys exists within a target set of keys.
+    
+    Args:
+        keys_to_check (Iterable[str]): The keys required to be present.
+        keys (Iterable[str]): The available keys to check against.
+        
+    Returns:
+        bool: True if all target keys exist, False otherwise.
+    """
     return set(keys_to_check).issubset(keys)
 
 def _is_valid_config(param_dict: Dict[str, Any]) -> bool:
-    """Filters invalid hyperparameter combinations (StatsForecast parity)."""
+    """Filters invalid hyperparameter combinations (StatsForecast parity).
+    
+    Args:
+        param_dict (Dict[str, Any]): A dictionary representing a single hyperparameter configuration.
+        
+    Returns:
+        bool: True if the configuration is logically valid, False if it conflicts.
+    """
     keys = param_dict.keys()
     
     if _logic_check(["seasonal_period", "max_rounds"], keys):
@@ -107,8 +224,15 @@ def generate_search_grid(
     season_length: Optional[Union[int, List[int]]], 
     user_config: Optional[List[Dict[str, Any]]] = None
 ) -> List[Dict[str, Any]]:
-    """Generates the hyperparameter grid."""
+    """Generates the hyperparameter grid.
     
+    Args:
+        season_length (Optional[Union[int, List[int]]]): The primary periodicity of the data.
+        user_config (Optional[List[Dict[str, Any]]], optional): Custom user-defined configurations.
+        
+    Returns:
+        List[Dict[str, Any]]: A list of all valid parameter configurations to test.
+    """
     if user_config is not None:
         if isinstance(user_config, list): return user_config
         keys, values = zip(*user_config.items())
@@ -136,7 +260,16 @@ def generate_search_grid(
     return [g for g in grid if _is_valid_config(g)]
 
 def add_gaussian_intervals(res: Dict[str, Any], level: List[int], sigma: float) -> Dict[str, Any]:
-    """Applies vectorized Gaussian intervals."""
+    """Applies vectorized Gaussian intervals.
+    
+    Args:
+        res (Dict[str, Any]): The dictionary containing the forecasted means.
+        level (List[int]): The list of confidence levels to evaluate.
+        sigma (float): The residual standard error calculated during model fit.
+        
+    Returns:
+        Dict[str, Any]: The input dictionary updated with interval keys.
+    """
     mean = res["mean"]
     lv_arr = jnp.array(level, dtype=jnp.float32)
     z = _z_from_levels(lv_arr)
@@ -153,15 +286,24 @@ def add_gaussian_intervals(res: Dict[str, Any], level: List[int], sigma: float) 
 
 # --- TRACKER CLASS ---
 class GridTracker:
-    def __init__(self):
-        self.total = 0
-        self.success = 0
-        self.lock = threading.Lock()
+    """A thread-safe tracking object for monitoring grid search progress."""
+    
+    def __init__(self) -> None:
+        """Initializes the counter and locking mechanism."""
+        self.total: int = 0
+        self.success: int = 0
+        self.lock: threading.Lock = threading.Lock()
 
-    def set_total(self, n):
+    def set_total(self, n: int) -> None:
+        """Sets the upper limit of expected iterations.
+        
+        Args:
+            n (int): The total number of configurations to evaluate.
+        """
         self.total = n
 
-    def increment_success(self):
+    def increment_success(self) -> None:
+        """Increments the success counter using a thread-safe lock."""
         with self.lock:
             self.success += 1
 
@@ -176,6 +318,16 @@ def cross_validation(
     
     Uses reduced max_rounds during CV for speed — enough to rank configs
     but not full convergence. The final model fit uses full max_rounds.
+    
+    Args:
+        folds (List[tuple]): A list containing pre-sliced validation chunks.
+        test_size (int): The number of future steps to predict per fold.
+        config (Dict[str, Any]): The specific hyperparameter set to evaluate.
+        has_exogenous (bool): Flag indicating if regressors exist in the folds.
+        cv_max_rounds (int, optional): Evaluation max boosting rounds constraint. Defaults to 10.
+        
+    Returns:
+        float: The average validation score across all tested windows.
     """
     cfg = config.copy()
     sp = cfg.pop("seasonal_period", None)
@@ -213,9 +365,21 @@ def optimize_grid_threaded(
     n_jobs: int = 4,
     verbose: bool = False
 ) -> Dict[str, Any]:
-    """
-    Parallel optimization using ThreadPoolExecutor.
+    """Parallel optimization using ThreadPoolExecutor.
     Pre-slices CV folds once for all configs to reduce overhead.
+    
+    Args:
+        y (jnp.ndarray): Target time series.
+        X (Optional[jnp.ndarray]): Matrix of exogenous variables.
+        test_size (int): Size of validation sets.
+        n_windows (int): Number of rolling cross-validation backtests.
+        step_size (int): Temporal spacing between validation chunks.
+        grid (List[Dict[str, Any]]): Master list of hyperparameter combinations.
+        n_jobs (int, optional): Thread execution limit. Defaults to 4.
+        verbose (bool, optional): Verbosity flag. Defaults to False.
+        
+    Returns:
+        Dict[str, Any]: The configuration dict that reported the lowest average error.
     """
     n_samples = y.shape[0]
     max_possible_windows = (n_samples - test_size - 4) // step_size + 1
@@ -252,7 +416,8 @@ def optimize_grid_threaded(
     tracker = GridTracker()
     tracker.set_total(len(grid))
 
-    def _worker(cfg):
+    def _worker(cfg: Dict[str, Any]) -> float:
+        """Internal worker function for mapping parallel threads."""
         try:
             score = cross_validation(folds, test_size, cfg, has_exogenous, cv_max_rounds=cv_rounds)
             tracker.increment_success()
@@ -270,7 +435,7 @@ def optimize_grid_threaded(
 
     print(f"  [AutoMFLES] Grid Search: Planned {tracker.total} runs | Completed {tracker.success} successfully.")
 
-    best_idx = np.argmin(scores)
+    best_idx = int(np.argmin(scores))
     return grid[best_idx]
 
 
@@ -279,6 +444,10 @@ def optimize_grid_threaded(
 # =============================================================================
 
 class AutoMFLES:
+    """The AutoMFLES user class which automatically explores configurations, standardizes 
+    data handling, and builds predictive bounds mapping down into an MFLES base-estimator.
+    """
+
     def __init__(
         self,
         test_size: int,
@@ -291,28 +460,57 @@ class AutoMFLES:
         prediction_intervals: Optional[Any] = None,
         alias: str = "AutoMFLES",
         n_jobs: int = 4
-    ):
+    ) -> None:
+        """Initializes the AutoMFLES wrapper class.
+        
+        Args:
+            test_size (int): Primary step horizon to evaluate internal cross validation.
+            season_length (Optional[Union[int, List[int]]], optional): Structural repetition frequency.
+            n_windows (int, optional): Allowed number of cross validation iterations. Defaults to 2.
+            config (Optional[List[Dict[str, Any]]], optional): Hardcoded overrides. Defaults to None.
+            step_size (Optional[int], optional): Steps separating CV windows. Defaults to test_size.
+            metric (str, optional): Assessed target loss metric. Defaults to 'smape'.
+            verbose (bool, optional): Reporting status flag. Defaults to False.
+            prediction_intervals (Optional[Any], optional): Settings dictating conformal bound output.
+            alias (str, optional): Custom system tracking ID. Defaults to "AutoMFLES".
+            n_jobs (int, optional): Authorized CPU Thread limits. Defaults to 4.
+            
+        Raises:
+            ValueError: If test_size or n_windows are <= 0.
+        """
         if test_size <= 0: raise ValueError("test_size must be > 0")
         if n_windows <= 0: raise ValueError("n_windows must be > 0")
 
-        self.test_size = test_size
-        self.season_length = season_length
-        self.n_windows = n_windows
-        self.config = config
-        self.step_size = step_size if step_size is not None else test_size
-        self.metric = metric
-        self.verbose = verbose
-        self.prediction_intervals = prediction_intervals
-        self.alias = alias
-        self.n_jobs = n_jobs
+        self.test_size: int = test_size
+        self.season_length: Optional[Union[int, List[int]]] = season_length
+        self.n_windows: int = n_windows
+        self.config: Optional[List[Dict[str, Any]]] = config
+        self.step_size: int = step_size if step_size is not None else test_size
+        self.metric: str = metric
+        self.verbose: bool = verbose
+        self.prediction_intervals: Optional[Any] = prediction_intervals
+        self.alias: str = alias
+        self.n_jobs: int = n_jobs
         
-        self.model_ = None
-        self.best_params_ = None
-        self.sigma_ = 0.0
-        self.scaling_stats_ = None
-        self._cached_y_hash = None  # New: Cache key for y (to detect changes)
+        self.model_: Optional[Dict[str, Any]] = None
+        self.best_params_: Optional[Dict[str, Any]] = None
+        self.sigma_: float = 0.0
+        self.scaling_stats_: Optional[Tuple[jnp.ndarray, jnp.ndarray]] = None
+        self._cached_y_hash: Optional[int] = None  # Cache key for y (to detect changes)
 
     def fit(self, y: Union[np.ndarray, jnp.ndarray], X: Optional[jnp.ndarray] = None) -> "AutoMFLES":
+        """Fits the AutoMFLES engine to the given time series and regressors.
+        
+        Accepts training time series data, conducts parallelized grid optimization,
+        applies required structural scaling, and fits the base system.
+        
+        Args:
+            y (Union[np.ndarray, jnp.ndarray]): Vector array of historical values.
+            X (Optional[jnp.ndarray], optional): Structural feature regressor inputs. Defaults to None.
+            
+        Returns:
+            AutoMFLES: A reference mapping back to itself to permit operation chaining.
+        """
         y = _ensure_float(y)
         y_hash = hash(y.tobytes())  # Simple hash to detect y changes
         
@@ -322,11 +520,11 @@ class AutoMFLES:
             self.scaling_stats_ = _get_stats(X)
             X = _standardize_data(X, *self.scaling_stats_)
         
-        # New: Skip optimization if already done and y/X unchanged
+        # Skip optimization if already done and y/X unchanged
         if self.best_params_ is None or self._cached_y_hash != y_hash:
             search_grid = generate_search_grid(self.season_length, self.config)
 
-        # Use THREADED optimization (Safe & Fast)
+            # Use THREADED optimization (Safe & Fast)
             self.best_params_ = optimize_grid_threaded(
                 y=y,
                 X=X,
@@ -358,6 +556,20 @@ class AutoMFLES:
         return self
 
     def predict(self, h: int, X: Optional[jnp.ndarray] = None, level: Optional[List[int]] = None) -> Dict[str, Any]:
+        """Calculates out-of-sample forward observations utilizing parameterized state mapping.
+        
+        Args:
+            h (int): Out-of-sample target evaluation step count.
+            X (Optional[jnp.ndarray], optional): Expected out-of-sample features array. Defaults to None.
+            level (Optional[List[int]], optional): Percentage integer bounds (e.g. 90, 95). Defaults to None.
+            
+        Returns:
+            Dict[str, Any]: Dictionary keys mapping "mean", and conditionally bound arrays.
+            
+        Raises:
+            RuntimeError: Tripped if action executed without preceding fit procedure.
+            ValueError: Tripped if inference attempts feature mapping absent historical features.
+        """
         if self.model_ is None: raise RuntimeError("Model not fitted.")
         level = _validate_levels(level)
 
@@ -375,4 +587,3 @@ class AutoMFLES:
             res = add_gaussian_intervals(res, level, self.sigma_)
 
         return res
-    
