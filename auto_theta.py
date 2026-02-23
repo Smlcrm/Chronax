@@ -61,10 +61,10 @@ class AutoTheta(BaseForecaster):
         self,
         season_length: int = 1,
         decomposition_type: str = "multiplicative",
-        model: str = None,
+        model: str | None = None,
         alias: str = "AutoTheta",
-        prediction_intervals: ConformalIntervals = None,
-        conformal_params: ConformalIntervals = None,
+        prediction_intervals: ConformalIntervals | None = None,
+        conformal_params: ConformalIntervals | None = None,
         n_samples: int = 200,
     ):
         """Initialize the AutoTheta model.
@@ -128,8 +128,8 @@ class AutoTheta(BaseForecaster):
     def predict(
         self,
         h: int,
-        X: jnp.ndarray = None,
-        level: list = None,
+        X: jnp.ndarray | None = None,
+        level: list | None = None,
     ) -> dict:
         r"""Predict with fitted AutoTheta.
 
@@ -175,9 +175,9 @@ class AutoTheta(BaseForecaster):
         self,
         y: jnp.ndarray,
         h: int,
-        X: jnp.ndarray = None,
-        X_future: jnp.ndarray = None,
-        level: list = None,
+        X: jnp.ndarray | None = None,
+        X_future: jnp.ndarray | None = None,
+        level: list | None = None,
         fitted: bool = False,
     ) -> dict:
         r"""Memory-efficient AutoTheta predictions.
@@ -229,9 +229,9 @@ class AutoTheta(BaseForecaster):
         self,
         y: jnp.ndarray,
         h: int,
-        X: jnp.ndarray = None,
-        X_future: jnp.ndarray = None,
-        level: list = None,
+        X: jnp.ndarray | None = None,
+        X_future: jnp.ndarray | None = None,
+        level: list | None = None,
         fitted: bool = False,
     ) -> dict:
         r"""Apply fitted AutoTheta model to a new time series.
@@ -297,7 +297,7 @@ class Theta(AutoTheta):
         season_length: int = 1,
         decomposition_type: str = "multiplicative",
         alias: str = "Theta",
-        prediction_intervals: ConformalIntervals = None,
+        prediction_intervals: ConformalIntervals | None = None,
         n_samples: int = 200,
     ):
         """Initialize the Theta (STM) model.

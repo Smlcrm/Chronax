@@ -6,10 +6,9 @@ Dynamic Standard Theta Method (DSTM), and Dynamic Optimized Theta Method (DOTM)
 with full JAX JIT compilation and two-phase ADAM + L-BFGS optimization.
 
 This module contains the core computational engine (state initialization,
-step functions, optimization, forecasting, Monte Carlo PI sampling) and the
-``Theta`` class (STM-only wrapper). The ``AutoTheta`` class (automatic model
-selection) lives in ``auto_theta.py`` and is re-exported here for backward
-compatibility.
+step functions, optimization, forecasting, Monte Carlo PI sampling).
+The ``AutoTheta`` and ``Theta`` classes live in ``auto_theta.py`` and are
+re-exported here for backward compatibility.
 
 Features:
 - Four model variants: STM, OTM, DSTM, DOTM
@@ -134,7 +133,7 @@ def _init_state(y: jnp.ndarray, model_type: int, initial_smoothed: float,
 _init_state = jax.jit(_init_state, static_argnums=(1,))
 
 
-def _make_step_fn(model_type_val: int) -> tuple:
+def _make_step_fn(model_type_val: int) -> tuple[callable, callable]:
     """Return (step_fn, forecast_step_fn) for the given model type.
 
     Step functions are designed for ``lax.scan``. Forecast step functions
@@ -501,8 +500,8 @@ _jit_optimize_theta = jax.jit(_jit_optimize_theta, static_argnums=(1, 6, 7, 8))
 # Parameter Initialization (Pure Python)
 # =============================================================================
 
-def _initparamtheta(initial_smoothed: float, alpha: float, theta: float,
-                    y: jnp.ndarray, model_type: int) -> dict:
+def _initparamtheta(initial_smoothed: float | None, alpha: float | None,
+                    theta: float | None, y: jnp.ndarray, model_type: int) -> dict:
     """Determine initial values and optimization flags per model type.
 
     STM/DSTM: theta fixed at 2.0, optimize level and alpha.
@@ -821,8 +820,9 @@ _compute_pi_samples = jax.jit(_compute_pi_samples, static_argnums=(1, 7, 8))
 # Full Pipeline Functions
 # =============================================================================
 
-def _fit_theta_model(y: jnp.ndarray, m: int, modeltype_str: str, initial_smoothed: float = None,
-                     alpha: float = None, theta: float = None) -> dict:
+def _fit_theta_model(y: jnp.ndarray, m: int, modeltype_str: str,
+                     initial_smoothed: float | None = None, alpha: float | None = None,
+                     theta: float | None = None) -> dict:
     """Fit a single theta model variant.
 
     Parameters
@@ -852,7 +852,7 @@ def _fit_theta_model(y: jnp.ndarray, m: int, modeltype_str: str, initial_smoothe
     return result
 
 
-def _forecast_from_model(obj: dict, h: int, level: list = None, n_samples: int = 200) -> dict:
+def _forecast_from_model(obj: dict, h: int, level: list | None = None, n_samples: int = 200) -> dict:
     """Generate forecasts from a fitted theta model dict.
 
     Parameters
@@ -920,9 +920,9 @@ def _forecast_from_model(obj: dict, h: int, level: list = None, n_samples: int =
     return res
 
 
-def _auto_theta(y: jnp.ndarray, m: int, model: str = None, initial_smoothed: float = None,
-                alpha: float = None, theta: float = None,
-                decomposition_type: str = "multiplicative") -> dict:
+def _auto_theta(y: jnp.ndarray, m: int, model: str | None = None,
+                initial_smoothed: float | None = None, alpha: float | None = None,
+                theta: float | None = None, decomposition_type: str = "multiplicative") -> dict:
     """Auto-select best theta model variant.
 
     Tests all 4 model types (or a single specified one), selects by MSE.
