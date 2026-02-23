@@ -176,7 +176,7 @@ class CrostonClassic(BaseForecaster):
         self,
         alias: str = "CrostonClassic",
         conformal_params: Optional[ConformalIntervals] = None,
-    ):
+    ) -> None:
         self.alias = alias
         self.conformal_params = conformal_params
         self.model_ = {}

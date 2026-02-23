@@ -90,7 +90,7 @@ class SimpleExponentialSmoothing(BaseForecaster):
         alpha: float,
         alias: str = "SES",
         conformal_params: ConformalIntervals | None = None,
-    ):
+    ) -> None:
         if not 0 <= alpha <= 1:
             raise ValueError(f"alpha must be in [0,1], got {alpha}")
         self.alpha = alpha
@@ -98,8 +98,21 @@ class SimpleExponentialSmoothing(BaseForecaster):
         self.conformal_params = conformal_params
         self.model_ = {}
     
-    def fit(self, y: jnp.ndarray, X: jnp.ndarray | None = None):
-        """Fit SES model."""
+    def fit(self, y: jnp.ndarray, X: jnp.ndarray | None = None) -> "SimpleExponentialSmoothing":
+        r"""Fit the SimpleExponentialSmoothing model.
+
+        Runs SES on the full series to produce fitted values and the final
+        smoothed level (used as the flat forecast). If `conformal_params` is
+        configured, conformity scores are computed and cached for predict().
+
+        Args:
+            y (jnp.ndarray): Clean time series of shape (t,).
+            X (jnp.ndarray | None): Exogenous variables (unused; included for
+                API compatibility). Default is None.
+
+        Returns:
+            SimpleExponentialSmoothing: Self (fitted model instance).
+        """
         y = utils.ensure_float(y)
         mod = _ses(y=y, alpha=self.alpha, h=1, fitted=True)
         self.model_ = dict(mod)
@@ -117,7 +130,24 @@ class SimpleExponentialSmoothing(BaseForecaster):
         X: jnp.ndarray | None = None,
         X_future: jnp.ndarray | None = None,
     ) -> dict:
-        """Pure forecast for conformity score computation."""
+        r"""Memory-efficient stateless fit+predict in one call.
+
+        Fits SES on `y` and immediately generates h-step ahead point forecasts
+        without storing any model state. Used internally by BaseForecaster for
+        conformity score computation in cross-validation windows.
+
+        Args:
+            y (jnp.ndarray): Clean time series of shape (t,).
+            h (int): Forecast horizon (number of steps ahead).
+            X (jnp.ndarray | None): In-sample exogenous variables (unused;
+                included for API compatibility). Default is None.
+            X_future (jnp.ndarray | None): Future exogenous variables (unused;
+                included for API compatibility). Default is None.
+
+        Returns:
+            dict: Dictionary containing:
+                - "mean": Point forecasts of shape (h,), all equal to the final smoothed level.
+        """
         y = utils.ensure_float(y)
         mod = _ses(y=y, alpha=self.alpha, h=h, fitted=False)
         return {"mean": mod["mean"]}
@@ -128,7 +158,29 @@ class SimpleExponentialSmoothing(BaseForecaster):
         X: jnp.ndarray | None = None,
         level: list[int] | None = None,
     ) -> dict:
-        """Generate predictions with optional conformal intervals."""
+        r"""Generate h-step ahead forecasts using the fitted model.
+
+        All h forecasts equal the final smoothed level ℓ[T]. Optionally adds
+        conformal prediction intervals using cached conformity scores from fit().
+
+        Args:
+            h (int): Forecast horizon (number of steps ahead).
+            X (jnp.ndarray | None): Exogenous variables (unused; included for
+                API compatibility). Default is None.
+            level (list[int] | None): Confidence levels (0–100) for prediction
+                intervals, e.g. [80, 95]. Requires `conformal_params` to be set.
+                Default is None.
+
+        Returns:
+            dict: Dictionary containing:
+                - "mean": Point forecasts of shape (h,).
+                - "lo-{l}" / "hi-{l}": Conformal interval bounds for each level l
+                  (only present when level is not None).
+
+        Raises:
+            ValueError: If level is requested but `conformal_params` is None.
+            ValueError: If level is requested but the model has not been fitted yet.
+        """
         mean = utils._repeat_val(val=self.model_["mean"][0], h=h)
         res = {"mean": mean}
         
@@ -150,7 +202,16 @@ class SimpleExponentialSmoothing(BaseForecaster):
         return res
     
     def predict_in_sample(self) -> dict:
-        """Access fitted in-sample predictions."""
+        r"""Return in-sample fitted values from the last fit() call.
+
+        Returns:
+            dict: Dictionary containing:
+                - "fitted": In-sample smoothed predictions of shape (t,).
+                  The first value is NaN (no prior level available at t=0).
+
+        Raises:
+            ValueError: If the model has not been fitted yet.
+        """
         if "fitted" not in self.model_:
             raise ValueError("Model must be fitted first.")
         return {"fitted": self.model_["fitted"]}

@@ -1,6 +1,35 @@
 """
-SeasonalExponentialSmoothing model with self-contained pure function kernels.
-All math/logic lives in pure functions; the class is a barebones orchestrator.
+SeasonalExponentialSmoothing (SES) for seasonal time series in JAX.
+
+Applies Simple Exponential Smoothing independently to each seasonal subseries
+(i.e. each phase of the cycle). The forecast for horizon h is a tiled repetition
+of per-season SES forecasts, making it suitable for data with stable seasonal
+patterns and no clear trend.
+
+Formula (per season s):
+    ℓ[t,s] = α · y[t] + (1-α) · ℓ[t-1,s]
+    ŷ[t+h, s] = ℓ[T, s]  (flat forecast per season)
+
+Implementation:
+    - Pure function kernels for JIT compilation and vmapping
+    - `_ses_forecast_masked`: SES on padded fixed-size arrays (JIT-safe)
+    - `_seasonal_exponential_smoothing_jit`: vmaps SES over all seasons at once
+    - `_seasonal_exponential_smoothing`: dispatcher handling the n < season_length edge case
+    - Class: thin orchestrator delegating to the kernels above
+
+Instance Attributes:
+    - season_length: number of observations per seasonal cycle
+    - alpha: smoothing parameter shared across all seasons (0 ≤ α ≤ 1)
+    - alias: model identifier string
+    - prediction_intervals: optional ConformalIntervals for conformal prediction
+    - conformal_params: alias for prediction_intervals (BaseForecaster compatibility)
+    - only_conformal_intervals: always True (no native parametric intervals)
+
+Methods:
+    - fit(y, X): fit per-season SES and optionally compute conformity scores
+    - predict(h, X, level): h-step ahead forecasts; optional conformal intervals
+    - predict_in_sample(): return in-sample fitted values
+    - forecast(y, h, X, X_future, level, fitted): stateless fit+predict
 """
 from functools import partial
 from typing import Optional, List, Dict, Tuple
@@ -163,7 +192,7 @@ class SeasonalExponentialSmoothing(BaseForecaster):
         alpha: float,
         alias: str = "SeasonalES",
         prediction_intervals: Optional[ConformalIntervals] = None,
-    ):
+    ) -> None:
         self.season_length = season_length
         self.alpha = alpha
         self.alias = alias
@@ -175,8 +204,21 @@ class SeasonalExponentialSmoothing(BaseForecaster):
         self,
         y: jnp.ndarray,
         X: Optional[jnp.ndarray] = None,
-    ):
-        r"""Fit the SeasonalExponentialSmoothing model."""
+    ) -> "SeasonalExponentialSmoothing":
+        r"""Fit the SeasonalExponentialSmoothing model.
+
+        Applies per-season SES to the input series and stores the fitted
+        seasonal pattern. If `prediction_intervals` is configured, conformity
+        scores are also computed and cached for use in `predict()`.
+
+        Args:
+            y (jnp.ndarray): Clean time series of shape (t,).
+            X (Optional[jnp.ndarray]): Exogenous variables (unused; included for
+                API compatibility). Default is None.
+
+        Returns:
+            SeasonalExponentialSmoothing: Self (fitted model instance).
+        """
         y = ensure_float(y)
         mod = _seasonal_exponential_smoothing(
             y=y,
@@ -194,8 +236,29 @@ class SeasonalExponentialSmoothing(BaseForecaster):
         h: int,
         X: Optional[jnp.ndarray] = None,
         level: Optional[List[int]] = None,
-    ):
-        r"""Predict with fitted SeasonalExponentialSmoothing."""
+    ) -> Dict[str, jnp.ndarray]:
+        r"""Generate h-step ahead forecasts using the fitted model.
+
+        Tiles the stored per-season SES forecasts to cover the requested
+        horizon. Optionally adds conformal prediction intervals.
+
+        Args:
+            h (int): Forecast horizon (number of steps ahead).
+            X (Optional[jnp.ndarray]): Exogenous variables (unused; included for
+                API compatibility). Default is None.
+            level (Optional[List[int]]): Confidence levels (0–100) for prediction
+                intervals, e.g. [80, 95]. Requires `prediction_intervals` to be set.
+                Default is None.
+
+        Returns:
+            Dict[str, jnp.ndarray]: Dictionary containing:
+                - "mean": Point forecasts of shape (h,).
+                - "lo-{l}" / "hi-{l}": Conformal interval bounds for each level l
+                  (only present when level is not None).
+
+        Raises:
+            Exception: If level is requested but `prediction_intervals` is None.
+        """
         mean = _repeat_val_seas(self.model_["mean"], h=h)
         res = {"mean": mean}
         if level is None:
@@ -207,8 +270,13 @@ class SeasonalExponentialSmoothing(BaseForecaster):
             raise Exception("You must pass `prediction_intervals` to compute them.")
         return res
 
-    def predict_in_sample(self):
-        r"""Access fitted SeasonalExponentialSmoothing insample predictions."""
+    def predict_in_sample(self) -> Dict[str, jnp.ndarray]:
+        r"""Return in-sample fitted values from the last fit() call.
+
+        Returns:
+            Dict[str, jnp.ndarray]: Dictionary containing:
+                - "fitted": In-sample predictions of shape (t,).
+        """
         res = {"fitted": self.model_["fitted"]}
         return res
 
@@ -220,8 +288,36 @@ class SeasonalExponentialSmoothing(BaseForecaster):
         X_future: Optional[jnp.ndarray] = None,
         level: Optional[List[int]] = None,
         fitted: bool = False,
-    ):
-        r"""Memory Efficient SeasonalExponentialSmoothing predictions."""
+    ) -> Dict[str, jnp.ndarray]:
+        r"""Memory-efficient stateless fit+predict in one call.
+
+        Fits the model on `y` and immediately generates forecasts without
+        storing any model state. Useful for cross-validation loops or
+        one-shot forecasting.
+
+        Args:
+            y (jnp.ndarray): Clean time series of shape (t,).
+            h (int): Forecast horizon (number of steps ahead).
+            X (Optional[jnp.ndarray]): In-sample exogenous variables (unused;
+                included for API compatibility). Default is None.
+            X_future (Optional[jnp.ndarray]): Future exogenous variables (unused;
+                included for API compatibility). Default is None.
+            level (Optional[List[int]]): Confidence levels (0–100) for prediction
+                intervals, e.g. [80, 95]. Requires `prediction_intervals` to be set.
+                Default is None.
+            fitted (bool): Whether to include in-sample fitted values in the output.
+                Default is False.
+
+        Returns:
+            Dict[str, jnp.ndarray]: Dictionary containing:
+                - "mean": Point forecasts of shape (h,).
+                - "fitted": In-sample fitted values of shape (t,) (only if fitted=True).
+                - "lo-{l}" / "hi-{l}": Conformal interval bounds for each level l
+                  (only present when level is not None).
+
+        Raises:
+            Exception: If level is requested but `prediction_intervals` is None.
+        """
         y = ensure_float(y)
         res = _seasonal_exponential_smoothing(
             y=y, h=h, fitted=fitted, alpha=self.alpha, season_length=self.season_length
