@@ -67,25 +67,6 @@ class AutoTheta(BaseForecaster):
         conformal_params: ConformalIntervals | None = None,
         n_samples: int = 200,
     ):
-        """Initialize the AutoTheta model.
-
-        Parameters
-        ----------
-        season_length : int, default 1
-            Number of observations per unit of time.
-        decomposition_type : str, default 'multiplicative'
-            Seasonal decomposition type: 'multiplicative' or 'additive'.
-        model : str or None, default None
-            Controlling theta model variant. None searches the best model.
-        alias : str, default 'AutoTheta'
-            Custom name of the model.
-        prediction_intervals : ConformalIntervals or None, default None
-            Configuration for conformal prediction intervals.
-        conformal_params : ConformalIntervals or None, default None
-            Parameters for conformal prediction intervals.
-        n_samples : int, default 200
-            Number of Monte Carlo samples for prediction intervals.
-        """
         self.season_length = season_length
         self.decomposition_type = decomposition_type
         self.model = model
@@ -99,7 +80,7 @@ class AutoTheta(BaseForecaster):
                 raise TypeError("conformal_params must be a ConformalIntervals object.")
             self.conformal_params = conformal_params
 
-    def fit(self, y: jnp.ndarray, X: jnp.ndarray = None) -> "AutoTheta":
+    def fit(self, y: jnp.ndarray, X: jnp.ndarray | None = None) -> "AutoTheta":
         r"""Fit the AutoTheta model.
 
         Parameters
@@ -152,7 +133,7 @@ class AutoTheta(BaseForecaster):
             fcst = _add_predict_conformal_intervals(self, fcst, level)
         return fcst
 
-    def predict_in_sample(self, level: list = None) -> dict:
+    def predict_in_sample(self, level: list | None = None) -> dict:
         r"""Access fitted AutoTheta in-sample predictions.
 
         Parameters
@@ -300,21 +281,6 @@ class Theta(AutoTheta):
         prediction_intervals: ConformalIntervals | None = None,
         n_samples: int = 200,
     ):
-        """Initialize the Theta (STM) model.
-
-        Parameters
-        ----------
-        season_length : int, default 1
-            Number of observations per unit of time.
-        decomposition_type : str, default 'multiplicative'
-            Seasonal decomposition type: 'multiplicative' or 'additive'.
-        alias : str, default 'Theta'
-            Custom name of the model.
-        prediction_intervals : ConformalIntervals or None, default None
-            Configuration for conformal prediction intervals.
-        n_samples : int, default 200
-            Number of Monte Carlo samples for prediction intervals.
-        """
         super().__init__(
             season_length=season_length,
             model="STM",

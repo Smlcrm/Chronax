@@ -263,7 +263,6 @@ def _pegels_resid(y: jnp.ndarray, model_type: int, initial_smoothed: jnp.ndarray
         final_state : Final state vector of shape (5,): [level, mean_y, An, Bn, mu].
         mse : Scalar optimization objective: sum(e[3:]^2) / max(mean(|y|), eps).
     """
-    n = y.shape[0]
     dtype = y.dtype
 
     # Initialize state
@@ -341,10 +340,9 @@ def _jit_optimize_theta(y: jnp.ndarray, model_type: int, x0: jnp.ndarray,
         theta : Optimized theta parameter in [1.0, 100.0].
     """
     dtype = y.dtype
-    eps_val = jnp.asarray(_EPSILON, dtype=dtype)
 
     # Scaling
-    y_std = jnp.maximum(jnp.std(y), eps_val)
+    y_std = jnp.maximum(jnp.std(y), _EPSILON)
     y_mean = jnp.mean(y)
 
     # Bounds for sigmoid reparameterization
@@ -744,7 +742,7 @@ def _compute_pi_samples(last_state: jnp.ndarray, model_type: int, alpha: jnp.nda
         Sample forecasts of shape (h, n_samples).
     """
     dtype = last_state.dtype
-    level, mean_y_state, An, Bn, _ = last_state
+    level, _, An, Bn, _ = last_state
     is_dynamic = (model_type == ModelType.DSTM) | (model_type == ModelType.DOTM)
 
     key = jrandom.PRNGKey(seed)
