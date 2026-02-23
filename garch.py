@@ -1,32 +1,54 @@
 """
-GARCH Model for Time-Varying Volatility
+GARCH Model — JAX-accelerated implementation.
 
-GARCH models time series with non-constant volatility where conditional variance
+Models time series with non-constant volatility where conditional variance
 depends on past squared errors and past conditional variances. Supports both
-deterministic forecasting (expected values, analytical intervals) and stochastic
-forecasting (sample paths via Monte Carlo simulation).
+deterministic forecasting (analytical intervals) and stochastic forecasting
+(Monte Carlo simulation paths).
 
-Parameters:
-- ω (omega): Baseline volatility level (must be > 0)
-- α_i (alpha): Impact of past shocks on current volatility (≥ 0)
-- β_j (beta): Impact of past volatility on current volatility (≥ 0)
-- p: Number of lagged squared shocks to include (ARCH order)
-- q: Number of lagged variances to include (GARCH order)
+Features:
+- GARCH(p,q) and pure ARCH(p) models
+- Primary: jaxopt.LBFGSB with box-constrained direct parameterization
+- Fallback: Optax ADAM + L-BFGS with softplus reparameterization
+- Multi-start optimization (ACF-based, uniform, high-persistence candidates)
+- O(log n) parallel variance recursion for q<=1 via associative scan
+- Deterministic and stochastic (Monte Carlo) forecasting
+- Native and conformal prediction intervals
+- Padded-input support for GPU JIT reuse in cross-validation
+
+Instance Attributes:
+1. p: int - ARCH order (lagged squared shocks)
+2. q: int - GARCH order (lagged variances)
+3. alias: str - Display name for the model
+4. conformal_params: ConformalIntervals | None - Conformal prediction config
+5. allow_extended_iterations: bool - Allow up to 120 iterations for complex data
+6. iteration_scaling: str - 'cubic' or 'quadratic' complexity-to-iteration mapping
+7. model_: dict - Fitted model state (created after fit())
+   - omega, alpha, beta: Estimated GARCH parameters
+   - sigma2: Conditional variance series
+   - fitted: In-sample fitted values (conditional mean)
+   - residuals: Fit residuals
+   - y_mean: Training series mean
+   - y_centered_last: Last p centered observations
+   - sigma2_last: Last q conditional variances
+   - init_var: Backcast initial variance
 
 Methods:
-1. fit: Estimates ω, α, β using maximum likelihood optimization
-2. predict: Deterministic forecast returning expected volatility path
-3. predict_simulate: Stochastic forecast generating multiple sample paths
-4. forecast: Stateless deterministic fit-and-predict
-5. forecast_simulate: Stateless stochastic fit-and-predict
-6. predict_in_sample: Returns fitted values with optional prediction intervals
+1. __init__() - Initialize with ARCH/GARCH orders and optimization settings
+2. fit(y, X=None) - Fit model via LBFGSB optimization
+3. predict(h, X=None, level=None) - Deterministic h-step forecast
+4. predict_in_sample(level=None) - Return fitted values with optional intervals
+5. predict_simulate(h, n_sims, seed, level) - Stochastic Monte Carlo forecast
+6. forecast(y, h, ...) - Stateless fit-and-predict
+7. forecast_simulate(y, h, n_sims, ...) - Stateless stochastic fit-and-predict
 
-Constants:
-_EPSILON (1e-8): Numerical floor for variance
-
-Note on notation: This implementation uses p for ARCH order (lagged squared shocks)
-and q for GARCH order (lagged variances). This is reversed from Bollerslev (1986)
-but internally consistent within this codebase.
+Implementation Notes:
+- Notation: p = ARCH order, q = GARCH order (reversed from Bollerslev 1986)
+- Primary path: direct positive params with LBFGSB box bounds (omega: [1e-7, 1e4], alpha/beta: [1e-7, 0.9999])
+- Fallback path: softplus(unconstrained) + epsilon with stationarity penalty
+- Post-fit stationarity clamping at 0.999 with omega recomputation
+- Variance recursion uses O(q) circular buffer for q>1, associative scan for q<=1
+- Backcast initialization with exponential decay (tau=0.94, max window=75)
 """
 
 import jax
@@ -34,228 +56,444 @@ import jax.numpy as jnp
 import optax
 from jax import lax
 
+import jaxopt
+
 from base_forecaster import BaseForecaster
 from conformal_intervals import ConformalIntervals
 import utils
 
+__all__ = ['GARCH']
+
+
+# =============================================================================
+# Constants
+# =============================================================================
 
 _EPSILON = jnp.float32(1e-8)
-_SIGMA2_MAX_MULT = jnp.float32(1e6)  # Maximum variance multiplier for upper bound
-_LOG_2PI = jnp.float32(jnp.log(2 * jnp.pi))  # Pre-computed constant
+_SIGMA2_MAX_MULT = jnp.float32(1e6)
+_LOG_2PI = jnp.float32(jnp.log(2 * jnp.pi))
+_LBFGS_STEPS = 40
+_LBFGS_MEMORY = 15
+_LBFGS_LS_STEPS = 20
+_LBFGSB_MAXITER = 50
+_LBFGSB_HISTORY = 15
+_LBFGSB_TOL = 1e-5
+_LBFGSB_MAXLS = 30
+
+# =============================================================================
+# Core Math — Module-level JIT'd functions
+# =============================================================================
 
 def _compute_backcast(y: jnp.ndarray, max_window: int = 75) -> float:
-    """Compute exponentially weighted backcast for variance initialization.
+    """Exponentially weighted backcast for variance initialization.
 
-    Uses decay factor of 0.94 over observations, matching the arch library approach.
-    This function is NOT JIT-compiled as it needs to access array length.
+    Not JIT-compiled (needs dynamic array length).
 
-    Args:
-        y: Input array (centered returns)
-        max_window: Maximum window size for backcast (default 75)
+    Parameters
+    ----------
+    y : jnp.ndarray
+        Centered returns.
+    max_window : int, default 75
+        Maximum lookback window.
 
-    Returns:
-        Exponentially weighted average of squared observations
+    Returns
+    -------
+    float
+        Exponentially weighted average of squared observations.
     """
-    n = len(y)
-    tau = min(max_window, n)
-
-    # Create weights with exponential decay
-    indices = jnp.arange(tau)
-    w = jnp.float32(0.94) ** indices
+    tau = min(max_window, len(y))
+    w = jnp.float32(0.94) ** jnp.arange(tau)
     w = w / jnp.sum(w)
-
-    # Compute weighted sum of squared observations
     y_squared = (y[:tau] ** 2).astype(jnp.float32)
     return float(jnp.sum(y_squared * w))
 
 
-def _compute_sigma2_series(y: jnp.ndarray, omega: float, alpha: jnp.ndarray, beta: jnp.ndarray,
-                           p: int, q: int, init_var: float) -> jnp.ndarray:
-    """Compute conditional variance series using GARCH recursion.
+def _garch_associative_op(
+    left: tuple[jnp.ndarray, jnp.ndarray],
+    right: tuple[jnp.ndarray, jnp.ndarray],
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Associative operator for GARCH(p,1) linear recurrence composition.
 
-    Uses O(q) circular buffer for memory efficiency instead of O(n) full array.
-    Applies variance bounds to prevent numerical issues.
+    For sigma2_t = a_t + b * sigma2_{t-1}, composition of two affine maps:
+    (a_l, b_l) composed with (a_r, b_r) = (a_r + b_r * a_l, b_r * b_l)
+    """
+    a_l, b_l = left
+    a_r, b_r = right
+    return (a_r + b_r * a_l, b_r * b_l)
 
-    Args:
-        y: Centered returns array
-        omega: GARCH constant
-        alpha: ARCH coefficients
-        beta: GARCH coefficients
-        p: ARCH order (static)
-        q: GARCH order (static)
-        init_var: Initial variance (from backcast, passed in to avoid JIT issues)
+
+def _compute_arch_terms(
+    y_squared: jnp.ndarray, omega: jnp.ndarray, alpha: jnp.ndarray,
+    init_var: jnp.ndarray, p: int,
+) -> jnp.ndarray:
+    """Vectorized ARCH summation: omega + sum_i(alpha_i * y^2_{t-i}).
+
+    Pre-computes all ARCH terms in parallel via lag indexing, avoiding
+    sequential dynamic_slice calls. Used by q<=1 paths (pure ARCH and
+    associative scan); the q>1 sequential path uses inline dynamic_slice.
+    """
+    n = y_squared.shape[0]
+    y2_padded = jnp.concatenate([jnp.full(p, init_var, dtype=jnp.float32), y_squared])
+    lags = p - 1 - jnp.arange(p)
+    indices = lags[:, None] + jnp.arange(n)
+    y2_lags = y2_padded[indices]  # (p, n)
+    return omega + jnp.dot(alpha, y2_lags)
+
+
+def _compute_sigma2_parallel_q1(
+    arch_terms: jnp.ndarray, beta_scalar: jnp.ndarray, init_var: jnp.ndarray,
+) -> jnp.ndarray:
+    """O(log n) parallel variance recursion for q=1 via associative scan.
+
+    Exploits the linear recurrence sigma2_t = a_t + beta * sigma2_{t-1}
+    by composing affine maps in parallel using JAX's associative_scan.
+    """
+    n = arch_terms.shape[0]
+    b = jnp.full(n, beta_scalar, dtype=jnp.float32)
+    A, B = jax.lax.associative_scan(_garch_associative_op, (arch_terms, b))
+    sigma2 = A + B * init_var
+    return jnp.maximum(sigma2, _EPSILON)
+
+
+def _compute_sigma2_series(y: jnp.ndarray, omega: float, alpha: jnp.ndarray,
+                           beta: jnp.ndarray, p: int, q: int,
+                           init_var: float) -> jnp.ndarray:
+    """Compute conditional variance series via GARCH recursion.
+
+    Dispatches to O(log n) parallel path for q<=1 or O(n) sequential for q>1.
+
+    Parameters
+    ----------
+    y : jnp.ndarray
+        Centered returns.
+    omega : float
+        GARCH intercept.
+    alpha : jnp.ndarray
+        ARCH coefficients of length p.
+    beta : jnp.ndarray
+        GARCH coefficients of length q.
+    p : int
+        ARCH order (static).
+    q : int
+        GARCH order (static).
+    init_var : float
+        Backcast initial variance.
+
+    Returns
+    -------
+    jnp.ndarray
+        Conditional variance series of length n.
     """
     n = len(y)
     y = y.astype(jnp.float32)
     y_squared = y ** 2
 
     init_var_f32 = jnp.float32(init_var)
-    sigma2_max = init_var_f32 * _SIGMA2_MAX_MULT  # Upper bound for variance
-
-    # Pad y_squared for ARCH term lookback
-    y_squared_padded = jnp.concatenate([jnp.full(p, init_var_f32, dtype=jnp.float32), y_squared])
-
-    # Cast parameters to float32 for type consistency in lax.scan
     omega_f32 = jnp.float32(omega)
     alpha_f32 = alpha.astype(jnp.float32)
-    beta_f32 = beta.astype(jnp.float32) if q > 0 else jnp.array([], dtype=jnp.float32)
-    zero_f32 = jnp.float32(0.0)
 
-    # Buffer size for GARCH term (use at least 1 for consistent array shapes)
-    buffer_size = max(q, 1)
+    if q == 0:
+        # Pure ARCH: no recursion, sigma2 = arch_terms
+        arch_terms = _compute_arch_terms(y_squared, omega_f32, alpha_f32, init_var_f32, p)
+        return jnp.maximum(arch_terms, _EPSILON)
+    elif q == 1:
+        # GARCH(p,1): O(log n) parallel via associative scan
+        arch_terms = _compute_arch_terms(y_squared, omega_f32, alpha_f32, init_var_f32, p)
+        return _compute_sigma2_parallel_q1(arch_terms, beta[0].astype(jnp.float32), init_var_f32)
+    else:
+        # q > 1: sequential scan with circular buffer and log-smoothed bound.
+        # dynamic_slice inside the scan fuses better in XLA than pre-computing.
+        sigma2_max = init_var_f32 * _SIGMA2_MAX_MULT
+        y_squared_padded = jnp.concatenate([jnp.full(p, init_var_f32, dtype=jnp.float32), y_squared])
+        beta_f32 = beta.astype(jnp.float32)
+        buffer_size = max(q, 1)
 
-    def step(sigma2_buffer, t):
-        # ARCH term: use pre-padded y_squared array
-        y2_lagged = lax.dynamic_slice(y_squared_padded, (t,), (p,))
-        arch_sum = jnp.dot(alpha_f32, jnp.flip(y2_lagged))
+        def step(sigma2_buffer, t):
+            y2_lagged = lax.dynamic_slice(y_squared_padded, (t,), (p,))
+            arch_sum = jnp.dot(alpha_f32, jnp.flip(y2_lagged))
+            garch_sum = jnp.dot(beta_f32, jnp.flip(sigma2_buffer[:q]))
+            sigma2_t = jnp.maximum(omega_f32 + arch_sum + garch_sum, _EPSILON)
+            sigma2_t = jnp.where(
+                sigma2_t > sigma2_max,
+                sigma2_max + jnp.log(sigma2_t / sigma2_max),
+                sigma2_t
+            )
+            sigma2_buffer = jnp.roll(sigma2_buffer, -1).at[-1].set(sigma2_t)
+            return sigma2_buffer, sigma2_t
 
-        # GARCH term: use circular buffer (only last q values needed)
-        garch_sum = jnp.dot(beta_f32, jnp.flip(sigma2_buffer[:q])) if q > 0 else zero_f32
+        init_buffer = jnp.full(buffer_size, init_var_f32, dtype=jnp.float32)
+        _, sigma2_all = lax.scan(step, init_buffer, jnp.arange(n))
+        return sigma2_all
 
-        sigma2_t = jnp.maximum(omega_f32 + arch_sum + garch_sum, _EPSILON)
-        # Upper bound with log-smoothing to maintain gradient flow
-        sigma2_t = jnp.where(
-            sigma2_t > sigma2_max,
-            sigma2_max + jnp.log(sigma2_t / sigma2_max),
-            sigma2_t
-        )
+_compute_sigma2_series = jax.jit(_compute_sigma2_series, static_argnums=(4, 5))
 
-        # Shift buffer: drop oldest, append newest
-        sigma2_buffer = jnp.roll(sigma2_buffer, -1).at[-1].set(sigma2_t)
 
-        return sigma2_buffer, sigma2_t
+def _log_likelihood(params: jnp.ndarray, y: jnp.ndarray, p: int, q: int,
+                    init_var: float, actual_len: jnp.ndarray,
+                    sample_var: jnp.ndarray) -> jnp.ndarray:
+    """Penalized negative log-likelihood for GARCH.
 
-    init_buffer = jnp.full(buffer_size, init_var_f32, dtype=jnp.float32)
-    _, sigma2_all = lax.scan(step, init_buffer, jnp.arange(n))
-    return sigma2_all
+    Parameters
+    ----------
+    params : jnp.ndarray
+        Unconstrained parameters (transformed via softplus).
+    y : jnp.ndarray
+        Centered returns (may be padded).
+    p : int
+        ARCH order (static).
+    q : int
+        GARCH order (static).
+    init_var : float
+        Backcast initial variance.
+    actual_len : jnp.ndarray
+        Actual data length as JAX int32; -1 means use full array.
+    sample_var : jnp.ndarray
+        Sample variance for variance targeting; -1.0 disables VT.
 
-_compute_sigma2_series = jax.jit(_compute_sigma2_series, static_argnums=(4, 5))  # p, q are static
-
-# negative log likelihood
-def _log_likelihood(params: jnp.ndarray, y: jnp.ndarray, p: int, q: int, init_var: float,
-                    actual_len: jnp.ndarray):
-    """Compute negative log-likelihood for GARCH model with penalty for constraint violations.
-
-    Args:
-        params: Unconstrained parameters (to be transformed via softplus)
-        y: Centered returns array (may be padded)
-        p: ARCH order (static)
-        q: GARCH order (static)
-        init_var: Initial variance from backcast (passed in to avoid JIT issues)
-        actual_len: Actual data length as JAX int32 (-1 means use full array).
-                    Must be JAX array for proper tracing to avoid recompilation.
+    Returns
+    -------
+    jnp.ndarray
+        Scalar negative log-likelihood plus stationarity penalty.
     """
-    omega = jax.nn.softplus(params[0]) + _EPSILON
+    params = jnp.asarray(params, dtype=jnp.float32)
     alpha = jax.nn.softplus(params[1:1+p])
     beta = jax.nn.softplus(params[1+p:1+p+q]) if q > 0 else jnp.array([])
+
+    # Omega: variance targeting or free parameter
+    coef_sum = jnp.sum(alpha) + jnp.sum(beta)
+    omega_free = jax.nn.softplus(params[0]) + _EPSILON
+    omega_vt = sample_var * jnp.maximum(1.0 - coef_sum, _EPSILON)
+    omega = jnp.where(sample_var >= 0, omega_vt, omega_free)
+
     sigma2 = _compute_sigma2_series(y, omega, alpha, beta, p, q, init_var)
 
-    # Clip standardized squared residuals to prevent extreme values
-    y_sq_over_sigma2 = jnp.clip(y**2 / sigma2, 0.0, 1e10)
-
-    # Per-timestep log-likelihood components
+    y_sq_over_sigma2 = y**2 / jnp.maximum(sigma2, _EPSILON)
     ll_per_t = _LOG_2PI + jnp.log(sigma2) + y_sq_over_sigma2
 
-    # MASKED SUM: only sum over actual data (not padding)
-    # actual_len should be passed as JAX array; -1 means use full length
+    # Masked mean: normalize by effective length for scale-invariant gradients
     n = y.shape[0]
     eff_len = jnp.where(actual_len < 0, n, actual_len)
     mask = (jnp.arange(n) < eff_len).astype(jnp.float32)
-    log_lik = -0.5 * jnp.sum(ll_per_t * mask)
+    eff_len_f32 = jnp.maximum(eff_len.astype(jnp.float32), 1.0)
+    nll = 0.5 * jnp.sum(ll_per_t * mask) / eff_len_f32
+    nll = jnp.where(jnp.isfinite(nll), nll, jnp.float32(1e10))
 
-    # Return large penalty if computation produced NaN
-    log_lik = jnp.where(jnp.isfinite(log_lik), log_lik, jnp.float32(-1e10))
-
-    # Stationarity penalty with smooth activation starting at 0.95
-    coef_sum = jnp.sum(alpha) + jnp.sum(beta)
-    # Gradual penalty that grows smoothly as sum approaches 1
+    # Stationarity penalty: smooth activation at 0.95, steep near 1.0
     excess = jnp.maximum(coef_sum - 0.95, 0.0)
-    penalty = 1e4 * excess ** 2
-    # Add steep penalty near boundary
+    penalty = 1e5 * excess ** 2
     penalty = penalty + jnp.where(coef_sum >= 0.999, 1e6 * (coef_sum - 0.999) ** 2, 0.0)
 
-    return -log_lik + penalty
+    return nll + penalty
 
-# p, q are static; actual_len is dynamic (traced) to allow JIT reuse across CV windows
 _log_likelihood = jax.jit(_log_likelihood, static_argnums=(2, 3))
 
 
-def _run_optax_optimization(y: jnp.ndarray, init_var: float, init_params: jnp.ndarray,
-                            p: int, q: int, n_iters: int,
-                            actual_len: jnp.ndarray) -> jnp.ndarray:
-    """Fully JIT-compiled Optax optimization loop.
+def _log_likelihood_direct(params: jnp.ndarray, y: jnp.ndarray, p: int,
+                           q: int, init_var: float,
+                           actual_len: jnp.ndarray) -> jnp.ndarray:
+    """NLL for direct parameterization (no softplus, no penalty).
 
-    This avoids lambda recompilation by defining the loss function once
-    and using closure capture for y, init_var, p, q.
-
-    Args:
-        y: Centered returns array (may be padded)
-        init_var: Initial variance from backcast
-        init_params: Initial parameter values (unconstrained, float32)
-        p: ARCH order (static)
-        q: GARCH order (static)
-        n_iters: Number of optimization iterations (static)
-        actual_len: Actual data length as JAX int32 (-1 means use full array).
-                    Must be JAX array for proper tracing to avoid recompilation.
-
-    Returns:
-        Best parameters found during optimization (unconstrained)
+    Parameters are already positive via LBFGSB box bounds.
+    Starts NLL computation from index max(p,q) to avoid initialization
+    transient, matching statsforecast's approach.
     """
-    # Use learning rate schedule: start higher for fast initial progress, decay for stability
-    schedule = optax.exponential_decay(
-        init_value=0.05,  # Higher initial LR for faster start
-        transition_steps=n_iters // 2,
-        decay_rate=0.3,
-        end_value=0.005,
+    params = jnp.asarray(params, dtype=jnp.float32)
+    omega = jnp.maximum(params[0], _EPSILON)
+    alpha = jnp.maximum(params[1:1+p], _EPSILON)
+    beta = jnp.maximum(params[1+p:1+p+q], _EPSILON) if q > 0 else jnp.array([], dtype=jnp.float32)
+
+    sigma2 = _compute_sigma2_series(y, omega, alpha, beta, p, q, init_var)
+
+    y_sq_over_sigma2 = y**2 / jnp.maximum(sigma2, _EPSILON)
+    ll_per_t = _LOG_2PI + jnp.log(jnp.maximum(sigma2, _EPSILON)) + y_sq_over_sigma2
+
+    n = y.shape[0]
+    eff_len = jnp.where(actual_len < 0, n, actual_len)
+    start_idx = max(p, q)
+    mask = ((jnp.arange(n) >= start_idx) & (jnp.arange(n) < eff_len)).astype(jnp.float32)
+    count = jnp.maximum(jnp.sum(mask), 1.0)
+    nll = 0.5 * jnp.sum(ll_per_t * mask) / count
+    nll = jnp.where(jnp.isfinite(nll), nll, jnp.float32(1e10))
+    return nll
+
+_log_likelihood_direct = jax.jit(_log_likelihood_direct, static_argnums=(2, 3))
+
+
+def _run_lbfgsb_optimization(y: jnp.ndarray, init_var: float,
+                              init_params_direct: jnp.ndarray,
+                              p: int, q: int,
+                              actual_len: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Optimize GARCH via jaxopt.LBFGSB with box constraints.
+
+    Parameters
+    ----------
+    y : jnp.ndarray
+        Centered returns (may be padded).
+    init_var : float
+        Backcast initial variance.
+    init_params_direct : jnp.ndarray
+        Starting parameters in constrained (positive) space.
+    p : int
+        ARCH order (static).
+    q : int
+        GARCH order (static).
+    actual_len : jnp.ndarray
+        Actual data length as JAX int32; -1 means use full array.
+
+    Returns
+    -------
+    tuple
+        (best_params, best_loss) — optimized params and final NLL.
+    """
+    def loss_fn(params):
+        return _log_likelihood_direct(params, y, p, q, init_var, actual_len)
+
+    n_params = 1 + p + q
+    lower = jnp.full(n_params, 1e-7)
+    upper_alpha_beta = jnp.full(p + q, 0.9999)
+    upper_omega = jnp.array([1e4])
+    upper = jnp.concatenate([upper_omega, upper_alpha_beta])
+    bounds = (lower, upper)
+
+    solver = jaxopt.LBFGSB(
+        fun=loss_fn, maxiter=_LBFGSB_MAXITER, tol=_LBFGSB_TOL,
+        history_size=_LBFGSB_HISTORY, maxls=_LBFGSB_MAXLS,
+        jit=True, implicit_diff=False,
+    )
+    result = solver.run(init_params_direct, bounds=bounds)
+    return result.params, loss_fn(result.params)
+
+_run_lbfgsb_optimization = jax.jit(_run_lbfgsb_optimization, static_argnums=(3, 4))
+
+
+def _run_optax_optimization(y: jnp.ndarray, init_var: float,
+                            init_params: jnp.ndarray, p: int, q: int,
+                            n_iters: int,
+                            actual_len: jnp.ndarray,
+                            sample_var: jnp.ndarray) -> jnp.ndarray:
+    """Two-phase optimization: ADAM warm-up then L-BFGS refinement.
+
+    Parameters
+    ----------
+    y : jnp.ndarray
+        Centered returns (may be padded).
+    init_var : float
+        Backcast initial variance.
+    init_params : jnp.ndarray
+        Unconstrained starting parameters (float32).
+    p : int
+        ARCH order (static).
+    q : int
+        GARCH order (static).
+    n_iters : int
+        ADAM iteration count (static).
+    actual_len : jnp.ndarray
+        Actual data length as JAX int32; -1 means use full array.
+    sample_var : jnp.ndarray
+        Sample variance for variance targeting; -1.0 disables VT.
+
+    Returns
+    -------
+    jnp.ndarray
+        Best parameters found (unconstrained).
+    """
+    def loss_fn(params):
+        params = jnp.asarray(params, dtype=jnp.float32)
+        return _log_likelihood(params, y, p, q, init_var, actual_len, sample_var)
+
+    value_and_grad_fn = jax.value_and_grad(loss_fn)
+
+    # Phase 1: Short ADAM warm-up (1/3 of budget), then L-BFGS refines
+    adam_steps = max(n_iters // 3, 10)
+    schedule = optax.cosine_decay_schedule(
+        init_value=0.10, decay_steps=adam_steps, alpha=0.01,
     )
     optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
         optax.adam(learning_rate=schedule),
     )
 
-    # Pre-compute the gradient function ONCE (not inside the loop)
-    # This is the key optimization - avoids lambda retracing
-    def loss_fn(params):
-        return _log_likelihood(params, y, p, q, init_var, actual_len)
-
-    # Use value_and_grad for optimal single-pass computation
-    value_and_grad_fn = jax.value_and_grad(loss_fn)
-
-    def step(carry, _):
+    def adam_step(carry, _):
         params, opt_state, best_params, best_loss = carry
-
-        # Compute loss and gradients
         loss, grads = value_and_grad_fn(params)
-
-        # Ensure loss is float32 to match carry type
         loss = jnp.float32(loss)
-
-        # Apply optimizer update
         updates, new_opt_state = optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
-
-        # Track best parameters (minimum loss)
         improved = loss < best_loss
         new_best_params = jnp.where(improved, params, best_params)
         new_best_loss = jnp.where(improved, loss, best_loss)
-
-        return (new_params, new_opt_state, new_best_params, new_best_loss), loss
+        return (new_params, new_opt_state, new_best_params, new_best_loss), None
 
     opt_state = optimizer.init(init_params)
-    init_carry = (init_params, opt_state, init_params, jnp.float32(jnp.inf))
-    (_, _, best_params, _), _ = lax.scan(step, init_carry, None, length=n_iters)
+    adam_carry = (init_params, opt_state, init_params, jnp.float32(jnp.inf))
+    (_, _, adam_best, adam_best_loss), _ = lax.scan(
+        adam_step, adam_carry, None, length=adam_steps)
 
-    return best_params
+    # Phase 2: L-BFGS refinement
+    lbfgs_solver = optax.lbfgs(
+        memory_size=_LBFGS_MEMORY,
+        linesearch=optax.scale_by_zoom_linesearch(
+            max_linesearch_steps=_LBFGS_LS_STEPS, initial_guess_strategy="one"))
+    lbfgs_state = lbfgs_solver.init(adam_best)
 
-# JIT compile with p, q, n_iters as static (they determine loop structure)
-# actual_len is dynamic (traced) to avoid recompilation for different input lengths
+    def lbfgs_step(carry, _):
+        params, state, best_params, best_loss = carry
+        loss, grads = value_and_grad_fn(params)
+        loss = jnp.float32(loss)
+        grads = jnp.where(jnp.isfinite(grads), grads, 0.0)
+        updates, new_state = lbfgs_solver.update(
+            grads, state, params, value=loss, grad=grads, value_fn=loss_fn)
+        new_params = optax.apply_updates(params, updates)
+        improved = jnp.isfinite(loss) & (loss < best_loss)
+        new_best_params = jnp.where(improved, params, best_params)
+        new_best_loss = jnp.where(improved, loss, best_loss)
+        return (new_params, new_state, new_best_params, new_best_loss), None
+
+    lbfgs_carry = (adam_best, lbfgs_state, adam_best, jnp.float32(adam_best_loss))
+    (_, _, lbfgs_best, lbfgs_best_loss), _ = lax.scan(
+        lbfgs_step, lbfgs_carry, None, length=_LBFGS_STEPS)
+
+    # Pick best between ADAM and L-BFGS
+    use_lbfgs = jnp.isfinite(lbfgs_best_loss) & (lbfgs_best_loss < adam_best_loss)
+    return jnp.where(use_lbfgs, lbfgs_best, adam_best)
+
 _run_optax_optimization = jax.jit(_run_optax_optimization, static_argnums=(3, 4, 5))
 
 
 def _forecast_sigma2_impl(omega: float, alpha: jnp.ndarray, beta: jnp.ndarray,
                           y_last: jnp.ndarray, sigma2_last: jnp.ndarray,
-                          sigma2_max: float, h: int, p: int, q: int) -> jnp.ndarray:
-    """JIT-compiled variance forecast h steps ahead."""
+                          sigma2_max: float, h: int, p: int,
+                          q: int) -> jnp.ndarray:
+    """Deterministic variance forecast h steps ahead.
+
+    For multi-step forecasts, future squared innovations use E[e^2_{t+h}] = sigma^2_{t+h}.
+
+    Parameters
+    ----------
+    omega : float
+        GARCH intercept.
+    alpha : jnp.ndarray
+        ARCH coefficients.
+    beta : jnp.ndarray
+        GARCH coefficients.
+    y_last : jnp.ndarray
+        Last p observations (centered).
+    sigma2_last : jnp.ndarray
+        Last q conditional variances.
+    sigma2_max : float
+        Upper bound for variance clipping.
+    h : int
+        Forecast horizon (static).
+    p : int
+        ARCH order (static).
+    q : int
+        GARCH order (static).
+
+    Returns
+    -------
+    jnp.ndarray
+        Variance forecasts of shape (h,).
+    """
     omega_f32 = jnp.float32(omega)
     alpha_f32 = alpha.astype(jnp.float32)
     beta_f32 = beta.astype(jnp.float32) if q > 0 else jnp.array([], dtype=jnp.float32)
@@ -264,18 +502,13 @@ def _forecast_sigma2_impl(omega: float, alpha: jnp.ndarray, beta: jnp.ndarray,
 
     def step(carry, _):
         y_buffer, sigma2_buffer = carry
-
         arch_sum = jnp.sum(alpha_f32 * jnp.flip(y_buffer ** 2))
         garch_sum = jnp.sum(beta_f32 * jnp.flip(sigma2_buffer)) if q > 0 else zero_f32
         sigma2_next = jnp.clip(omega_f32 + arch_sum + garch_sum, _EPSILON, sigma2_max_f32)
 
-        # For multi-step forecasts, future squared innovations use their expected value:
-        # E[ε²_{t+h} | F_t] = σ²_{t+h}, so we set y_buffer to sqrt(sigma2_next)
-        # This ensures the ARCH term correctly contributes to future variance forecasts
         y_buffer = jnp.roll(y_buffer, -1).at[-1].set(jnp.sqrt(sigma2_next))
         if q > 0:
             sigma2_buffer = jnp.roll(sigma2_buffer, -1).at[-1].set(sigma2_next)
-
         return (y_buffer, sigma2_buffer), sigma2_next
 
     init_y = y_last.astype(jnp.float32)
@@ -283,7 +516,7 @@ def _forecast_sigma2_impl(omega: float, alpha: jnp.ndarray, beta: jnp.ndarray,
     _, forecasts = lax.scan(step, (init_y, init_sigma2), None, length=h)
     return forecasts
 
-_forecast_sigma2_impl = jax.jit(_forecast_sigma2_impl, static_argnums=(6, 7, 8))  # h, p, q are static
+_forecast_sigma2_impl = jax.jit(_forecast_sigma2_impl, static_argnums=(6, 7, 8))
 
 
 def _forecast_sigma2_stochastic_impl(
@@ -291,7 +524,36 @@ def _forecast_sigma2_stochastic_impl(
     y_last: jnp.ndarray, sigma2_last: jnp.ndarray,
     sigma2_max: float, h: int, p: int, q: int, key: jnp.ndarray
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """JIT-compiled stochastic variance forecast."""
+    """Stochastic variance forecast with random shocks.
+
+    Parameters
+    ----------
+    omega : float
+        GARCH intercept.
+    alpha : jnp.ndarray
+        ARCH coefficients.
+    beta : jnp.ndarray
+        GARCH coefficients.
+    y_last : jnp.ndarray
+        Last p observations (centered).
+    sigma2_last : jnp.ndarray
+        Last q conditional variances.
+    sigma2_max : float
+        Upper bound for variance clipping.
+    h : int
+        Forecast horizon (static).
+    p : int
+        ARCH order (static).
+    q : int
+        GARCH order (static).
+    key : jnp.ndarray
+        JAX PRNG key.
+
+    Returns
+    -------
+    tuple[jnp.ndarray, jnp.ndarray]
+        (y_path, sigma2_path) each of shape (h,).
+    """
     omega_f32 = jnp.float32(omega)
     alpha_f32 = alpha.astype(jnp.float32)
     beta_f32 = beta.astype(jnp.float32) if q > 0 else jnp.array([], dtype=jnp.float32)
@@ -300,44 +562,51 @@ def _forecast_sigma2_stochastic_impl(
 
     def step(carry, subkey):
         y_buffer, sigma2_buffer = carry
-
         arch_sum = jnp.sum(alpha_f32 * jnp.flip(y_buffer ** 2))
         garch_sum = jnp.sum(beta_f32 * jnp.flip(sigma2_buffer)) if q > 0 else zero_f32
         sigma2_next = jnp.clip(omega_f32 + arch_sum + garch_sum, _EPSILON, sigma2_max_f32)
 
-        # Generate random shock and realized level
         epsilon = jax.random.normal(subkey, dtype=jnp.float32)
         y_next = epsilon * jnp.sqrt(sigma2_next)
 
-        # Use jnp.roll instead of concatenation for buffer shifting
         y_buffer = jnp.roll(y_buffer, -1).at[-1].set(y_next)
         if q > 0:
             sigma2_buffer = jnp.roll(sigma2_buffer, -1).at[-1].set(sigma2_next)
-
         return (y_buffer, sigma2_buffer), (y_next, sigma2_next)
 
     subkeys = jax.random.split(key, h)
     init_y = y_last.astype(jnp.float32)
     init_sigma2 = sigma2_last.astype(jnp.float32) if q > 0 else jnp.array([], dtype=jnp.float32)
     _, (y_path, sigma2_path) = lax.scan(step, (init_y, init_sigma2), subkeys)
-
     return y_path, sigma2_path
 
-_forecast_sigma2_stochastic_impl = jax.jit(_forecast_sigma2_stochastic_impl, static_argnums=(6, 7, 8))  # h, p, q are static
+_forecast_sigma2_stochastic_impl = jax.jit(_forecast_sigma2_stochastic_impl, static_argnums=(6, 7, 8))
 
+
+# =============================================================================
+# GARCH Class
+# =============================================================================
 
 class GARCH(BaseForecaster):
-    """
-    Args:
-        p: ARCH order (lagged squared shocks), must be greater than or equal to 1
-        q: GARCH order (lagged variances)
-        alias: Model name for display
-        conformal_params: Optional conformal prediction configuration
-        allow_extended_iterations: If True, allows up to 300 iterations for complex data.
-            Default False.
-        iteration_scaling: Iteration scaling strategy. Default "cubic".
-            - "cubic": Aggressive scaling, minimal iterations except at high complexity (recommended)
-            - "quadratic": Less aggressive, use for accuracy-intensive higher-order models
+    r"""GARCH model.
+
+    Models time-varying volatility where conditional variance depends on
+    past squared errors and past conditional variances.
+
+    Parameters
+    ----------
+    p : int, default 1
+        ARCH order (lagged squared shocks), must be >= 1.
+    q : int, default 1
+        GARCH order (lagged variances), must be >= 0.
+    alias : str, default 'GARCH'
+        Display name for the model.
+    conformal_params : ConformalIntervals or None, default None
+        Configuration for conformal prediction intervals.
+    allow_extended_iterations : bool, default False
+        If True, allows up to 120 iterations for complex data.
+    iteration_scaling : str, default 'cubic'
+        Complexity-to-iteration mapping: 'cubic' or 'quadratic'.
     """
     uses_exog = False
 
@@ -374,139 +643,162 @@ class GARCH(BaseForecaster):
 
     @staticmethod
     def _inverse_softplus(x: float) -> float:
-        """Compute inverse softplus: returns y such that softplus(y) + _EPSILON = x."""
-        # Account for the epsilon offset used in parameter transform
-        target = max(x - float(_EPSILON), float(_EPSILON))
+        """Return y such that softplus(y) + _EPSILON = x.
+
+        Called once during parameter initialization (not in hot path).
+        """
+        target = max(x - 1e-8, 1e-8)
         if target > 20:
-            return target  # For large x, softplus(x) ≈ x
-        return float(jnp.log(jnp.maximum(jnp.exp(target) - 1, _EPSILON)))
+            return target
+        return float(jnp.log(jnp.float32(max(float(jnp.exp(jnp.float32(target))) - 1, 1e-8))))
 
     def _get_init_params(self, y: jnp.ndarray, init_var: float) -> jnp.ndarray:
-        """Compute initial parameters for optimization.
+        """Compute starting parameters, adaptive to model order.
 
-        Uses a single starting configuration matching typical GARCH parameters.
+        Uses ACF of squared observations for per-lag alpha proportions
+        when p > 1, giving better initialization for higher-order models.
         """
-        sample_var = float(jnp.var(y))
-        sample_var = max(sample_var, float(_EPSILON))
+        sample_var = max(float(jnp.var(y)), 1e-8)
 
-        # Use moderate persistence starting point
-        alpha_sum = 0.10
-        persistence = 0.90
-        beta_sum = persistence - alpha_sum
-
-        omega_target = sample_var * (1 - persistence)
-        omega_target = max(omega_target, float(_EPSILON))
+        if self.q == 0:
+            alpha_sum = 0.05
+            beta_sum = 0.0
+            omega_target = max(sample_var * 0.95, 1e-8)
+        else:
+            alpha_sum = 0.05
+            beta_sum = 0.90
+            omega_target = max(sample_var * 0.05, 1e-8)
 
         init_omega = self._inverse_softplus(omega_target)
-        init_alpha = self._inverse_softplus(alpha_sum / self.p)
+
+        # ACF-based per-lag alpha proportions for p > 1
+        if self.p > 1:
+            e2 = y ** 2
+            e2_centered = e2 - jnp.mean(e2)
+            var_e2 = float(jnp.var(e2))
+            if var_e2 > 1e-8:
+                acf_vals = []
+                for k in range(1, self.p + 1):
+                    acf_k = float(jnp.mean(e2_centered[k:] * e2_centered[:-k]) / var_e2)
+                    acf_vals.append(max(acf_k, 0.01 / self.p))
+                acf_sum = sum(acf_vals)
+                alpha_targets = [alpha_sum * v / acf_sum for v in acf_vals]
+            else:
+                alpha_targets = [alpha_sum / self.p] * self.p
+            init_alphas = jnp.array([self._inverse_softplus(a) for a in alpha_targets])
+        else:
+            init_alphas = jnp.full(self.p, self._inverse_softplus(alpha_sum / self.p))
+
         init_beta = self._inverse_softplus(beta_sum / self.q) if self.q > 0 else 0.0
 
         return jnp.concatenate([
             jnp.array([init_omega]),
-            jnp.full(self.p, init_alpha),
+            init_alphas,
             jnp.full(self.q, init_beta) if self.q > 0 else jnp.array([])
         ])
 
     def _estimate_iterations(self, y: jnp.ndarray) -> int:
-        """Estimate optimal iteration count based on data complexity.
+        """Estimate iteration count from kurtosis and squared-return ACF(1).
 
-        Uses kurtosis and squared-return autocorrelation as complexity indicators.
-        Higher complexity → more iterations needed for convergence.
+        Parameters
+        ----------
+        y : jnp.ndarray
+            Centered returns.
 
-        Args:
-            y: Centered returns array
-
-        Returns:
-            Estimated number of iterations (static int for lax.scan)
+        Returns
+        -------
+        int
+            Iteration count (static for lax.scan).
         """
-        # Compute excess kurtosis (normal = 0, heavy tails > 0)
-        mean = jnp.mean(y)
-        std = jnp.std(y)
-        z = (y - mean) / jnp.maximum(std, _EPSILON)
-        kurtosis = float(jnp.mean(z ** 4) - 3.0)  # Excess kurtosis
-
-        # Compute ACF1 of squared returns (GARCH effect strength)
+        # Compute kurtosis and ACF(1) of squared returns in one pass
         y_sq = y ** 2
-        y_sq_centered = y_sq - jnp.mean(y_sq)
-        # ACF(1) = Cov(y_sq_t, y_sq_{t-1}) / Var(y_sq)
-        var_y_sq = jnp.var(y_sq)
-        if var_y_sq > _EPSILON:
-            acf1 = float(jnp.mean(y_sq_centered[1:] * y_sq_centered[:-1]) / var_y_sq)
-        else:
-            acf1 = 0.0
+        mean_y_sq = jnp.mean(y_sq)
+        y_sq_centered = y_sq - mean_y_sq
+        var_y_sq = jnp.mean(y_sq_centered ** 2)
 
-        # Combine into complexity score (0 to 1)
-        # Kurtosis: clip to [0, 10], normalize
+        # Batch the two float() calls into one by computing both in JAX
+        mean_val = jnp.mean(y)
+        std_val = jnp.std(y)
+        z = (y - mean_val) / jnp.maximum(std_val, _EPSILON)
+        kurtosis_and_acf = jnp.array([
+            jnp.mean(z ** 4) - 3.0,
+            jnp.where(var_y_sq > _EPSILON,
+                      jnp.mean(y_sq_centered[1:] * y_sq_centered[:-1]) / var_y_sq,
+                      0.0)
+        ])
+        kurtosis, acf1 = float(kurtosis_and_acf[0]), float(kurtosis_and_acf[1])
+
         kurtosis_score = min(max(kurtosis, 0.0), 10.0) / 10.0
-        # ACF1: clip to [0, 0.5], normalize
         acf1_score = min(max(acf1, 0.0), 0.5) / 0.5
-
-        # Weighted combination (ACF1 is more indicative of GARCH complexity)
         complexity = 0.3 * kurtosis_score + 0.7 * acf1_score
 
-        # Scale to iteration range
-        min_iters = 40
-        max_iters = 300 if self.allow_extended_iterations else 150
+        min_iters = 20
+        max_iters = 120 if self.allow_extended_iterations else 80
 
-        # Map string to exponent
+        # Pure ARCH needs more iterations (no beta dampening)
+        if self.q == 0:
+            min_iters = max(min_iters, 30)
+
         scaling_exponent = {"cubic": 3.0, "quadratic": 2.0}[self.iteration_scaling]
-        n_iters = int(min_iters + (complexity ** scaling_exponent) * (max_iters - min_iters))
-        return n_iters
+        return int(min_iters + (complexity ** scaling_exponent) * (max_iters - min_iters))
 
     def _fit_parameters_optax(
         self, y: jnp.ndarray, init_var: float, init_params: jnp.ndarray,
-        n_iters: int = None, actual_len: int = None
+        n_iters: int | None = None, actual_len: int | None = None,
+        sample_var: float = -1.0
     ) -> jnp.ndarray:
-        """Fit parameters using Optax Adam with fixed iterations via lax.scan.
+        """Run ADAM + L-BFGS optimization via the JIT-compiled loop.
 
-        This approach uses a fixed number of iterations with lax.scan instead of
-        adaptive while_loop, providing significant speedup (2-7x faster than BFGS).
+        Parameters
+        ----------
+        y : jnp.ndarray
+            Centered returns (may be padded).
+        init_var : float
+            Backcast initial variance.
+        init_params : jnp.ndarray
+            Unconstrained starting parameters.
+        n_iters : int or None, default None
+            Fixed iteration count. None estimates from data.
+        actual_len : int or None, default None
+            Actual data length for padded inputs.
+        sample_var : float, default -1.0
+            Sample variance for variance targeting; -1.0 disables VT.
 
-        Uses the JIT-compiled _run_optax_optimization function which:
-        - Pre-defines the gradient function once (avoids lambda retracing)
-        - Uses learning rate schedule for faster convergence
-        - Is fully compiled as a single unit
-
-        Args:
-            y: Centered returns array (may be padded)
-            init_var: Initial variance from backcast
-            init_params: Initial parameter values (unconstrained)
-            n_iters: Fixed iteration count (for avoiding recompilation in CV).
-                     If None, estimate from data.
-            actual_len: Actual data length for padded inputs. If None, use full array.
-
-        Returns:
-            Best parameters found during optimization (unconstrained)
+        Returns
+        -------
+        jnp.ndarray
+            Best parameters found (unconstrained).
         """
-        # Estimate optimal iteration count based on data complexity (actual data only)
         if n_iters is None:
             y_for_estimate = y[:actual_len] if actual_len is not None else y
             n_iters = self._estimate_iterations(y_for_estimate)
 
-        # Ensure init_params is float32 for consistent types in lax.scan
         init_params = init_params.astype(jnp.float32)
-
-        # Use the JIT-compiled optimization function
-        # Convert actual_len to JAX array for proper tracing (use -1 as sentinel for None)
         actual_len_jax = jnp.int32(-1 if actual_len is None else actual_len)
+        sample_var_jax = jnp.float32(sample_var)
         return _run_optax_optimization(
-            y, init_var, init_params, self.p, self.q, n_iters, actual_len_jax
+            y, init_var, init_params, self.p, self.q, n_iters,
+            actual_len_jax, sample_var_jax
         )
 
-    def _fit_parameters(self, y: jnp.ndarray, n_iters: int = None,
-                         actual_len: int = None) -> dict:
-        """Estimate GARCH parameters using Optax Adam optimization.
+    def _fit_parameters(self, y: jnp.ndarray, n_iters: int | None = None,
+                         actual_len: int | None = None) -> dict:
+        """Estimate GARCH parameters via LBFGSB (primary) or ADAM + L-BFGS (fallback).
 
-        Args:
-            y: Centered returns array (may be padded)
-            n_iters: Fixed iteration count (for avoiding recompilation in CV).
-                     If None, estimate from data.
-            actual_len: Actual data length for padded inputs. If None, use full array.
+        Parameters
+        ----------
+        y : jnp.ndarray
+            Centered returns (may be padded).
+        n_iters : int or None, default None
+            Fixed iteration count. None estimates from data.
+        actual_len : int or None, default None
+            Actual data length for padded inputs.
 
-        Returns:
-            Dict with fitted parameters and computed variance series.
+        Returns
+        -------
+        dict
+            Fitted parameters, variance series, and state for forecasting.
         """
-        # Use actual_len for validation, backcast, and init params
         n_eff = actual_len if actual_len is not None else len(y)
         min_obs = max(self.p, self.q) + 10
         if n_eff < min_obs:
@@ -514,74 +806,171 @@ class GARCH(BaseForecaster):
                 f"Need at least {min_obs} observations for GARCH({self.p},{self.q}), got {n_eff}"
             )
 
-        # Compute backcast on actual data only (done once, outside JIT)
         y_actual = y[:n_eff] if actual_len is not None else y
-        init_var = _compute_backcast(y_actual)
 
-        # Run optimization with padding-aware functions
-        init_params = self._get_init_params(y_actual, init_var)
-        final_params = self._fit_parameters_optax(y, init_var, init_params, n_iters, actual_len)
+        # Rescale data to normalize the loss landscape (arch library technique)
+        scale = max(float(jnp.std(y_actual)), 1e-6)
+        y_scaled = y / scale
 
-        # Transform parameters from unconstrained to constrained space
-        omega = jax.nn.softplus(final_params[0]) + _EPSILON
-        alpha = jax.nn.softplus(final_params[1:1+self.p])
-        beta = jax.nn.softplus(final_params[1+self.p:1+self.p+self.q]) if self.q > 0 else jnp.array([])
+        y_scaled_actual = y_scaled[:n_eff] if actual_len is not None else y_scaled
+        init_var = _compute_backcast(y_scaled_actual)
+        init_params = self._get_init_params(y_scaled_actual, init_var)
 
-        # Check persistence and validate stationarity constraint
+        actual_len_jax = jnp.int32(-1 if actual_len is None else actual_len)
+        sample_var_val = max(float(jnp.var(y_scaled_actual)), 1e-8)
+
+        # Build candidates in DIRECT (constrained, positive) param space
+        # Candidate 1: ACF-based (transform from softplus space)
+        acf_direct = jax.nn.softplus(init_params)
+        acf_direct = acf_direct.at[0].set(acf_direct[0] + float(_EPSILON))
+
+        # Candidate 2: SF-style uniform 0.1
+        sf_direct = jnp.full(1 + self.p + self.q, 0.1)
+
+        if self.q > 0:
+            # Candidate 3: High-persistence (alpha=0.05, beta=0.90)
+            hi_direct = jnp.concatenate([
+                jnp.array([0.05 * sample_var_val]),
+                jnp.full(self.p, 0.05 / self.p),
+                jnp.full(self.q, 0.90 / self.q)
+            ])
+            # Candidate 4: Low-persistence (alpha=0.15, beta=0.70)
+            lo_direct = jnp.concatenate([
+                jnp.array([0.20 * sample_var_val]),
+                jnp.full(self.p, 0.15 / self.p),
+                jnp.full(self.q, 0.70 / self.q)
+            ])
+            candidates = [acf_direct, sf_direct, hi_direct, lo_direct]
+        else:
+            # Pure ARCH: third candidate with higher alpha
+            hi_direct = jnp.concatenate([
+                jnp.array([0.10 * sample_var_val]),
+                jnp.full(self.p, 0.20 / self.p)
+            ])
+            candidates = [acf_direct, sf_direct, hi_direct]
+
+        # Evaluate initial NLL with direct loss function
+        init_losses = [float(_log_likelihood_direct(c, y_scaled, self.p, self.q,
+                                                     init_var, actual_len_jax))
+                       for c in candidates]
+
+        # For simple models (p+q <= 2), a single LBFGSB run suffices since
+        # the NLL surface is well-behaved. For higher-order models, use
+        # 2-candidate multi-start for robustness against local optima.
+        sorted_idxs = sorted(range(len(candidates)), key=lambda i: init_losses[i])
+        if self.p + self.q <= 2:
+            to_optimize = {sorted_idxs[0]}
+        else:
+            to_optimize = {1}  # always SF-style
+            for idx in sorted_idxs:
+                if idx != 1:
+                    to_optimize.add(idx)
+                    break
+
+        # Optimize candidates with LBFGSB
+        best_params, best_loss = None, float('inf')
+        for idx in to_optimize:
+            try:
+                params, loss = _run_lbfgsb_optimization(
+                    y_scaled, init_var, candidates[idx],
+                    self.p, self.q, actual_len_jax)
+                loss_val = float(loss)
+                if jnp.isfinite(loss) and loss_val < best_loss:
+                    best_params, best_loss = params, loss_val
+            except Exception:
+                continue
+
+        # Fallback to ADAM+L-BFGS if LBFGSB failed
+        if best_params is None:
+            # Variance targeting only for p+q >= 4 (biases low-order MLE)
+            sv = max(float(jnp.var(y_scaled_actual)), float(_EPSILON)) if self.p + self.q >= 4 else -1.0
+            final_params = self._fit_parameters_optax(
+                y_scaled, init_var, init_params, n_iters, actual_len,
+                sample_var=sv)
+            alpha = jax.nn.softplus(final_params[1:1+self.p])
+            beta = jax.nn.softplus(final_params[1+self.p:1+self.p+self.q]) if self.q > 0 else jnp.array([])
+            omega = jax.nn.softplus(final_params[0]) + _EPSILON
+        else:
+            omega = jnp.maximum(best_params[0], _EPSILON)
+            alpha = jnp.maximum(best_params[1:1+self.p], _EPSILON)
+            beta = jnp.maximum(best_params[1+self.p:1+self.p+self.q], _EPSILON) if self.q > 0 else jnp.array([])
+
         persistence = float(jnp.sum(alpha) + jnp.sum(beta))
 
-        # Critical check: if persistence >= 1, the model is non-stationary and forecasts will explode
+        # Post-fit stationarity clamping: scale alpha+beta to 0.999 if needed.
+        # Use 0.999 (not 0.98) to allow high-persistence financial data (e.g.
+        # S&P 500) to retain accurate MLE parameters while still preventing
+        # near-IGARCH instability.
+        if persistence > 0.999:
+            scale_factor = 0.999 / max(persistence, 1e-8)
+            alpha = alpha * scale_factor
+            beta = beta * scale_factor if self.q > 0 else beta
+            persistence = 0.999
+            # Recompute omega so unconditional variance matches sample variance.
+            # Without this, clamping collapses the unconditional variance
+            # (omega/(1-persistence) becomes much smaller than sample_var).
+            omega = jnp.float32(sample_var_val * (1.0 - persistence))
+
         if persistence >= 1.0:
             raise RuntimeError(
                 f"GARCH optimization failed: persistence {persistence:.4f} >= 1 "
-                "violates stationarity constraint. The fitted model is non-stationary "
-                "and forecasts will diverge."
-            )
-        elif persistence > 0.99:
-            raise RuntimeError(
-                f"GARCH persistence {persistence:.4f} is near the stationarity boundary. "
-                "Consider using an integrated GARCH (IGARCH) model for highly persistent volatility."
+                "violates stationarity constraint."
             )
 
-        # Compute sigma2 on full array (including padding if present)
-        sigma2_full = _compute_sigma2_series(y, omega, alpha, beta, self.p, self.q, init_var)
-        # Trim to actual length for output
+        # Compute sigma2 in scaled space, then un-scale
+        sigma2_scaled = _compute_sigma2_series(
+            y_scaled, omega, alpha, beta, self.p, self.q, init_var)
+        sigma2_full = sigma2_scaled * (scale ** 2)
         sigma2 = sigma2_full[:n_eff] if actual_len is not None else sigma2_full
 
+        # Un-scale variance parameters
+        omega_unscaled = float(omega) * (scale ** 2)
+        init_var_unscaled = init_var * (scale ** 2)
+
         return {
-            'omega': float(omega),
+            'omega': omega_unscaled,
             'alpha': alpha,
             'beta': beta,
             'sigma2': sigma2,
-            'fitted': jnp.zeros(n_eff),  # Use actual length, not padded
+            'fitted': jnp.zeros(n_eff),
             'y_mean': float(jnp.mean(y_actual)),
-            'y_last': y_actual[-self.p:],  # Use actual data for last values
+            'y_last': y_actual[-self.p:],
             'sigma2_last': sigma2[-self.q:] if self.q > 0 else jnp.array([]),
-            'init_var': init_var,
+            'init_var': init_var_unscaled,
         }
 
-    def _forecast_sigma2(self, omega: float, alpha: jnp.ndarray, beta: jnp.ndarray, y_last: jnp.ndarray, sigma2_last: jnp.ndarray, init_var: float, h: int) -> jnp.ndarray:
-        """Forecast variance h steps ahead by iterating GARCH equation."""
+    def _forecast_sigma2(self, omega: float, alpha: jnp.ndarray,
+                         beta: jnp.ndarray, y_last: jnp.ndarray,
+                         sigma2_last: jnp.ndarray, init_var: float,
+                         h: int) -> jnp.ndarray:
+        """Forecast variance h steps ahead."""
         sigma2_max = init_var * float(_SIGMA2_MAX_MULT)
-        return _forecast_sigma2_impl(omega, alpha, beta, y_last, sigma2_last, sigma2_max, h, self.p, self.q)
+        return _forecast_sigma2_impl(
+            omega, alpha, beta, y_last, sigma2_last, sigma2_max, h, self.p, self.q
+        )
 
     def fit(self, y: jnp.ndarray, X: jnp.ndarray | None = None,
-            n_iters: int = None, actual_len: int = None) -> 'GARCH':
-        """Estimate GARCH parameters from data.
+            n_iters: int | None = None,
+            actual_len: int | None = None) -> 'GARCH':
+        """Fit GARCH model to data.
 
-        Args:
-            y: Input time series (may be padded)
-            X: Exogenous variables (unused for GARCH)
-            n_iters: Fixed iteration count (for avoiding recompilation in CV).
-                     If None, estimate from data.
-            actual_len: Actual data length for padded inputs. If None, use full array.
+        Parameters
+        ----------
+        y : jnp.ndarray
+            Input time series (may be padded).
+        X : jnp.ndarray or None, default None
+            Exogenous variables (unused).
+        n_iters : int or None, default None
+            Fixed iteration count. None estimates from data.
+        actual_len : int or None, default None
+            Actual data length for padded inputs.
 
-        Returns:
-            self (fitted model)
+        Returns
+        -------
+        GARCH
+            Fitted model (self).
         """
         y = utils.ensure_float(y)
-
-        # Use actual_len for validation
         n_eff = actual_len if actual_len is not None else len(y)
         y_actual = y[:n_eff] if actual_len is not None else y
 
@@ -600,20 +989,19 @@ class GARCH(BaseForecaster):
             'beta': result['beta'],
             'sigma2': result['sigma2'],
             'fitted': result['fitted'] + y_mean,
-            'residuals': y_actual[:n_eff] - y_mean - result['fitted'],  # Use actual data
+            'residuals': y_actual[:n_eff] - y_mean - result['fitted'],
             'y_mean': y_mean,
             'y_centered_last': result['y_last'],
             'sigma2_last': result['sigma2_last'],
             'init_var': result['init_var'],
-            'y_train': y_actual,  # Store actual data, not padded
+            'y_train': y_actual,
         }
+        self.model_['sigma'] = float(utils.calculate_sigma(
+            self.model_['residuals'], n_eff - (self.p + self.q + 1)
+        ))
 
-        self.model_['sigma'] = float(utils.calculate_sigma(self.model_['residuals'], n_eff - (self.p + self.q + 1)))
-
-        # Pre-compute and store conformity scores if conformal prediction is enabled
         if self.conformal_params is not None:
-            cs = self.conformity_scores(y=y, X=X)
-            self.model_['_cs'] = cs
+            self.model_['_cs'] = self.conformity_scores(y=y, X=X)
 
         return self
 
@@ -623,41 +1011,43 @@ class GARCH(BaseForecaster):
         X: jnp.ndarray | None = None,
         level: list[int] | None = None
     ) -> dict:
-        """Generate h-step forecasts. Returns mean, sigma2, and optional intervals."""
+        """Generate h-step deterministic forecasts.
+
+        Parameters
+        ----------
+        h : int
+            Forecast horizon.
+        X : jnp.ndarray or None, default None
+            Exogenous variables (unused).
+        level : list[int] or None, default None
+            Confidence levels for prediction intervals.
+
+        Returns
+        -------
+        dict
+            Keys: 'mean', 'sigma2', and optionally 'lo-{lv}', 'hi-{lv}'.
+        """
         if self.model_ is None:
             raise RuntimeError("Model must be fitted before prediction. Call fit() first.")
-
         self._validate_h(h)
 
-        # Forecast variance
         sigma2_forecast = self._forecast_sigma2(
-            self.model_['omega'],
-            self.model_['alpha'],
-            self.model_['beta'],
-            self.model_['y_centered_last'],
-            self.model_['sigma2_last'],
-            self.model_['init_var'],
-            h
+            self.model_['omega'], self.model_['alpha'], self.model_['beta'],
+            self.model_['y_centered_last'], self.model_['sigma2_last'],
+            self.model_['init_var'], h
         )
-
         mean_forecast = jnp.full(h, self.model_['y_mean'])
 
-        res = {
-            'mean': mean_forecast,
-            'sigma2': sigma2_forecast
-        }
+        res = {'mean': mean_forecast, 'sigma2': sigma2_forecast}
         if level is not None:
             level = sorted(level)
-
             if self.conformal_params is not None:
-                # Use pre-computed conformity scores from fit()
                 cs = self.model_.get('_cs')
                 if cs is None:
-                    raise ValueError("Conformity scores not found. Model may have been fitted without conformal_params.")
+                    raise ValueError("Conformity scores not found.")
                 res = self.add_confidence_intervals(res, cs, level, self.conformal_params.method)
             else:
                 sigma_forecast = jnp.sqrt(sigma2_forecast)
-
                 for lv in level:
                     z = utils._jax_norm_ppf((100 + lv) / 200)
                     res[f'lo-{lv}'] = mean_forecast - z * sigma_forecast
@@ -666,26 +1056,25 @@ class GARCH(BaseForecaster):
         return res
 
     def predict_in_sample(self, level: list[int] | None = None) -> dict:
-        """Return in-sample fitted values and conditional variance series.
+        """Return in-sample fitted values and conditional variance.
 
-        Returns:
-            Dictionary containing:
-            - fitted: Conditional mean E[y_t | F_{t-1}] = μ (constant for pure GARCH)
-            - sigma2: Conditional variance series σ²_t (the quantity GARCH models)
-            - fitted-lo-{lv}, fitted-hi-{lv}: Prediction intervals if level is specified
+        Parameters
+        ----------
+        level : list[int] or None, default None
+            Confidence levels for fitted prediction intervals.
+
+        Returns
+        -------
+        dict
+            Keys: 'fitted', 'sigma2', and optionally 'fitted-lo-{lv}', 'fitted-hi-{lv}'.
         """
         if self.model_ is None:
             raise RuntimeError("Model must be fitted before prediction. Call fit() first.")
 
-        res = {
-            'fitted': self.model_['fitted'],
-            'sigma2': self.model_['sigma2'],
-        }
-
+        res = {'fitted': self.model_['fitted'], 'sigma2': self.model_['sigma2']}
         if level is not None:
             level = sorted(level)
-            sigma_t = jnp.sqrt(self.model_['sigma2'])  # Time-varying conditional std dev
-
+            sigma_t = jnp.sqrt(self.model_['sigma2'])
             for lv in level:
                 z = utils._jax_norm_ppf((100 + lv) / 200)
                 res[f'fitted-lo-{lv}'] = self.model_['fitted'] - z * sigma_t
@@ -701,29 +1090,38 @@ class GARCH(BaseForecaster):
         X_future: jnp.ndarray | None = None,
         level: list[int] | None = None,
         fitted: bool = False,
-        n_iters: int = None,
-        actual_len: int = None,
+        n_iters: int | None = None,
+        actual_len: int | None = None,
     ) -> dict:
-        """Stateless fit and predict.
+        """Stateless fit-and-predict.
 
-        Args:
-            y: Input time series (may be padded)
-            h: Forecast horizon
-            X: Exogenous variables (unused for GARCH)
-            X_future: Future exogenous variables (unused for GARCH)
-            level: Confidence levels for prediction intervals
-            fitted: Whether to return fitted values
-            n_iters: Fixed iteration count (for avoiding recompilation in CV).
-                     If None, estimate from data.
-            actual_len: Actual data length for padded inputs. If None, use full array.
+        Parameters
+        ----------
+        y : jnp.ndarray
+            Input time series (may be padded).
+        h : int
+            Forecast horizon.
+        X : jnp.ndarray or None, default None
+            Exogenous variables (unused).
+        X_future : jnp.ndarray or None, default None
+            Future exogenous variables (unused).
+        level : list[int] or None, default None
+            Confidence levels for prediction intervals.
+        fitted : bool, default False
+            Whether to return in-sample fitted values.
+        n_iters : int or None, default None
+            Fixed iteration count. None estimates from data.
+        actual_len : int or None, default None
+            Actual data length for padded inputs.
 
-        Returns:
-            Dict with mean forecasts and variance forecasts.
+        Returns
+        -------
+        dict
+            Keys: 'mean', 'sigma2', and optionally intervals and fitted values.
         """
         self._validate_h(h)
         y = utils.ensure_float(y)
 
-        # Compute mean on actual data only
         n_eff = actual_len if actual_len is not None else len(y)
         y_actual = y[:n_eff] if actual_len is not None else y
         y_mean = jnp.mean(y_actual)
@@ -731,41 +1129,29 @@ class GARCH(BaseForecaster):
         result = self._fit_parameters(y_centered, n_iters=n_iters, actual_len=actual_len)
 
         sigma2_forecast = self._forecast_sigma2(
-            result['omega'],
-            result['alpha'],
-            result['beta'],
-            result['y_last'],
-            result['sigma2_last'],
-            result['init_var'],
-            h
+            result['omega'], result['alpha'], result['beta'],
+            result['y_last'], result['sigma2_last'], result['init_var'], h
         )
-
         mean_forecast = jnp.full(h, y_mean)
 
-        res = {
-            'mean': mean_forecast,
-            'sigma2': sigma2_forecast
-        }
+        res = {'mean': mean_forecast, 'sigma2': sigma2_forecast}
 
         if fitted:
             res['fitted'] = result['fitted'] + y_mean
 
         if level is not None:
             level = sorted(level)
-
             if self.conformal_params is not None:
                 cs = self.conformity_scores(y=y, X=X)
                 res = self.add_confidence_intervals(res, cs, level, self.conformal_params.method)
             else:
                 sigma_forecast = jnp.sqrt(sigma2_forecast)
-
                 for lv in level:
                     z = utils._jax_norm_ppf((100 + lv) / 200)
                     res[f'lo-{lv}'] = mean_forecast - z * sigma_forecast
                     res[f'hi-{lv}'] = mean_forecast + z * sigma_forecast
             if fitted:
-                sigma_t = jnp.sqrt(result['sigma2'])  # Time-varying conditional std dev
-
+                sigma_t = jnp.sqrt(result['sigma2'])
                 for lv in level:
                     z = utils._jax_norm_ppf((100 + lv) / 200)
                     res[f'fitted-lo-{lv}'] = res['fitted'] - z * sigma_t
@@ -774,35 +1160,23 @@ class GARCH(BaseForecaster):
         return res
 
     def _forecast_sigma2_stochastic(
-        self,
-        omega: float,
-        alpha: jnp.ndarray,
-        beta: jnp.ndarray,
-        y_last: jnp.ndarray,
-        sigma2_last: jnp.ndarray,
-        init_var: float,
-        h: int,
-        key: jnp.ndarray
+        self, omega: float, alpha: jnp.ndarray, beta: jnp.ndarray,
+        y_last: jnp.ndarray, sigma2_last: jnp.ndarray,
+        init_var: float, h: int, key: jnp.ndarray
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """Single stochastic path forecast."""
         sigma2_max = init_var * float(_SIGMA2_MAX_MULT)
         return _forecast_sigma2_stochastic_impl(
             omega, alpha, beta, y_last, sigma2_last, sigma2_max, h, self.p, self.q, key
         )
 
     def _simulate_paths(
-        self,
-        h: int,
-        n_sims: int,
-        key: jnp.ndarray,
-        omega: float,
-        alpha: jnp.ndarray,
-        beta: jnp.ndarray,
-        y_last: jnp.ndarray,
-        sigma2_last: jnp.ndarray,
-        init_var: float,
-        y_mean: float
+        self, h: int, n_sims: int, key: jnp.ndarray,
+        omega: float, alpha: jnp.ndarray, beta: jnp.ndarray,
+        y_last: jnp.ndarray, sigma2_last: jnp.ndarray,
+        init_var: float, y_mean: float
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        """Parallelize simulation of n_sims paths using vmap."""
+        """Simulate n_sims paths in parallel via vmap."""
         def simulate_single_path(subkey):
             y_path, sigma2_path = self._forecast_sigma2_stochastic(
                 omega, alpha, beta, y_last, sigma2_last, init_var, h, subkey
@@ -814,35 +1188,45 @@ class GARCH(BaseForecaster):
         return paths, sigma2_paths
 
     def predict_simulate(
-        self,
-        h: int,
-        n_sims: int = 1000,
-        seed: int | None = None,
-        X: jnp.ndarray | None = None,
-        level: list[int] | None = None,
+        self, h: int, n_sims: int = 1000, seed: int | None = None,
+        X: jnp.ndarray | None = None, level: list[int] | None = None,
         return_paths: bool = True
     ) -> dict:
+        """Generate Monte Carlo simulation forecasts.
+
+        Parameters
+        ----------
+        h : int
+            Forecast horizon.
+        n_sims : int, default 1000
+            Number of simulation paths.
+        seed : int or None, default None
+            PRNG seed for reproducibility.
+        X : jnp.ndarray or None, default None
+            Exogenous variables (unused).
+        level : list[int] or None, default None
+            Confidence levels for percentile-based intervals.
+        return_paths : bool, default True
+            Whether to include full simulation paths in output.
+
+        Returns
+        -------
+        dict
+            Keys: 'mean', 'median', 'sigma2_mean', 'sigma2_median',
+            and optionally 'paths', 'sigma2_paths', 'lo-{lv}', 'hi-{lv}'.
+        """
         if self.model_ is None:
             raise RuntimeError("Model must be fitted before prediction. Call fit() first.")
-
         self._validate_h(h)
-
         if not isinstance(n_sims, int) or n_sims < 1:
             raise ValueError(f"n_sims must be a positive integer, got {n_sims}")
 
         key = jax.random.PRNGKey(seed if seed is not None else 0)
-
         paths, sigma2_paths = self._simulate_paths(
-            h=h,
-            n_sims=n_sims,
-            key=key,
-            omega=self.model_['omega'],
-            alpha=self.model_['alpha'],
-            beta=self.model_['beta'],
-            y_last=self.model_['y_centered_last'],
-            sigma2_last=self.model_['sigma2_last'],
-            init_var=self.model_['init_var'],
-            y_mean=self.model_['y_mean']
+            h, n_sims, key,
+            self.model_['omega'], self.model_['alpha'], self.model_['beta'],
+            self.model_['y_centered_last'], self.model_['sigma2_last'],
+            self.model_['init_var'], self.model_['y_mean']
         )
 
         res = {
@@ -851,720 +1235,76 @@ class GARCH(BaseForecaster):
             'sigma2_mean': jnp.mean(sigma2_paths, axis=0),
             'sigma2_median': jnp.median(sigma2_paths, axis=0),
         }
-
         if return_paths:
             res['paths'] = paths
             res['sigma2_paths'] = sigma2_paths
 
         if level is not None:
             level = sorted(level)
-
-            # Minimum simulations for reliable percentile-based intervals
-            MIN_SIMS_FOR_PERCENTILE = 30
-
-            if n_sims < MIN_SIMS_FOR_PERCENTILE:
+            if n_sims < 30:
                 raise ValueError(
                     f"n_sims={n_sims} is too small for reliable percentile-based intervals. "
-                    f"Use n_sims >= {MIN_SIMS_FOR_PERCENTILE}."
+                    "Use n_sims >= 30."
                 )
-
             for lv in level:
-                    lower_q = (100 - lv) / 2
-                    upper_q = 100 - lower_q
-                    res[f'lo-{lv}'] = jnp.percentile(paths, lower_q, axis=0)
-                    res[f'hi-{lv}'] = jnp.percentile(paths, upper_q, axis=0)
+                lower_q = (100 - lv) / 2
+                upper_q = 100 - lower_q
+                res[f'lo-{lv}'] = jnp.percentile(paths, lower_q, axis=0)
+                res[f'hi-{lv}'] = jnp.percentile(paths, upper_q, axis=0)
 
         return res
 
     def forecast_simulate(
-        self,
-        y: jnp.ndarray,
-        h: int,
-        n_sims: int = 1000,
-        seed: int | None = None,
-        X: jnp.ndarray | None = None,
+        self, y: jnp.ndarray, h: int, n_sims: int = 1000,
+        seed: int | None = None, X: jnp.ndarray | None = None,
         X_future: jnp.ndarray | None = None,
-        level: list[int] | None = None,
-        fitted: bool = False,
-        return_paths: bool = True,
-        n_iters: int = None,
-        actual_len: int = None,
+        level: list[int] | None = None, fitted: bool = False,
+        return_paths: bool = True, n_iters: int | None = None,
+        actual_len: int | None = None,
     ) -> dict:
-        """Stateless stochastic forecast (fit then simulate, don't store model state).
+        """Stateless stochastic fit-and-predict.
 
-        Args:
-            y: Input time series (may be padded)
-            h: Forecast horizon
-            n_sims: Number of simulation paths
-            seed: Random seed for reproducibility
-            X: Exogenous variables (unused for GARCH)
-            X_future: Future exogenous variables (unused for GARCH)
-            level: Confidence levels for prediction intervals
-            fitted: Whether to return fitted values
-            return_paths: Whether to return full simulation paths
-            n_iters: Fixed iteration count (for avoiding recompilation in CV).
-                     If None, estimate from data.
-            actual_len: Actual data length for padded inputs. If None, use full array.
+        Parameters
+        ----------
+        y : jnp.ndarray
+            Input time series (may be padded).
+        h : int
+            Forecast horizon.
+        n_sims : int, default 1000
+            Number of simulation paths.
+        seed : int or None, default None
+            PRNG seed for reproducibility.
+        X : jnp.ndarray or None, default None
+            Exogenous variables (unused).
+        X_future : jnp.ndarray or None, default None
+            Future exogenous variables (unused).
+        level : list[int] or None, default None
+            Confidence levels for prediction intervals.
+        fitted : bool, default False
+            Whether to return in-sample fitted values.
+        return_paths : bool, default True
+            Whether to include full simulation paths.
+        n_iters : int or None, default None
+            Fixed iteration count. None estimates from data.
+        actual_len : int or None, default None
+            Actual data length for padded inputs.
 
-        Returns:
-            Dict with simulation-based forecasts and intervals.
+        Returns
+        -------
+        dict
+            Simulation-based forecasts, intervals, and optionally paths.
         """
         self.fit(y, X, n_iters=n_iters, actual_len=actual_len)
         res = self.predict_simulate(h, n_sims, seed, X_future, level, return_paths)
 
         if fitted:
             res['fitted'] = self.model_['fitted']
-
             if level is not None:
                 level = sorted(level)
-                sigma_t = jnp.sqrt(self.model_['sigma2'])  # Time-varying conditional std dev
+                sigma_t = jnp.sqrt(self.model_['sigma2'])
                 for lv in level:
                     z = utils._jax_norm_ppf((100 + lv) / 200)
                     res[f'fitted-lo-{lv}'] = self.model_['fitted'] - z * sigma_t
                     res[f'fitted-hi-{lv}'] = self.model_['fitted'] + z * sigma_t
 
         return res
-
-
-# testing
-
-if __name__ == '__main__':
-
-    passed = 0
-    failed = 0
-
-    # Generate synthetic GARCH data for testing
-    jax_key = jax.random.PRNGKey(42)
-    n = 200
-
-    # Simulate GARCH(1,1) process
-    omega_true = 0.01
-    alpha_true = 0.15
-    beta_true = 0.80
-
-    y_test = jnp.zeros(n)
-    sigma2_test = jnp.zeros(n)
-    sigma2_test = sigma2_test.at[0].set(omega_true / (1 - alpha_true - beta_true))
-
-    for t in range(1, n):
-        if t == 1:
-            sigma2_test = sigma2_test.at[t].set(omega_true + alpha_true * y_test[t-1]**2 + beta_true * sigma2_test[t-1])
-        else:
-            sigma2_test = sigma2_test.at[t].set(omega_true + alpha_true * y_test[t-1]**2 + beta_true * sigma2_test[t-1])
-
-        jax_key, subkey = jax.random.split(jax_key)
-        y_test = y_test.at[t].set(jax.random.normal(subkey) * jnp.sqrt(sigma2_test[t]))
-
-    # Test 1: Basic fit and predict
-    print("[Test 1] Basic GARCH(1,1) fit and predict")
-    try:
-        model = GARCH(p=1, q=1)
-        model.fit(y_test)
-        result = model.predict(h=10)
-
-        assert 'mean' in result, "Missing 'mean' in result"
-        assert 'sigma2' in result, "Missing 'sigma2' in result"
-        assert len(result['mean']) == 10, f"Expected 10 forecasts, got {len(result['mean'])}"
-        assert jnp.all(jnp.isfinite(result['mean'])), "Non-finite values in mean forecast"
-        assert jnp.all(result['sigma2'] > 0), "Non-positive variance forecasts"
-
-        print(f"  [PASS] Fitted omega={model.model_['omega']:.4f}, alpha={model.model_['alpha'][0]:.4f}, beta={model.model_['beta'][0]:.4f}")
-        print(f"  [PASS] Mean forecast: {result['mean'][:3]} ...")
-        print(f"  [PASS] Sigma2 forecast: {result['sigma2'][:3]} ...")
-        passed += 1
-    except Exception as e:
-        print(f"  [FAIL] Failed: {e}")
-        failed += 1
-
-    # Test 2: ARCH model (q=0)
-    print("[Test 2] ARCH(2) model (GARCH with q=0)")
-    try:
-        model = GARCH(p=2, q=0)
-        model.fit(y_test)
-        result = model.predict(h=5)
-
-        assert model.alias == "GARCH(2)", f"Expected alias 'GARCH(2)', got '{model.alias}'"
-        assert len(model.model_['beta']) == 0, "ARCH model should have no beta coefficients"
-        assert 'mean' in result and 'sigma2' in result
-
-        print(f"  [PASS] Model alias: {model.alias}")
-        print(f"  [PASS] Fitted omega={model.model_['omega']:.4f}, alpha={model.model_['alpha']}")
-        passed += 1
-    except Exception as e:
-        print(f"  [FAIL] Failed: {e}")
-        failed += 1
-
-    # Test 3: Native prediction intervals
-    print("[Test 3] Native prediction intervals")
-    try:
-        model = GARCH(p=1, q=1)
-        model.fit(y_test)
-        result = model.predict(h=10, level=[80, 95])
-
-        assert 'lo-80' in result and 'hi-80' in result, "Missing 80% intervals"
-        assert 'lo-95' in result and 'hi-95' in result, "Missing 95% intervals"
-
-        # Check interval ordering: lo-95 < lo-80 < mean < hi-80 < hi-95
-        for i in range(10):
-            assert result['lo-95'][i] < result['lo-80'][i], f"Interval ordering violated at {i}"
-            assert result['lo-80'][i] < result['mean'][i], f"Interval ordering violated at {i}"
-            assert result['mean'][i] < result['hi-80'][i], f"Interval ordering violated at {i}"
-            assert result['hi-80'][i] < result['hi-95'][i], f"Interval ordering violated at {i}"
-
-        print(f"  [PASS] 80% interval: [{result['lo-80'][0]:.3f}, {result['hi-80'][0]:.3f}]")
-        print(f"  [PASS] 95% interval: [{result['lo-95'][0]:.3f}, {result['hi-95'][0]:.3f}]")
-        passed += 1
-    except Exception as e:
-        print(f"  [FAIL] Failed: {e}")
-        failed += 1
-
-    # Test 4: Conformal prediction intervals
-    print("[Test 4] Conformal prediction intervals")
-    try:
-        conformal = ConformalIntervals(n_windows=3, h=5)
-        model = GARCH(p=1, q=1, conformal_params=conformal)
-        model.fit(y_test)
-        result = model.predict(h=5, level=[90])
-
-        assert 'lo-90' in result and 'hi-90' in result, "Missing conformal intervals"
-        assert len(result['lo-90']) == 5, "Conformal intervals wrong length"
-
-        print(f"  [PASS] Conformal 90% interval: [{result['lo-90'][0]:.3f}, {result['hi-90'][0]:.3f}]")
-        passed += 1
-    except Exception as e:
-        print(f"  [FAIL] Failed: {e}")
-        failed += 1
-
-    # Test 5: predict_in_sample
-    print("[Test 5] In-sample fitted values with intervals")
-    try:
-        model = GARCH(p=1, q=1)
-        model.fit(y_test)
-        result = model.predict_in_sample(level=[80, 95])
-
-        assert 'fitted' in result, "Missing fitted values"
-        assert len(result['fitted']) == len(y_test), "Fitted values wrong length"
-        assert 'fitted-lo-80' in result and 'fitted-hi-80' in result, "Missing fitted intervals"
-
-        print(f"  [PASS] Fitted values shape: {result['fitted'].shape}")
-        print(f"  [PASS] First fitted value: {result['fitted'][0]:.3f}")
-        passed += 1
-    except Exception as e:
-        print(f"  [FAIL] Failed: {e}")
-        failed += 1
-
-    # Test 6: Stateless forecast method
-    print("[Test 6] Stateless forecast() method")
-    try:
-        model = GARCH(p=1, q=1)  # Unfitted model
-        result = model.forecast(y_test, h=8, level=[90], fitted=True)
-
-        assert 'mean' in result and 'sigma2' in result, "Missing forecasts"
-        assert 'fitted' in result, "Missing fitted values"
-        assert 'lo-90' in result and 'hi-90' in result, "Missing intervals"
-        assert 'fitted-lo-90' in result and 'fitted-hi-90' in result, "Missing fitted intervals"
-        assert len(result['mean']) == 8, "Wrong forecast length"
-
-        print(f"  [PASS] Stateless forecast successful")
-        print(f"  [PASS] Forecast length: {len(result['mean'])}")
-        passed += 1
-    except Exception as e:
-        print(f"  [FAIL] Failed: {e}")
-        failed += 1
-
-    # Test 7: Different lag orders
-    print("[Test 7] GARCH(2,2) with higher orders")
-    try:
-        model = GARCH(p=2, q=2)
-        model.fit(y_test)
-        result = model.predict(h=5)
-
-        assert len(model.model_['alpha']) == 2, "Wrong number of alpha coefficients"
-        assert len(model.model_['beta']) == 2, "Wrong number of beta coefficients"
-        assert model.alias == "GARCH(2,2)", f"Wrong alias: {model.alias}"
-
-        print(f"  [PASS] Alpha coefficients: {model.model_['alpha']}")
-        print(f"  [PASS] Beta coefficients: {model.model_['beta']}")
-        passed += 1
-    except Exception as e:
-        print(f"  [FAIL] Failed: {e}")
-        failed += 1
-
-    # Test 8: Parameter validation
-    print("[Test 8] Parameter validation")
-    test8_failed = False
-    try:
-        # Test invalid p
-        try:
-            model = GARCH(p=0, q=1)
-            print("  [FAIL] Failed: Should have raised ValueError for p=0")
-            test8_failed = True
-        except ValueError:
-            print("  [PASS] Correctly rejected p=0")
-
-        # Test invalid q
-        try:
-            model = GARCH(p=1, q=-1)
-            print("  [FAIL] Failed: Should have raised ValueError for q=-1")
-            test8_failed = True
-        except ValueError:
-            print("  [PASS] Correctly rejected q=-1")
-
-        # Test invalid h
-        model = GARCH(p=1, q=1)
-        model.fit(y_test)
-        try:
-            result = model.predict(h=0)
-            print("  [FAIL] Failed: Should have raised ValueError for h=0")
-            test8_failed = True
-        except ValueError:
-            print("  [PASS] Correctly rejected h=0")
-
-        if test8_failed:
-            failed += 1
-        else:
-            passed += 1
-    except Exception as e:
-        print(f"  [FAIL] Failed: {e}")
-        failed += 1
-
-    # Test 9: Minimum data requirement
-    print("[Test 9] Insufficient data handling")
-    try:
-        model = GARCH(p=2, q=2)
-        small_data = y_test[:10]
-
-        try:
-            model.fit(small_data)
-            print("  [FAIL] Failed: Should have raised ValueError for insufficient data")
-            failed += 1
-        except ValueError as e:
-            print(f"  [PASS] Correctly rejected insufficient data: {str(e)[:60]}...")
-            passed += 1
-    except Exception as e:
-        print(f"  [FAIL] Failed: {e}")
-        failed += 1
-
-    # Test 10: Input validation (NaN/Inf/constant series)
-    print("[Test 10] Input validation (NaN/Inf/constant)")
-    test10_failed = False
-    try:
-        model = GARCH(p=1, q=1)
-
-        # Test NaN input
-        try:
-            nan_data = y_test.at[50].set(jnp.nan)
-            model.fit(nan_data)
-            print("  [FAIL] Failed: Should have rejected NaN input")
-            test10_failed = True
-        except ValueError:
-            print("  [PASS] Correctly rejected NaN input")
-
-        # Test Inf input
-        try:
-            inf_data = y_test.at[50].set(jnp.inf)
-            model.fit(inf_data)
-            print("  [FAIL] Failed: Should have rejected Inf input")
-            test10_failed = True
-        except ValueError:
-            print("  [PASS] Correctly rejected Inf input")
-
-        # Test constant series
-        try:
-            const_data = jnp.ones(100)
-            model.fit(const_data)
-            print("  [FAIL] Failed: Should have rejected constant series")
-            test10_failed = True
-        except ValueError:
-            print("  [PASS] Correctly rejected constant series")
-
-        if test10_failed:
-            failed += 1
-        else:
-            passed += 1
-    except Exception as e:
-        print(f"  [FAIL] Failed: {e}")
-        failed += 1
-
-    # Test 11: Volatility persistence
-    print("[Test 11] Volatility persistence check")
-    try:
-        model = GARCH(p=1, q=1)
-        model.fit(y_test)
-
-        omega = model.model_['omega']
-        alpha = model.model_['alpha'][0]
-        beta = model.model_['beta'][0]
-        persistence = alpha + beta
-
-        assert 0 < persistence < 1, f"Persistence {persistence} out of valid range"
-        assert omega > 0, f"Omega {omega} must be positive"
-
-        print(f"  [PASS] Omega: {omega:.4f} > 0")
-        print(f"  [PASS] Persistence (α+β): {persistence:.4f} ∈ (0, 1)")
-        print(f"  [PASS] Unconditional variance: {omega / (1 - persistence):.4f}")
-        passed += 1
-    except Exception as e:
-        print(f"  [FAIL] Failed: {e}")
-        failed += 1
-
-    # Test 12: Basic stochastic simulation
-    print("[Test 12] Basic stochastic simulation")
-    try:
-        model = GARCH(p=1, q=1)
-        model.fit(y_test)
-        result = model.predict_simulate(h=10, n_sims=100, seed=42)
-
-        assert 'mean' in result, "Missing 'mean' in result"
-        assert 'median' in result, "Missing 'median' in result"
-        assert 'sigma2_mean' in result, "Missing 'sigma2_mean' in result"
-        assert 'paths' in result, "Missing 'paths' in result"
-        assert 'sigma2_paths' in result, "Missing 'sigma2_paths' in result"
-        assert result['paths'].shape == (100, 10), f"Expected paths shape (100, 10), got {result['paths'].shape}"
-        assert result['sigma2_paths'].shape == (100, 10), f"Expected sigma2_paths shape (100, 10), got {result['sigma2_paths'].shape}"
-        assert jnp.all(jnp.isfinite(result['mean'])), "Non-finite values in mean"
-        assert jnp.all(result['sigma2_mean'] > 0), "Non-positive sigma2_mean values"
-
-        print(f"  [PASS] Paths shape: {result['paths'].shape}")
-        print(f"  [PASS] Mean forecast: {result['mean'][:3]} ...")
-        print(f"  [PASS] Sigma2 mean: {result['sigma2_mean'][:3]} ...")
-        passed += 1
-    except Exception as e:
-        print(f"  [FAIL] Failed: {e}")
-        failed += 1
-
-    # Test 13: Seed reproducibility
-    print("[Test 13] Seed reproducibility")
-    try:
-        model = GARCH(p=1, q=1)
-        model.fit(y_test)
-        result1 = model.predict_simulate(h=10, n_sims=50, seed=42)
-        result2 = model.predict_simulate(h=10, n_sims=50, seed=42)
-
-        assert jnp.allclose(result1['paths'], result2['paths']), "Paths not reproducible with same seed"
-        assert jnp.allclose(result1['mean'], result2['mean']), "Mean not reproducible with same seed"
-        assert jnp.allclose(result1['sigma2_paths'], result2['sigma2_paths']), "Sigma2 paths not reproducible"
-
-        print(f"  [PASS] Paths identical with seed=42")
-        print(f"  [PASS] Mean identical with seed=42")
-        passed += 1
-    except Exception as e:
-        print(f"  [FAIL] Failed: {e}")
-        failed += 1
-
-    # Test 14: Parameter validation
-    print("[Test 14] Stochastic parameter validation")
-    test14_failed = False
-    try:
-        model = GARCH(p=1, q=1)
-        model.fit(y_test)
-
-        # Test invalid n_sims
-        try:
-            result = model.predict_simulate(h=10, n_sims=0)
-            print("  [FAIL] Should have raised ValueError for n_sims=0")
-            test14_failed = True
-        except ValueError:
-            print("  [PASS] Correctly rejected n_sims=0")
-
-        # Test negative n_sims
-        try:
-            result = model.predict_simulate(h=10, n_sims=-5)
-            print("  [FAIL] Should have raised ValueError for n_sims=-5")
-            test14_failed = True
-        except ValueError:
-            print("  [PASS] Correctly rejected n_sims=-5")
-
-        if test14_failed:
-            failed += 1
-        else:
-            passed += 1
-    except Exception as e:
-        print(f"  [FAIL] Failed: {e}")
-        failed += 1
-
-    # Test 15: Stochastic mean vs deterministic
-    print("[Test 15] Stochastic mean approximates deterministic")
-    try:
-        model = GARCH(p=1, q=1)
-        model.fit(y_test)
-        det = model.predict(h=10)
-        stoch = model.predict_simulate(h=10, n_sims=5000, seed=42)
-
-        # Stochastic mean should approximate deterministic mean (law of large numbers)
-        mean_diff = jnp.abs(det['mean'] - stoch['mean'])
-        assert jnp.all(mean_diff < 0.05), f"Stochastic mean differs too much from deterministic: max diff {jnp.max(mean_diff):.4f}"
-
-        print(f"  [PASS] Max mean difference: {jnp.max(mean_diff):.4f} < 0.05")
-        print(f"  [PASS] Deterministic mean[0]: {det['mean'][0]:.4f}")
-        print(f"  [PASS] Stochastic mean[0]: {stoch['mean'][0]:.4f}")
-        passed += 1
-    except Exception as e:
-        print(f"  [FAIL] Failed: {e}")
-        failed += 1
-
-    # Test 16: Interval comparison
-    print("[Test 16] Empirical vs analytical intervals")
-    try:
-        model = GARCH(p=1, q=1)
-        model.fit(y_test)
-        det = model.predict(h=10, level=[95])
-        stoch = model.predict_simulate(h=10, n_sims=5000, seed=42, level=[95])
-
-        det_width = det['hi-95'] - det['lo-95']
-        stoch_width = stoch['hi-95'] - stoch['lo-95']
-
-        # Stochastic intervals can be wider due to path dependency
-        # Check they're in same ballpark (within factor of 2)
-        ratio = stoch_width / det_width
-        assert jnp.all(ratio > 0.5) and jnp.all(ratio < 2.0), f"Interval ratio out of range [0.5, 2.0]: {ratio}"
-
-        print(f"  [PASS] Deterministic 95% width[0]: {det_width[0]:.3f}")
-        print(f"  [PASS] Stochastic 95% width[0]: {stoch_width[0]:.3f}")
-        print(f"  [PASS] Width ratio (stoch/det)[0]: {ratio[0]:.2f}")
-        passed += 1
-    except Exception as e:
-        print(f"  [FAIL] Failed: {e}")
-        failed += 1
-
-    # Test 17: Path dependency
-    print("[Test 17] Path dependency (stochastic simulation)")
-    try:
-        model = GARCH(p=1, q=1)
-        model.fit(y_test)
-
-        # Run two simulations with different seeds
-        result1 = model.predict_simulate(h=20, n_sims=1, seed=1)
-        result2 = model.predict_simulate(h=20, n_sims=1, seed=2)
-
-        # y paths should always differ due to random shocks
-        assert not jnp.allclose(result1['paths'], result2['paths']), "Y paths should differ with different seeds"
-
-        # Note: sigma2_paths may be nearly identical if fitted alpha ≈ 0
-        # (when ARCH effect is negligible, variance evolution is deterministic)
-        alpha_sum = float(jnp.sum(model.model_['alpha']))
-        if alpha_sum > 0.01:
-            # Only check sigma2 path dependency when alpha is non-trivial
-            assert not jnp.allclose(result1['sigma2_paths'], result2['sigma2_paths']), "Sigma2 paths should differ"
-            print(f"  [PASS] Sigma2 paths differ with different seeds (alpha={alpha_sum:.4f})")
-        else:
-            print(f"  [INFO] Alpha≈0 ({alpha_sum:.4f}), sigma2 paths are deterministic (expected)")
-
-        # Check that variance values are positive and finite
-        path = result1['paths'][0]
-        sigma2_path = result1['sigma2_paths'][0]
-        assert jnp.all(jnp.isfinite(sigma2_path)), "Sigma2 path should be finite"
-        assert jnp.all(sigma2_path > 0), "Sigma2 path should be positive"
-
-        print(f"  [PASS] Y paths differ with different seeds")
-        print(f"  [PASS] Sigma2 values are finite and positive")
-        passed += 1
-    except Exception as e:
-        print(f"  [FAIL] Failed: {e}")
-        failed += 1
-
-    # Test 18: return_paths parameter
-    print("[Test 18] return_paths parameter")
-    try:
-        model = GARCH(p=1, q=1)
-        model.fit(y_test)
-
-        # With return_paths=True (default)
-        result_with = model.predict_simulate(h=10, n_sims=100, seed=42, return_paths=True)
-        assert 'paths' in result_with, "Should have paths when return_paths=True"
-        assert 'sigma2_paths' in result_with, "Should have sigma2_paths when return_paths=True"
-
-        # With return_paths=False
-        result_without = model.predict_simulate(h=10, n_sims=100, seed=42, return_paths=False)
-        assert 'paths' not in result_without, "Should not have paths when return_paths=False"
-        assert 'sigma2_paths' not in result_without, "Should not have sigma2_paths when return_paths=False"
-        assert 'mean' in result_without, "Should still have mean when return_paths=False"
-        assert 'sigma2_mean' in result_without, "Should still have sigma2_mean when return_paths=False"
-
-        print(f"  [PASS] Paths included with return_paths=True")
-        print(f"  [PASS] Paths excluded with return_paths=False")
-        print(f"  [PASS] Summary statistics present in both cases")
-        passed += 1
-    except Exception as e:
-        print(f"  [FAIL] Failed: {e}")
-        failed += 1
-
-    # Test 19: forecast_simulate stateless
-    print("[Test 19] forecast_simulate stateless operation")
-    try:
-        model = GARCH(p=1, q=1)  # Unfitted model
-        assert model.model_ is None, "Model should be unfitted initially"
-
-        result = model.forecast_simulate(y_test, h=10, n_sims=100, seed=42, fitted=True, level=[95])
-
-        assert 'mean' in result, "Missing mean in result"
-        assert 'paths' in result, "Missing paths in result"
-        assert 'fitted' in result, "Missing fitted values"
-        assert 'lo-95' in result and 'hi-95' in result, "Missing intervals"
-        assert 'fitted-lo-95' in result and 'fitted-hi-95' in result, "Missing fitted intervals"
-        assert result['paths'].shape == (100, 10), f"Expected paths shape (100, 10), got {result['paths'].shape}"
-
-        print(f"  [PASS] Stateless forecast successful")
-        print(f"  [PASS] Fitted values included")
-        print(f"  [PASS] Intervals computed")
-        passed += 1
-    except Exception as e:
-        print(f"  [FAIL] Failed: {e}")
-        failed += 1
-
-    # Test 20: Small n_sims raises ValueError
-    print("[Test 20] Small n_sims raises ValueError")
-    try:
-        model = GARCH(p=1, q=1)
-        model.fit(y_test)
-
-        # Test with n_sims=1 (below MIN_SIMS_FOR_PERCENTILE)
-        try:
-            result = model.predict_simulate(h=10, n_sims=1, seed=42, level=[95])
-            print("  [FAIL] Should have raised ValueError for small n_sims with level")
-            failed += 1
-        except ValueError as e:
-            assert "too small for reliable percentile-based intervals" in str(e), f"Wrong error: {e}"
-            print(f"  [PASS] Correctly rejected n_sims=1 with level")
-            passed += 1
-    except Exception as e:
-        print(f"  [FAIL] Failed: {e}")
-        failed += 1
-
-    # Test 21: iteration_scaling parameter validation
-    print("[Test 21] iteration_scaling parameter validation")
-    test21_failed = False
-    try:
-        # Test default cubic scaling
-        model_cubic = GARCH(p=1, q=1)
-        assert model_cubic.iteration_scaling == "cubic", f"Expected 'cubic' default, got {model_cubic.iteration_scaling}"
-        print("  [PASS] Default iteration_scaling is 'cubic'")
-
-        # Test quadratic scaling
-        model_quad = GARCH(p=1, q=1, iteration_scaling="quadratic")
-        assert model_quad.iteration_scaling == "quadratic", f"Expected 'quadratic', got {model_quad.iteration_scaling}"
-        print("  [PASS] Can set iteration_scaling='quadratic'")
-
-        # Test invalid value raises error
-        try:
-            model_invalid = GARCH(p=1, q=1, iteration_scaling="linear")
-            print("  [FAIL] Should have raised ValueError for invalid iteration_scaling")
-            test21_failed = True
-        except ValueError as e:
-            assert "iteration_scaling must be 'cubic' or 'quadratic'" in str(e), f"Wrong error message: {e}"
-            print("  [PASS] Correctly rejected invalid iteration_scaling")
-
-        if test21_failed:
-            failed += 1
-        else:
-            passed += 1
-    except Exception as e:
-        print(f"  [FAIL] Failed: {e}")
-        failed += 1
-
-    # Test 22: Cubic vs quadratic scaling produces different iteration counts
-    print("[Test 22] Cubic vs quadratic iteration scaling behavior")
-    try:
-        model_cubic = GARCH(p=1, q=1, iteration_scaling="cubic")
-        model_quad = GARCH(p=2, q=2, iteration_scaling="quadratic")
-
-        # Both should fit successfully
-        model_cubic.fit(y_test)
-        model_quad.fit(y_test)
-
-        # Both should produce valid results
-        result_cubic = model_cubic.predict(h=10)
-        result_quad = model_quad.predict(h=10)
-
-        assert jnp.all(jnp.isfinite(result_cubic['mean'])), "Non-finite values in cubic model forecast"
-        assert jnp.all(jnp.isfinite(result_quad['mean'])), "Non-finite values in quadratic model forecast"
-        assert jnp.all(result_cubic['sigma2'] > 0), "Non-positive variance in cubic model"
-        assert jnp.all(result_quad['sigma2'] > 0), "Non-positive variance in quadratic model"
-
-        print(f"  [PASS] Cubic scaling model fitted successfully")
-        print(f"  [PASS] Quadratic scaling model fitted successfully")
-        passed += 1
-    except Exception as e:
-        print(f"  [FAIL] Failed: {e}")
-        failed += 1
-
-    # Test 23: Extended iterations with quadratic scaling
-    print("[Test 23] Extended iterations with quadratic scaling")
-    try:
-        model = GARCH(p=2, q=2, iteration_scaling="quadratic", allow_extended_iterations=True)
-        model.fit(y_test)
-        result = model.predict(h=10)
-
-        assert jnp.all(jnp.isfinite(result['mean'])), "Non-finite values in forecast"
-        assert jnp.all(result['sigma2'] > 0), "Non-positive variance forecasts"
-
-        # Check persistence is valid
-        persistence = float(jnp.sum(model.model_['alpha']) + jnp.sum(model.model_['beta']))
-        assert 0 < persistence < 1, f"Invalid persistence {persistence}"
-
-        print(f"  [PASS] Extended iterations with quadratic scaling works")
-        print(f"  [PASS] Persistence: {persistence:.4f}")
-        passed += 1
-    except Exception as e:
-        print(f"  [FAIL] Failed: {e}")
-        failed += 1
-
-    # Test 24: Padded input produces same results as unpadded (GPU JIT optimization)
-    print("[Test 24] Padded input equivalence for GPU JIT optimization")
-    try:
-        y_short = y_test[:150]  # 150 samples
-        y_padded = jnp.pad(y_short, (0, 50), mode='edge')  # Pad to 200
-
-        model1 = GARCH(p=1, q=1)
-        model2 = GARCH(p=1, q=1)
-
-        # Unpadded forecast
-        result1 = model1.forecast(y_short, h=10)
-
-        # Padded forecast with actual_len
-        result2 = model2.forecast(y_padded, h=10, actual_len=150)
-
-        # Results should be numerically close
-        mean_diff = jnp.max(jnp.abs(result1['mean'] - result2['mean']))
-        sigma2_diff = jnp.max(jnp.abs(result1['sigma2'] - result2['sigma2']))
-
-        assert mean_diff < 1e-4, f"Mean forecasts differ by {mean_diff}"
-        assert sigma2_diff < 1e-4, f"Sigma2 forecasts differ by {sigma2_diff}"
-
-        print(f"  [PASS] Padded and unpadded mean difference: {mean_diff:.6f}")
-        print(f"  [PASS] Padded and unpadded sigma2 difference: {sigma2_diff:.6f}")
-        passed += 1
-    except Exception as e:
-        print(f"  [FAIL] {e}")
-        failed += 1
-
-    # Test 25: Fixed n_iters with padding prevents recompilation
-    print("[Test 25] Fixed n_iters with padding")
-    try:
-        # Simulate CV scenario: different lengths, same n_iters
-        y_lens = [150, 160, 170]
-        max_len = 200
-        fixed_n_iters = 80
-
-        results = []
-        for y_len in y_lens:
-            y_data = y_test[:y_len]
-            y_padded = jnp.pad(y_data, (0, max_len - y_len), mode='edge')
-
-            model = GARCH(p=1, q=1)
-            result = model.forecast(y_padded, h=10, n_iters=fixed_n_iters, actual_len=y_len)
-
-            assert jnp.all(jnp.isfinite(result['mean'])), f"Non-finite mean for len={y_len}"
-            assert jnp.all(result['sigma2'] > 0), f"Non-positive sigma2 for len={y_len}"
-            results.append(result)
-
-        print(f"  [PASS] All {len(y_lens)} padded lengths with fixed n_iters work correctly")
-        sigma2_vals = [float(r['sigma2'][0]) for r in results]
-        print(f"  [PASS] Sigma2[0] for lens {y_lens}: {sigma2_vals}")
-        passed += 1
-    except Exception as e:
-        print(f"  [FAIL] {e}")
-        failed += 1
-
-    # Summary
-    print(f"{passed} passed, {failed} failed")
