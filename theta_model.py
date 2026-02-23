@@ -5,36 +5,18 @@ Implements the Standard Theta Method (STM), Optimized Theta Method (OTM),
 Dynamic Standard Theta Method (DSTM), and Dynamic Optimized Theta Method (DOTM)
 with full JAX JIT compilation and two-phase ADAM + L-BFGS optimization.
 
+This module contains the core computational engine (state initialization,
+step functions, optimization, forecasting, Monte Carlo PI sampling) and the
+``Theta`` class (STM-only wrapper). The ``AutoTheta`` class (automatic model
+selection) lives in ``auto_theta.py`` and is re-exported here for backward
+compatibility.
+
 Features:
-- Four model variants: STM, OTM, DSTM, DOTM with automatic selection
+- Four model variants: STM, OTM, DSTM, DOTM
 - Additive and multiplicative seasonal decomposition
 - Monte Carlo prediction intervals
 - JAX JIT compilation for performance
-- Four prediction methods: fit/predict, predict_in_sample, forecast, forward
-
-Instance Attributes:
-1. season_length: int - Number of observations per unit of time (e.g., 12 for monthly)
-2. decomposition_type: str - Seasonal decomposition type ('multiplicative' or 'additive')
-3. model: str | None - Controlling theta model variant, or None for auto-selection
-4. alias: str - Custom name for the model
-5. prediction_intervals: ConformalIntervals | None - Conformal prediction interval config
-6. conformal_params: ConformalIntervals - Parameters for conformal prediction intervals
-7. n_samples: int - Number of Monte Carlo samples for prediction intervals (default 200)
-8. model_: dict - Fitted model state (created after fit())
-   - par: Dict with initial_smoothed, alpha, theta
-   - residuals: One-step-ahead forecast errors
-   - final_state: Final state vector [level, mean_y, An, Bn, mu]
-   - mse: Optimization objective value
-   - modeltype: Best model variant name
-   - fitted: In-sample fitted values (after fit())
-
-Methods:
-1. __init__() - Initialize with season length, decomposition, and model variant
-2. fit(y, X=None) - Fit model to training data via ADAM + L-BFGS optimization
-3. predict(h, X=None, level=None) - Generate forecasts with fitted model
-4. predict_in_sample(level=None) - Return fitted values with optional intervals
-5. forecast(y, h, X=None, X_future=None, level=None, fitted=False) - Stateless prediction
-6. forward(y, h, X=None, X_future=None, level=None, fitted=False) - Apply fitted model to new data
+- Two-phase ADAM + L-BFGS optimization
 
 Implementation Notes:
 - State vector: [level, mean_y, An, Bn, mu] (5 elements)
@@ -51,14 +33,7 @@ import jax.numpy as jnp
 import jax.random as jrandom
 import optax
 from jax import lax
-from base_forecaster import BaseForecaster
-from conformal_intervals import ConformalIntervals
 from utils import (
-    ensure_float,
-    _add_fitted_pi,
-    _store_cs,
-    _add_conformal_intervals,
-    _add_predict_conformal_intervals,
     is_constant,
     seasonal_decompose,
     acf,
@@ -73,6 +48,20 @@ from utils import (
 # =============================================================================
 
 class ModelType:
+    """Integer constants and name maps for Theta model variants.
+
+    Attributes
+    ----------
+    STM : int
+        Standard Theta Method (theta fixed at 2.0).
+    OTM : int
+        Optimized Theta Method (theta optimized).
+    DSTM : int
+        Dynamic Standard Theta Method (dynamic An/Bn, theta fixed at 2.0).
+    DOTM : int
+        Dynamic Optimized Theta Method (dynamic An/Bn, theta optimized).
+    """
+
     STM = 1
     OTM = 2
     DSTM = 3
@@ -93,7 +82,8 @@ __all__ = ['Theta', 'AutoTheta', 'ModelType']
 # Core Math — Module-level JIT'd functions
 # =============================================================================
 
-def _init_state(y: jnp.ndarray, model_type: int, initial_smoothed: float, alpha: float, theta: float) -> jnp.ndarray:
+def _init_state(y: jnp.ndarray, model_type: int, initial_smoothed: float,
+                alpha: float, theta: float) -> jnp.ndarray:
     """Initialize the 5-element state vector [level, mean_y, An, Bn, mu].
 
     For STM/OTM: An, Bn come from OLS linear regression on full series.
@@ -157,15 +147,29 @@ def _make_step_fn(model_type_val: int) -> tuple:
 
     Returns
     -------
-    step_fn : callable
-        Fit step: carry = (level, mean_y, An, Bn, alpha, theta, step_idx),
-        input = y_t, output = (e_t, mu_t).
-    forecast_step_fn : callable
-        Forecast step: same carry, input unused, output = mu.
+    tuple[callable, callable]
+        step_fn : Fit step: carry = (level, mean_y, An, Bn, alpha, theta,
+        step_idx), input = y_t, output = (e_t, mu_t).
+        forecast_step_fn : Forecast step: same carry, input unused,
+        output = mu.
     """
     is_dynamic = model_type_val in (ModelType.DSTM, ModelType.DOTM)
 
-    def step_fn(carry, y_t):
+    def step_fn(carry: tuple, y_t: jnp.ndarray) -> tuple[tuple, tuple]:
+        """Single fit step for lax.scan.
+
+        Parameters
+        ----------
+        carry : tuple
+            (level, mean_y, An, Bn, alpha, theta, step_idx).
+        y_t : jnp.ndarray
+            Observation at time t.
+
+        Returns
+        -------
+        tuple[tuple, tuple]
+            Updated carry and (residual, fitted_value).
+        """
         level, mean_y, An, Bn, alpha, theta, i = carry
 
         decay = (1.0 - alpha) ** i
@@ -186,7 +190,23 @@ def _make_step_fn(model_type_val: int) -> tuple:
         new_carry = (new_level, new_mean_y, new_An, new_Bn, alpha, theta, i + 1.0)
         return new_carry, (e_t, mu)
 
-    def forecast_step_fn(carry, _unused):
+    def forecast_step_fn(carry: tuple, _unused: jnp.ndarray) -> tuple[tuple, jnp.ndarray]:
+        """Single forecast step for lax.scan.
+
+        Uses mu (the forecast) as the pseudo-observation for SES level updates.
+
+        Parameters
+        ----------
+        carry : tuple
+            (level, mean_y, An, Bn, alpha, theta, step_idx).
+        _unused : jnp.ndarray
+            Ignored scan input.
+
+        Returns
+        -------
+        tuple[tuple, jnp.ndarray]
+            Updated carry and forecast value mu.
+        """
         level, mean_y, An, Bn, alpha, theta, i = carry
 
         decay = (1.0 - alpha) ** i
@@ -239,12 +259,10 @@ def _pegels_resid(y: jnp.ndarray, model_type: int, initial_smoothed: jnp.ndarray
 
     Returns
     -------
-    residuals : jnp.ndarray
-        One-step-ahead errors of shape (n,).
-    final_state : jnp.ndarray
-        Final state vector of shape (5,): [level, mean_y, An, Bn, mu].
-    mse : jnp.ndarray
-        Scalar optimization objective: sum(e[3:]^2) / max(mean(|y|), eps).
+    tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]
+        residuals : One-step-ahead errors of shape (n,).
+        final_state : Final state vector of shape (5,): [level, mean_y, An, Bn, mu].
+        mse : Scalar optimization objective: sum(e[3:]^2) / max(mean(|y|), eps).
     """
     n = y.shape[0]
     dtype = y.dtype
@@ -318,12 +336,10 @@ def _jit_optimize_theta(y: jnp.ndarray, model_type: int, x0: jnp.ndarray,
 
     Returns
     -------
-    level : jnp.ndarray
-        Optimized initial smoothed level.
-    alpha : jnp.ndarray
-        Optimized smoothing parameter in [0.1, 0.99].
-    theta : jnp.ndarray
-        Optimized theta parameter in [1.0, 100.0].
+    tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]
+        level : Optimized initial smoothed level.
+        alpha : Optimized smoothing parameter in [0.1, 0.99].
+        theta : Optimized theta parameter in [1.0, 100.0].
     """
     dtype = y.dtype
     eps_val = jnp.asarray(_EPSILON, dtype=dtype)
@@ -338,8 +354,19 @@ def _jit_optimize_theta(y: jnp.ndarray, model_type: int, x0: jnp.ndarray,
     theta_lo = jnp.asarray(1.0, dtype=dtype)
     theta_hi = jnp.asarray(100.0, dtype=dtype)
 
-    def _to_constrained(p):
-        """Map unconstrained parameters to bounded space."""
+    def _to_constrained(p: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        """Map unconstrained parameters to bounded space.
+
+        Parameters
+        ----------
+        p : jnp.ndarray
+            Unconstrained parameter vector.
+
+        Returns
+        -------
+        tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]
+            (level, alpha, theta) in their constrained ranges.
+        """
         idx = 0
         if opt_level:
             level = y_mean + y_std * p[idx]
@@ -361,11 +388,19 @@ def _jit_optimize_theta(y: jnp.ndarray, model_type: int, x0: jnp.ndarray,
 
         return level, alpha, theta
 
-    # Initialize unconstrained parameters
-    n_params = int(opt_level) + int(opt_alpha) + int(opt_theta)
-    init_unconstrained = jnp.zeros(max(n_params, 1), dtype=dtype)
+    def loss_fn(p_unconstrained: jnp.ndarray) -> jnp.ndarray:
+        """Compute MSE loss from unconstrained parameters.
 
-    def loss_fn(p_unconstrained):
+        Parameters
+        ----------
+        p_unconstrained : jnp.ndarray
+            Unconstrained parameter vector.
+
+        Returns
+        -------
+        jnp.ndarray
+            Scalar MSE loss.
+        """
         p_unconstrained = jnp.asarray(p_unconstrained, dtype=dtype)
         level, alpha, theta = _to_constrained(p_unconstrained)
         _, _, mse = _pegels_resid(y, model_type, level, alpha, theta)
@@ -374,9 +409,23 @@ def _jit_optimize_theta(y: jnp.ndarray, model_type: int, x0: jnp.ndarray,
     # Phase 1: ADAM warm-up
     vg_fn = jax.value_and_grad(loss_fn)
     adam_opt = optax.adam(_ADAM_LR)
-    adam_state = adam_opt.init(init_unconstrained)
+    adam_state = adam_opt.init(x0)
 
-    def _adam_step(carry, _):
+    def _adam_step(carry: tuple, _: jnp.ndarray) -> tuple[tuple, None]:
+        """Single ADAM optimization step for lax.scan.
+
+        Parameters
+        ----------
+        carry : tuple
+            (params, optimizer_state, best_params, best_loss).
+        _ : jnp.ndarray
+            Unused scan input.
+
+        Returns
+        -------
+        tuple[tuple, None]
+            Updated carry and None.
+        """
         p, state, best_p, best_loss = carry
         loss, grads = vg_fn(p)
         grads = jnp.where(jnp.isfinite(grads), grads, 0.0)
@@ -388,7 +437,7 @@ def _jit_optimize_theta(y: jnp.ndarray, model_type: int, x0: jnp.ndarray,
         return (new_p, new_state, best_p, best_loss), None
 
     inf_val = jnp.asarray(float('inf'), dtype=dtype)
-    adam_carry = (init_unconstrained, adam_state, init_unconstrained, inf_val)
+    adam_carry = (x0, adam_state, x0, inf_val)
     (_, _, adam_best_p, adam_best_loss), _ = lax.scan(
         _adam_step, adam_carry, jnp.arange(_ADAM_STEPS),
     )
@@ -403,7 +452,21 @@ def _jit_optimize_theta(y: jnp.ndarray, model_type: int, x0: jnp.ndarray,
     )
     lbfgs_state = lbfgs_solver.init(adam_best_p)
 
-    def _lbfgs_step(carry, _):
+    def _lbfgs_step(carry: tuple, _: jnp.ndarray) -> tuple[tuple, None]:
+        """Single L-BFGS optimization step for lax.scan.
+
+        Parameters
+        ----------
+        carry : tuple
+            (params, optimizer_state, best_params, best_loss).
+        _ : jnp.ndarray
+            Unused scan input.
+
+        Returns
+        -------
+        tuple[tuple, None]
+            Updated carry and None.
+        """
         p, state, best_p, best_loss = carry
         loss, grads = vg_fn(p)
         grads = jnp.where(jnp.isfinite(grads), grads, 0.0)
@@ -438,7 +501,8 @@ _jit_optimize_theta = jax.jit(_jit_optimize_theta, static_argnums=(1, 6, 7, 8))
 # Parameter Initialization (Pure Python)
 # =============================================================================
 
-def _initparamtheta(initial_smoothed: float, alpha: float, theta: float, y: jnp.ndarray, model_type: int) -> dict:
+def _initparamtheta(initial_smoothed: float, alpha: float, theta: float,
+                    y: jnp.ndarray, model_type: int) -> dict:
     """Determine initial values and optimization flags per model type.
 
     STM/DSTM: theta fixed at 2.0, optimize level and alpha.
@@ -452,7 +516,7 @@ def _initparamtheta(initial_smoothed: float, alpha: float, theta: float, y: jnp.
         Smoothing parameter. None triggers optimization.
     theta : float or None
         Theta parameter. None triggers optimization (OTM/DOTM only).
-    y : array-like
+    y : jnp.ndarray
         Time series (used for default initial_smoothed = y[0]/2).
     model_type : int
         ModelType constant.
@@ -506,7 +570,7 @@ def _run_theta_optimization(y: jnp.ndarray, model_type: int, par: dict) -> dict:
 
     Parameters
     ----------
-    y : array-like
+    y : jnp.ndarray
         Time series.
     model_type : int
         ModelType constant.
@@ -556,7 +620,7 @@ def _run_theta_optimization(y: jnp.ndarray, model_type: int, par: dict) -> dict:
     if opt_alpha:
         x0_list.append(0.0)  # sigmoid(0) = 0.5 → alpha ≈ 0.545
     if opt_theta:
-        x0_list.append(0.0)  # sigmoid(0) = 0.5 → theta ≈ 50.5
+        x0_list.append(-4.595119850134589)  # logit((2-1)/(100-1)) → theta ≈ 2.0
 
     x0 = jnp.array(x0_list, dtype=jnp.float32)
 
@@ -645,8 +709,8 @@ def _compute_pi_samples(last_state: jnp.ndarray, model_type: int, alpha: jnp.nda
     """Generate Monte Carlo prediction interval samples.
 
     Produces ``n_samples`` stochastic forecast paths of length ``h``.
-    Each path adds N(0, sigma) noise to the deterministic forecast,
-    then updates states with the sample mean.
+    Each path adds N(0, sigma) noise to the deterministic forecast
+    and evolves its own independent level/trend state.
 
     For static models (STM, OTM), An and Bn remain constant — they are
     derived from OLS on the full training series. Only dynamic models
@@ -687,13 +751,30 @@ def _compute_pi_samples(last_state: jnp.ndarray, model_type: int, alpha: jnp.nda
     key = jrandom.PRNGKey(seed)
     samples = jnp.zeros((h, n_samples), dtype=dtype)
 
-    # Pre-cast constants to dtype to avoid float64 promotion
+    # Pre-cast constants and inputs to dtype to avoid float64 promotion
+    sigma = jnp.asarray(sigma, dtype=dtype)
     one = jnp.asarray(1.0, dtype=dtype)
     six = jnp.asarray(6.0, dtype=dtype)
     two = jnp.asarray(2.0, dtype=dtype)
     eps_c = jnp.asarray(_EPSILON, dtype=dtype)
 
-    def body_fn(j, val):
+    def body_fn(j: int, val: tuple) -> tuple:
+        """Single MC simulation step for lax.fori_loop.
+
+        Parameters
+        ----------
+        j : int
+            Forecast step index (0-based).
+        val : tuple
+            (smoothed, mean_y_acc, A, B, samples_array, prng_key),
+            all arrays of shape (n_samples,) except samples (h, n_samples)
+            and key (scalar).
+
+        Returns
+        -------
+        tuple
+            Updated val with new state and samples[j] filled.
+        """
         smoothed, mean_y_acc, A, B, samp, rng = val
         i = n + j
 
@@ -705,17 +786,16 @@ def _compute_pi_samples(last_state: jnp.ndarray, model_type: int, alpha: jnp.nda
 
         rng, subkey = jrandom.split(rng)
         eps = jrandom.normal(subkey, shape=(n_samples,), dtype=dtype) * sigma
-        s = mu + eps
+        s = mu + eps  # (n_samples,)
 
-        # Cast to maintain dtype
-        s_mean = jnp.mean(s).astype(dtype)
-        new_smoothed = (alpha * s_mean + (one - alpha) * smoothed).astype(dtype)
-        new_mean_y = ((i_f * mean_y_acc + s_mean) / (i_f + one)).astype(dtype)
+        # Per-path state updates — each sample path evolves independently
+        new_smoothed = alpha * s + (one - alpha) * smoothed  # (n_samples,)
+        new_mean_y = (i_f * mean_y_acc + s) / (i_f + one)   # (n_samples,)
 
         # Only update An/Bn for dynamic models; static models keep OLS values
         if is_dynamic:
-            new_B = (((i_f - one) * B + six * (s_mean - mean_y_acc) / (i_f + one)) / (i_f + two)).astype(dtype)
-            new_A = (new_mean_y - new_B * (i_f + two) / two).astype(dtype)
+            new_B = ((i_f - one) * B + six * (s - mean_y_acc) / (i_f + one)) / (i_f + two)
+            new_A = new_mean_y - new_B * (i_f + two) / two
         else:
             new_A = A
             new_B = B
@@ -725,10 +805,10 @@ def _compute_pi_samples(last_state: jnp.ndarray, model_type: int, alpha: jnp.nda
 
     _, _, _, _, samples, _ = lax.fori_loop(
         0, h, body_fn,
-        (jnp.asarray(level, dtype=dtype),
-         jnp.asarray(mean_y, dtype=dtype),
-         jnp.asarray(An, dtype=dtype),
-         jnp.asarray(Bn, dtype=dtype),
+        (jnp.broadcast_to(jnp.asarray(level, dtype=dtype), (n_samples,)),
+         jnp.broadcast_to(jnp.asarray(mean_y, dtype=dtype), (n_samples,)),
+         jnp.broadcast_to(jnp.asarray(An, dtype=dtype), (n_samples,)),
+         jnp.broadcast_to(jnp.asarray(Bn, dtype=dtype), (n_samples,)),
          samples, key),
     )
 
@@ -978,262 +1058,30 @@ def _forward_theta(fitted_model: dict, y: jnp.ndarray) -> dict:
 
 
 # =============================================================================
-# AutoTheta Class
+# Backward-compatible re-exports (AutoTheta and Theta live in auto_theta.py)
 # =============================================================================
 
-class AutoTheta(BaseForecaster):
-    r"""AutoTheta model.
-
-    Automatically selects the best Theta model variant (STM, OTM, DSTM, DOTM)
-    using MSE.
+def __getattr__(name: str):
+    """Lazy import of AutoTheta and Theta from auto_theta to avoid circular imports.
 
     Parameters
     ----------
-    season_length : int, default 1
-        Number of observations per unit of time.
-    decomposition_type : str, default 'multiplicative'
-        Seasonal decomposition type: 'multiplicative' or 'additive'.
-    model : str or None, default None
-        Controlling theta model variant. None searches the best model.
-    alias : str, default 'AutoTheta'
-        Custom name of the model.
-    prediction_intervals : ConformalIntervals or None, default None
-        Configuration for conformal prediction intervals.
-    conformal_params : ConformalIntervals or None, default None
-        Parameters for conformal prediction intervals.
-    n_samples : int, default 200
-        Number of Monte Carlo samples for prediction intervals.
+    name : str
+        Attribute name being accessed.
+
+    Returns
+    -------
+    type
+        The requested class.
+
+    Raises
+    ------
+    AttributeError
+        If the attribute is not found.
     """
-
-    def __init__(
-        self,
-        season_length: int = 1,
-        decomposition_type: str = "multiplicative",
-        model: str = None,
-        alias: str = "AutoTheta",
-        prediction_intervals: ConformalIntervals = None,
-        conformal_params: ConformalIntervals = None,
-        n_samples: int = 200,
-    ):
-        self.season_length = season_length
-        self.decomposition_type = decomposition_type
-        self.model = model
-        self.alias = alias
-        self.prediction_intervals = prediction_intervals
-        self.n_samples = n_samples
-        if conformal_params is None:
-            self.conformal_params = ConformalIntervals()
-        else:
-            if not isinstance(conformal_params, ConformalIntervals):
-                raise TypeError("conformal_params must be a ConformalIntervals object.")
-            self.conformal_params = conformal_params
-
-    def fit(self, y: jnp.ndarray, X: jnp.ndarray = None) -> "AutoTheta":
-        r"""Fit the AutoTheta model.
-
-        Parameters
-        ----------
-        y : jnp.ndarray
-            Clean time series of shape (t,).
-        X : jnp.ndarray or None, default None
-            Optional exogenous of shape (t, n_x).
-
-        Returns
-        -------
-        AutoTheta
-            Fitted model instance.
-        """
-        y = ensure_float(y)
-        self.model_ = _auto_theta(
-            y=y,
-            m=self.season_length,
-            model=self.model,
-            decomposition_type=self.decomposition_type,
-        )
-        self.model_["fitted"] = y - self.model_["residuals"]
-        _store_cs(self, y, X)
-        return self
-
-    def predict(
-        self,
-        h: int,
-        X: jnp.ndarray = None,
-        level: list = None,
-    ) -> dict:
-        r"""Predict with fitted AutoTheta.
-
-        Parameters
-        ----------
-        h : int
-            Forecast horizon.
-        X : jnp.ndarray or None, default None
-            Optional exogenous of shape (h, n_x).
-        level : list of float or None, default None
-            Confidence levels (0-100) for prediction intervals.
-
-        Returns
-        -------
-        dict
-            Keys: 'mean' and optionally 'lo-{lv}', 'hi-{lv}'.
-        """
-        fcst = _forecast_from_model(self.model_, h=h, level=level, n_samples=self.n_samples)
-        if self.prediction_intervals is not None and level is not None:
-            fcst = _add_predict_conformal_intervals(self, fcst, level)
-        return fcst
-
-    def predict_in_sample(self, level: list = None) -> dict:
-        r"""Access fitted AutoTheta in-sample predictions.
-
-        Parameters
-        ----------
-        level : list of float or None, default None
-            Confidence levels (0-100) for prediction intervals.
-
-        Returns
-        -------
-        dict
-            Keys: 'fitted' and optionally 'lo-{lv}', 'hi-{lv}'.
-        """
-        res = {"fitted": self.model_["fitted"]}
-        if level is not None:
-            se = jnp.std(self.model_["residuals"][3:], ddof=1)
-            res = _add_fitted_pi(res=res, se=se, level=level)
-        return res
-
-    def forecast(
-        self,
-        y: jnp.ndarray,
-        h: int,
-        X: jnp.ndarray = None,
-        X_future: jnp.ndarray = None,
-        level: list = None,
-        fitted: bool = False,
-    ) -> dict:
-        r"""Memory-efficient AutoTheta predictions.
-
-        Fits and forecasts without storing model state.
-
-        Parameters
-        ----------
-        y : jnp.ndarray
-            Clean time series of shape (t,).
-        h : int
-            Forecast horizon.
-        X : jnp.ndarray or None, default None
-            Optional exogenous of shape (t, n_x).
-        X_future : jnp.ndarray or None, default None
-            Optional future exogenous of shape (h, n_x).
-        level : list of float or None, default None
-            Confidence levels (0-100) for prediction intervals.
-        fitted : bool, default False
-            Whether to return in-sample predictions.
-
-        Returns
-        -------
-        dict
-            Keys: 'mean', and optionally 'fitted', 'lo-{lv}', 'hi-{lv}'.
-        """
-        y = ensure_float(y)
-        mod = _auto_theta(
-            y=y,
-            m=self.season_length,
-            model=self.model,
-            decomposition_type=self.decomposition_type,
-        )
-        res = _forecast_from_model(mod, h, level=level, n_samples=self.n_samples)
-
-        if self.prediction_intervals is not None and level is not None:
-            res = _add_conformal_intervals(self, fcst=res, y=y, X=X, level=level)
-
-        if fitted:
-            res["fitted"] = y - mod["residuals"]
-
-        if level is not None and fitted:
-            se = jnp.std(mod["residuals"][3:], ddof=1)
-            res = _add_fitted_pi(res=res, se=se, level=level)
-
-        return res
-
-    def forward(
-        self,
-        y: jnp.ndarray,
-        h: int,
-        X: jnp.ndarray = None,
-        X_future: jnp.ndarray = None,
-        level: list = None,
-        fitted: bool = False,
-    ) -> dict:
-        r"""Apply fitted AutoTheta model to a new time series.
-
-        Uses the model type and parameters from the original fit.
-
-        Parameters
-        ----------
-        y : jnp.ndarray
-            Clean time series of shape (n,).
-        h : int
-            Forecast horizon.
-        X : jnp.ndarray or None, default None
-            Optional exogenous of shape (n, n_x).
-        X_future : jnp.ndarray or None, default None
-            Optional future exogenous of shape (h, n_x).
-        level : list of float or None, default None
-            Confidence levels (0-100) for prediction intervals.
-        fitted : bool, default False
-            Whether to return in-sample predictions.
-
-        Returns
-        -------
-        dict
-            Keys: 'mean', and optionally 'fitted', 'lo-{lv}', 'hi-{lv}'.
-        """
-        if not hasattr(self, "model_"):
-            raise Exception("You have to use the `fit` method first")
-        y = ensure_float(y)
-        mod = _forward_theta(self.model_, y=y)
-        res = _forecast_from_model(mod, h, level=level, n_samples=self.n_samples)
-        if self.prediction_intervals is not None and level is not None:
-            res = _add_conformal_intervals(self, fcst=res, y=y, X=X, level=level)
-        if fitted:
-            res["fitted"] = y - mod["residuals"]
-        if level is not None and fitted:
-            se = jnp.std(mod["residuals"][3:], ddof=1)
-            res = _add_fitted_pi(res=res, se=se, level=level)
-        return res
-
-
-class Theta(AutoTheta):
-    r"""Standard Theta Method (STM).
-
-    A simplified version of AutoTheta that always uses the Standard Theta Model.
-
-    Parameters
-    ----------
-    season_length : int, default 1
-        Number of observations per unit of time.
-    decomposition_type : str, default 'multiplicative'
-        Seasonal decomposition type: 'multiplicative' or 'additive'.
-    alias : str, default 'Theta'
-        Custom name of the model.
-    prediction_intervals : ConformalIntervals or None, default None
-        Configuration for conformal prediction intervals.
-    n_samples : int, default 200
-        Number of Monte Carlo samples for prediction intervals.
-    """
-
-    def __init__(
-        self,
-        season_length: int = 1,
-        decomposition_type: str = "multiplicative",
-        alias: str = "Theta",
-        prediction_intervals: ConformalIntervals = None,
-        n_samples: int = 200,
-    ):
-        super().__init__(
-            season_length=season_length,
-            model="STM",
-            decomposition_type=decomposition_type,
-            alias=alias,
-            prediction_intervals=prediction_intervals,
-            n_samples=n_samples,
-        )
+    if name in ("AutoTheta", "Theta"):
+        from auto_theta import AutoTheta, Theta  # noqa: F811
+        if name == "AutoTheta":
+            return AutoTheta
+        return Theta
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
