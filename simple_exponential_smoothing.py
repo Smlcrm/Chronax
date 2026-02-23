@@ -15,7 +15,7 @@ Where:
     - T is the final observation index
 
 Implementation:
-    - Uses jax.lax.scan for efficient recursive computation of fitted values
+    - Uses jax.lax.fori_loop for efficient recursive computation of fitted values
     - JIT-compiled with static_argnums for h and fitted parameters
     - Integrates with BaseForecaster for conformal prediction intervals
 
@@ -45,35 +45,6 @@ import utils
 # Core JAX Functions
 # ============================================================================
 
-def _ses_forecast(x: jnp.ndarray, alpha: float) -> tuple[float, jnp.ndarray]:
-    """
-    Compute one-step ahead SES forecast using jax.lax.scan.
-    
-    Recursion:
-        fitted[0] = x[0]
-        fitted[i] = alpha * x[i-1] + (1-alpha) * fitted[i-1]
-        forecast = alpha * x[-1] + (1-alpha) * fitted[-1]
-    
-    Args:
-        x: Time series, shape (n,)
-        alpha: Smoothing parameter in [0,1]
-        
-    Returns:
-        (forecast, fitted_values) where fitted[0] is NaN
-    """
-    complement = 1.0 - alpha
-    
-    def scan_fn(prev_fitted, x_prev):
-        curr_fitted = alpha * x_prev + complement * prev_fitted
-        return curr_fitted, curr_fitted
-    
-    init_fitted = x[0]
-    final_fitted, fitted_rest = jax.lax.scan(scan_fn, init_fitted, x[:-1])
-    forecast = alpha * x[-1] + complement * final_fitted
-    fitted = jnp.concatenate([jnp.array([jnp.nan]), fitted_rest])
-    
-    return forecast, fitted
-
 
 @_partial(jax.jit, static_argnums=(2, 3))
 def _ses(y: jnp.ndarray, alpha: float, h: int, fitted: bool) -> dict:
@@ -90,7 +61,7 @@ def _ses(y: jnp.ndarray, alpha: float, h: int, fitted: bool) -> dict:
     Returns:
         Dict with "mean" and optionally "fitted"
     """
-    fcst, fitted_vals = _ses_forecast(y, alpha)
+    fcst, fitted_vals = utils._ses_forecast(y, alpha)
     out = {"mean": utils._repeat_val(val=fcst, h=h)}
     if fitted:
         out["fitted"] = fitted_vals

@@ -2,7 +2,6 @@
 SeasonalExponentialSmoothing model with self-contained pure function kernels.
 All math/logic lives in pure functions; the class is a barebones orchestrator.
 """
-import math
 from functools import partial
 from typing import Optional, List, Dict, Tuple
 
@@ -12,56 +11,28 @@ from jax import lax
 
 from conformal_intervals import ConformalIntervals
 from base_forecaster import BaseForecaster
+import utils
+from utils import (
+    ensure_float,
+    _repeat_val_seas,
+    _add_conformal_distribution_intervals,
+    _get_conformal_method,
+    _conformal_method,
+    _store_cs,
+    _add_conformal_intervals,
+    _add_predict_conformal_intervals,
+)
 
 
 # =============================================================================
 # PURE FUNCTION KERNELS
 # =============================================================================
 # Architecture (functional, like auto_arima):
-#   - _ses_forecast: core SES for a single season slice (JIT)
-#   - _seasonal_exponential_smoothing: main kernel - per-season SES + tile (pure)
-#   - _repeat_val_seas: forecast tiling (JIT)
+#   - _ses_forecast_masked: SES over first n_eff elements of a padded slice (JIT)
+#   - _seasonal_exponential_smoothing_jit: main kernel - vmap over seasons + tile (JIT)
+#   - _seasonal_exponential_smoothing: dispatcher (pure, handles n < season_length edge case)
 #   - Class: barebones orchestrator, delegates to kernels above
 # =============================================================================
-
-def ensure_float(y: jnp.ndarray) -> jnp.ndarray:
-    if not jnp.issubdtype(y.dtype, jnp.floating):
-        return y.astype(jnp.float32)
-    return y
-
-
-@partial(jax.jit, static_argnums=(1,))
-def _repeat_val_seas(season_vals: jnp.ndarray, h: int) -> jnp.ndarray:
-    """
-    Tile seasonal values to cover forecast horizon h.
-    JAX equivalent of statsforecast.utils._repeat_val_seas()
-    """
-    repeats = math.ceil(h / season_vals.size)
-    return jnp.tile(season_vals, repeats)[:h]
-
-
-@jax.jit
-def _ses_forecast(x: jnp.ndarray, alpha: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """One-step ahead forecast and in-sample fitted values for SES."""
-    x = ensure_float(x)
-    dtype = x.dtype
-    alpha = jnp.asarray(alpha, dtype=dtype)
-    complement = jnp.asarray(1.0, dtype=dtype) - alpha
-
-    n = x.shape[0]
-    fitted = jnp.empty_like(x)
-    fitted = fitted.at[0].set(x[0])
-
-    def body_fun(i, carry):
-        j, fitted_arr = carry
-        next_val = alpha * x[j] + complement * fitted_arr[j]
-        fitted_arr = fitted_arr.at[i].set(next_val)
-        return (j + 1, fitted_arr)
-
-    _, fitted = lax.fori_loop(1, n, body_fun, (0, fitted))
-    forecast = alpha * x[n - 1] + complement * fitted[n - 1]
-    fitted = fitted.at[0].set(jnp.asarray(jnp.nan, dtype=dtype))
-    return forecast, fitted
 
 
 @jax.jit
@@ -156,69 +127,6 @@ def _seasonal_exponential_smoothing(
         return {"mean": jnp.full(h, jnp.nan, dtype=y.dtype)}
 
     return _seasonal_exponential_smoothing_jit(y, h, fitted, season_length, alpha)
-
-
-def _add_conformal_distribution_intervals(
-    fcst: dict,
-    cs: jnp.ndarray,
-    level: list,
-) -> dict:
-    """
-    Adds conformal intervals to the `fcst` dict based on conformal scores `cs`.
-    `level` should be already sorted.
-    """
-    level = sorted(level)
-    alphas = jnp.array([100 - lv for lv in level], dtype=jnp.float32)
-    cuts_lower = (alphas / 200.0)[::-1]
-    cuts_upper = 1.0 - (alphas / 200.0)
-    cuts = jnp.concatenate([cuts_lower, cuts_upper])
-
-    mean = fcst["mean"].reshape(1, -1)
-    scores = jnp.vstack([mean - cs, mean + cs])
-    quantiles = jnp.quantile(scores, cuts, axis=0)
-
-    lo_cols = [f"lo-{lv}" for lv in reversed(level)]
-    hi_cols = [f"hi-{lv}" for lv in level]
-    out_cols = lo_cols + hi_cols
-
-    for i, col in enumerate(out_cols):
-        fcst[col] = quantiles[i]
-
-    return fcst
-
-
-def _get_conformal_method(method: str):
-    available_methods = {
-        "conformal_distribution": _add_conformal_distribution_intervals,
-    }
-    if method not in available_methods:
-        raise ValueError(
-            f"prediction intervals method {method} not supported "
-            f"please choose one of {', '.join(available_methods)}"
-        )
-    return available_methods[method]
-
-
-def _conformal_method(self):
-    return _get_conformal_method(self.prediction_intervals.method)
-
-
-def _store_cs(self, y, X):
-    if self.prediction_intervals is not None:
-        self._cs = self.conformity_scores(y, X)
-
-
-def _add_conformal_intervals(self, fcst, y, X, level):
-    if self.prediction_intervals is not None and level is not None:
-        cs = self.conformity_scores(y, X) if y is not None else self._cs
-        conformal_fn = _conformal_method(self)
-        res = conformal_fn(fcst=fcst, cs=cs, level=level)
-        return res
-    return fcst
-
-
-def _add_predict_conformal_intervals(self, fcst, level):
-    return _add_conformal_intervals(self, fcst=fcst, y=None, X=None, level=level)
 
 
 # =============================================================================
