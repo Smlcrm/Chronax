@@ -1,3 +1,6 @@
+
+"""ADIDA forecaster implementation."""
+
 import jax.numpy as jnp
 from jax import jit, lax
 from functools import lru_cache
@@ -12,7 +15,7 @@ from utils import (
     _store_cs,
 )
 from base_forecaster import BaseForecaster
-from typing import Optional, List
+from typing import Callable, Dict, List, Optional, Tuple
 from conformal_intervals import ConformalIntervals
 import warnings
 
@@ -23,8 +26,12 @@ _ALPHA_SEARCH_ITERS = 8
 
 _JIT_MIN_CHUNKS = 2
 
+ForecastDict = Dict[str, jnp.ndarray]
+ChunkForecastRunner = Callable[[jnp.ndarray], jnp.ndarray]
+
 
 def _interval_mean(y: jnp.ndarray) -> jnp.ndarray:
+    """Compute the average interval between non-zero observations."""
     nonzero_mask = y != 0
     nonzero_count = jnp.count_nonzero(nonzero_mask)
     if nonzero_count == 0:
@@ -38,10 +45,13 @@ def _interval_mean(y: jnp.ndarray) -> jnp.ndarray:
 
 
 def _ses_sse(alpha: jnp.ndarray, x: jnp.ndarray) -> jnp.ndarray:
+    """Return the sum of squared one-step errors for SES."""
     complement = 1.0 - alpha
     init_carry = (x[0], jnp.array(0.0, dtype=x.dtype))
 
-    def body(i: int, carry):
+    def body(
+        i: int, carry: Tuple[jnp.ndarray, jnp.ndarray]
+    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
         forecast, sse = carry
         forecast = alpha * x[i - 1] + complement * forecast
         err = x[i] - forecast
@@ -52,9 +62,10 @@ def _ses_sse(alpha: jnp.ndarray, x: jnp.ndarray) -> jnp.ndarray:
 
 
 def _ses_forecast(alpha: jnp.ndarray, x: jnp.ndarray) -> jnp.ndarray:
+    """Compute the next SES forecast for an aggregated series."""
     complement = 1.0 - alpha
 
-    def body(i: int, forecast: jnp.ndarray):
+    def body(i: int, forecast: jnp.ndarray) -> jnp.ndarray:
         return alpha * x[i - 1] + complement * forecast
 
     fitted_last = lax.fori_loop(1, x.shape[0], body, x[0])
@@ -62,6 +73,7 @@ def _ses_forecast(alpha: jnp.ndarray, x: jnp.ndarray) -> jnp.ndarray:
 
 
 def _optimized_ses_forecast(x: jnp.ndarray) -> jnp.ndarray:
+    """Optimize alpha via golden-section search and produce SES forecast."""
     left = jnp.array(_ALPHA_LOWER, dtype=x.dtype)
     right = jnp.array(_ALPHA_UPPER, dtype=x.dtype)
     ratio = jnp.array(_GOLDEN_RATIO, dtype=x.dtype)
@@ -70,10 +82,29 @@ def _optimized_ses_forecast(x: jnp.ndarray) -> jnp.ndarray:
     fc = _ses_sse(c, x)
     fd = _ses_sse(d, x)
 
-    def step(_: int, state):
+    def step(
+        _: int,
+        state: Tuple[
+            jnp.ndarray,
+            jnp.ndarray,
+            jnp.ndarray,
+            jnp.ndarray,
+            jnp.ndarray,
+            jnp.ndarray,
+        ],
+    ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         left, right, c, d, fc, fd = state
 
-        def keep_left(curr):
+        def keep_left(
+            curr: Tuple[
+                jnp.ndarray,
+                jnp.ndarray,
+                jnp.ndarray,
+                jnp.ndarray,
+                jnp.ndarray,
+                jnp.ndarray,
+            ]
+        ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
             left, right, c, d, fc, fd = curr
             right = d
             d = c
@@ -82,7 +113,16 @@ def _optimized_ses_forecast(x: jnp.ndarray) -> jnp.ndarray:
             fc = _ses_sse(c, x)
             return left, right, c, d, fc, fd
 
-        def keep_right(curr):
+        def keep_right(
+            curr: Tuple[
+                jnp.ndarray,
+                jnp.ndarray,
+                jnp.ndarray,
+                jnp.ndarray,
+                jnp.ndarray,
+                jnp.ndarray,
+            ]
+        ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
             left, right, c, d, fc, fd = curr
             left = c
             c = d
@@ -100,7 +140,8 @@ def _optimized_ses_forecast(x: jnp.ndarray) -> jnp.ndarray:
     return _ses_forecast(alpha, x)
 
 
-def _chunk_forecast_impl(series: jnp.ndarray, aggregation_level: int):
+def _chunk_forecast_impl(series: jnp.ndarray, aggregation_level: int) -> jnp.ndarray:
+    """Forecast aggregated chunks and return the next aggregated sum."""
     lost_remainder_data = series.shape[0] % aggregation_level
     y_cut = series[lost_remainder_data:]
     n_chunks = y_cut.shape[0] // aggregation_level
@@ -119,16 +160,18 @@ def _chunk_forecast_impl(series: jnp.ndarray, aggregation_level: int):
 
 
 @lru_cache(maxsize=256)
-def _get_chunk_forecast_runner(aggregation_level: int):
+def _get_chunk_forecast_runner(aggregation_level: int) -> ChunkForecastRunner:
+    """Return a cached JIT runner specialized for an aggregation level."""
     aggregation_level = max(1, int(aggregation_level))
 
     @jit
-    def _run(series: jnp.ndarray):
+    def _run(series: jnp.ndarray) -> jnp.ndarray:
         return _chunk_forecast_impl(series, aggregation_level)
 
     return _run
 
-def _chunk_forecast_fast(y: jnp.ndarray, aggregation_level: int):
+def _chunk_forecast_fast(y: jnp.ndarray, aggregation_level: int) -> jnp.ndarray:
+    """Use cached JIT path when enough chunks are available."""
     aggregation_level = max(1, int(aggregation_level))
     n_chunks = y.shape[0] // aggregation_level
 
@@ -139,14 +182,16 @@ def _chunk_forecast_fast(y: jnp.ndarray, aggregation_level: int):
     return _get_chunk_forecast_runner(aggregation_level)(y)
 
 
-def _repeat_val_jax(val: jnp.ndarray, h: int):
+def _repeat_val_jax(val: jnp.ndarray, h: int) -> jnp.ndarray:
+    """Create a length-``h`` vector with a repeated scalar value."""
     return jnp.full((h,), val)
 
 
 def _adida_point(
     y: jnp.ndarray,  # time series
     h: int,  # forecasting horizon
-):
+) -> ForecastDict:
+    """Generate ADIDA point forecasts for horizon ``h``."""
     mean_interval = _interval_mean(y)
     aggregation_level = max(1, int(jnp.round(mean_interval).item()))
     sums_forecast = _chunk_forecast_fast(y, aggregation_level)
@@ -158,7 +203,8 @@ def _adida(
     y: jnp.ndarray,  # time series
     h: int,  # forecasting horizon
     fitted: bool,  # fitted values
-):
+) -> ForecastDict:
+    """Compute ADIDA forecasts and optional in-sample fitted values."""
     if not fitted:
         return _adida_point(y=y, h=h)
 
@@ -191,7 +237,10 @@ def _adida(
     return res
 
 
-def _fit_adida(model: "ADIDA", y: jnp.ndarray, X: Optional[jnp.ndarray]):
+def _fit_adida(
+    model: "ADIDA", y: jnp.ndarray, X: Optional[jnp.ndarray]
+) -> "ADIDA":
+    """Fit ADIDA state needed for fast future predictions."""
     y = ensure_float(y)
     model._y = y
     model.model_ = _adida_point(y=y, h=1)
@@ -200,7 +249,8 @@ def _fit_adida(model: "ADIDA", y: jnp.ndarray, X: Optional[jnp.ndarray]):
     return model
 
 
-def _point_predict(model: "ADIDA", h: int):
+def _point_predict(model: "ADIDA", h: int) -> ForecastDict:
+    """Create repeated point forecasts from fitted ADIDA mean."""
     return {"mean": _repeat_val_jax(val=model.model_["mean"][0], h=h)}
 
 
@@ -209,7 +259,8 @@ def _predict_without_intervals(
     h: int,
     X: Optional[jnp.ndarray],
     level: Optional[List[int]],
-):
+) -> ForecastDict:
+    """Predict horizon ``h`` without prediction intervals."""
     del X, level
     return _point_predict(model, h)
 
@@ -219,7 +270,8 @@ def _predict_with_intervals(
     h: int,
     X: Optional[jnp.ndarray],
     level: Optional[List[int]],
-):
+) -> ForecastDict:
+    """Predict horizon ``h`` and optionally add conformal intervals."""
     del X
     res = _point_predict(model, h)
     if level is None:
@@ -227,7 +279,10 @@ def _predict_with_intervals(
     return _add_predict_conformal_intervals(model, res, sorted(level))
 
 
-def _forecast_core(y: jnp.ndarray, h: int, fitted: bool):
+def _forecast_core(
+    y: jnp.ndarray, h: int, fitted: bool
+) -> Tuple[jnp.ndarray, ForecastDict]:
+    """Shared forecast path returning cleaned input and outputs."""
     y = ensure_float(y)
     res = _adida(y=y, h=h, fitted=True) if fitted else _adida_point(y=y, h=h)
     return y, res
@@ -241,7 +296,8 @@ def _forecast_without_intervals(
     X_future: Optional[jnp.ndarray],
     level: Optional[List[int]],
     fitted: bool,
-):
+) -> ForecastDict:
+    """Forecast without interval computation."""
     del model, X, X_future, level
     _, res = _forecast_core(y=y, h=h, fitted=fitted)
     return res
@@ -255,7 +311,8 @@ def _forecast_with_intervals(
     X_future: Optional[jnp.ndarray],
     level: Optional[List[int]],
     fitted: bool,
-):
+) -> ForecastDict:
+    """Forecast and add conformal/fitted intervals when requested."""
     del X_future
     y, res = _forecast_core(y=y, h=h, fitted=fitted)
     if level is None:
@@ -268,7 +325,10 @@ def _forecast_with_intervals(
     return res
 
 
-def _predict_in_sample_adida(model: "ADIDA", level: Optional[List[int]] = None):
+def _predict_in_sample_adida(
+    model: "ADIDA", level: Optional[List[int]] = None
+) -> ForecastDict:
+    """Return in-sample fitted values and optional intervals."""
     fitted = _adida(y=model._y, h=1, fitted=True)["fitted"]
     res = {"fitted": fitted}
     if level is not None:
@@ -282,7 +342,7 @@ class ADIDA(BaseForecaster):
         self,
         alias: str = "ADIDA",
         prediction_intervals: Optional[ConformalIntervals] = None,
-    ):
+    ) -> None:
         """ADIDA model.
 
         Aggregate-Dissagregate Intermittent Demand Approach: Uses temporal aggregation to reduce the
@@ -321,7 +381,7 @@ class ADIDA(BaseForecaster):
         self,
         y: jnp.ndarray,
         X: Optional[jnp.ndarray] = None,
-    ):
+    ) -> "ADIDA":
         """Fit the ADIDA model.
 
         Fit an ADIDA to a time series (numpy array) `y`.
@@ -340,7 +400,7 @@ class ADIDA(BaseForecaster):
         h: int,
         X: Optional[jnp.ndarray] = None,
         level: Optional[List[int]] = None,
-    ):
+    ) -> ForecastDict:
         """Predict with fitted ADIDA.
 
         Args:
@@ -353,7 +413,7 @@ class ADIDA(BaseForecaster):
         """
         return self._predict_impl(self, h, X, level)
 
-    def predict_in_sample(self, level: Optional[List[int]] = None):
+    def predict_in_sample(self, level: Optional[List[int]] = None) -> ForecastDict:
         """Access fitted ADIDA insample predictions.
 
         Args:
@@ -372,7 +432,7 @@ class ADIDA(BaseForecaster):
         X_future: Optional[jnp.ndarray] = None,
         level: Optional[List[int]] = None,
         fitted: bool = False,
-    ):
+    ) -> ForecastDict:
         """Memory Efficient ADIDA predictions.
 
         This method avoids memory burden due from object storage.
@@ -391,7 +451,7 @@ class ADIDA(BaseForecaster):
             dict: Dictionary with entries `mean` for point predictions and `level_*` for probabilistic predictions.
         """
         return self._forecast_impl(self, y, h, X, X_future, level, fitted)
-    
+
 # # Test Cases
 # def test():
 #     # simple increasing series
