@@ -1,7 +1,58 @@
+"""
+File: test_loss_functions.py
+
+High-level Purpose:
+    Validates correctness and numerical stability of forecasting loss functions
+    implemented in `loss_functions.py` through deterministic, edge-case, and
+    cross-framework consistency tests.
+
+Problem Solved:
+    Ensures metric implementations remain mathematically consistent with
+    reference NumPy/TensorFlow calculations and robust under common corner cases
+    such as zeros, negatives, and shape broadcasting behavior.
+
+Architectural Role:
+    Acts as the regression and verification layer for the metrics subsystem in
+    the forecasting codebase, protecting downstream benchmark and model quality
+    evaluations from silent metric drift.
+
+Major Classes/Functions:
+    - Fixtures: `test_data`, `multi_quantile_data`.
+    - Unit tests for all exported deterministic and probabilistic losses.
+    - Parametrized tests for dtype behavior and numerical edge cases.
+
+External Dependencies:
+    - `pytest`, `numpy`
+    - `jax.numpy`
+    - `tensorflow` (cross-validation baseline)
+    - `loss_functions` module under test
+
+Expected Inputs and Outputs:
+    - Input: synthetic fixture arrays and parameterized metric configurations.
+    - Output: pytest pass/fail assertions; no returned runtime data.
+
+Example:
+    >>> # pytest -q test_loss_functions.py
+
+Assumptions:
+    - TensorFlow is available in the test environment for cross-checks.
+    - JAX and NumPy produce numerically comparable float outputs under test
+      tolerances.
+
+Side Effects:
+    - Executes test assertions and can raise failures via pytest.
+
+Author:
+    Auto-documented
+Date:
+    2026-02-21
+"""
+
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.scipy.special import xlogy  # Import xlogy for Tweedie deviance calculation
+from typing import Any, Callable, Tuple
 
 # --- New Imports ---
 import tensorflow as tf  # Import TensorFlow for cross-validation
@@ -12,7 +63,7 @@ from loss_functions import *
 # --- Fixtures --- #
 
 @pytest.fixture
-def test_data():
+def test_data() -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Basic test data, now as 4D tensors."""
     # Shape (B, C, H, W) -> (1, 1, 2, 3) = 6 elements
     y_true = jnp.array([[[[10.0, 20.0, 30.0],
@@ -25,7 +76,7 @@ def test_data():
     return y_true, y_pred, y_seasonal
 
 @pytest.fixture
-def multi_quantile_data():
+def multi_quantile_data() -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Data for multi-quantile losses, now as 4D/5D tensors."""
     # y_true: (B, C, H, W) -> (1, 1, 2, 2) = 4 elements
     y_true = jnp.array([[[[10.0, 20.0],
@@ -44,7 +95,35 @@ def multi_quantile_data():
 
 # --- Tests for Scale-Dependent Errors --- #
 
-def test_mean_absolute_error(test_data):
+def test_mean_absolute_error(test_data: Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]) -> None:
+    """
+    Validate that mean_absolute_error matches NumPy and TensorFlow references.
+
+    Detailed Description:
+        Computes MAE using the module's mean_absolute_error on the fixture
+        (y_true, y_pred, y_seasonal). Asserts that the result is close to the
+        same value computed with NumPy (np.mean(np.abs(y_true - y_pred))) and
+        to the TensorFlow equivalent (tf.reduce_mean(tf.abs(y_true_tf - y_pred_tf))),
+        within relative tolerance 1e-6. Ensures the JAX implementation is
+        numerically correct and consistent across frameworks.
+
+    Args:
+        test_data (Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]): Fixture
+            (y_true, y_pred, y_seasonal); only first two are used for MAE.
+
+    Returns:
+        None. Fails via pytest if any assertion fails.
+
+    Raises:
+        AssertionError: If JAX result differs from NumPy or TensorFlow beyond rtol.
+
+    Side Effects:
+        None. Pure comparison and assert.
+
+    Notes:
+        Role: Regression test for the core MAE metric used by scaled and
+        relative metrics; guards against implementation drift.
+    """
     y_true, y_pred, _ = test_data  # Unpack the fixture data, ignoring the seasonal component
     
     # 1. Calculate JAX implementation
@@ -60,7 +139,8 @@ def test_mean_absolute_error(test_data):
     expected_tf = tf.reduce_mean(tf.abs(y_true_tf - y_pred_tf))
     np.testing.assert_allclose(actual, expected_tf.numpy(), rtol=1e-6)
 
-def test_mean_squared_error(test_data):
+def test_mean_squared_error(test_data: Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]) -> None:
+    """Validate MSE against NumPy and TensorFlow baselines."""
     y_true, y_pred, _ = test_data
     
     # 1. JAX
@@ -76,7 +156,8 @@ def test_mean_squared_error(test_data):
     expected_tf = tf.reduce_mean(tf.square(y_true_tf - y_pred_tf))
     np.testing.assert_allclose(actual, expected_tf.numpy(), rtol=1e-6)
 
-def test_root_mean_squared_error(test_data):
+def test_root_mean_squared_error(test_data: Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]) -> None:
+    """Validate RMSE against NumPy and TensorFlow baselines."""
     y_true, y_pred, _ = test_data
     
     # 1. JAX
@@ -92,7 +173,8 @@ def test_root_mean_squared_error(test_data):
     expected_tf = tf.sqrt(tf.reduce_mean(tf.square(y_true_tf - y_pred_tf)))
     np.testing.assert_allclose(actual, expected_tf.numpy(), rtol=1e-6)
 
-def test_bias(test_data):
+def test_bias(test_data: Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]) -> None:
+    """Validate element-wise bias computation across frameworks."""
     y_true, y_pred, _ = test_data
     
     # 1. JAX
@@ -108,7 +190,8 @@ def test_bias(test_data):
     expected_tf = y_pred_tf - y_true_tf
     np.testing.assert_allclose(actual, expected_tf.numpy(), rtol=1e-6)
 
-def test_cfe(test_data):
+def test_cfe(test_data: Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]) -> None:
+    """Validate cumulative forecast error sequence behavior."""
     y_true, y_pred, _ = test_data
     
     # 1. JAX
@@ -125,7 +208,8 @@ def test_cfe(test_data):
     expected_tf = tf.cumsum(errors_flat)
     np.testing.assert_allclose(actual, expected_tf.numpy(), rtol=1e-6)
 
-def test_pis(test_data):
+def test_pis(test_data: Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]) -> None:
+    """Validate absolute cumulative forecast error implementation."""
     y_true, y_pred, _ = test_data
 
     # 1. JAX
@@ -142,7 +226,8 @@ def test_pis(test_data):
     expected_tf = tf.abs(tf.cumsum(errors_flat))
     np.testing.assert_allclose(actual, expected_tf.numpy(), rtol=1e-6)
 
-def test_spis(test_data):
+def test_spis(test_data: Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]) -> None:
+    """Validate scaled period-in-stock metric implementation."""
     y_true, y_pred, _ = test_data
     
     # 1. JAX
@@ -165,7 +250,8 @@ def test_spis(test_data):
 
 # --- Tests for Percentage Errors --- #
 
-def test_mean_absolute_percentage_error(test_data):
+def test_mean_absolute_percentage_error(test_data: Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]) -> None:
+    """Validate MAPE implementation against reference baselines."""
     y_true, y_pred, _ = test_data
     
     # 1. JAX
@@ -181,7 +267,8 @@ def test_mean_absolute_percentage_error(test_data):
     expected_tf = tf.reduce_mean(tf.abs(y_true_tf - y_pred_tf) / tf.abs(y_true_tf))
     np.testing.assert_allclose(actual, expected_tf.numpy(), rtol=1e-6)
 
-def test_symmetric_mean_absolute_percentage_error(test_data):
+def test_symmetric_mean_absolute_percentage_error(test_data: Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]) -> None:
+    """Validate SMAPE implementation against reference baselines."""
     y_true, y_pred, _ = test_data
     
     # 1. JAX
@@ -199,7 +286,8 @@ def test_symmetric_mean_absolute_percentage_error(test_data):
 
 # --- Tests for Scale-Independent Errors --- #
 
-def test_mean_absolute_scaled_error(test_data):
+def test_mean_absolute_scaled_error(test_data: Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]) -> None:
+    """Validate MASE implementation against NumPy and TensorFlow."""
     y_true, y_pred, y_seasonal = test_data
     
     # 1. JAX
@@ -220,7 +308,8 @@ def test_mean_absolute_scaled_error(test_data):
     expected_tf = tf.reduce_mean(num_tf / (den_tf + 1e-8))
     np.testing.assert_allclose(actual, expected_tf.numpy(), rtol=1e-6)
 
-def test_relative_mean_absolute_error(test_data):
+def test_relative_mean_absolute_error(test_data: Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]) -> None:
+    """Validate relative MAE implementation against reference baselines."""
     y_true, y_pred, y_base = test_data # using y_seasonal as y_base
     
     # 1. JAX
@@ -241,7 +330,8 @@ def test_relative_mean_absolute_error(test_data):
     expected_tf = tf.reduce_mean(num_tf / (den_tf + 1e-8))
     np.testing.assert_allclose(actual, expected_tf.numpy(), rtol=1e-6)
 
-def test_normalized_deviation(test_data):
+def test_normalized_deviation(test_data: Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]) -> None:
+    """Validate normalized deviation metric implementation."""
     y_true, y_pred, _ = test_data
     
     # 1. JAX
@@ -261,7 +351,8 @@ def test_normalized_deviation(test_data):
     expected_tf = num_tf / (den_tf + 1e-8)
     np.testing.assert_allclose(actual, expected_tf.numpy(), rtol=1e-6)
 
-def test_mean_squared_scaled_error(test_data):
+def test_mean_squared_scaled_error(test_data: Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]) -> None:
+    """Validate MSSE implementation against reference baselines."""
     y_true, y_pred, y_seasonal = test_data
     
     # 1. JAX
@@ -282,7 +373,8 @@ def test_mean_squared_scaled_error(test_data):
     expected_tf = tf.reduce_mean(num_tf / (den_tf + 1e-8))
     np.testing.assert_allclose(actual, expected_tf.numpy(), rtol=1e-6)
 
-def test_root_mean_squared_scaled_error(test_data):
+def test_root_mean_squared_scaled_error(test_data: Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]) -> None:
+    """Validate RMSSE implementation against reference baselines."""
     y_true, y_pred, y_seasonal = test_data
     
     # 1. JAX
@@ -305,7 +397,33 @@ def test_root_mean_squared_scaled_error(test_data):
 
 # --- Tests for Quantile Losses --- #
 
-def test_quantile_loss_basic():
+def test_quantile_loss_basic() -> None:
+    """
+    Check quantile loss asymmetry for over- vs under-prediction at q=0.1 and q=0.9.
+
+    Detailed Description:
+        For a known (y, y_over, y_under) setup, verifies that at q=0.1
+        overestimation gives loss 0.9 and underestimation 0.1, and at q=0.9
+        the opposite. Cross-validates the same logic with TensorFlow's
+        maximum(q*delta, (q-1)*delta) and asserts consistency. Confirms the
+        pinball loss penalizes errors in the correct direction per quantile.
+
+    Args:
+        None. Uses fixed in-test arrays.
+
+    Returns:
+        None. Fails via pytest on assertion error.
+
+    Raises:
+        AssertionError: If expected loss values or TF comparison fail.
+
+    Side Effects:
+        None.
+
+    Notes:
+        Role: Sanity test for quantile loss used in quantile regression and
+        probabilistic metrics (MQL, CRPS-style).
+    """
     """Test quantile loss with known over/under estimation."""
     y = jnp.array([[1.0, 2.0, 3.0],
                    [1.5, 2.5, 3.5]]).reshape(1, 1, 2, 3)
@@ -342,7 +460,8 @@ def test_quantile_loss_basic():
     np.testing.assert_allclose(actual_under, expected_tf_under_2.numpy(), rtol=1e-6)
 
 
-def test_scaled_quantile_loss(test_data):
+def test_scaled_quantile_loss(test_data: Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]) -> None:
+    """Validate scaled quantile loss computation."""
     y_true, y_pred, y_seasonal = test_data
     q = 0.25  # Set a specific quantile level for the test
     
@@ -366,7 +485,8 @@ def test_scaled_quantile_loss(test_data):
     expected_tf = num_tf / (den_tf + 1e-8)
     np.testing.assert_allclose(actual, expected_tf.numpy(), rtol=1e-6)
 
-def test_multi_quantile_loss(multi_quantile_data):
+def test_multi_quantile_loss(multi_quantile_data: Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]) -> None:
+    """Validate multi-quantile pinball loss computation."""
     y_true, y_pred_quantiles, quantiles, _ = multi_quantile_data
 
     # 1. JAX
@@ -395,7 +515,8 @@ def test_multi_quantile_loss(multi_quantile_data):
     expected_tf = tf.reduce_mean(loss_tf)
     np.testing.assert_allclose(actual, expected_tf.numpy(), rtol=1e-6)
 
-def test_scaled_multi_quantile_loss(multi_quantile_data):
+def test_scaled_multi_quantile_loss(multi_quantile_data: Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]) -> None:
+    """Validate scaled multi-quantile loss computation."""
     y_true, y_pred_quantiles, quantiles, y_seasonal = multi_quantile_data
 
     # 1. JAX
@@ -427,7 +548,8 @@ def test_scaled_multi_quantile_loss(multi_quantile_data):
 
 # --- Tests for Probabilistic Metrics --- #
 
-def test_coverage():
+def test_coverage() -> None:
+    """Validate empirical interval coverage computation."""
     y = jnp.array([[[[10, 20, 30, 40, 50], [60, 70, 80, 90, 100]]]])
     
     # Bounds designed to cover the first 7 points (10 through 70) and exclude the last 3 (80, 90, 100).
@@ -447,7 +569,8 @@ def test_coverage():
     expected_tf = tf.reduce_mean(tf.cast(covered_tf, dtype=tf.float32))
     np.testing.assert_allclose(actual, expected_tf.numpy(), rtol=1e-6)
 
-def test_calibration():
+def test_calibration() -> None:
+    """Validate quantile calibration fraction computation."""
     y = jnp.array([10, 20, 30, 40, 50]).reshape(1, 1, 1, 5)      # true values
     y_pred = jnp.array([5, 25, 29, 40, 55]).reshape(1, 1, 1, 5)    # predicted quantile values
     # y <= y_pred: [F,  T,  F,  T,  T] -> 3/5 = 0.6
@@ -463,7 +586,8 @@ def test_calibration():
     expected_tf = tf.reduce_mean(tf.cast(calibrated_tf, dtype=tf.float32))
     np.testing.assert_allclose(actual, expected_tf.numpy(), rtol=1e-6)
 
-def test_scaled_crps(multi_quantile_data):
+def test_scaled_crps(multi_quantile_data: Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]) -> None:
+    """Validate scaled CRPS approximation based on multi-quantile loss."""
     y_true, y_pred_quantiles, quantiles, _ = multi_quantile_data
 
     # 1. JAX
@@ -508,7 +632,13 @@ def test_scaled_crps(multi_quantile_data):
     ]
 )
 
-def test_tweedie_deviance(test_data, power, expected_loss_fn, tf_loss_fn):
+def test_tweedie_deviance(
+    test_data: Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray],
+    power: float,
+    expected_loss_fn: Callable[[np.ndarray, np.ndarray], float],
+    tf_loss_fn: Callable[[tf.Tensor, tf.Tensor], tf.Tensor],
+) -> None:
+    """Validate Tweedie deviance across Gaussian, Poisson, and Gamma cases."""
     y, y_pred, _ = test_data
 
     # # Optionally add a model/channel dimension if needed
@@ -530,7 +660,8 @@ def test_tweedie_deviance(test_data, power, expected_loss_fn, tf_loss_fn):
     expected_tf = tf_loss_fn(y_tf, y_pred_tf)
     np.testing.assert_allclose(actual, expected_tf.numpy(), rtol=1e-4)
 
-def test_tweedie_deviance_zero_handling():
+def test_tweedie_deviance_zero_handling() -> None:
+    """Validate Tweedie Poisson branch behavior when targets contain zeros."""
     # Test power=1 with y=0
     y = jnp.array([1.0, 0.0, 3.0])  # Define true values, including a zero
     y_pred = jnp.array([1.5, 2.0, 2.5])[:, None] # Shape (3, 1)
@@ -564,8 +695,34 @@ def test_tweedie_deviance_zero_handling():
 
 
 
-def test_scaled_error_zero_and_negative_denominator():
-    """Edge case: scaled errors with zero or negative denominators."""
+def test_scaled_error_zero_and_negative_denominator() -> None:
+    """
+    Ensure scaled error metrics remain defined for degenerate denominators.
+
+    Detailed Description:
+        Tests mean_absolute_scaled_error when the seasonal baseline is
+        identical to y_true (zero denominator) and when the baseline differs
+        in a way that could make denominator components negative. Asserts
+        that MASE does not become NaN for the zero case and remains positive
+        in the other, guarding against numerical or definitional edge cases in
+        production use.
+
+    Args:
+        None. Uses small fixed arrays.
+
+    Returns:
+        None. Fails if MASE is NaN or non-positive where it should be valid.
+
+    Raises:
+        AssertionError: If edge-case behavior is incorrect.
+
+    Side Effects:
+        None.
+
+    Notes:
+        Role: Edge-case test for scale-independent metrics when baselines
+        are poor or data is pathological.
+    """
     y_true = jnp.array([10.0, 20.0])
     y_pred = jnp.array([12.0, 18.0])
 
@@ -580,7 +737,7 @@ def test_scaled_error_zero_and_negative_denominator():
     assert mase_neg > 0, "MASE should remain positive even with negative denominator components"
 
 
-def test_quantile_loss_median_equivalence():
+def test_quantile_loss_median_equivalence() -> None:
     """Quantile loss with q=0.5 should behave like MAE/2."""
     y_true = jnp.array([1.0, 2.0, 3.0])
     y_pred = jnp.array([2.0, 1.0, 4.0])
@@ -599,7 +756,7 @@ def test_quantile_loss_median_equivalence():
     np.testing.assert_allclose(ql, ql_tf.numpy(), rtol=1e-6)
 
 
-def test_tweedie_deviance_inverse_gaussian():
+def test_tweedie_deviance_inverse_gaussian() -> None:
     """Tweedie deviance edge case: power > 2 (Inverse Gaussian-like)."""
     y = jnp.array([[[[10.0, 20.0, 30.0],
                      [40.0, 50.0, 60.0]]]])
@@ -616,7 +773,7 @@ def test_tweedie_deviance_inverse_gaussian():
     "metric_fn",
     [mean_absolute_percentage_error, symmetric_mean_absolute_percentage_error, mean_absolute_scaled_error],
 )
-def test_percentage_and_scaled_error_parametrized(metric_fn):
+def test_percentage_and_scaled_error_parametrized(metric_fn: Callable[..., jnp.ndarray]) -> None:
     """Parametrized test to ensure stability across variety."""
     y_true = jnp.array([10.0, 0.0, -5.0, 20.0])  # includes zero and negative
     y_pred = jnp.array([12.0, 1.0, -4.0, 19.0])
@@ -642,7 +799,7 @@ def test_percentage_and_scaled_error_parametrized(metric_fn):
         relative_mean_absolute_error,
     ],
 )
-def test_dtype_preservation(fn):
+def test_dtype_preservation(fn: Callable[..., jnp.ndarray]) -> None:
     """Ensure JAX functions return jnp.ndarray of correct dtype."""
     y_true = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float32)
     y_pred = jnp.array([1.1, 1.9, 3.2], dtype=jnp.float32)

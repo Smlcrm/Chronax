@@ -174,7 +174,7 @@ class SeasonalWindowAverage(BaseForecaster):
         window_size: int,
         alias: str = "SeasWA",
         conformal_params: ConformalIntervals | None = None,
-    ):
+    ) -> None:
         """
         Initialize SeasonalWindowAverage model.
         

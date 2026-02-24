@@ -1,5 +1,5 @@
 """
-The base_forecaster class defines basic attributes and functionalities for all models in statsforecast.
+BaseForecaster defines the shared interface and common infrastructure for all models in Chronax.
 
 Instance Attributes:
 1. alias; model name, declared in model's __init__
@@ -9,47 +9,53 @@ Instance Attributes:
 Class Attributes:
 1. uses_exog; boolean representing model's exogenous variable handling
 
-Methods: 
-1. new() has no signature and returns a shallow copy of the object. 
-   In the event the original object contains a complex data structure, a shallow copy uses a reference to the same object.
-   In contrast, a deep copy duplicates the entire data structure.
+Methods:
+1. new() returns a shallow copy of the object, used internally to clone a model without mutating state.
 
-   The original implementation of new() in statsforecast copies instance attributes from __dict__.
-   Using a dictionary to store instance attributes is flexible, but computationally inefficient.
-   __slots__ provides an efficient alternative for storing instance attributes, but is harder to implement. 
-   new() is implemented twice, once to handle __dict__ and once to handle __slots__. The latter is commented out.
+2. __repr__ returns the model's alias for easy identification.
 
-2. Implementing __repr__ allows users to easily call the name of the model, stored in alias
+3. fit(y, X=None) [abstractmethod]
+   Must be implemented by every subclass. Fits the model to univariate time series y,
+   sets self.model_, and returns self. X is optional exogenous input.
 
-3. conformity_scores()'s signature consists of two arguments, y and X, both JAX arrays, and returns a 2D JAX array, the model's conformity score on y.
-   The second argument, X, is optional to allow exogenous variable handling.
-   A model's conformity score is defined by the absolute difference between the forecasted value and the actual value for h forecasted positions and across n_windows.
+4. predict(h, X=None, level=None) [abstractmethod]
+   Must be implemented by every subclass. Generates h-step-ahead forecasts,
+   returning a dict with at least {"mean": jnp.ndarray}. Optionally adds
+   confidence intervals when level is provided.
 
-   There are two notable changes from the original implementation of conformity_scores. 
-   (a) native error handling: conformity_scores now natively checks that the conformal_params attribute is not None as well as ensuring an adequate number of samples per window.
-       The original implementation used a wrapper function to do so.
-        
-   (b) vectorization of sequential iteration: vmap enables parallelization of a given function.
-       scan_fn is a functional method that calculates the conformity score for a single window.
-       The original implementation uses sequential iteration. 
+5. forecast(y, h, X=None, X_future=None, level=None, fitted=False) [abstractmethod]
+   Must be implemented by every subclass. Stateless fit+predict on y, forecasting h steps ahead.
+   Implementations differ significantly across models (fitted values, model-specific kwargs, etc.).
+   Subclasses may extend the signature with additional optional parameters.
 
-4. add_confidence_intervals()'s signature consists of four arguments: fcst, cs, level, and method. It returns a modified version of fcst. It is a static method.
-   fcst is a dictionary that contains a model's forecast results. cs is the 2D JAX array returned by conformity_scores().
-   level is a list consisting of either ints or floats, denoting the desired confidence interval. method is a string denoting the conformal method.
-   Using the model's conformity score, this method calculates the confidence interval of the model's forecasted values, based on the specified level(s) and conformal method.
+6. forward(y, h, X=None, X_future=None, level=None, fitted=False) [concrete, overridable]
+   Updates the model on new data y and forecasts h steps ahead. Default delegates to forecast().
+   Subclasses with warm-start re-estimation (e.g. Holt, HoltWinters, ETS) override this.
+
+7. conformity_scores(y, X=None) computes the model's conformity score on y as a 2D JAX array.
+   A model's conformity score is the absolute difference between forecasted and actual values
+   across h positions and n_windows. Uses vmap for parallelization over windows.
+
+8. add_confidence_intervals(fcst, cs, level, method) [staticmethod]
+   Adds conformal prediction intervals to a forecast dict using pre-computed conformity scores.
 
 Notes:
--  Exogenous variable support is model-specific, not framework-level. 
-   The boolean uses_exog must be overriden in the model's implementation.
+-  Exogenous variable support is model-specific, not framework-level.
+   The boolean uses_exog must be overridden in the model's implementation.
+-  Known signature inconsistencies in subclasses (future fixes):
+   Naive and RandomWalkWithDrift use reversed (h, y) order in forecast/forward.
+   RandomWalkWithDrift.predict is missing the X parameter.
+   AutoCES.forecast is missing level and fitted parameters.
 """
 import jax
 import jax.numpy as jnp
 import utils
+from abc import ABC, abstractmethod
 from jax import lax, vmap
 
 from utils import _get_conformal_method
 
-class BaseForecaster:
+class BaseForecaster(ABC):
     uses_exog = False
 
     def new(self):
@@ -74,6 +80,52 @@ class BaseForecaster:
 
     def __repr__(self):
         return self.alias
+
+    @abstractmethod
+    def fit(self, y: jnp.ndarray, X: jnp.ndarray | None = None) -> "BaseForecaster":
+        """
+        Fit the model to univariate time series y.
+        Must set self.model_ and return self.
+        """
+
+    @abstractmethod
+    def predict(self, h: int, X: jnp.ndarray | None = None, level: list[int | float] | None = None) -> dict:
+        """
+        Generate h-step-ahead forecasts.
+        Returns a dict with at least {"mean": jnp.ndarray}.
+        """
+
+    @abstractmethod
+    def forecast(
+        self,
+        y: jnp.ndarray,
+        h: int,
+        X: jnp.ndarray | None = None,
+        X_future: jnp.ndarray | None = None,
+        level: list[int | float] | None = None,
+        fitted: bool = False,
+    ) -> dict:
+        """
+        Stateless fit+predict on y, forecasting h steps ahead.
+        Must return a dict with at least {"mean": jnp.ndarray}.
+        Subclasses may extend the signature with model-specific optional parameters.
+        """
+
+    def forward(
+        self,
+        y: jnp.ndarray,
+        h: int,
+        X: jnp.ndarray | None = None,
+        X_future: jnp.ndarray | None = None,
+        level: list[int | float] | None = None,
+        fitted: bool = False,
+    ) -> dict:
+        """
+        Update the model on new data y and forecast h steps ahead.
+        Default delegates to forecast(). Subclasses with warm-start
+        behavior (e.g. Holt, HoltWinters, ETS) override this.
+        """
+        return self.forecast(y=y, h=h, X=X, X_future=X_future, level=level, fitted=fitted)
 
     def conformity_scores(
         self,

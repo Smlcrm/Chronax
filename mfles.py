@@ -1,54 +1,66 @@
 """
 MFLES (Multi-Feature Locally Exponential Smoothing) in JAX
 
-This module implements an advanced forecasting model that combines multiple components:
-- Linear trend with optional changepoints (piecewise linear via LASSO)
-- Multiple seasonal patterns (Fourier series representation)
-- Residual smoothing (Simple Exponential Smoothing ensemble)
-- Exogenous variables support
-- Robust estimation options (Siegel repeated medians)
+Implements a StatsForecast-compatible MFLES model that combines multiple
+additive components fitted iteratively to residuals, fully JIT-compiled
+via lax.while_loop for performance.
+
+**Components:**
+- Piecewise linear trend with adaptive changepoints (LASSO, fraction-based knot selection)
+- Multiple seasonal patterns via Fourier series (OLS or weighted OLS)
+- Residual smoothing via SES ensemble ("lite" mode) or rolling means ("full" mode)
+- Optional exogenous variables via OLS
+- Robust estimation via Siegel repeated medians (auto-detected or user-specified)
 
 **Algorithm:**
-MFLES iteratively fits components to residuals:
-1. Initial median-based estimates
-2. Seasonal components via Fourier series + (weighted) OLS
-3. Linear trend via OLS, robust regression, or piecewise LASSO
-4. Residual smoothing via SES ensemble or rolling means
-5. Exogenous variables via OLS
-6. Iterates until convergence or max rounds
+Each iteration fits components sequentially to the current residuals:
+1. Median-based initialization
+2. Seasonal update: Fourier OLS/WLS on residuals, cycling through periods each round
+3. Trend update: OLS, robust (Siegel), or piecewise LASSO with adaptive knots
+4. Residual smoothing: SES ensemble or rolling mean
+5. Exogenous update: OLS on remaining residuals
+6. Convergence check: stops after 6 consecutive non-improving rounds or max_rounds
 
 **Formulas:**
 - Seasonal: y_t = Σ [a_k cos(2πkt/T) + b_k sin(2πkt/T)] for k=1..K
-- Trend: y_t = β₀ + β₁t + Σ β_k max(0, t-τ_k) (piecewise linear)
+- Trend: y_t = β₀ + β₁t + Σ β_k max(0, t-τ_k) (piecewise linear, LASSO-regularized)
 - SES: ŷ_t = α·y_t + (1-α)·ŷ_{t-1}
 
 **Implementation:**
-- JIT-compiled components for performance
-- Automatic robustness detection via coefficient of variation
-- Supports additive and multiplicative modes
-- Automatic hyperparameter selection via `optimize` method
-- Conforms to `BaseForecaster` interface
+- Entire fitting loop JIT-compiled via lax.while_loop with a _LoopState NamedTuple
+- Static boolean flags (has_seasonality, use_changepoints, etc.) baked into the loop
+  at compile time via _make_fit_loop, avoiding runtime branching overhead
+- Adaptive changepoint count: n_changepoints as a float (e.g. 0.25) sets knots
+  proportional to series length, capped at 50
+- Multiplicative mode: automatic when seasonal_period is provided and series is positive;
+  uses log-transform internally, reverted at predict time
+- Seasonal tail fix: last full period stored in _LoopState for correct multi-step forecasting
+- Conformal prediction intervals via BaseForecaster.conformity_scores
 
 **Attributes:**
-- `robust`: Use robust regression (Siegel) vs OLS
-- `multiplicative`: Log-transform for multiplicative seasonality
-- `penalty`: Trend dampening factor based on R² (optional)
+- `robust`: Siegel repeated medians (True), OLS (False), or auto-detect (None)
+- `multiplicative`: Log-space fitting for multiplicative seasonality (set during fit)
+- `penalty`: R²-based trend dampening scalar (set during fit, optional)
+- `verbose`: Verbosity level (currently unused, reserved for future logging)
 
 **Methods:**
-- `fit(y, seasonal_period, X, ...)`: Fit all components to series
-- `predict(h, X, level)`: Forecast h steps ahead with optional intervals
-- `optimize(y, ...)`: Auto-tune hyperparameters via cross-validation
+- `fit(y, seasonal_period, X, ...)`: Fit all components; extensive hyperparameter control
+- `predict(h, X, level)`: Forecast h steps from fitted state; optional conformal intervals
+- `forecast(y, h, ...)`: Stateless fit+predict (inherits base class default)
+- `optimize(y, ...)`: Auto-tune hyperparameters via rolling cross-validation
 """
 # mfles.py
 from __future__ import annotations
 from functools import partial as _partial
 from typing import NamedTuple
+import numpy as np
 import jax
 import jax.numpy as jnp
 from jax import lax
 
 import utils
 from base_forecaster import BaseForecaster
+from conformal_intervals import ConformalIntervals
 
 
 # ============================================================================
@@ -78,17 +90,72 @@ class _LoopState(NamedTuple):
     converged: jnp.ndarray          # early stopping flag (scalar bool)
 
 @jax.jit
-def _mse(y, yhat): return jnp.mean((y - yhat) ** 2)
+def _mse(y: jnp.ndarray, yhat: jnp.ndarray) -> jnp.ndarray:
+    """Mean squared error metric.
+
+    Args:
+        y: Actual values
+        yhat: Predicted values
+
+    Returns:
+        Scalar MSE value
+    """
+    return jnp.mean((y - yhat) ** 2)
+
 @jax.jit
-def _mae(y, yhat): return jnp.mean(jnp.abs(y - yhat))
+def _mae(y: jnp.ndarray, yhat: jnp.ndarray) -> jnp.ndarray:
+    """Mean absolute error metric.
+
+    Args:
+        y: Actual values
+        yhat: Predicted values
+
+    Returns:
+        Scalar MAE value
+    """
+    return jnp.mean(jnp.abs(y - yhat))
+
 @jax.jit
-def _mape(y, yhat): return jnp.mean(jnp.abs((y - yhat) / (jnp.abs(y) + 1e-10)))
+def _mape(y: jnp.ndarray, yhat: jnp.ndarray) -> jnp.ndarray:
+    """Mean absolute percentage error metric.
+
+    Args:
+        y: Actual values
+        yhat: Predicted values
+
+    Returns:
+        Scalar MAPE value
+    """
+    return jnp.mean(jnp.abs((y - yhat) / (jnp.abs(y) + 1e-10)))
+
 @jax.jit
-def _smape(y, yhat): return jnp.mean(2.0 * jnp.abs(y - yhat) / (jnp.abs(y) + jnp.abs(yhat) + 1e-10))
+def _smape(y: jnp.ndarray, yhat: jnp.ndarray) -> jnp.ndarray:
+    """Symmetric mean absolute percentage error metric.
+
+    Args:
+        y: Actual values
+        yhat: Predicted values
+
+    Returns:
+        Scalar SMAPE value
+    """
+    return jnp.mean(2.0 * jnp.abs(y - yhat) / (jnp.abs(y) + jnp.abs(yhat) + 1e-10))
 _metric2fn = {"mse": _mse, "mae": _mae, "mape": _mape, "smape": _smape}
 
 @_partial(jax.jit, static_argnums=(1,))
 def _rolling_mean(y: jnp.ndarray, window: int) -> jnp.ndarray:
+    """Compute rolling window average with left-edge retention.
+
+    Averages values over a sliding window. For the first (window-1) positions,
+    returns original values to avoid boundary artifacts.
+
+    Args:
+        y: Input array to smooth
+        window: Window size for averaging (static)
+
+    Returns:
+        Smoothed array with same shape as input
+    """
     if window <= 1:
         return y
     kernel = jnp.ones((window,), dtype=y.dtype) / window
@@ -124,26 +191,98 @@ def _ses_ensemble_via_utils(resids: jnp.ndarray, alphas: jnp.ndarray, smooth: bo
     return lax.cond(smooth, smooth_path, rolling_path)
 
 @jax.jit
-def _cap_outliers(y: jnp.ndarray, k=3.0) -> jnp.ndarray:
+def _cap_outliers(y: jnp.ndarray, k: float = 3.0) -> jnp.ndarray:
+    """Clip outliers beyond k standard deviations from mean.
+
+    Applies Winsorization to cap extreme values at k standard deviations
+    from the mean in both directions.
+
+    Args:
+        y: Input array
+        k: Number of standard deviations for clipping threshold
+
+    Returns:
+        Array with outliers clipped to [mean - k*std, mean + k*std]
+    """
     mu, sd = jnp.mean(y), jnp.std(y)
     return jnp.clip(y, mu - k * sd, mu + k * sd)
 
-def _set_fourier(period: int) -> int:
-    return 5 if period < 10 else (10 if period < 70 else 15)
+@jax.jit
+def _fourier_order_from_period(period: jnp.ndarray) -> jnp.ndarray:
+    """Determine Fourier series order based on seasonal period length.
 
-@_partial(jax.jit, static_argnums=(0, 1, 2))
-def _fourier_series(n: int, period: int, order: int) -> jnp.ndarray:
+    Uses StatsForecast-compatible heuristic:
+    - Period < 10: order 5
+    - Period < 70: order 10
+    - Period >= 70: order 15
+
+    Args:
+        period: Seasonal period (can be array or scalar)
+
+    Returns:
+        Fourier order as int32 array
+    """
+    p = period.astype(jnp.int32)
+    return jnp.where(p < 10, jnp.int32(5), jnp.where(p < 70, jnp.int32(10), jnp.int32(15)))
+
+@_partial(jax.jit, static_argnums=(0, 2, 3, 4))
+def _build_fourier_and_weights_stack(
+    n: int,
+    sp_array: jnp.ndarray,
+    max_order: int,
+    forced_order: int,
+    use_weights: bool,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Build Fourier design matrices and optional seasonality weights using JAX primitives.
+
+    Creates stacked Fourier series design matrices for multiple seasonal periods,
+    with optional recency-weighted coefficients for improved stability on long series.
+
+    Args:
+        n: Series length (static)
+        sp_array: Array of seasonal periods to create Fourier features for
+        max_order: Maximum Fourier order across all periods (static)
+        forced_order: User-specified Fourier order, or -1 for auto-detection (static)
+        use_weights: Whether to compute recency weights for seasonal fitting (static)
+
+    Returns:
+        Tuple of (fourier_stack, weights_stack) where:
+            - fourier_stack: Shape (num_periods, n, 2*max_order) with cos/sin features
+            - weights_stack: Shape (num_periods, n) with recency weights (or zeros if disabled)
+    """
     t = jnp.arange(1, n + 1, dtype=jnp.float32).reshape(-1, 1)
-    k = jnp.arange(1, order + 1, dtype=jnp.float32).reshape(1, -1)
-    X = 2.0 * jnp.pi * t @ (k / float(period))
-    return jnp.hstack([jnp.cos(X), jnp.sin(X)])
+    k = jnp.arange(1, max_order + 1, dtype=jnp.float32).reshape(1, -1)
+    col_idx = jnp.arange(2 * max_order, dtype=jnp.int32)
+    time_idx = jnp.arange(n, dtype=jnp.int32)
 
-@_partial(jax.jit, static_argnums=(0, 1))
-def _seasonality_weights(n: int, period: int) -> jnp.ndarray:
-    return 1.0 + (jnp.arange(n) // period).astype(jnp.float32)
+    def one(period: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+        p_f = period.astype(jnp.float32)
+        angles = 2.0 * jnp.pi * t * (k / p_f)
+        fs = jnp.concatenate([jnp.cos(angles), jnp.sin(angles)], axis=1)
+        order = jnp.int32(forced_order) if forced_order > 0 else _fourier_order_from_period(period)
+        mask = (col_idx < (2 * order)).astype(fs.dtype)
+        fs = fs * mask
+        weights = 1.0 + (time_idx // period).astype(jnp.float32)
+        return fs, weights
+
+    fourier_stack, weights_stack = jax.vmap(one)(sp_array)
+    if not use_weights:
+        weights_stack = jnp.zeros_like(weights_stack)
+    return fourier_stack, weights_stack
 
 def _median_init(y: jnp.ndarray, period: int | None) -> jnp.ndarray:
-    """Initialize with period-wise medians."""
+    """Initialize fitted values with period-wise median smoothing.
+
+    Computes medians over complete cycles of the given period, repeating
+    the pattern across the series length. Used for robust initial estimates.
+
+    Args:
+        y: Input time series array
+        period: Seasonal period for median computation, or None for global median
+
+    Returns:
+        Array of same shape as y with period-wise median initialization
+    """
     n = y.shape[0]
     if period is None:
         return jnp.full_like(y, jnp.median(y))
@@ -159,6 +298,18 @@ def _median_init(y: jnp.ndarray, period: int | None) -> jnp.ndarray:
 
 @jax.jit
 def _fast_ols_fit_predict(x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
+    """Fit simple linear regression (scalar predictor) and return fitted values.
+
+    Efficiently computes OLS fit for univariate regression using closed-form
+    solution without matrix inversion.
+
+    Args:
+        x: Predictor variable (1D array)
+        y: Response variable (1D array)
+
+    Returns:
+        Fitted values from linear model: slope * x + intercept
+    """
     M = x.shape[0]
     x_sum, y_sum = jnp.sum(x), jnp.sum(y)
     x2, xy = jnp.dot(x, x), jnp.dot(x, y)
@@ -169,6 +320,19 @@ def _fast_ols_fit_predict(x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
 
 @jax.jit
 def _siegel_repeated_medians(x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
+    """Fit a robust linear regression via Siegel repeated medians and return fitted values.
+
+    Computes pairwise slopes between all point pairs, takes the median slope
+    per point, then the median of those medians as the global slope. Robust
+    to up to 50% outliers in both x and y.
+
+    Args:
+        x: Predictor array of shape (n,).
+        y: Response array of shape (n,).
+
+    Returns:
+        Fitted values slope*x + intercept of shape (n,).
+    """
     n = x.shape[0]
     X_i = x[:, None]; X_j = x[None, :]
     Y_i = y[:, None]; Y_j = y[None, :]
@@ -182,20 +346,56 @@ def _siegel_repeated_medians(x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
 
 @jax.jit
 def _ols_predict(X: jnp.ndarray, y: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Fit OLS regression and return fitted values and coefficients.
+
+    Solves the normal equations via pseudo-inverse: β = pinv(XᵀX) · Xᵀy.
+
+    Args:
+        X: Design matrix of shape (n, p).
+        y: Response vector of shape (n,).
+
+    Returns:
+        Tuple of (fitted values of shape (n,), coefficient vector of shape (p,)).
+    """
     beta = jnp.linalg.pinv(X.T @ X) @ (X.T @ y)
     return X @ beta, beta
 
 @jax.jit
 def _wls_predict(X: jnp.ndarray, y: jnp.ndarray, w: jnp.ndarray) -> jnp.ndarray:
+    """Fit Weighted Least Squares regression and return fitted values.
+
+    Solves the weighted normal equations: β = pinv(XᵀWX) · XᵀWy, where W = diag(w).
+
+    Args:
+        X: Design matrix of shape (n, p).
+        y: Response vector of shape (n,).
+        w: Non-negative weight vector of shape (n,).
+
+    Returns:
+        Fitted values of shape (n,).
+    """
     WX = X * w[:, None]
     beta = jnp.linalg.pinv(X.T @ WX) @ (X.T @ (w * y))
     return X @ beta
 
 @jax.jit
 def _cov_proxy(y: jnp.ndarray, mult: int = 1) -> jnp.ndarray:
-    """Coefficient of variation proxy for robustness detection."""
+    """Coefficient of variation proxy used for robust-mode auto-detection.
+
+    In multiplicative mode (mult != 0), uses a log-space variance formula
+    consistent with StatsForecast's MFLES implementation. In additive mode,
+    returns std/mean.
+
+    Args:
+        y: Residual or series array.
+        mult: Non-zero for multiplicative formula, zero for additive (std/mean).
+
+    Returns:
+        Scalar CoV proxy value.
+    """
     def mult_path():
-        return jnp.sqrt(jnp.exp(jnp.log(10.0) * (jnp.std(y) ** 2)) - 1.0)
+        # Keep parity with StatsForecast's multiplicative CoV proxy formula.
+        return jnp.sqrt(jnp.exp(jnp.log(10.0) * (jnp.std(y) ** 2) - 1.0))
     
     def additive_path():
         sd, mu = jnp.std(y), jnp.mean(y)
@@ -203,33 +403,7 @@ def _cov_proxy(y: jnp.ndarray, mult: int = 1) -> jnp.ndarray:
     
     return lax.cond(mult != 0, mult_path, additive_path)
 
-def _knots_from_gradients(y: jnp.ndarray, k: int, max_knots: int = 50) -> jnp.ndarray:
-    """
-    Select knots based on gradients. Returns fixed-size array for JIT compatibility.
-    
-    Args:
-        y: Input series
-        k: Number of knots to select (can be dynamic)
-        max_knots: Maximum number of knots (static, for fixed output size)
-    
-    Returns:
-        Array of shape (max_knots,) with knot positions (padded with zeros if k < max_knots)
-    """
-    g = jnp.abs(jnp.diff(y))
-    idx = jnp.argsort(-g)
-    
-    # Create fixed-size output array
-    knots = jnp.zeros(max_knots, dtype=jnp.int32)
-    
-    # Fill with top k indices using masking
-    fill_mask = jnp.arange(max_knots) < k
-    # Take indices with wrapping (safe indexing)
-    safe_idx = idx[jnp.minimum(jnp.arange(max_knots), idx.shape[0] - 1)]
-    knots = jnp.where(fill_mask, safe_idx + 1, 0)
-    knots = jnp.clip(knots, 0, y.shape[0] - 1)
-    
-    return jnp.sort(knots)
-
+@_partial(jax.jit, static_argnums=(0, 2))
 def _uniform_knots(n: int, k: int, max_knots: int = 50) -> jnp.ndarray:
     """
     Create uniformly spaced knots. Returns fixed-size array for JIT compatibility.
@@ -254,6 +428,7 @@ def _uniform_knots(n: int, k: int, max_knots: int = 50) -> jnp.ndarray:
     
     return knots
 
+@_partial(jax.jit, static_argnums=(0,))
 def _hinge_basis_from_knots(n: int, knots: jnp.ndarray) -> jnp.ndarray:
     """
     Create hinge basis functions from knots.
@@ -276,31 +451,24 @@ def _hinge_basis_from_knots(n: int, knots: jnp.ndarray) -> jnp.ndarray:
     # Concatenate: [t, ones, hinges]
     return jnp.concatenate([t.reshape(-1, 1), jnp.ones((n, 1), t.dtype), H], axis=1)
 
+@jax.jit
 def _spectral_step(X: jnp.ndarray) -> float:
     s = jnp.linalg.svd(X, full_matrices=False, compute_uv=False)
     L = (s[0] ** 2) + 1e-6
     return 1.0 / L
 
+@jax.jit
 def _soft(z: jnp.ndarray, lam: float) -> jnp.ndarray:
     return jnp.sign(z) * jnp.maximum(0.0, jnp.abs(z) - lam)
 
 @jax.jit
-def _lasso_ista(X: jnp.ndarray, y: jnp.ndarray, alpha: float, maxiter: int = 200, tol: float = 1e-4) -> jnp.ndarray:
-    step = _spectral_step(X)
-    return _lasso_ista_with_step(X, y, alpha, step, maxiter)
-
 def _lasso_ista_with_step(X: jnp.ndarray, y: jnp.ndarray, alpha: float, step: jnp.ndarray, maxiter: int = 200) -> jnp.ndarray:
     """LASSO via ISTA with pre-computed spectral step (avoids redundant SVD)."""
     beta = jnp.zeros((X.shape[1],), dtype=y.dtype)
-    def body(carry):
-        b = carry
+    def body(i, b):
         grad = X.T @ (X @ b - y)
-        b_new = _soft(b - step * grad, step * alpha)
-        return b_new, jnp.linalg.norm(b_new - b)
-    def loop(b):
-        b_new = lax.fori_loop(0, maxiter, lambda i, bb: body(bb)[0], b)
-        return b_new
-    return loop(beta)
+        return _soft(b - step * grad, step * alpha)
+    return lax.fori_loop(0, maxiter, body, beta)
 
 
 # ============================================================================
@@ -328,11 +496,12 @@ class _FitConfig(NamedTuple):
     round_penalty: float
     alpha: float                   # LASSO regularization
     cov_threshold: float
+    multiplicative_flag: int       # 1 if multiplicative mode, else 0
     n_cps: int                     # number of changepoints
     max_period: int                # max seasonal period (for seas_tail allocation)
     n_exo_features: int            # number of exogenous features
-    convergence_tol: float         # absolute tolerance for early stopping
-    min_iter: int                  # minimum iterations before allowing early stop (n-dependent)
+    min_iter: int                  # minimum rounds before early-stop check
+    lasso_maxiter: int             # ISTA iterations for changepoint trend fit
 
 
 def _fit_body(
@@ -361,21 +530,12 @@ def _fit_body(
     cur = _mse(config.y_tr, state.fitted)
     
     # -------------------------------------------------------------------------
-    # 2. Convergence check (early stopping with relative tolerance)
+    # 2. Convergence check (StatsForecast-style non-improvement counting)
     # -------------------------------------------------------------------------
     improved = cur < state.best
-    improvement = state.best - cur
     new_best = lax.cond(improved, lambda: cur, lambda: state.best)
     new_stalls = lax.cond(improved, lambda: jnp.int32(0), lambda: state.stalls + 1)
-
-    # Early stopping with n-dependent minimum iterations:
-    # Small n (100-1000): min_iter=10-15 (quick convergence)
-    # Large n (5000+): min_iter=25-30 (trend needs more iterations)
-    stall_stop = new_stalls >= 5
-    relative_improvement = improvement / (new_best + 1e-12)
-    small_improvement = improved & (relative_improvement < config.convergence_tol)
-    past_minimum = i >= config.min_iter  # n-dependent threshold
-    converged = past_minimum & (stall_stop | small_improvement)
+    converged = (i >= config.min_iter) & (new_stalls >= 6)
 
     
     # -------------------------------------------------------------------------
@@ -405,13 +565,14 @@ def _fit_body(
         new_seasonal = lax.cond(seas_improves, lambda: state.seasonal_component + seas, lambda: state.seasonal_component)
         new_best_after_seas = lax.cond(seas_improves, lambda: test_seas, lambda: new_best)
         
-        # Update seas_tail (last p values of seasonal)
+        # Update seas_tail from the cumulative seasonal component.
+        # Using only the incremental `seas` update underestimates forecast seasonality.
         p = config.sp_array[k]
         max_p = state.seas_tail.shape[0]  # This is static (known at trace time)
         
         # Always copy last max_p elements (static slice size), track actual period in seas_tail_len
         # The actual period values are in the last p positions, but we copy max_p for JIT compat
-        last_max_p = lax.dynamic_slice(seas, (n - max_p,), (max_p,))
+        last_max_p = lax.dynamic_slice(new_seasonal, (n - max_p,), (max_p,))
         
         # Rearrange so that the last p values are at the start
         # We need seas[-p:] at positions [0:p], but we have seas[-max_p:] in last_max_p
@@ -474,25 +635,27 @@ def _fit_body(
     resids = config.y_tr - new_fitted2
     
     # -------------------------------------------------------------------------
-    # 5. Trend + guarded SES update
+    # 5. Trend + residual smoothing update
     # -------------------------------------------------------------------------
-    # Odd rounds: trend (piecewise/robust/OLS)
-    # Even rounds: OLS by default, with late guarded SES attempt.
+    # StatsForecast-compatible cadence:
+    # - Odd rounds: trend update (robust / OLS / piecewise)
+    # - Even rounds (after round 4): residual smoothing update
     is_odd = (i % 2) == 1
 
     def trend_piecewise():
         Xb = config.hinge_basis
-        beta = _lasso_ista_with_step(Xb, resids, config.alpha, config.lasso_step, 50)
+        beta = _lasso_ista_with_step(Xb, resids, config.alpha, config.lasso_step, config.lasso_maxiter)
         return (Xb @ beta) * config.linear_lr
 
     def trend_robust():
-        return _siegel_repeated_medians(config.x_idx, resids) * config.linear_lr
+        return _siegel_repeated_medians(config.x_idx, resids)
 
     def trend_ols():
-        return _fast_ols_fit_predict(config.x_idx, resids) * config.linear_lr
+        return _fast_ols_fit_predict(config.x_idx, resids)
 
     def odd_round_candidate():
-        use_piecewise = use_changepoints & (config.n_cps > 0)
+        # SF behavior: first odd trend round uses OLS even when changepoints are enabled.
+        use_piecewise = use_changepoints & (config.n_cps > 0) & (i != jnp.int32(1))
         tren = lax.cond(
             state.robust,
             trend_robust,
@@ -504,58 +667,28 @@ def _fit_body(
         return tren, improves, test, jnp.bool_(False)
 
     def even_round_candidate():
-        # Fast fallback trend path
-        ols_tren = trend_ols()
-        ols_test = _mse(config.y_tr, new_fitted2 + ols_tren)
-        ols_improves = ols_test < new_best_after_exo
+        # Even rounds before i>4 do not update in SF MFLES.
+        def no_even_update():
+            zero = jnp.zeros_like(resids)
+            return zero, jnp.bool_(False), new_best_after_exo, jnp.bool_(True)
 
-        # SES controller:
-        # 0=off, 1=lite, 2=full, 3=adaptive(lite->full escalation)
-        # Attempt SES only in later rounds with strict gain thresholds.
-        def try_ses():
-            capped_resids = resids.at[-2:].set(_cap_outliers(resids, 3.0)[-2:])
-            # Detrend first so SES focuses on residual autocorrelation, not slope.
-            detrended = capped_resids - _fast_ols_fit_predict(config.x_idx, capped_resids)
-            lite_tren = _ses_ensemble_via_utils(detrended, config.ses_alphas, False, 1) * (config.rs_lr * 0.2)
-            lite_test = _mse(config.y_tr, new_fitted2 + lite_tren)
-            lite_improves = (lite_test < (new_best_after_exo * (1.0 - 0.01))) & (lite_test < ols_test)
-
-            if ses_mode_code == 1:
-                use_ses = lite_improves
-                chosen = lax.cond(use_ses, lambda: lite_tren, lambda: ols_tren)
-                chosen_test = lax.cond(use_ses, lambda: lite_test, lambda: ols_test)
-                chosen_improves = lax.cond(use_ses, lambda: lite_improves, lambda: ols_improves)
-                return chosen, chosen_improves, chosen_test, use_ses
-
-            full_tren = _ses_ensemble_via_utils(detrended, config.ses_alphas, True, 1) * (config.rs_lr * 0.2)
-            full_test = _mse(config.y_tr, new_fitted2 + full_tren)
-            full_improves = (full_test < (new_best_after_exo * (1.0 - 0.01))) & (full_test < ols_test)
-
+        def ses_update():
+            # ses_mode:
+            # 0=off, 1=lite(rolling), 2=full(SES ensemble), 3=adaptive(use smoother flag)
             if ses_mode_code == 2:
-                use_ses = full_improves
-                chosen = lax.cond(use_ses, lambda: full_tren, lambda: ols_tren)
-                chosen_test = lax.cond(use_ses, lambda: full_test, lambda: ols_test)
-                chosen_improves = lax.cond(use_ses, lambda: full_improves, lambda: ols_improves)
-                return chosen, chosen_improves, chosen_test, use_ses
+                ses_tren = _ses_ensemble_via_utils(resids, config.ses_alphas, True, 1) * config.rs_lr
+            elif ses_mode_code == 3:
+                ses_tren = _ses_ensemble_via_utils(resids, config.ses_alphas, bool(smoother), 1) * config.rs_lr
+            else:
+                ses_tren = _ses_ensemble_via_utils(resids, config.ses_alphas, False, 1) * config.rs_lr
 
-            # Adaptive: start with lite; use full only if it clearly outperforms lite.
-            use_full = lite_improves & full_improves & (full_test < (lite_test * (1.0 - 0.002)))
-            ses_tren = lax.cond(use_full, lambda: full_tren, lambda: lite_tren)
-            ses_test = lax.cond(use_full, lambda: full_test, lambda: lite_test)
-            ses_improves = lax.cond(use_full, lambda: full_improves, lambda: lite_improves)
-            use_ses = ses_improves
-            chosen = lax.cond(use_ses, lambda: ses_tren, lambda: ols_tren)
-            chosen_test = lax.cond(use_ses, lambda: ses_test, lambda: ols_test)
-            chosen_improves = lax.cond(use_ses, lambda: ses_improves, lambda: ols_improves)
-            return chosen, chosen_improves, chosen_test, use_ses
+            ses_test = _mse(config.y_tr, new_fitted2 + ses_tren)
+            ses_improves = ses_test < (new_best_after_exo * (1.0 - config.round_penalty))
+            return ses_tren, ses_improves, ses_test, jnp.bool_(True)
 
-        def no_ses():
-            return ols_tren, ols_improves, ols_test, jnp.bool_(False)
-
-        # Delay SES attempts; early rounds prioritize trend convergence.
         if ses_mode_code == 0:
-            return no_ses()
-        return lax.cond(i >= jnp.int32(12), try_ses, no_ses)
+            return no_even_update()
+        return lax.cond(i > jnp.int32(4), ses_update, no_even_update)
 
     tren, trend_improves, test_trend, used_ses = lax.cond(
         is_odd,
@@ -576,6 +709,26 @@ def _fit_body(
         trend_improves & used_ses,
         lambda: state.ses_component + tren,
         lambda: state.ses_component
+    )
+
+    # Keep trend state aligned with SF logic:
+    # - accepted trend update contributes tren[-2:] to trend tail
+    # - accepted residual smoother contributes tren[-1] to both tail points
+    def trend_from_linear():
+        delta = jnp.array([tren[-2], tren[-1]], dtype=state.trend_tail.dtype)
+        return state.trend_tail + delta
+
+    def trend_from_ses():
+        return state.trend_tail + tren[-1]
+
+    new_trend_tail = lax.cond(
+        trend_improves & (~used_ses),
+        trend_from_linear,
+        lambda: lax.cond(
+            trend_improves & used_ses,
+            trend_from_ses,
+            lambda: state.trend_tail
+        )
     )
 
     # Compute R² penalty on first trend iteration.
@@ -599,8 +752,7 @@ def _fit_body(
     # -------------------------------------------------------------------------
     if init_robust:
         def detect_robust():
-            multiplicative = config.y_tr.min() > 0  # Approximation
-            return _cov_proxy(resids, jnp.int32(multiplicative)) > config.cov_threshold
+            return _cov_proxy(resids, jnp.int32(config.multiplicative_flag)) > config.cov_threshold
 
         new_robust = lax.cond(
             i == 0,
@@ -619,7 +771,6 @@ def _fit_body(
     # -------------------------------------------------------------------------
     # 8. Return new state
     # -------------------------------------------------------------------------
-    # Note: trend_tail will be computed from final fitted values AFTER the loop
     return _LoopState(
         i=i + 1,
         fitted=new_fitted3,
@@ -627,7 +778,7 @@ def _fit_body(
         seasonal_component=new_seasonal,
         ses_component=new_ses,
         exogenous_component=new_exo_comp,
-        trend_tail=state.trend_tail,  # Keep as-is, will be updated after loop
+        trend_tail=new_trend_tail,
         seas_tail=new_seas_tail,
         seas_tail_len=new_seas_tail_len,
         best=new_best_final,
@@ -686,57 +837,166 @@ def _make_fit_loop(
 
 
 class MFLES(BaseForecaster):
+    """
+    JAX MFLES implementation with StatsForecast-compatible default behavior.
+
+    MFLES (Multi-Feature Locally Exponential Smoothing) combines multiple additive
+    components — piecewise linear trend, Fourier seasonal patterns, and residual
+    smoothing — fitted iteratively to successive residuals in a JIT-compiled loop.
+
+    The goal is algorithmic parity with MFLES in StatsForecast while keeping
+    the implementation JAX-friendly for speed at larger scales.
+
+    Parity-oriented defaults:
+    - robust=None  -> auto-detect robust mode from residual CoV proxy.
+    - changepoints=True  -> piecewise LASSO trend enabled by default.
+    - ses_mode="lite"  -> rolling residual smoother (matches StatsForecast default).
+
+    Args:
+        verbose (int): Verbosity level (currently reserved, unused). Default is 1.
+        robust (bool | None): If True, uses Siegel repeated medians for trend fitting.
+            If False, uses OLS. If None, auto-detects based on residual variability.
+            Default is None.
+        alias (str): Model name identifier. Default is "MFLES".
+        conformal_params (ConformalIntervals | None): Conformal prediction configuration
+            for generating prediction intervals. Default is None.
+
+    Attributes:
+        model_ (dict): Populated after fit(); contains fitted values and all components.
+        multiplicative (bool): Whether the last fit used multiplicative (log-space) mode.
+        penalty (float | None): R²-based trend dampening scalar (set during fit).
+        trend_penalty (bool): Whether trend damping is applied during predict().
+        seasonality (jnp.ndarray | None): Last seasonal period tail used for forecasting.
+        trend (jnp.ndarray): Two-element array [prev_end, curr_end] for slope extrapolation.
+    """
     uses_exog = True
 
-    def __init__(self, verbose: int = 1, robust: bool | None = None, alias: str = "MFLES", conformal_params=None):
+    def __init__(self, verbose: int = 1, robust: bool | None = None, alias: str = "MFLES", conformal_params: ConformalIntervals | None = None) -> None:
         self.alias = alias
         self.conformal_params = conformal_params
         self.model_ = {}
         self.verbose = verbose
-        # Disable robust auto-detection for large series (O(n²) complexity)
-        self.robust = robust if robust is not None else False
+        self.robust = robust
         self.predicted = None
         self._exo_beta = None
         self.penalty = None
 
     def fit(
         self,
-        y,
-        seasonal_period=None,
-        X=None,
-        fourier_order=None,
-        ma=None,
-        alpha=1.0,
-        decay=-1,
-        n_changepoints=0.25,
-        seasonal_lr=0.9,
-        rs_lr=1.0,
-        exogenous_lr=1.0,
+        y: jnp.ndarray,
+        seasonal_period: int | list[int] | None = None,
+        X: jnp.ndarray | None = None,
+        fourier_order: int | None = None,
+        ma: int | list[int] | None = None,
+        alpha: float = 1.0,
+        decay: float = -1,
+        n_changepoints: float | int = 0.25,
+        seasonal_lr: float = 0.9,
+        rs_lr: float = 1.0,
+        exogenous_lr: float = 1.0,
         exogenous_estimator=None,
-        exogenous_params={},
-        linear_lr=1.0,
-        cov_threshold=0.7,
-        moving_medians=False,
-        max_rounds=50,
-        min_alpha=0.05,
-        max_alpha=1.0,
-        round_penalty=0.0001,
-        trend_penalty=True,
-        multiplicative=None,
-        changepoints=True,
-        smoother=False,
-        ses_mode: str = "adaptive",
-        seasonality_weights=False,
-        gradient_strategy=False,
-    ):
+        exogenous_params: dict = {},
+        linear_lr: float = 0.9,
+        cov_threshold: float = 0.7,
+        moving_medians: bool = False,
+        max_rounds: int = 50,
+        min_alpha: float = 0.05,
+        max_alpha: float = 1.0,
+        round_penalty: float = 0.0001,
+        trend_penalty: bool = True,
+        multiplicative: bool | None = None,
+        changepoints: bool = True,
+        smoother: bool = False,
+        ses_mode: str = "lite",
+        seasonality_weights: bool = False,
+        gradient_strategy: bool = False,
+    ) -> "MFLES":
+        """Fit the MFLES model to a time series.
+
+        Runs the JIT-compiled iterative fitting loop that alternately updates
+        seasonal, trend, residual-smoothing, and exogenous components until
+        convergence or `max_rounds` is reached.
+
+        Args:
+            y (jnp.ndarray): Input time series of shape (n,).
+            seasonal_period (int | list[int] | None): Seasonal period(s) for Fourier
+                features. Pass a list for multiple seasonalities. None disables
+                seasonality. Default is None.
+            X (jnp.ndarray | None): Exogenous design matrix of shape (n, p).
+                Default is None.
+            fourier_order (int | None): Fixed Fourier order for all periods.
+                None uses the auto-heuristic (5 / 10 / 15 based on period length).
+                Default is None.
+            ma (int | list[int] | None): Moving-average window(s) for residual
+                smoothing cadence. None defaults to [1]. Default is None.
+            alpha (float): LASSO regularization strength for changepoint trend.
+                Default is 1.0.
+            decay (float): Unused legacy parameter (kept for API compatibility).
+                Default is -1.
+            n_changepoints (float | int): Number of changepoint knots. A float < 1
+                is treated as a fraction of series length (e.g. 0.25 → 25% of n).
+                An int specifies knots directly. None or 0 disables changepoints.
+                Default is 0.25.
+            seasonal_lr (float): Learning rate multiplier applied to seasonal updates.
+                Default is 0.9.
+            rs_lr (float): Learning rate multiplier for residual-smoothing updates.
+                Default is 1.0.
+            exogenous_lr (float): Learning rate multiplier for exogenous updates.
+                Default is 1.0.
+            exogenous_estimator: Unused legacy parameter. Default is None.
+            exogenous_params (dict): Unused legacy parameter. Default is {}.
+            linear_lr (float): Learning rate multiplier for trend updates.
+                Default is 0.9.
+            cov_threshold (float): CoV proxy threshold for auto robust-mode detection.
+                Set to -1 to effectively disable. Default is 0.7.
+            moving_medians (bool): If True, initialises fitted values with period-wise
+                medians instead of zeros. Default is False.
+            max_rounds (int): Maximum number of fitting iterations. Default is 50.
+            min_alpha (float): Minimum SES alpha in the ensemble grid. Default is 0.05.
+            max_alpha (float): Maximum SES alpha in the ensemble grid. Default is 1.0.
+            round_penalty (float): Improvement threshold fraction required before
+                accepting a residual-smoothing update. Default is 0.0001.
+            trend_penalty (bool): If True, dampens trend slope by the R² penalty
+                computed on the first trend iteration. Default is True.
+            multiplicative (bool | None): If True, fits in log-space (multiplicative
+                seasonality). If None, auto-detected: True when seasonal_period is set
+                and all values are positive. Default is None.
+            changepoints (bool): If True, enables piecewise linear trend via LASSO.
+                Default is True.
+            smoother (bool): Used only when ses_mode="adaptive": True selects SES
+                ensemble, False selects rolling mean. Default is False.
+            ses_mode (str): Residual smoothing strategy. One of:
+                - "off": no residual smoothing
+                - "lite": rolling mean (StatsForecast default)
+                - "full": SES ensemble
+                - "adaptive": controlled by the `smoother` flag
+                Default is "lite".
+            seasonality_weights (bool): If True, applies recency-weighted OLS for
+                Fourier seasonal fitting. Auto-enabled for multiplicative single-period
+                series. Default is False.
+            gradient_strategy (bool): Legacy flag (currently unused). Default is False.
+
+        Returns:
+            MFLES: Self (fitted model instance) for method chaining.
+        """
         y = utils.ensure_float(jnp.asarray(y).reshape(-1))
         n = y.shape[0]
+
+        # StatsForecast-compatible multiplicative decision:
+        # - if seasonality is provided, prefer multiplicative mode
+        # - disable multiplicative when the series contains non-positive values
         if multiplicative is None:
-            multiplicative = seasonal_period is not None and jnp.min(y) > 0
+            if seasonal_period is None:
+                multiplicative = False
+            else:
+                multiplicative = True
+            if bool(jnp.min(y) <= 0):
+                multiplicative = False
         if multiplicative:
             const = jnp.min(y)
             y_tr = jnp.log(y)
-            mean, std = jnp.array(0.0, y.dtype), jnp.array(1.0, y.dtype)
+            mean = jnp.array(0.0, dtype=y.dtype)
+            std = jnp.array(1.0, dtype=y.dtype)
         else:
             const = None
             mean, std = jnp.mean(y), jnp.std(y)
@@ -761,16 +1021,14 @@ class MFLES(BaseForecaster):
 
         sp_list = None
         if seasonal_period is not None:
-            sp_list = seasonal_period if isinstance(seasonal_period, list) else [int(seasonal_period)]
-        seas_tail = None
-        fourier_series = []
-        cycle_weights = []
-        if sp_list is not None:
-            for p in sp_list:
-                fo = int(_set_fourier(p)) if fourier_order is None else int(fourier_order)
-                fourier_series.append(_fourier_series(n, p, fo))
-                if seasonality_weights:
-                    cycle_weights.append(_seasonality_weights(n, p))
+            if isinstance(seasonal_period, (list, tuple, np.ndarray)):
+                raw_periods = np.asarray(seasonal_period, dtype=np.int32).reshape(-1)
+            else:
+                raw_periods = np.asarray([int(seasonal_period)], dtype=np.int32)
+            valid_periods = raw_periods[(raw_periods > 1) & (raw_periods < n)]
+            if valid_periods.size > 0:
+                _, first_idx = np.unique(valid_periods, return_index=True)
+                sp_list = valid_periods[np.sort(first_idx)].tolist()
 
         linear_component = jnp.zeros(n, y.dtype)
         seasonal_component = jnp.zeros(n, y.dtype)
@@ -782,12 +1040,24 @@ class MFLES(BaseForecaster):
 
         ma_cycle = [1] if ma is None else (ma if isinstance(ma, list) else [int(ma)])
 
-        if isinstance(n_changepoints, float) and n_changepoints < 1:
+        if n_changepoints is None:
+            changepoints = False
+            n_cps = 0
+        elif isinstance(n_changepoints, float) and n_changepoints < 1:
             n_cps = int(n_changepoints * n)
         elif isinstance(n_changepoints, int):
             n_cps = n_changepoints
         else:
             n_cps = 0
+
+        if not changepoints:
+            n_cps = 0
+
+        # SF uses min(n_changepoints, 0.1 * n). We keep that behavior but
+        # apply a fixed knot cap so complexity scales monotonically with n.
+        cp_cap = 64
+        n_cps = max(0, min(int(n_cps), int(0.1 * n), cp_cap))
+        effective_changepoints = bool(changepoints and n_cps > 0)
 
         # Fixed max_rounds for all series lengths to maximize JIT cache reuse
         # Note: StatsForecast MFLES runs all iterations without early stopping
@@ -800,27 +1070,53 @@ class MFLES(BaseForecaster):
         has_seasonality = sp_list is not None
         has_exogenous = X is not None
         use_seasonality_weights = bool(seasonality_weights)
-        use_changepoints = bool(changepoints)
-        init_robust = self.robust is None  # Need auto-detection
+        if (not use_seasonality_weights) and has_seasonality and bool(multiplicative) and (len(sp_list) == 1):
+            # For long positive seasonal series, recency-weighted seasonal fits
+            # are generally more stable than uniform OLS and improve accuracy.
+            use_seasonality_weights = True
+        use_changepoints = bool(effective_changepoints)
+        robust_init_value = self.robust
+        init_robust = robust_init_value is None  # Need auto-detection
+
+        # JAX guardrail: robust auto-detection can select Siegel regression,
+        # which is O(n^2). For very long series this dominates runtime.
+        if init_robust and n >= 5000:
+            init_robust = False
+            robust_init_value = False
+
+        # SF behavior: cov_threshold=-1 disables safeguards by using a very large threshold.
+        if cov_threshold == -1:
+            cov_threshold = 10000
+
         ses_mode_norm = str(ses_mode).lower()
         if ses_mode_norm not in ("off", "lite", "full", "adaptive"):
             raise ValueError("ses_mode must be one of: 'off', 'lite', 'full', 'adaptive'")
         ses_mode_code = {"off": 0, "lite": 1, "full": 2, "adaptive": 3}[ses_mode_norm]
         
-        # Stack Fourier series into 3D array (num_periods, n, max_cols)
+        # Build Fourier and optional seasonality-weight stacks with JAX primitives.
         if has_seasonality:
-            max_fourier_cols = max(fs.shape[1] for fs in fourier_series)
-            fourier_stack = jnp.zeros((len(sp_list), n, max_fourier_cols), dtype=y.dtype)
-            for idx, fs in enumerate(fourier_series):
-                fourier_stack = fourier_stack.at[idx, :, :fs.shape[1]].set(fs)
-            
-            if use_seasonality_weights:
-                weights_stack = jnp.stack(cycle_weights, axis=0)
-            else:
-                weights_stack = jnp.zeros((len(sp_list), n), dtype=y.dtype)
-            
             sp_array = jnp.array(sp_list, dtype=jnp.int32)
-            max_period = max(sp_list)
+            max_period = int(max(sp_list))
+            forced_order = max(1, int(fourier_order)) if fourier_order is not None else -1
+            # IMPORTANT: avoid padding Fourier matrices with extra all-zero columns.
+            # Rank-deficient X can perturb pinv-based OLS (vs StatsForecast which
+            # builds an exact-width Fourier design).
+            if forced_order > 0:
+                max_fourier_order = forced_order
+            else:
+                # Mirror StatsForecast's set_fourier(period) rule in Python.
+                def _sf_fourier(p: int) -> int:
+                    return 5 if p < 10 else (10 if p < 70 else 15)
+                max_fourier_order = int(max(_sf_fourier(int(p)) for p in sp_list))
+            fourier_stack, weights_stack = _build_fourier_and_weights_stack(
+                n=n,
+                sp_array=sp_array,
+                max_order=max_fourier_order,
+                forced_order=forced_order,
+                use_weights=use_seasonality_weights,
+            )
+            fourier_stack = fourier_stack.astype(y.dtype)
+            weights_stack = weights_stack.astype(y.dtype)
         else:
             fourier_stack = jnp.zeros((1, n, 1), dtype=y.dtype)
             weights_stack = jnp.zeros((1, n), dtype=y.dtype)
@@ -838,29 +1134,27 @@ class MFLES(BaseForecaster):
         # Pre-compute alphas for SES ensemble (static shape)
         ses_alphas = jnp.arange(float(min_alpha), float(max_alpha) + 1e-9, 0.05, dtype=y.dtype)
 
-        # Adaptive linear_lr: at large n, the slope per timestep is tiny (0.0003-0.0007)
-        # requiring higher lr to accumulate enough over 25 trend updates (50 iters / 2)
-        # Formula: scale by min(2.0, 1 + 0.00025*(n-2000)) for n >= 2000
-        if n >= 2000:
-            scale_factor = min(2.0, 1.0 + 0.00025 * (n - 2000))
-            effective_linear_lr = linear_lr * scale_factor
+        # Use explicit learning-rate hyperparameters directly.
+        effective_linear_lr = float(linear_lr)
+        effective_seasonal_lr = float(seasonal_lr)
+        if n < 250:
+            min_iter = 0
+        elif n < 1000:
+            min_iter = 6
         else:
-            effective_linear_lr = linear_lr
-
-        # Adaptive min_iter: balance speed vs accuracy based on series length
-        # Smaller n converges faster, larger n needs more iterations for trend
-        if n < 1000:
             min_iter = 10
-        elif n < 2000:
-            min_iter = 15
-        elif n < 5000:
-            min_iter = 20
+        # Keep high ISTA budget for short series; use a shared budget for
+        # medium/large lengths to avoid 5k being slower than 10k.
+        if n <= 1000:
+            lasso_maxiter = 200
+        elif n <= 10000:
+            lasso_maxiter = 64
         else:
-            min_iter = 25
+            lasso_maxiter = 48
 
-        # Pre-compute hinge basis + spectral step ONCE (avoid redundant SVD per iteration)
-        if bool(changepoints) and n_cps > 0 and not bool(gradient_strategy):
-            knots = _uniform_knots(n, n_cps)
+        # Pre-compute piecewise basis + spectral step once.
+        if bool(effective_changepoints) and n_cps > 0 and not bool(gradient_strategy):
+            knots = _uniform_knots(n, n_cps, max_knots=n_cps)
             hinge_basis = _hinge_basis_from_knots(n, knots)
             lasso_step = jnp.array(_spectral_step(hinge_basis), dtype=y.dtype)
         else:
@@ -880,18 +1174,19 @@ class MFLES(BaseForecaster):
             ses_alphas=ses_alphas,
             hinge_basis=hinge_basis,
             lasso_step=lasso_step,
-            seasonal_lr=float(seasonal_lr),
+            seasonal_lr=float(effective_seasonal_lr),
             linear_lr=float(effective_linear_lr),
             exogenous_lr=float(exogenous_lr),
             rs_lr=float(rs_lr),
             round_penalty=float(round_penalty),
             alpha=float(alpha),
             cov_threshold=float(cov_threshold),
+            multiplicative_flag=int(bool(multiplicative)),
             n_cps=n_cps,
             max_period=max_period,
             n_exo_features=n_exo_features,
-            convergence_tol=1e-4,  # Early stopping tolerance
-            min_iter=min_iter,  # n-dependent minimum iterations
+            min_iter=int(min_iter),
+            lasso_maxiter=int(lasso_maxiter),
         )
         
         # Initialize loop state
@@ -907,7 +1202,7 @@ class MFLES(BaseForecaster):
             seas_tail_len=jnp.int32(0),
             best=jnp.array(jnp.inf, dtype=y.dtype),  # Match dtype with y
             stalls=jnp.int32(0),
-            robust=jnp.bool_(self.robust if self.robust is not None else False),
+            robust=jnp.bool_(robust_init_value if robust_init_value is not None else False),
             penalty=jnp.float32(0.0),
             exo_beta=jnp.zeros(max(n_exo_features, 1), dtype=y.dtype),
             converged=jnp.bool_(False),
@@ -940,9 +1235,9 @@ class MFLES(BaseForecaster):
         self.median_component = median_component
         self.exogenous_component = final_state.exogenous_component
 
-        # Extract trend from linear component only
-        # Note: SES captures residual noise/seasonality, not trend
-        self.trend = jnp.array([self.linear_component[-2], self.linear_component[-1]], dtype=fitted.dtype)
+        # Trend tail is tracked during fitting to mirror SF trend updates
+        # (trend updates add tren[-2:], residual smoother adds tren[-1]).
+        self.trend = final_state.trend_tail.astype(fitted.dtype)
         
         # Extract seasonality tail (dynamic slice based on seas_tail_len)
         if has_seasonality and final_state.seas_tail_len > 0:
@@ -965,7 +1260,19 @@ class MFLES(BaseForecaster):
 
         return self._finalize_fit(fitted, multiplicative)
 
-    def _finalize_fit(self, fitted_tr: jnp.ndarray, multiplicative: bool):
+    def _finalize_fit(self, fitted_tr: jnp.ndarray, multiplicative: bool) -> "MFLES":
+        """Reverse scaling on fitted values and populate model_ dict.
+
+        Converts fitted values from transformed space (log or standardised)
+        back to the original scale and stores all components in `self.model_`.
+
+        Args:
+            fitted_tr (jnp.ndarray): Fitted values in transformed space of shape (n,).
+            multiplicative (bool): If True, applies exp(); otherwise reverses z-score.
+
+        Returns:
+            MFLES: Self (for method chaining inside fit()).
+        """
         if multiplicative:
             fitted = jnp.exp(fitted_tr)
         else:
@@ -987,7 +1294,28 @@ class MFLES(BaseForecaster):
         self.fitted_ = fitted  # Store fitted values
         return self  # Return self for method chaining
 
-    def predict(self, h: int, X=None, level: list[int | float] | None = None):
+    def predict(self, h: int, X: jnp.ndarray | None = None, level: list[int | float] | None = None) -> dict:
+        """Generate h-step ahead forecasts from the fitted model.
+
+        Extrapolates the stored trend tail by the fitted slope (optionally damped
+        by the R² penalty), tiles the seasonal tail, and adds any exogenous contribution.
+        Optionally computes conformal prediction intervals.
+
+        Args:
+            h (int): Forecast horizon (number of steps ahead).
+            X (jnp.ndarray | None): Future exogenous matrix of shape (h, p).
+                Required only if the model was fitted with exogenous variables.
+                Default is None.
+            level (list[int | float] | None): Confidence levels (0–100) for conformal
+                prediction intervals, e.g. [80, 95]. Requires `conformal_params` to
+                be set. Default is None.
+
+        Returns:
+            dict: Dictionary containing:
+                - "mean": Point forecasts of shape (h,).
+                - "lo-{l}" / "hi-{l}": Conformal interval bounds for each level l
+                  (only present when level is not None).
+        """
         h = int(h)
         last, prev = self.trend[1], self.trend[0]
         slope = (last - prev)
@@ -1017,20 +1345,76 @@ class MFLES(BaseForecaster):
             out = self.add_confidence_intervals(out, cs, level, "conformal_distribution")
         return out
 
-    def forecast(self, y, h, X=None, X_future=None, level: list[int | float] | None = None, seasonal_period=None, **fit_kwargs):
+    def forecast(
+        self,
+        y: jnp.ndarray,
+        h: int,
+        X: jnp.ndarray | None = None,
+        X_future: jnp.ndarray | None = None,
+        level: list[int | float] | None = None,
+        seasonal_period: int | list[int] | None = None,
+        **fit_kwargs,
+    ) -> dict:
+        """Stateless fit+predict in one call (convenience wrapper).
+
+        Creates a fresh model copy, fits it on `y`, and immediately generates
+        forecasts. Does not store any state on `self`.
+
+        Args:
+            y (jnp.ndarray): Input time series of shape (n,).
+            h (int): Forecast horizon.
+            X (jnp.ndarray | None): In-sample exogenous matrix of shape (n, p).
+                Default is None.
+            X_future (jnp.ndarray | None): Future exogenous matrix of shape (h, p).
+                Default is None.
+            level (list[int | float] | None): Confidence levels for conformal intervals.
+                Default is None.
+            seasonal_period (int | list[int] | None): Seasonal period(s) passed to fit.
+                Default is None.
+            **fit_kwargs: Any additional keyword arguments forwarded to fit().
+
+        Returns:
+            dict: Same output as predict() — "mean" and optional interval keys.
+        """
         return self.new().fit(y, X=X, seasonal_period=seasonal_period, **fit_kwargs).predict(h, X=X_future, level=level)
 
     def optimize(
         self,
-        y,
-        seasonal_period,
-        n_steps,
-        test_size,
-        step_size=1,
-        metric="smape",
-        X=None,
-        params=None,
-    ):
+        y: jnp.ndarray,
+        seasonal_period: int | list[int] | None,
+        n_steps: int,
+        test_size: int,
+        step_size: int = 1,
+        metric: str = "smape",
+        X: jnp.ndarray | None = None,
+        params: list[dict] | None = None,
+    ) -> dict:
+        """Auto-tune MFLES hyperparameters via rolling cross-validation.
+
+        Evaluates a grid of candidate configurations on rolling validation windows
+        and returns the configuration with the lowest average error metric.
+
+        Args:
+            y (jnp.ndarray): Full time series used for cross-validation.
+            seasonal_period (int | list[int] | None): Seasonal period(s) passed to fit()
+                in each fold. Also drives the default candidate grid when params=None.
+            n_steps (int): Number of rolling validation windows to evaluate.
+            test_size (int): Number of observations held out as the test horizon in
+                each window.
+            step_size (int): Step (in observations) between successive validation
+                windows. Default is 1.
+            metric (str): Error metric to minimise. One of "mse", "mae", "mape",
+                "smape". Default is "smape".
+            X (jnp.ndarray | None): Exogenous matrix of shape (n, p) aligned with y.
+                Sliced appropriately for each fold. Default is None.
+            params (list[dict] | None): Explicit list of fit() kwarg dicts to evaluate.
+                If None, a default grid is constructed based on seasonal_period.
+                Default is None.
+
+        Returns:
+            dict: The best-performing hyperparameter dictionary (suitable as **kwargs
+                to fit()).
+        """
         y = utils.ensure_float(jnp.asarray(y).reshape(-1))
         metric_fn = _metric2fn[metric]
         total = y.shape[0]

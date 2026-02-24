@@ -152,8 +152,7 @@ def extract_demand(y: jnp.ndarray) -> jnp.ndarray:
         Array containing only positive values from y.
 
     Example:
-        >>> y = jnp.array([0, 5, 0, 0, 3, 2, 0])
-        >>> extract_demand(y)
+        >>> extract_demand(jnp.array([0, 5, 0, 0, 3, 2, 0]))
         Array([5., 3., 2.], dtype=float32)
     """
     return y[y > 0]
@@ -172,8 +171,7 @@ def extract_probability(y: jnp.ndarray) -> jnp.ndarray:
         Binary array where 1 indicates demand occurred, 0 indicates no demand.
 
     Example:
-        >>> y = jnp.array([0, 5, 0, 0, 3, 2, 0])
-        >>> extract_probability(y)
+        >>> extract_probability(jnp.array([0, 5, 0, 0, 3, 2, 0]))
         Array([0., 1., 0., 0., 1., 1., 0.], dtype=float32)
     """
     return (y != 0).astype(y.dtype)
@@ -247,16 +245,14 @@ def _calculate_intervals(
         raise ValueError(f"sigmah shape {sigmah.shape} does not match h={h}")
 
     z = jnp.asarray(_quantiles(level), dtype=jnp.float32)
-
     lo = mean[:, None] - sigmah[:, None] * z[None, :]
     hi = mean[:, None] + sigmah[:, None] * z[None, :]
 
-    out = {}
+    out: Dict[str, jnp.ndarray] = {}
     for i, lv in enumerate(level[::-1]):
         out[f"lo-{int(lv)}"] = lo[:, len(level) - 1 - i]
     for i, lv in enumerate(level):
         out[f"hi-{int(lv)}"] = hi[:, i]
-
     return out
 
 
@@ -354,10 +350,18 @@ def _add_conformal_distribution_intervals(
     hi_cols = [f"hi-{lv}" for lv in level]
     out_cols = lo_cols + hi_cols
 
-    for i, col in enumerate(out_cols):
-        fcst[col] = quantiles[i]
+    Convenience wrapper around :func:`_add_conformal_intervals` for the
+    ``predict()`` method where no new data is available.
 
-    return fcst
+    Args:
+        self: A BaseForecaster instance.
+        fcst: Forecast dict with at least a "mean" key.
+        level: Confidence levels (0-100).
+
+    Returns:
+        Updated fcst dict with interval keys added.
+    """
+    return _add_conformal_intervals(self, fcst=fcst, y=None, X=None, level=level)
 
 
 def _get_conformal_method(method: str) -> Callable:
@@ -506,6 +510,7 @@ def _ses_forecast_nan(x: jnp.ndarray, alpha: jnp.ndarray) -> Tuple[jnp.ndarray, 
     fitted = fitted.at[first_valid_idx].set(jnp.nan)
     return forecast, fitted
 
+    Fully JIT-compiled via lax.fori_loop; handles arbitrary dtypes.
 
 @jax.jit
 def _ses_sse(alpha: jnp.ndarray, x: jnp.ndarray) -> jnp.ndarray:
@@ -536,6 +541,12 @@ def _ses_sse(alpha: jnp.ndarray, x: jnp.ndarray) -> jnp.ndarray:
     _, sse = lax.fori_loop(1, n, body_fun, init_state)
     return sse
 
+    def body_fun(i: int, forecast: jnp.ndarray) -> jnp.ndarray:
+        return lax.cond(
+            i < n_eff,
+            lambda: alpha * x[i - 1] + complement * forecast,
+            lambda: forecast,
+        )
 
 @jax.jit
 def _ses_forecast(x: jnp.ndarray, alpha: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
@@ -868,6 +879,8 @@ def _window_average(
     mean = _window_average_core(y, window_size, h)
     return {"mean": mean}
 
+    Args:
+        x: Input time series of shape (n,).
 
 def _chunk_sums(array: jnp.ndarray, chunk_size: int) -> jnp.ndarray:
     """Split array into equal chunks and sum each. Incomplete tail discarded.
@@ -1071,7 +1084,6 @@ def _expand_fitted_intervals(fitted: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray
     out, _ = jax.lax.fori_loop(1, n, body_fn, (out, 0))
     return out
 
-
 # ============================================================
 # SECTION 8 — Seasonal & Decomposition
 # ============================================================
@@ -1122,6 +1134,16 @@ def _seasonal_exponential_smoothing(
         fcst["fitted"] = fitted_vals
     return fcst
 
+def thetamodel(
+    y: jnp.ndarray,
+    m: int,
+    modeltype: str,
+    initial_smoothed: float,
+    alpha: float,
+    theta: float,
+    nmse: int,
+) -> Dict:
+    """Fit a Theta model to a time series.
 
 def _seasonal_naive(
     y: jnp.ndarray,
@@ -1304,30 +1326,20 @@ def _imapa_aggregate_jit(y: jnp.ndarray, max_k: int) -> jnp.ndarray:
     n = y.shape[0]
     forecasts = jnp.full((max_k,), jnp.asarray(jnp.nan, dtype=dtype))
 
-    def body(k, forecasts_arr):
-        n_chunks = n // k
-        lost = n - (n_chunks * k)
-        idx = jnp.arange(n)
-        valid = idx >= lost
-        y_masked = jnp.where(valid, y, jnp.asarray(0.0, dtype=dtype))
-        seg_ids = (idx - lost) // k
-        seg_ids = jnp.maximum(seg_ids, 0)
-        padded = jnp.zeros((n,), dtype=dtype)
-        padded = padded.at[seg_ids].add(y_masked)
+    if jnp.isinf(best_ic):
+        raise Exception("No theta model variant could be fitted to the data.")
 
-        def compute_forecast():
-            f = _optimized_ses_forecast_masked(padded, n_chunks)
-            return f / jnp.asarray(k, dtype=dtype)
+    if decompose:
+        if decomposition_type == "multiplicative":
+            best_model["residuals"] = best_model["residuals"] * y_decompose
+        else:
+            best_model["residuals"] = best_model["residuals"] + y_decompose
+        best_model["decompose"] = decompose
+        best_model["decomposition_type"] = decomposition_type
+        best_model["seas_forecast"] = dict(seas_forecast)
 
-        fcast = lax.cond(
-            n_chunks == 0,
-            lambda: jnp.asarray(jnp.nan, dtype=dtype),
-            compute_forecast,
-        )
-        forecasts_arr = forecasts_arr.at[k - 1].set(fcast)
-        return forecasts_arr
+    return best_model
 
-    return lax.fori_loop(1, max_k + 1, body, forecasts)
 
 
 def _imapa(
@@ -1360,16 +1372,18 @@ def _imapa(
             res["fitted"] = f
         return res
 
-    y = ensure_float(y)
-    dtype = y.dtype
 
-    y_intervals = _intervals(y)
-    mean_interval = jnp.mean(y_intervals)
-    max_aggregation_level = int(jnp.rint(mean_interval).item())
-    if max_aggregation_level < 1:
-        max_aggregation_level = 1
+# ============================================================
+# SECTION 11 — Information Criteria
+# ============================================================
 
-    forecasts = _imapa_aggregate_jit(y, max_aggregation_level)
+@jax.jit
+def calculate_information_criteria(
+    residuals: jnp.ndarray,
+    n_params: int,
+    n: int,
+) -> Dict[str, jnp.ndarray]:
+    """Compute AIC, BIC, and AICc from model residuals.
 
     # Mean of finite forecasts
     finite_mask = jnp.isfinite(forecasts)
@@ -1379,18 +1393,17 @@ def _imapa(
         jnp.asarray(0.0, dtype=dtype),
     )
 
-    res: Dict = {"mean": _repeat_val_(val=forecast, h=h)}
+    Args:
+        residuals: Model residuals of shape (n,).
+        n_params: Number of free parameters in the model.
+        n: Number of observations.
 
-    if fitted:
-        warnings.warn("Computing fitted values for IMAPA is very expensive.")
-        n = y.size
-        fitted_vals = jnp.empty_like(y)
-        fitted_vals = fitted_vals.at[0].set(jnp.asarray(jnp.nan, dtype=dtype))
-        for i in range(n - 1):
-            sub = y[: i + 1]
-            sub_res = _imapa(sub, h=1, fitted=False)
-            fitted_vals = fitted_vals.at[i + 1].set(sub_res["mean"][0])
-        res["fitted"] = fitted_vals
+    Returns:
+        Dict with keys ``"loglik"``, ``"aic"``, ``"bic"``, ``"aicc"``.
+        ``"aicc"`` is ``inf`` when n - n_params - 1 <= 0.
+    """
+    sse = jnp.sum(residuals ** 2)
+    lik = n * jnp.log(sse + 1e-10)
 
     return res
 

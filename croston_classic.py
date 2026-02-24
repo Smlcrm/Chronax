@@ -176,7 +176,7 @@ class CrostonClassic(BaseForecaster):
         self,
         alias: str = "CrostonClassic",
         conformal_params: Optional[ConformalIntervals] = None,
-    ):
+    ) -> None:
         self.alias = alias
         self.conformal_params = conformal_params
         self.model_ = {}
@@ -271,12 +271,7 @@ class CrostonClassic(BaseForecaster):
         # Add native (parametric) fitted intervals if requested
         if level is not None:
             level = sorted(level)
-            # res = {**res, **utils._add_fitted_pi(
-            res = {**res, **utils._add_fitted_pi_1(
-                fitted=self.model_["fitted"],
-                sigmah=self.model_["sigma"],
-                level=level
-            )}
+            res = utils._add_fitted_pi(res, self.model_["sigma"], level)
         
         return res
     

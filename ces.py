@@ -72,21 +72,64 @@ FULL = 3
 
 @dataclass
 class CESParams:
+    """Parameters for Complex Exponential Smoothing model variants.
+
+    This dataclass holds the smoothing parameters for different CES model variants.
+    The complex-valued smoothing parameter is α_complex = α_0 + i*α_1, which controls
+    how the state rotates in the complex plane. Seasonal damping parameters (β_0, β_1)
+    are used only in PARTIAL and FULL variants.
+
+    Attributes:
+        alpha_0: Real component of complex smoothing parameter (default 1.3)
+        alpha_1: Imaginary component of complex smoothing parameter (default 1.0)
+        beta_0: Seasonal damping parameter for PARTIAL/FULL variants (default None)
+                In PARTIAL: controls simple seasonal damping
+                In FULL: real component of complex seasonal damping
+        beta_1: Seasonal damping parameter for FULL variant only (default None)
+                Imaginary component of complex seasonal damping
+    """
     alpha_0: float = 1.3
     alpha_1: float = 1.0
     beta_0: Optional[float] = None
     beta_1: Optional[float] = None
-    
+
     @classmethod
     def for_variant(cls, variant: int) -> 'CESParams':
+        """Create default CESParams for a given model variant.
+
+        Returns appropriate default parameters based on the seasonal variant:
+        - NONE (0): alpha_0=1.3, alpha_1=1.0
+        - SIMPLE (1): alpha_0=1.3, alpha_1=1.0
+        - PARTIAL (2): alpha_0=1.3, alpha_1=1.0, beta_0=0.1
+        - FULL (3): alpha_0=1.3, alpha_1=1.0, beta_0=1.3, beta_1=1.0
+
+        Args:
+            variant: Model variant identifier. One of:
+                - NONE (0): No seasonality
+                - SIMPLE (1): Simple seasonal component
+                - PARTIAL (2): Partial seasonal damping
+                - FULL (3): Full seasonal damping
+
+        Returns:
+            CESParams instance with appropriate defaults for the variant
+        """
         if variant == PARTIAL:
             return cls(alpha_0=1.3, alpha_1=1.0, beta_0=0.1)
         elif variant == FULL:
             return cls(alpha_0=1.3, alpha_1=1.0, beta_0=1.3, beta_1=1.0)
         else:
             return cls(alpha_0=1.3, alpha_1=1.0)
-    
+
     def to_dict(self) -> Dict:
+        """Convert parameters to dictionary format.
+
+        Returns:
+            Dictionary with keys:
+                - 'alpha_0': float
+                - 'alpha_1': float
+                - 'beta_0': Optional[float]
+                - 'beta_1': Optional[float]
+        """
         return {
             'alpha_0': self.alpha_0,
             'alpha_1': self.alpha_1,
@@ -99,7 +142,19 @@ from functools import partial
 
 @partial(jit, static_argnums=(1,))
 def _init_state_n(y: jnp.ndarray, m: int) -> jnp.ndarray:
-    """Initialize NONE state with static m - padded to max size for lax.switch."""
+    """Initialize state for NONE variant (no seasonality).
+
+    Computes the mean of the first min(max(10, m), len(y)) observations and uses it
+    to initialize both real and imaginary components of the state. The state is padded
+    to (m, 4) for compatibility with lax.switch.
+
+    Args:
+        y: Input time series array
+        m: Seasonal period (used for padding even though no seasonality)
+
+    Returns:
+        State array of shape (m, 4) with columns [real, imag, 0, 0]
+    """
     idx = jnp.minimum(jnp.maximum(10, m), len(y))
     # Use masking for JIT compatibility
     mask = jnp.arange(len(y)) < idx
@@ -113,7 +168,19 @@ def _init_state_n(y: jnp.ndarray, m: int) -> jnp.ndarray:
 
 @partial(jit, static_argnums=(1,))
 def _init_state_s(y: jnp.ndarray, m: int) -> jnp.ndarray:
-    """Initialize SIMPLE state with static m - padded to (m, 4)."""
+    """Initialize state for SIMPLE variant (simple seasonality).
+
+    Uses the first m observations directly to initialize the state. Each observation
+    initializes the real component, with imaginary component set to obs/1.1. The last
+    two columns (seasonal damping) remain zero as they are not used in SIMPLE variant.
+
+    Args:
+        y: Input time series array (must have length >= m)
+        m: Seasonal period
+
+    Returns:
+        State array of shape (m, 4) with columns [real, imag, 0, 0]
+    """
     states = jnp.zeros((m, 4), dtype=jnp.float32)
     states = states.at[:, 0].set(y[:m])
     states = states.at[:, 1].set(y[:m] / 1.1)
@@ -123,7 +190,19 @@ def _init_state_s(y: jnp.ndarray, m: int) -> jnp.ndarray:
 
 @partial(jit, static_argnums=(1,))
 def _init_state_p(y: jnp.ndarray, m: int) -> jnp.ndarray:
-    """Initialize PARTIAL state with static m - padded to (m, 4)."""
+    """Initialize state for PARTIAL variant (partial seasonal damping).
+
+    Initializes the trend components (real/imaginary) with the mean of the first m values.
+    Extracts seasonal components via moving average detrending when sufficient data is
+    available (n >= 2*m), otherwise uses simple deviations from the mean.
+
+    Args:
+        y: Input time series array
+        m: Seasonal period
+
+    Returns:
+        State array of shape (m, 4) with columns [real, imag, seasonal, 0]
+    """
     states = jnp.zeros((m, 4), dtype=jnp.float32)
     mean_val = jnp.mean(y[:m])
     states = states.at[:, 0].set(mean_val)
@@ -150,7 +229,19 @@ def _init_state_p(y: jnp.ndarray, m: int) -> jnp.ndarray:
 
 @partial(jit, static_argnums=(1,))
 def _init_state_f(y: jnp.ndarray, m: int) -> jnp.ndarray:
-    """Initialize FULL state with static m."""
+    """Initialize state for FULL variant (full seasonal damping).
+
+    Initializes trend components (real/imaginary) with the mean of the first m values.
+    Extracts seasonal components (real and imaginary) via moving average detrending
+    when sufficient data is available (n >= 2*m), otherwise uses simple deviations.
+
+    Args:
+        y: Input time series array
+        m: Seasonal period
+
+    Returns:
+        State array of shape (m, 4) with columns [real, imag, seasonal_real, seasonal_imag]
+    """
     states = jnp.zeros((m, 4), dtype=jnp.float32)
     mean_val = jnp.mean(y[:m])
     states = states.at[:, 0].set(mean_val)
@@ -178,7 +269,20 @@ def _init_state_f(y: jnp.ndarray, m: int) -> jnp.ndarray:
 
 @partial(jit, static_argnums=(1, 2))
 def init_state(y: jnp.ndarray, m: int, season_type: int) -> jnp.ndarray:
-    """Initialize state with static m and season_type - uses lax.switch."""
+    """Initialize CES state vector based on model variant.
+
+    Dispatches to the appropriate initialization function based on season_type using
+    lax.switch for efficient JIT-compiled branching. All variants return states padded
+    to (m, 4) for compatibility.
+
+    Args:
+        y: Input time series array
+        m: Seasonal period
+        season_type: Model variant (NONE=0, SIMPLE=1, PARTIAL=2, FULL=3)
+
+    Returns:
+        State array of shape (m, 4)
+    """
     return lax.switch(
         season_type,
         [
@@ -201,6 +305,24 @@ def _update_state_none_partial_full(
     beta_0: float,
     beta_1: float,
 ) -> jnp.ndarray:
+    """Update CES state for NONE, PARTIAL, or FULL variants (previous-step state).
+
+    Computes the innovation error from the previous state, updates the complex
+    trend components (real/imaginary), and conditionally updates seasonal components
+    based on the variant. Uses lax.cond for JIT-safe branching.
+
+    Args:
+        state_prev: Previous time-step state vector of shape (4,).
+        y_obs: Observed value at current time step.
+        alpha_0: Real part of complex smoothing parameter.
+        alpha_1: Imaginary part of complex smoothing parameter.
+        season_type: Model variant (NONE=0, PARTIAL=2, FULL=3).
+        beta_0: Real seasonal damping parameter (used by PARTIAL/FULL).
+        beta_1: Imaginary seasonal damping parameter (used by FULL only).
+
+    Returns:
+        Updated state vector of shape (4,).
+    """
     e = y_obs - state_prev[0]
     
     state_new = jnp.zeros_like(state_prev)
@@ -239,6 +361,21 @@ def _update_state_simple(
     alpha_0: float,
     alpha_1: float,
 ) -> jnp.ndarray:
+    """Update CES state for the SIMPLE seasonal variant (m-step lagged state).
+
+    Uses the state from m steps ago (the matching seasonal phase) to compute
+    the innovation and update only the complex trend components. Seasonal
+    components are carried forward implicitly through the ring buffer.
+
+    Args:
+        state_lag: State vector from m steps ago of shape (4,).
+        y_obs: Observed value at current time step.
+        alpha_0: Real part of complex smoothing parameter.
+        alpha_1: Imaginary part of complex smoothing parameter.
+
+    Returns:
+        Updated state vector of shape (4,).
+    """
     e = y_obs - state_lag[0]
     
     state_new = jnp.zeros_like(state_lag)
@@ -262,6 +399,24 @@ def _update_state_partial_full_lag(
     beta_0: float,
     beta_1: float,
 ) -> jnp.ndarray:
+    """Update CES state for PARTIAL/FULL variants using the m-step lagged state.
+
+    Computes the innovation from the lagged state (subtracting the seasonal
+    component) and updates both trend and seasonal components accordingly.
+    Uses lax.cond to branch between PARTIAL and FULL seasonal updates.
+
+    Args:
+        state_lag: State vector from m steps ago of shape (4,).
+        y_obs: Observed value at current time step.
+        alpha_0: Real part of complex smoothing parameter.
+        alpha_1: Imaginary part of complex smoothing parameter.
+        season_type: Model variant (PARTIAL=2 or FULL=3).
+        beta_0: Real seasonal damping parameter.
+        beta_1: Imaginary seasonal damping parameter (FULL only).
+
+    Returns:
+        Updated state vector of shape (4,).
+    """
     e = y_obs - state_lag[0] - jnp.where(season_type > SIMPLE, state_lag[2], 0.0)
     
     state_new = jnp.zeros_like(state_lag)
@@ -366,7 +521,27 @@ def ces_fit_forward(
     season_type: int,
     m: int,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """Forward pass with static season_type and m."""
+    """Run a single forward CES pass over the series using lax.scan.
+
+    Scans `ces_update_step` over observations y[m:] starting from the
+    initialised state buffer (first m states). season_type and m are
+    static for JIT compilation.
+
+    Args:
+        y: Time series of shape (n,).
+        init_state: Initial state buffer of shape (m, 4).
+        alpha_0: Real part of complex smoothing parameter.
+        alpha_1: Imaginary part of complex smoothing parameter.
+        beta_0: Seasonal damping parameter (real).
+        beta_1: Seasonal damping parameter (imaginary, FULL only).
+        season_type: Model variant (static: NONE=0, SIMPLE=1, PARTIAL=2, FULL=3).
+        m: Seasonal period (static).
+
+    Returns:
+        Tuple of:
+            - final_states: State buffer after processing all observations, shape (m, 4).
+            - forecasts: One-step-ahead in-sample forecasts for y[m:], shape (n-m,).
+    """
     states_buffer = init_state.copy()
     
     (final_states, _), forecasts = lax.scan(
@@ -387,6 +562,25 @@ def ces_fit_backfit(
     season_type: int,
     m: int,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Fit CES using a three-pass back-fitting procedure for better initialisation.
+
+    Runs three consecutive forward passes: forward → backward (reversed series)
+    → forward again. The backward pass refines the initial state before the final
+    forward pass, substantially reducing initialisation bias on short series.
+
+    Args:
+        y: Time series of shape (n,).
+        init_state: Initial state buffer of shape (m, 4).
+        params: CESParams instance with smoothing parameters.
+        season_type: Model variant (NONE=0, SIMPLE=1, PARTIAL=2, FULL=3).
+        m: Seasonal period.
+
+    Returns:
+        Tuple of:
+            - final_states: State buffer from the last forward pass, shape (m, 4).
+            - forecasts: In-sample one-step-ahead forecasts from the last forward
+              pass for y[m:], shape (n-m,).
+    """
     beta_0 = params.beta_0 if params.beta_0 is not None else 0.0
     beta_1 = params.beta_1 if params.beta_1 is not None else 0.0
     
@@ -488,6 +682,32 @@ def ces_fit_single(
     season_type: int,
     params: Optional[CESParams] = None,
 ) -> Dict:
+    """Fit a single CES variant and return metrics, fitted values, and state.
+
+    Initialises the state vector, runs back-fitting, computes in-sample
+    residuals, and calculates information criteria (AIC, BIC, AICc).
+
+    Args:
+        y: Time series of shape (n,).
+        m: Seasonal period.
+        season_type: Model variant (NONE=0, SIMPLE=1, PARTIAL=2, FULL=3).
+        params: CESParams with smoothing parameters. If None, uses
+            CESParams.for_variant(season_type) defaults.
+
+    Returns:
+        Dict with keys:
+            - "loglik" (float): Log-likelihood.
+            - "aic" / "bic" / "aicc" (float): Information criteria.
+            - "mse" / "amse" (float): Mean squared error on y[m:].
+            - "fitted" (jnp.ndarray): In-sample fitted values, shape (n,).
+            - "residuals" (jnp.ndarray): Residuals y[m:] − ŷ[m:], shape (n-m,).
+            - "states" (jnp.ndarray): Final state buffer, shape (m, 4).
+            - "par" (dict): Parameter dict from params.to_dict().
+            - "m" (int): Seasonal period used.
+            - "n" (int): Series length.
+            - "seasontype" (int): Variant used.
+            - "sigma2" (float): Residual variance estimate.
+    """
     y = ensure_float(y)
     
     if params is None:
@@ -538,6 +758,27 @@ def auto_ces(
     model: str = "Z",
     ic: str = "aicc",
 ) -> Dict:
+    """Fit CES with automatic or fixed model selection.
+
+    When model="Z", fits all applicable variants (NONE always; SIMPLE/PARTIAL/FULL
+    when n >= 2*m) and returns the fit with the lowest information criterion.
+    Otherwise, fits the specified variant directly.
+
+    Args:
+        y: Time series of shape (n,).
+        m: Seasonal period. Default is 1 (no seasonality).
+        model: Variant selector. "Z" for automatic selection; one of "N", "S", "P",
+            "F" to fix the variant. Default is "Z".
+        ic: Information criterion used for model selection when model="Z".
+            One of "aic", "bic", "aicc". Default is "aicc".
+
+    Returns:
+        Dict from ces_fit_single() for the selected variant, containing fitted
+        values, residuals, states, parameters, and information criteria.
+
+    Raises:
+        ValueError: If model="Z" and no variant could be fitted successfully.
+    """
     y = ensure_float(y)
     
     model_map = {"N": NONE, "S": SIMPLE, "P": PARTIAL, "F": FULL}
@@ -571,24 +812,67 @@ def auto_ces(
 
 
 class AutoCES(BaseForecaster):
+    """Complex Exponential Smoothing model with optional automatic variant selection.
+
+    Wraps `auto_ces` / `ces_fit_single` in the BaseForecaster interface.
+    When model="Z", selects the best variant (NONE/SIMPLE/PARTIAL/FULL) by AICc.
+    All JAX core functions are JIT-compiled; the class itself is a thin orchestrator.
+
+    Args:
+        season_length (int): Seasonal period m. Use 1 for non-seasonal data.
+            Default is 1.
+        model (str): Variant selector passed to auto_ces(). "Z" for automatic
+            selection; "N", "S", "P", or "F" to fix the variant. Default is "Z".
+        alias (str): Model name for display / repr. Default is "CES".
+        conformal_params (Optional[ConformalIntervals]): Conformal prediction
+            configuration for generating prediction intervals. Default is None.
+
+    Attributes:
+        model_ (dict | None): Populated after fit(); contains fitted values,
+            residuals, states, parameters, and information criteria from
+            ces_fit_single(). None before first fit.
+    """
+
     uses_exog = False
-    
+
     def __init__(
         self,
         season_length: int = 1,
         model: str = "Z",
         alias: str = "CES",
         conformal_params: Optional[ConformalIntervals] = None,
-    ):
+    ) -> None:
+        """Initialise AutoCES with model configuration.
+
+        Args:
+            season_length (int): Seasonal period m. Default is 1.
+            model (str): Variant selector ("Z", "N", "S", "P", "F"). Default is "Z".
+            alias (str): Model name identifier. Default is "CES".
+            conformal_params (Optional[ConformalIntervals]): Conformal prediction
+                configuration. Default is None.
+        """
         self.season_length = season_length
         self.model = model
         self.alias = alias
         self.conformal_params = conformal_params
         self.model_ = None
     
-    def fit(self, y: jnp.ndarray, X: Optional[jnp.ndarray] = None):
+    def fit(self, y: jnp.ndarray, X: Optional[jnp.ndarray] = None) -> "AutoCES":
+        """Fit the CES model to a time series.
+
+        Handles the constant-series edge case separately (stores a trivial state).
+        Otherwise delegates to auto_ces() which runs variant selection and back-fitting.
+
+        Args:
+            y (jnp.ndarray): Input time series of shape (n,).
+            X (Optional[jnp.ndarray]): Exogenous variables (unused; kept for API
+                compatibility). Default is None.
+
+        Returns:
+            AutoCES: Self (fitted model instance) for method chaining.
+        """
         y = ensure_float(y)
-        
+
         if jnp.std(y) < 1e-10:
             # Constant series - create proper state for forecasting
             mean_val = jnp.mean(y)
@@ -614,6 +898,21 @@ class AutoCES(BaseForecaster):
         X: Optional[jnp.ndarray] = None,
         X_future: Optional[jnp.ndarray] = None,
     ) -> Dict:
+        """Stateless fit+forecast: fit if not already done, then generate forecasts.
+
+        If model_ is None, fits the model on y first. Otherwise uses existing state.
+        Does not support conformal intervals (use predict() after fit() for that).
+
+        Args:
+            y (jnp.ndarray): Input time series of shape (n,). Used only if not fitted.
+            h (int): Forecast horizon (number of steps ahead).
+            X (Optional[jnp.ndarray]): Exogenous variables (unused). Default is None.
+            X_future (Optional[jnp.ndarray]): Future exogenous variables (unused).
+                Default is None.
+
+        Returns:
+            Dict: Dictionary with key "mean" containing forecasts of shape (h,).
+        """
         if self.model_ is None:
             self.fit(y, X)
         
@@ -634,6 +933,29 @@ class AutoCES(BaseForecaster):
         return {'mean': forecasts}
     
     def predict(self, h: int, X: Optional[jnp.ndarray] = None, level: Optional[List[int]] = None) -> Dict:
+        """Generate h-step ahead forecasts from the fitted CES model.
+
+        Runs the JIT-compiled ces_forecast() function from the stored final state.
+        Handles the constant-series edge case (alpha=0) by returning flat forecasts.
+        Optionally adds conformal prediction intervals.
+
+        Args:
+            h (int): Forecast horizon (number of steps ahead).
+            X (Optional[jnp.ndarray]): Exogenous variables (unused; kept for API
+                compatibility). Default is None.
+            level (Optional[List[int]]): Confidence levels (0–100) for conformal
+                prediction intervals, e.g. [90, 95]. Requires conformal_params to
+                be set. Default is None.
+
+        Returns:
+            Dict: Dictionary containing:
+                - "mean": Point forecasts of shape (h,).
+                - "lo-{l}" / "hi-{l}": Conformal interval bounds for each level l
+                  (only present when level is not None and conformal_params is set).
+
+        Raises:
+            ValueError: If called before fit().
+        """
         if self.model_ is None:
             raise ValueError("Model must be fitted before prediction")
         
