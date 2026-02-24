@@ -77,10 +77,20 @@ __all__ = ['HoltWinters']
 # Core Math — Module-level JIT'd functions
 # =============================================================================
 
-def _to_constrained(p_raw, l0_decomp, b0_decomp, s0_decomp,
-                    l_scale, b_scale, s_scale,
-                    is_additive_season, season_length):
-    """Convert unconstrained parameters to constrained space via sigmoid."""
+def _to_constrained(p_raw: jnp.ndarray, l0_decomp: float, b0_decomp: float,
+                    s0_decomp: jnp.ndarray, l_scale: jnp.ndarray,
+                    b_scale: jnp.ndarray, s_scale: jnp.ndarray,
+                    is_additive_season: bool, season_length: int
+                    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray,
+                               jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Convert unconstrained parameters to constrained space via sigmoid.
+
+    Smoothing parameters (alpha, beta, gamma) are mapped to (eps, 1-eps)
+    via sigmoid. State parameters (l0, b0, s0) are offsets from the
+    decomposition-based initial estimates, scaled by data-derived factors.
+    The last seasonal factor is pinned by the constraint (sum-to-0 for
+    additive, mean-to-1 for multiplicative).
+    """
     m = season_length
     eps = _EPS_PARAM
 
@@ -101,16 +111,24 @@ def _to_constrained(p_raw, l0_decomp, b0_decomp, s0_decomp,
     return alpha, beta, gamma, l0, b0, s0
 
 
-def _hw_core(alpha, beta, gamma, l0, b0, s0, y,
-             phi, is_additive_error, is_additive_season, season_length):
+def _hw_core(alpha: jnp.ndarray, beta: jnp.ndarray, gamma: jnp.ndarray,
+             l0: jnp.ndarray, b0: jnp.ndarray, s0: jnp.ndarray,
+             y: jnp.ndarray, phi: float,
+             is_additive_season: bool, season_length: int
+             ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray,
+                        jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Forward pass and MLE loss for Holt-Winters.
 
-    Returns loss, fitted_vals, final_level, final_trend, final_seasonal, residuals.
+    Error type (A vs M) only affects prediction intervals, not state
+    updates or loss, so it is not a parameter here.
+
+    Returns (loss, fitted_vals, final_level, final_trend, final_seasonal, residuals).
     """
     m = season_length
     n = y.shape[0]
 
-    def step_AAA(carry, y_t):
+    # Additive seasonality: y_hat = (level + phi*trend) + seasonal
+    def step_additive(carry, y_t):
         level_prev, trend_prev, seasonal_prev, a, b, g = carry
         phi_trend = phi * trend_prev
         s_prev = seasonal_prev[0]
@@ -124,7 +142,8 @@ def _hw_core(alpha, beta, gamma, l0, b0, s0, y,
         seasonal_new = seasonal_new.at[-1].set(new_seasonal)
         return (level, trend, seasonal_new, a, b, g), y_hat
 
-    def step_AAM(carry, y_t):
+    # Multiplicative seasonality: y_hat = (level + phi*trend) * seasonal
+    def step_multiplicative(carry, y_t):
         level_prev, trend_prev, seasonal_prev, a, b, g = carry
         phi_trend = phi * trend_prev
         s_prev = seasonal_prev[0]
@@ -138,42 +157,7 @@ def _hw_core(alpha, beta, gamma, l0, b0, s0, y,
         seasonal_new = seasonal_new.at[-1].set(new_seasonal)
         return (level, trend, seasonal_new, a, b, g), y_hat
 
-    def step_MAA(carry, y_t):
-        level_prev, trend_prev, seasonal_prev, a, b, g = carry
-        phi_trend = phi * trend_prev
-        s_prev = seasonal_prev[0]
-
-        y_hat = level_prev + phi_trend + s_prev
-        level = a * (y_t - s_prev) + (1 - a) * (level_prev + phi_trend)
-        trend = b * (level - level_prev) + (1 - b) * phi_trend
-        new_seasonal = g * (y_t - level) + (1 - g) * s_prev
-
-        seasonal_new = jnp.roll(seasonal_prev, -1)
-        seasonal_new = seasonal_new.at[-1].set(new_seasonal)
-        return (level, trend, seasonal_new, a, b, g), y_hat
-
-    def step_MAM(carry, y_t):
-        level_prev, trend_prev, seasonal_prev, a, b, g = carry
-        phi_trend = phi * trend_prev
-        s_prev = seasonal_prev[0]
-
-        y_hat = (level_prev + phi_trend) * s_prev
-        level = a * (y_t / jnp.maximum(s_prev, _EPSILON)) + (1 - a) * (level_prev + phi_trend)
-        trend = b * (level - level_prev) + (1 - b) * phi_trend
-        new_seasonal = g * (y_t / jnp.maximum(level, _EPSILON)) + (1 - g) * s_prev
-
-        seasonal_new = jnp.roll(seasonal_prev, -1)
-        seasonal_new = seasonal_new.at[-1].set(new_seasonal)
-        return (level, trend, seasonal_new, a, b, g), y_hat
-
-    if is_additive_error and is_additive_season:
-        step_fn = step_AAA
-    elif is_additive_error and not is_additive_season:
-        step_fn = step_AAM
-    elif not is_additive_error and is_additive_season:
-        step_fn = step_MAA
-    else:
-        step_fn = step_MAM
+    step_fn = step_additive if is_additive_season else step_multiplicative
 
     init_carry = (l0, b0, s0, alpha, beta, gamma)
     final_carry, fitted_vals = lax.scan(step_fn, init_carry, y)
@@ -190,20 +174,26 @@ def _hw_core(alpha, beta, gamma, l0, b0, s0, y,
 # Optimizer — ADAM + L-BFGS
 # =============================================================================
 
-def _optimize_hw(y, l0_decomp, b0_decomp, s0_decomp,
-                 phi, is_additive_error, is_additive_season, season_length):
+def _optimize_hw(y: jnp.ndarray, l0_decomp: float, b0_decomp: float,
+                 s0_decomp: jnp.ndarray, phi: float,
+                 is_additive_season: bool, season_length: int
+                 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray,
+                            jnp.ndarray, jnp.ndarray,
+                            jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Two-phase ADAM + L-BFGS optimization for Holt-Winters.
 
     Parameters
     ----------
     y : jnp.ndarray
         Time series of shape (n,).
-    l0_decomp, b0_decomp, s0_decomp : float/jnp.ndarray
-        Initial state estimates from classical decomposition.
+    l0_decomp : float
+        Initial level from classical decomposition.
+    b0_decomp : float
+        Initial trend from classical decomposition.
+    s0_decomp : jnp.ndarray
+        Initial seasonal factors from classical decomposition, shape (m,).
     phi : float
-        Damping factor (static arg).
-    is_additive_error : bool
-        Whether error type is additive (static arg).
+        Damping factor (static arg). 1.0 for undamped.
     is_additive_season : bool
         Whether season type is additive (static arg).
     season_length : int
@@ -224,13 +214,13 @@ def _optimize_hw(y, l0_decomp, b0_decomp, s0_decomp,
     else:
         s_scale = jnp.std(y) / jnp.maximum(jnp.mean(y), _EPSILON)
 
-    def loss_fn(p_raw):
+    def loss_fn(p_raw: jnp.ndarray) -> jnp.ndarray:
         p_raw = jnp.asarray(p_raw, dtype=dtype)
         alpha, beta, gamma, l0, b0, s0 = _to_constrained(
             p_raw, l0_decomp, b0_decomp, s0_decomp,
             l_scale, b_scale, s_scale, is_additive_season, m)
         loss, *_ = _hw_core(alpha, beta, gamma, l0, b0, s0, y,
-                            phi, is_additive_error, is_additive_season, m)
+                            phi, is_additive_season, m)
         return loss
 
     vg_fn = jax.value_and_grad(loss_fn)
@@ -246,7 +236,7 @@ def _optimize_hw(y, l0_decomp, b0_decomp, s0_decomp,
     adam_opt = optax.adam(_ADAM_LR)
     adam_state = adam_opt.init(p0)
 
-    def adam_step(carry, _):
+    def adam_step(carry: tuple, _: None) -> tuple[tuple, None]:
         p, state, best_p, best_loss = carry
         loss, grads = vg_fn(p)
         grads = jnp.where(jnp.isfinite(grads), grads, 0.0)
@@ -268,7 +258,7 @@ def _optimize_hw(y, l0_decomp, b0_decomp, s0_decomp,
             max_linesearch_steps=_LBFGS_LS_STEPS, initial_guess_strategy="one"))
     lbfgs_state = lbfgs_solver.init(adam_best_p)
 
-    def lbfgs_step(carry, _):
+    def lbfgs_step(carry: tuple, _: None) -> tuple[tuple, None]:
         p, state, best_p, best_loss = carry
         loss, grads = vg_fn(p)
         grads = jnp.where(jnp.isfinite(grads), grads, 0.0)
@@ -294,11 +284,11 @@ def _optimize_hw(y, l0_decomp, b0_decomp, s0_decomp,
         l_scale, b_scale, s_scale, is_additive_season, m)
     loss, fitted, level, trend, seasonal, residuals = _hw_core(
         alpha, beta, gamma, l0, b0, s0, y,
-        phi, is_additive_error, is_additive_season, m)
+        phi, is_additive_season, m)
 
     return fitted, level, trend, seasonal, residuals, alpha, beta, gamma
 
-_optimize_hw = jax.jit(_optimize_hw, static_argnums=(4, 5, 6, 7))
+_optimize_hw = jax.jit(_optimize_hw, static_argnums=(4, 5, 6))
 
 
 # =============================================================================
@@ -324,10 +314,6 @@ class HoltWinters(BaseForecaster):
         Custom name for the model.
     conformal_params : ConformalIntervals | None, default None
         Parameters for conformal prediction intervals.
-    allow_extended_iterations : bool, default False
-        No-op, kept for API compatibility.
-    iteration_scaling : str, default 'quadratic'
-        No-op, kept for API compatibility.
     """
 
     @staticmethod
@@ -346,7 +332,20 @@ class HoltWinters(BaseForecaster):
     def _initialize_states(self, y: jnp.ndarray) -> tuple[float, float, jnp.ndarray]:
         """Initialize level, trend, and seasonal states via classical decomposition.
 
-        Returns (l0, b0, s0) where s0 has shape (season_length,).
+        When fewer than 2 full seasons are available, falls back to simple
+        averages.  Otherwise uses OLS on per-season averages to estimate a
+        per-step trend, then detrends to extract the seasonal pattern.
+
+        Parameters
+        ----------
+        y : jnp.ndarray
+            Time series of shape (n,).
+
+        Returns
+        -------
+        tuple[float, float, jnp.ndarray]
+            (l0, b0, s0) — initial level, per-step trend, and seasonal
+            factors of shape (season_length,).
         """
         m = self.season_length
         n = len(y)
@@ -395,12 +394,18 @@ class HoltWinters(BaseForecaster):
         return l0, b0, s0.astype(jnp.float32)
 
     def _get_phi(self) -> float:
+        """Return the damping factor: self.phi (or 0.9) if damped, else 1.0."""
         if self.damped:
             return self.phi if self.phi is not None else 0.9
         return 1.0
 
-    def _compute_base_variance(self, t, alpha, beta, phi):
-        """Compute base variance for trend component (Hyndman et al. 2008)."""
+    def _compute_base_variance(self, t: jnp.ndarray, alpha: float,
+                               beta: float, phi: float) -> jnp.ndarray:
+        """Compute cumulative variance multiplier for the trend component.
+
+        Uses the damped-trend formula when phi < 1 (Hyndman et al. 2008,
+        Ch. 6) and the simpler undamped formula otherwise.
+        """
         if self.damped and phi < 0.9999:
             denom = jnp.maximum(1 - phi, _EPSILON)
             denom2 = jnp.maximum(1 - phi**2, _EPSILON)
@@ -412,7 +417,8 @@ class HoltWinters(BaseForecaster):
             exp1 = alpha**2 + alpha * beta * t + (1 / 6) * beta**2 * t * (2 * t - 1)
             return 1 + (t - 1) * exp1
 
-    def _validate_forecast_inputs(self, y, h, level):
+    def _validate_forecast_inputs(self, y: jnp.ndarray, h: int,
+                                  level: list[int] | None) -> jnp.ndarray:
         """Validate and convert inputs for forecast/forward methods."""
         y = utils.ensure_float(y)
         if len(y) < self.season_length:
@@ -425,14 +431,17 @@ class HoltWinters(BaseForecaster):
         return y
 
     def _fit_parameters(self, y: jnp.ndarray) -> dict:
-        """Fit model parameters and return results dictionary."""
+        """Fit smoothing parameters and initial states via ADAM + L-BFGS.
+
+        Returns a dict with keys: 'fitted', 'level', 'trend', 'seasonal',
+        'residuals', 'alpha', 'beta', 'gamma', 'sigma'.
+        """
         l0, b0, s0 = self._initialize_states(y)
         phi = self._get_phi()
-        is_additive_error = self.error_type == 'A'
         is_additive_season = self.season_type == 'A'
 
         fitted, level, trend, seasonal, residuals, alpha, beta, gamma = _optimize_hw(
-            y, l0, b0, s0, phi, is_additive_error, is_additive_season, self.season_length)
+            y, l0, b0, s0, phi, is_additive_season, self.season_length)
 
         n_params = 3 + 2 + (self.season_length - 1)
         return {
@@ -442,7 +451,8 @@ class HoltWinters(BaseForecaster):
             'sigma': utils.calculate_sigma(residuals, len(y) - n_params),
         }
 
-    def _generate_forecasts(self, level, trend, seasonal, phi, h):
+    def _generate_forecasts(self, level: jnp.ndarray, trend: jnp.ndarray,
+                            seasonal: jnp.ndarray, phi: float, h: int) -> jnp.ndarray:
         """Generate h-step ahead point forecasts (vectorized)."""
         m = self.season_length
         t_vals = jnp.arange(1, h + 1, dtype=jnp.float32)
@@ -459,7 +469,9 @@ class HoltWinters(BaseForecaster):
         else:
             return (level + trend_components) * s_components
 
-    def _calculate_native_intervals(self, mean, sigma, alpha, beta, gamma, phi, h):
+    def _calculate_native_intervals(self, mean: jnp.ndarray, sigma: float,
+                                     alpha: float, beta: float, gamma: float,
+                                     phi: float, h: int) -> jnp.ndarray:
         """Calculate prediction interval width (sigmah) using analytical formulas.
 
         Based on Hyndman et al. (2008) and Taylor (2003).
@@ -478,8 +490,14 @@ class HoltWinters(BaseForecaster):
 
         return sigmah
 
-    def _add_interval_bounds(self, res, values, sigmah, level, prefix=''):
-        """Add lo/hi prediction interval bounds to result dict."""
+    def _add_interval_bounds(self, res: dict, values: jnp.ndarray,
+                             sigmah: jnp.ndarray | float, level: list[int],
+                             prefix: str = '') -> dict:
+        """Add lo/hi prediction interval bounds to result dict.
+
+        ``sigmah`` may be a per-step array (forecast intervals) or a
+        scalar (fitted-value intervals), both broadcast correctly.
+        """
         for lv in reversed(level):
             alpha_level = (100 - lv) / 100
             z = utils._jax_norm_ppf(1 - alpha_level / 2)
@@ -487,7 +505,10 @@ class HoltWinters(BaseForecaster):
             res[f'{prefix}hi-{lv}'] = values + z * sigmah
         return res
 
-    def _compute_forecast_with_intervals(self, result, phi, h, level, fitted, y, X):
+    def _compute_forecast_with_intervals(self, result: dict, phi: float, h: int,
+                                          level: list[int] | None, fitted: bool,
+                                          y: jnp.ndarray,
+                                          X: jnp.ndarray | None) -> dict:
         """Generate forecasts and optionally add intervals and fitted values."""
         mean = self._generate_forecasts(
             result['level'], result['trend'], result['seasonal'], phi, h)
@@ -530,8 +551,6 @@ class HoltWinters(BaseForecaster):
         phi: float | None = None,
         alias: str = "HoltWinters",
         conformal_params: ConformalIntervals | None = None,
-        allow_extended_iterations: bool = False,
-        iteration_scaling: str = "quadratic",
     ):
         if not isinstance(season_length, int) or season_length < 2:
             raise ValueError(f"season_length must be an integer >= 2, got {season_length}")
@@ -549,8 +568,6 @@ class HoltWinters(BaseForecaster):
             raise ValueError(
                 f"conformal_params must be a ConformalIntervals instance, got {type(conformal_params).__name__}"
             )
-        if iteration_scaling not in ("cubic", "quadratic"):
-            raise ValueError(f"iteration_scaling must be 'cubic' or 'quadratic', got '{iteration_scaling}'")
 
         self.season_length = season_length
         self.error_type = error_type
@@ -559,8 +576,6 @@ class HoltWinters(BaseForecaster):
         self.phi = phi
         self.alias = alias
         self.conformal_params = conformal_params
-        self.allow_extended_iterations = allow_extended_iterations
-        self.iteration_scaling = iteration_scaling
 
     def fit(self, y: jnp.ndarray, X: jnp.ndarray | None = None) -> 'HoltWinters':
         r"""Fit the Holt-Winters model.
