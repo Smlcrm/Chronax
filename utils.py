@@ -1,97 +1,155 @@
 """
-1. ensure_float() has one signature, a JAX array, and returns one object, a JAX array.
-   It is a helper method for to ensure that the datatypes within a given array are float32. 
+utils.py — Shared utilities for all Chronax forecasting models.
+
+Sections
+--------
+1.  Type / Dtype Helpers          ensure_float, calculate_sigma, _jax_norm_ppf, _quantiles
+2.  Data Extraction Helpers       extract_demand, extract_probability
+3.  Forecast Output Helpers       _repeat_val, _repeat_val_seas, _calculate_intervals,
+                                   _add_fitted_pi, _add_fitted_pi_1
+4.  Conformal Interval Helpers    _add_conformal_distribution_intervals, _get_conformal_method,
+                                   _conformal_method, _store_cs, _add_conformal_intervals,
+                                   _add_predict_conformal_intervals
+5.  SES Core                      _ses_forecast_nan, _ses_sse, _ses_forecast,
+                                   _ses_sse_masked, _ses_forecast_last_masked,
+                                   _golden_bounded_minimize,
+                                   _optimized_ses_forecast, _optimized_ses_forecast_masked
+6.  Aggregation / Chunking        _window_average_core, _window_average,
+                                   _chunk_sums, _chunk_forecast
+7.  Intermittent Demand Helpers   _demand, _intervals_c, _intervals,
+                                   _expand_fitted_demand, _expand_fitted_intervals
+8.  Seasonal & Decomposition      _seasonal_exponential_smoothing, _seasonal_naive,
+                                   seasonal_decompose, _linear_extrapolate_tail
+9.  IMAPA                         _imapa_aggregate_jit, _imapa
+10. Miscellaneous                 is_constant, acf, calculate_information_criteria
+
+Public API (imported by other modules)
+---------------------------------------
+ensure_float, calculate_sigma, extract_demand, extract_probability,
+_repeat_val, _repeat_val_seas, _quantiles, _calculate_intervals,
+_add_fitted_pi, _add_fitted_pi_1,
+_add_conformal_distribution_intervals, _get_conformal_method,
+_conformal_method, _store_cs, _add_conformal_intervals, _add_predict_conformal_intervals,
+_seasonal_naive, _seasonal_exponential_smoothing, _window_average,
+_intervals, _intervals_c, _expand_fitted_intervals, _expand_fitted_demand, _imapa,
+calculate_information_criteria, is_constant, acf, results
 """
-import os
+
+# ============================================================
+# IMPORTS & CONFIG
+# ============================================================
+
+import math
+import warnings
 from collections import namedtuple
 from functools import partial
-from typing import Optional, List, Dict, Union, Tuple
-from jax.scipy.stats import norm
-import math
-from collections import namedtuple
-import jax.random as jrandom
+_partial = partial  # alias used in @_partial(jax.jit, ...) decorators
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import jax
-from jax import jit, lax
 import jax.numpy as jnp
-from jax.scipy.optimize import minimize
-from jax.scipy.special import ndtri  # JAX inverse normal CDF
+import jax.random as jrandom
+from jax import jit, lax
+from jax.scipy.stats import norm
 
+# Enable float64 precision — required by the golden-section SES optimizer.
+# Note: this affects the entire JAX session.
+jax.config.update("jax_enable_x64", True)
+
+# Named tuple returned by optimize_theta_target_fn and used by ets_functions.
 results = namedtuple("results", "x fn nit simplex")
 
 
-import os
-from collections import namedtuple
-from functools import partial
-from typing import Optional, List, Dict, Union, Tuple
-from jax.scipy.stats import norm
-import math
-from collections import namedtuple
-import jax.random as jrandom
-
-import jax
-from jax import jit, lax
-import jax.numpy as jnp
-from jax.scipy.optimize import minimize
-from jax.scipy.special import ndtri  # JAX inverse normal CDF
-
-results = namedtuple("results", "x fn nit simplex")
+# ============================================================
+# SECTION 1 — Type / Dtype Helpers
+# ============================================================
 
 def ensure_float(y: jnp.ndarray) -> jnp.ndarray:
+    """Cast array to float32 if it is not already a floating-point dtype.
+
+    Args:
+        y: Input JAX array of any dtype.
+
+    Returns:
+        The same array if already floating-point, otherwise cast to float32.
+    """
     if not jnp.issubdtype(y.dtype, jnp.floating):
         return y.astype(jnp.float32)
     return y
 
+
 @jax.jit
 def calculate_sigma(residuals: jnp.ndarray, n: int) -> jnp.ndarray:
-    """Calculate sigma for residuals using JAX operations.
+    """Compute the root-mean-square of residuals (RMS sigma).
 
     Args:
-        residuals: Residual values
-        n: Number of degrees of freedom
+        residuals: Residual values as a JAX array.
+        n: Number of degrees of freedom (denominator).
 
     Returns:
-        Sigma value as JAX array
+        Scalar sigma value; returns 0.0 when n <= 0.
     """
-    sigma = jnp.where(
+    return jnp.where(
         n > 0,
-        jnp.sqrt(jnp.nansum(residuals**2) / n),
-        0.0
+        jnp.sqrt(jnp.nansum(residuals ** 2) / n),
+        0.0,
     )
-    return sigma
 
-def _jax_norm_ppf(p):
-    """JAX implementation of normal percent point function (inverse CDF).
 
-    Uses Beasley-Springer-Moro approximation for the inverse normal CDF.
+def _jax_norm_ppf(p: jnp.ndarray) -> jnp.ndarray:
+    """Inverse normal CDF (percent-point function) implemented in JAX.
+
+    Uses the Beasley-Springer-Moro rational approximation.
+
+    Args:
+        p: Probability value(s) in (0, 1).
+
+    Returns:
+        Corresponding z-score(s).
     """
-    # Clamp p to avoid numerical issues
     p = jnp.clip(p, 1e-10, 1 - 1e-10)
-
-    # For p > 0.5, use symmetry
     sign = jnp.where(p > 0.5, 1.0, -1.0)
     p_adj = jnp.where(p > 0.5, p, 1.0 - p)
 
-    # Beasley-Springer-Moro approximation
     c0, c1, c2 = 2.515517, 0.802853, 0.010328
     d1, d2, d3 = 1.432788, 0.189269, 0.001308
 
     t = jnp.sqrt(-2 * jnp.log(1 - p_adj))
-    z = t - (c0 + c1 * t + c2 * t**2) / (1 + d1 * t + d2 * t**2 + d3 * t**3)
-
+    z = t - (c0 + c1 * t + c2 * t ** 2) / (1 + d1 * t + d2 * t ** 2 + d3 * t ** 3)
     return sign * z
+
+
+def _quantiles(level: List[Union[int, float]]) -> jnp.ndarray:
+    """Convert confidence levels to z-scores using the normal inverse CDF.
+
+    JAX equivalent of statsforecast.utils._quantiles().
+
+    Args:
+        level: List of confidence levels in [0, 100], e.g. [80, 95].
+
+    Returns:
+        Array of z-scores, one per level.
+    """
+    level_arr = jnp.atleast_1d(jnp.asarray(level, jnp.float32))
+    p = 0.5 + (level_arr / 200.0)
+    return jax.vmap(_jax_norm_ppf)(p)
+
+
+# ============================================================
+# SECTION 2 — Data Extraction Helpers
+# ============================================================
 
 def extract_demand(y: jnp.ndarray) -> jnp.ndarray:
     """Extract positive (non-zero) demand values from a time series.
 
-    This is used for intermittent demand models like TSB and Croston,
+    Used for intermittent demand models like TSB and Croston,
     where we need to separate demand occurrences from no-demand periods.
 
     Args:
-        y: Time series array that may contain zeros
+        y: Time series array that may contain zeros.
 
     Returns:
-        Array containing only positive values from y
+        Array containing only positive values from y.
 
     Example:
         >>> y = jnp.array([0, 5, 0, 0, 3, 2, 0])
@@ -100,17 +158,18 @@ def extract_demand(y: jnp.ndarray) -> jnp.ndarray:
     """
     return y[y > 0]
 
-def extract_probability(y: jnp.ndarray) -> jnp.ndarray:
-    """Convert time series to binary probability indicator (1=demand, 0=no demand).
 
-    This is used for intermittent demand models like TSB to track the
+def extract_probability(y: jnp.ndarray) -> jnp.ndarray:
+    """Convert time series to binary indicator (1=demand, 0=no demand).
+
+    Used for intermittent demand models like TSB to track the
     probability of demand occurrence at each time step.
 
     Args:
-        y: Time series array
+        y: Time series array.
 
     Returns:
-        Binary array where 1 indicates demand occurred, 0 indicates no demand
+        Binary array where 1 indicates demand occurred, 0 indicates no demand.
 
     Example:
         >>> y = jnp.array([0, 5, 0, 0, 3, 2, 0])
@@ -120,78 +179,66 @@ def extract_probability(y: jnp.ndarray) -> jnp.ndarray:
     return (y != 0).astype(y.dtype)
 
 
-def ensure_float(y: jnp.ndarray) -> jnp.ndarray:
-    if not jnp.issubdtype(y.dtype, jnp.floating):
-        return y.astype(jnp.float32)
-    return y
+# ============================================================
+# SECTION 3 — Forecast Output Helpers
+# ============================================================
 
-@jax.jit
-def calculate_sigma(residuals: jnp.ndarray, n: int) -> jnp.ndarray:
-    """Calculate sigma for residuals using JAX operations.
+@_partial(jax.jit, static_argnums=(1,))
+def _repeat_val(val: float, h: int) -> jnp.ndarray:
+    """Repeat scalar value h times.
+
+    JAX equivalent of statsforecast.utils._repeat_val().
 
     Args:
-        residuals: Residual values
-        n: Number of degrees of freedom
+        val: Scalar value to repeat.
+        h: Number of repetitions (forecast horizon).
 
     Returns:
-        Sigma value as JAX array
+        Array of length h filled with val.
     """
-    sigma = jnp.where(
-        n > 0,
-        jnp.sqrt(jnp.nansum(residuals**2) / n),
-        0.0
-    )
-    return sigma
+    return jnp.full(h, val, dtype=jnp.float32)
 
-def _jax_norm_ppf(p):
-    """JAX implementation of normal percent point function (inverse CDF).
 
-    Uses Beasley-Springer-Moro approximation for the inverse normal CDF.
-    """
-    # Clamp p to avoid numerical issues
-    p = jnp.clip(p, 1e-10, 1 - 1e-10)
+@_partial(jax.jit, static_argnums=(1,))
+def _repeat_val_seas(season_vals: jnp.ndarray, h: int) -> jnp.ndarray:
+    """Tile seasonal values to cover forecast horizon h.
 
-    # For p > 0.5, use symmetry
-    sign = jnp.where(p > 0.5, 1.0, -1.0)
-    p_adj = jnp.where(p > 0.5, p, 1.0 - p)
+    JAX equivalent of statsforecast.utils._repeat_val_seas().
 
-    # Beasley-Springer-Moro approximation
-    c0, c1, c2 = 2.515517, 0.802853, 0.010328
-    d1, d2, d3 = 1.432788, 0.189269, 0.001308
-
-    t = jnp.sqrt(-2 * jnp.log(1 - p_adj))
-    z = t - (c0 + c1 * t + c2 * t**2) / (1 + d1 * t + d2 * t**2 + d3 * t**3)
-
-    return sign * z
-
-def _quantiles(level: list[int | float]) -> jnp.ndarray:
-    """
-    Convert confidence levels to z-scores using normal inverse CDF.
-    JAX equivalent of statsforecast.utils._quantiles()
-    
     Args:
-        level: List of confidence levels (0-100), e.g., [80, 95]
-        
+        season_vals: Seasonal pattern of shape (season_length,).
+        h: Forecast horizon (static — must be known at compile time).
+
     Returns:
-        Array of z-scores corresponding to each level
+        Tiled pattern of length h.
+
+    Example:
+        >>> season_vals = jnp.array([10.0, 20.0, 30.0])
+        >>> _repeat_val_seas(season_vals, h=7)
+        array([10., 20., 30., 10., 20., 30., 10.])
     """
-    level_arr = jnp.atleast_1d(jnp.asarray(level, jnp.float32))
-    p = 0.5 + (level_arr / 200.0)
-    return jax.vmap(_jax_norm_ppf)(p)
+    repeats = math.ceil(h / season_vals.size)
+    return jnp.tile(season_vals, repeats)[:h]
+
 
 def _calculate_intervals(
     res: dict,
-    level: list[int],
+    level: List[int],
     h: int,
-    sigmah: jnp.ndarray | float
+    sigmah: Union[jnp.ndarray, float],
 ) -> dict:
-    """
-    Calculate native (non-conformal) prediction intervals using normal quantiles.
-    Compatible with SeasonalNaive.predict() calls.
-    """
-    # Ensure mean is a JAX array
-    mean = jnp.asarray(res["mean"], dtype=jnp.float32)
+    """Calculate native (non-conformal) prediction intervals using normal quantiles.
 
+    Args:
+        res: Forecast result dict containing 'mean'.
+        level: List of confidence levels (0-100).
+        h: Forecast horizon.
+        sigmah: Standard error (scalar or array of length h).
+
+    Returns:
+        Dict with 'lo-{lv}' and 'hi-{lv}' keys for each level.
+    """
+    mean = jnp.asarray(res["mean"], dtype=jnp.float32)
     sigmah = jnp.asarray(sigmah, dtype=jnp.float32)
 
     if sigmah.ndim == 0:
@@ -212,157 +259,24 @@ def _calculate_intervals(
 
     return out
 
-# def _add_fitted_pi(
-def _add_fitted_pi_1(
-    fitted: jnp.ndarray, 
-    sigmah: jnp.ndarray | float, 
-    level: list[int]
+
+def _add_fitted_pi(
+    res: dict,
+    se: jnp.ndarray,
+    level: Union[List[int], jnp.ndarray],
 ) -> dict:
-    """
-    Calculate NATIVE (non-conformal) fitted (in-sample) prediction intervals.
-    JAX equivalent of statsforecast.models._add_fitted_pi()
-    
+    """Add in-sample prediction intervals to a fitted result dict.
+
+    Used by theta/HW/ETS models. Works with scalar or vector se via reshaping.
+
     Args:
-        fitted: Fitted values of shape (t,)
-        sigmah: Standard error for predictions (scalar or array)
-        level: Sorted list of confidence levels
-        
+        res: Result dict containing 'fitted'.
+        se: Standard error (scalar or vector).
+        level: Confidence levels (0-100).
+
     Returns:
-        Dictionary with 'fitted-lo-XX' and 'fitted-hi-XX' keys for each level
+        Updated res dict with 'fitted-lo-{lv}' and 'fitted-hi-{lv}' keys.
     """
-    z = _quantiles(level)
-    # Broadcast to shape (t, len(level))
-    lo = fitted[:, None] - z[None, :] * sigmah
-    hi = fitted[:, None] + z[None, :] * sigmah
-    
-    out = {}
-    for i, lv in enumerate(level[::-1]):
-        out[f"fitted-lo-{int(lv)}"] = lo[:, len(level) - 1 - i]
-    for i, lv in enumerate(level):
-        out[f"fitted-hi-{int(lv)}"] = hi[:, i]
-    return out
-
-from functools import partial as _partial
-
-@_partial(jax.jit, static_argnums=(1,))
-def _repeat_val_seas(season_vals: jnp.ndarray, h: int) -> jnp.ndarray:
-    """
-    Tile seasonal values to cover forecast horizon h.
-    JAX equivalent of statsforecast.utils._repeat_val_seas()
-    
-    Args:
-        season_vals: Seasonal pattern of shape (season_length,)
-        h: Forecast horizon (static - must be known at compile time)
-        
-    Returns:
-        Tiled pattern of length h
-        
-    Example:
-        >>> season_vals = jnp.array([10.0, 20.0, 30.0])
-        >>> _repeat_val_seas(season_vals, h=7)
-        array([10., 20., 30., 10., 20., 30., 10.])
-    """
-    import math
-    repeats = math.ceil(h / season_vals.size)
-    return jnp.tile(season_vals, repeats)[:h]
-
-@_partial(jax.jit, static_argnums=(1,))
-def _repeat_val(val: float, h: int) -> jnp.ndarray:
-    """
-    Repeat scalar value h times.
-    JAX equivalent of statsforecast.utils._repeat_val()
-    
-    Args:
-        val: Scalar value to repeat
-        h: Number of repetitions (forecast horizon)
-        
-    Returns:
-        Array of length h filled with val
-    """
-    return jnp.full(h, val, dtype=jnp.float32)
-
-@partial(jax.jit, static_argnums=(1, 2))
-def _window_average_core(y: jnp.ndarray, window_size: int, h: int) -> jnp.ndarray:
-    """
-    JIT-able core: take the last `window_size` values using dynamic_slice (static size),
-    average them, and repeat to length h.
-    """
-    n = y.shape[0]
-    # start = max(0, n - window_size)  (dynamic start is OK; size must be static)
-    start = jnp.maximum(0, n - window_size)
-    tail = lax.dynamic_slice(y, (start,), (window_size,))
-    wavg = jnp.mean(tail)
-    return jnp.full((h,), wavg, dtype=y.dtype)
-
-def _window_average(
-    y: jnp.ndarray,  # time series
-    h: int,          # forecasting horizon
-    fitted: bool,    # fitted values
-    window_size: int # window size
-):
-    if fitted:
-        raise NotImplementedError("return fitted")
-    if y.size < window_size:
-        return {"mean": jnp.full((h,), jnp.nan, dtype=y.dtype)}
-    # JIT-compiled fast path
-    mean = _window_average_core(y, window_size, h)
-    return {"mean": mean}
-
-def _seasonal_naive(
-    y,
-    h: int,
-    season_length: int,
-    fitted: bool = False,
-) -> Dict[str, jnp.ndarray]:
-    """
-    JAX implementation of seasonal-naive forecast.
-    
-    Args:
-        y: 1-D array-like (length T). Will be converted to jax array (float32).
-        h: forecast horizon (int >= 1)
-        season_length: seasonal period m (int >= 1)
-        fitted: if True, also return in-sample fitted values
-        
-    Returns:
-        dict with keys:
-          - "mean": jnp.ndarray shape (h,)
-          - optionally "fitted": jnp.ndarray shape (T,)
-    """
-    # convert input to jax array float32
-    y_j = jnp.asarray(y, dtype=jnp.float32).squeeze()
-    if y_j.ndim != 1:
-        raise ValueError("y must be a 1-D array")
-    T = y_j.shape[0]
-    m = int(season_length)
-    if m <= 0:
-        raise ValueError("season_length must be a positive integer")
-    if T < m:
-        raise ValueError(f"Series length T={T} must be at least season_length={m}")
-    if not isinstance(h, int) or h < 1:
-        raise ValueError("h must be a positive integer")
-
-    # last m observations (shape (m,))
-    last_m = y_j[-m:]
-
-    # build mean forecast by cycling through last_m
-    idx = jnp.arange(h) % m            # shape (h,)
-    mean = last_m[idx]                 # shape (h,)
-
-    out = {"mean": mean}
-
-    if fitted:
-        # build fitted array: NaN for first m entries, and y[0:T-m] mapped to positions m..T-1
-        fitted = jnp.full((T,), jnp.nan, dtype=jnp.float32)
-        # values to place: y[0 : T-m]
-        vals = y_j[: T - m]
-        # scatter assignment into fitted at positions m..T-1
-        positions = jnp.arange(m, T)
-        fitted = fitted.at[positions].set(vals)
-        out["fitted"] = fitted
-
-    return out
-
-def _add_fitted_pi(res, se, level):
     level = sorted(level)
     level = jnp.asarray(level)
     quantiles = _quantiles(level=level)
@@ -374,27 +288,68 @@ def _add_fitted_pi(res, se, level):
     res = {**res, **lo, **hi}
     return res
 
+
+def _add_fitted_pi_1(
+    fitted: jnp.ndarray,
+    sigmah: Union[jnp.ndarray, float],
+    level: List[int],
+) -> dict:
+    """Calculate native (non-conformal) fitted (in-sample) prediction intervals.
+
+    JAX equivalent of statsforecast.models._add_fitted_pi().
+    Used by historic_average and croston_classic models.
+
+    Args:
+        fitted: Fitted values of shape (t,).
+        sigmah: Standard error for predictions (scalar or array).
+        level: Sorted list of confidence levels (0-100).
+
+    Returns:
+        Dict with 'fitted-lo-{lv}' and 'fitted-hi-{lv}' keys for each level.
+    """
+    z = _quantiles(level)
+    lo = fitted[:, None] - z[None, :] * sigmah
+    hi = fitted[:, None] + z[None, :] * sigmah
+
+    out = {}
+    for i, lv in enumerate(level[::-1]):
+        out[f"fitted-lo-{int(lv)}"] = lo[:, len(level) - 1 - i]
+    for i, lv in enumerate(level):
+        out[f"fitted-hi-{int(lv)}"] = hi[:, i]
+    return out
+
+
+# ============================================================
+# SECTION 4 — Conformal Interval Helpers
+# ============================================================
+
 def _add_conformal_distribution_intervals(
     fcst: dict,
     cs: jnp.ndarray,
-    level: list[float] | list[int],
+    level: Union[List[float], List[int]],
 ) -> dict:
-    """
-    Adds conformal intervals to the `fcst` dict based on conformal scores `cs`.
-    `level` should be already sorted. This strategy creates forecast paths
-    based on errors and calculates quantiles using those paths.
+    """Add conformal intervals to forecast dict based on conformal scores.
+
+    Creates forecast paths from errors and calculates quantiles.
+
+    Args:
+        fcst: Forecast dict containing 'mean'.
+        cs: Conformal scores array.
+        level: Sorted list of confidence levels (0-100).
+
+    Returns:
+        Updated fcst dict with 'lo-{lv}' and 'hi-{lv}' keys.
     """
     level = sorted(level)
     alphas = jnp.array([100 - lv for lv in level], dtype=jnp.float32)
-    cuts_lower = (alphas / 200.0)[::-1]          # lower cuts reversed
-    cuts_upper = 1.0 - (alphas / 200.0)         # upper cuts
+    cuts_lower = (alphas / 200.0)[::-1]
+    cuts_upper = 1.0 - (alphas / 200.0)
     cuts = jnp.concatenate([cuts_lower, cuts_upper])
 
-    mean = fcst["mean"].reshape(1, -1)          # 2D: 1 x horizon
-    scores = jnp.vstack([mean - cs, mean + cs]) # shape: 2 x horizon
+    mean = fcst["mean"].reshape(1, -1)
+    scores = jnp.vstack([mean - cs, mean + cs])
     quantiles = jnp.quantile(scores, cuts, axis=0)
 
-    # generate column names
     lo_cols = [f"lo-{lv}" for lv in reversed(level)]
     hi_cols = [f"hi-{lv}" for lv in level]
     out_cols = lo_cols + hi_cols
@@ -404,642 +359,75 @@ def _add_conformal_distribution_intervals(
 
     return fcst
 
-def _get_conformal_method(method: str):
+
+def _get_conformal_method(method: str) -> Callable:
+    """Look up a conformal prediction interval method by name.
+
+    Args:
+        method: Method name (currently only 'conformal_distribution').
+
+    Returns:
+        The corresponding interval function.
+
+    Raises:
+        ValueError: If method is not supported.
+    """
     available_methods = {
         "conformal_distribution": _add_conformal_distribution_intervals,
-        # "conformal_error": _add_conformal_error_intervals,
     }
-    if method not in available_methods.keys():
+    if method not in available_methods:
         raise ValueError(
             f"prediction intervals method {method} not supported "
             f"please choose one of {', '.join(available_methods.keys())}"
         )
     return available_methods[method]
 
-# Optional: jitted wrapper (uncomment to use)
-# _seasonal_naive_jit = jax.jit(_seasonal_naive, static_argnums=(1,2,3))
 
-@jax.jit
-def _ses_forecast_nan(x, alpha):
-    """
-    Simple Exponential Smoothing forecast with NaN handling.
-    
-    Skips NaN values in computation - useful for padded arrays from Croston models.
-    """
-    complement = 1 - alpha
-    n = x.size
-    fitted = jnp.full_like(x, jnp.nan)
-    
-    # Find first non-NaN value
-    is_valid = ~jnp.isnan(x)
-    first_valid_idx = jnp.argmax(is_valid)  # Index of first True (non-NaN)
-    first_valid_val = x[first_valid_idx]
-    
-    # Initialize fitted with first valid value
-    fitted = fitted.at[first_valid_idx].set(first_valid_val)
-    
-    def body_fun(i, fitted_arr):
-        # Only update if current value is not NaN
-        val = x[i]
-        prev_fitted = fitted_arr[i-1]
-        
-        # Compute new fitted value: use previous fitted if current is NaN
-        new_fitted = jnp.where(
-            jnp.isnan(val),
-            jnp.nan,  # Keep NaN if input is NaN
-            jnp.where(
-                jnp.isnan(prev_fitted),
-                val,  # If no previous fitted, use current value
-                alpha * val + complement * prev_fitted
-            )
-        )
-        fitted_arr = fitted_arr.at[i].set(new_fitted)
-        return fitted_arr
-    
-    # Apply SES to all positions after first valid
-    fitted = jax.lax.fori_loop(first_valid_idx + 1, n, body_fun, fitted)
-    
-    # Forecast: find last non-NaN value
-    last_valid_idx = n - 1 - jnp.argmax(is_valid[::-1])
-    forecast = fitted[last_valid_idx]
-    
-    # Set first fitted to NaN to match original behavior
-    fitted = fitted.at[first_valid_idx].set(jnp.nan)
-    
-    return forecast, fitted
+def _conformal_method(self) -> Callable:
+    """Retrieve the conformal method from a model's prediction_intervals config.
 
-
-def _seasonal_exponential_smoothing(y, h, fitted, season_length, alpha):
-    n = y.size
-    if n < season_length:
-        return {"mean": jnp.full(h, jnp.nan, dtype=y.dtype)}
-
-    season_vals = jnp.full((season_length,), jnp.nan, dtype=y.dtype)
-    fitted_vals = jnp.full_like(y, jnp.nan)
-
-    for i in range(season_length):
-        init_idx = i + n % season_length
-        x = y[init_idx::season_length]  # Python slice, works fine
-
-        forecast, fitted_season = _ses_forecast(x, alpha)
-
-        season_vals = season_vals.at[i].set(forecast)
-
-        for k in range(fitted_season.size):
-            fitted_vals = fitted_vals.at[init_idx + k * season_length].set(fitted_season[k])
-
-    out = _repeat_val_seas(season_vals, h)
-    fcst = {"mean": out}
-    if fitted:
-        fcst["fitted"] = fitted_vals
-    return fcst
-
-@jax.jit
-def calculate_information_criteria(
-    residuals: jnp.ndarray,
-    n_params: int,
-    n: int,
-) -> Dict[str, jnp.ndarray]:
-    """Calculate AIC, BIC, and AICc from residuals (JIT-compiled, returns JAX arrays)."""
-    sse = jnp.sum(residuals ** 2)
-    lik = n * jnp.log(sse + 1e-10)
-    
-    aic = lik + 2 * n_params
-    bic = lik + jnp.log(n) * n_params
-    denom = n - n_params - 1
-    aicc = jnp.where(
-        denom > 0,
-        aic + (2 * n_params * (n_params + 1)) / denom,
-        jnp.inf
-    )
-    
-    # Return JAX arrays instead of Python floats for JIT compatibility
-    return {
-        'loglik': -0.5 * lik,
-        'aic': aic,
-        'bic': bic,
-        'aicc': aicc,
-    }
-
-
-@jax.jit
-def _demand(x: jnp.ndarray) -> jnp.ndarray:
-    """
-    Extract positive (non-zero) elements from array.
-    Used by Croston-family models for intermittent demand.
-    
     Args:
-        x: Input array
-        
+        self: A forecaster instance with prediction_intervals attribute.
+
     Returns:
-        Fixed-size array with non-zero values packed at start, rest filled with NaN
-        
-    Example:
-        >>> x = jnp.array([0., 5., 0., 3., 0.])
-        >>> _demand(x)
-        array([5., 3., nan, nan, nan])
-        
-    Note:
-        Returns fixed-size array (same size as input) for JIT compatibility.
-        Non-zero values are packed at the start, remaining positions filled with NaN.
+        The conformal interval function.
     """
-    # Get indices where x > 0, with fill_value for padding
-    indices = jnp.where(x > 0, size=x.size, fill_value=-1)[0]
-    
-    # Create result array: gather values where indices are valid, else NaN
-    result = jnp.where(
-        indices >= 0,
-        jnp.where(indices < x.size, x[jnp.clip(indices, 0, x.size-1)], jnp.nan),
-        jnp.nan
-    )
-    return result
+    return _get_conformal_method(self.prediction_intervals.method)
 
 
-@jax.jit
-# def _intervals(x: jnp.ndarray) -> jnp.ndarray:
-def _intervals_c(x: jnp.ndarray) -> jnp.ndarray:
-    """
-    Compute intervals between non-zero elements.
-    Used by Croston-family models for intermittent demand.
-    
+def _store_cs(self, y: jnp.ndarray, X: Optional[jnp.ndarray]) -> None:
+    """Compute and store conformal scores on the model instance.
+
     Args:
-        x: Input array
-        
-    Returns:
-        Fixed-size array with intervals packed at start, rest filled with NaN
-        
-    Example:
-        >>> x = jnp.array([0., 5., 0., 0., 3., 0., 2.])
-        >>> _intervals(x)
-        array([1., 3., 2., nan, nan, nan, nan])  # First interval at position 1, then gap of 3, then gap of 2
-        
-    Note:
-        Returns fixed-size array (same size as input) for JIT compatibility.
-        Intervals are packed at the start, remaining positions filled with NaN.
+        self: A forecaster instance with prediction_intervals and conformity_scores.
+        y: Training time series.
+        X: Optional exogenous variables.
     """
-    # Get indices of non-zero elements, with fill_value for padding
-    nonzero_idxs = jnp.where(x != 0, size=x.size, fill_value=-1)[0]
-    
-    # Compute positions (1-indexed)
-    positions = jnp.where(nonzero_idxs >= 0, nonzero_idxs + 1, -1)
-    
-    # Compute intervals using diff with prepend
-    intervals = jnp.diff(positions, prepend=0)
-    
-    # Mask out invalid intervals (where positions were -1)
-    valid_mask = positions >= 0
-    result = jnp.where(valid_mask, intervals.astype(x.dtype), jnp.nan)
-    
-    return result
-
-
-def _expand_fitted_demand(fitted: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
-    """
-    Expand demand fitted values back to original series length.
-    Used by Croston-family models.
-    
-    Args:
-        fitted: SES fitted values for demand (length = num_nonzero + 1)
-        y: Original time series
-        
-    Returns:
-        Fitted values expanded to match y's length
-        
-    Logic:
-        - If y[i-1] > 0: Use next fitted value (demand occurred)
-        - If y[i-1] == 0 and we've seen demand: Carry forward previous value
-        - If y[i-1] == 0 and no demand yet: Use naive forecast (y[i-1])
-    """
-    n = y.size
-    out = jnp.full_like(y, jnp.nan)
-    
-    def body_fn(i, state):
-        out_arr, fitted_idx = state
-        
-        # If previous value was positive, advance fitted index
-        fitted_idx = jnp.where(
-            y[i - 1] > 0,
-            fitted_idx + 1,
-            fitted_idx
-        )
-        
-        # Determine output value based on conditions
-        val = jax.lax.cond(
-            y[i - 1] > 0,
-            lambda: fitted[fitted_idx],  # Use new fitted value
-            lambda: jax.lax.cond(
-                fitted_idx > 0,
-                lambda: out_arr[i - 1],  # Carry forward previous
-                lambda: y[i - 1]  # Use naive (no demand seen yet)
-            )
-        )
-        
-        out_arr = out_arr.at[i].set(val)
-        return out_arr, fitted_idx
-    
-    out, _ = jax.lax.fori_loop(1, n, body_fn, (out, 0))
-    return out
-
-
-def _expand_fitted_intervals(fitted: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
-    """
-    Expand interval fitted values back to original series length.
-    Used by Croston-family models.
-    
-    Args:
-        fitted: SES fitted values for intervals (length = num_nonzero + 1)
-        y: Original time series
-        
-    Returns:
-        Fitted intervals expanded to match y's length (avoids division by zero)
-        
-    Logic:
-        - If y[i-1] != 0: Use next fitted value, but replace 0 with 1 (avoid div by zero)
-        - If y[i-1] == 0 and we've seen intervals: Carry forward previous value
-        - If y[i-1] == 0 and no intervals yet: Use 1 (avoid division by zero)
-    """
-    n = y.size
-    out = jnp.full_like(y, jnp.nan)
-    
-    def body_fn(i, state):
-        out_arr, fitted_idx = state
-        
-        # If previous value was non-zero, advance fitted index
-        fitted_idx = jnp.where(
-            y[i - 1] != 0,
-            fitted_idx + 1,
-            fitted_idx
-        )
-        
-        # Determine output value based on conditions
-        val = jax.lax.cond(
-            y[i - 1] != 0,
-            lambda: jnp.where(
-                fitted[fitted_idx] == 0,
-                1.0,  # Avoid division by zero
-                fitted[fitted_idx]
-            ),
-            lambda: jax.lax.cond(
-                fitted_idx > 0,
-                lambda: out_arr[i - 1],  # Carry forward previous
-                lambda: 1.0  # No intervals seen yet, use 1
-            )
-        )
-        
-        out_arr = out_arr.at[i].set(val)
-        return out_arr, fitted_idx
-    
-    out, _ = jax.lax.fori_loop(1, n, body_fn, (out, 0))
-    return out
-
-
-@jax.jit
-def _demand(x: jnp.ndarray) -> jnp.ndarray:
-    """
-    Extract positive (non-zero) elements from array.
-    Used by Croston-family models for intermittent demand.
-    
-    Args:
-        x: Input array
-        
-    Returns:
-        Fixed-size array with non-zero values packed at start, rest filled with NaN
-        
-    Example:
-        >>> x = jnp.array([0., 5., 0., 3., 0.])
-        >>> _demand(x)
-        array([5., 3., nan, nan, nan])
-        
-    Note:
-        Returns fixed-size array (same size as input) for JIT compatibility.
-        Non-zero values are packed at the start, remaining positions filled with NaN.
-    """
-    # Get indices where x > 0, with fill_value for padding
-    indices = jnp.where(x > 0, size=x.size, fill_value=-1)[0]
-    
-    # Create result array: gather values where indices are valid, else NaN
-    result = jnp.where(
-        indices >= 0,
-        jnp.where(indices < x.size, x[jnp.clip(indices, 0, x.size-1)], jnp.nan),
-        jnp.nan
-    )
-    return result
-
-
-@jax.jit
-def _intervals(x: jnp.ndarray) -> jnp.ndarray:
-    """
-    Compute intervals between non-zero elements.
-    Used by Croston-family models for intermittent demand.
-    
-    Args:
-        x: Input array
-        
-    Returns:
-        Fixed-size array with intervals packed at start, rest filled with NaN
-        
-    Example:
-        >>> x = jnp.array([0., 5., 0., 0., 3., 0., 2.])
-        >>> _intervals(x)
-        array([1., 3., 2., nan, nan, nan, nan])  # First interval at position 1, then gap of 3, then gap of 2
-        
-    Note:
-        Returns fixed-size array (same size as input) for JIT compatibility.
-        Intervals are packed at the start, remaining positions filled with NaN.
-    """
-    # Get indices of non-zero elements, with fill_value for padding
-    nonzero_idxs = jnp.where(x != 0, size=x.size, fill_value=-1)[0]
-    
-    # Compute positions (1-indexed)
-    positions = jnp.where(nonzero_idxs >= 0, nonzero_idxs + 1, -1)
-    
-    # Compute intervals using diff with prepend
-    intervals = jnp.diff(positions, prepend=0)
-    
-    # Mask out invalid intervals (where positions were -1)
-    valid_mask = positions >= 0
-    result = jnp.where(valid_mask, intervals.astype(x.dtype), jnp.nan)
-    
-    return result
-
-
-def _expand_fitted_demand(fitted: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
-    """
-    Expand demand fitted values back to original series length.
-    Used by Croston-family models.
-    
-    Args:
-        fitted: SES fitted values for demand (length = num_nonzero + 1)
-        y: Original time series
-        
-    Returns:
-        Fitted values expanded to match y's length
-        
-    Logic:
-        - If y[i-1] > 0: Use next fitted value (demand occurred)
-        - If y[i-1] == 0 and we've seen demand: Carry forward previous value
-        - If y[i-1] == 0 and no demand yet: Use naive forecast (y[i-1])
-    """
-    n = y.size
-    out = jnp.full_like(y, jnp.nan)
-    
-    def body_fn(i, state):
-        out_arr, fitted_idx = state
-        
-        # If previous value was positive, advance fitted index
-        fitted_idx = jnp.where(
-            y[i - 1] > 0,
-            fitted_idx + 1,
-            fitted_idx
-        )
-        
-        # Determine output value based on conditions
-        val = jax.lax.cond(
-            y[i - 1] > 0,
-            lambda: fitted[fitted_idx],  # Use new fitted value
-            lambda: jax.lax.cond(
-                fitted_idx > 0,
-                lambda: out_arr[i - 1],  # Carry forward previous
-                lambda: y[i - 1]  # Use naive (no demand seen yet)
-            )
-        )
-        
-        out_arr = out_arr.at[i].set(val)
-        return out_arr, fitted_idx
-    
-    out, _ = jax.lax.fori_loop(1, n, body_fn, (out, 0))
-    return out
-
-
-def _expand_fitted_intervals(fitted: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
-    """
-    Expand interval fitted values back to original series length.
-    Used by Croston-family models.
-    
-    Args:
-        fitted: SES fitted values for intervals (length = num_nonzero + 1)
-        y: Original time series
-        
-    Returns:
-        Fitted intervals expanded to match y's length (avoids division by zero)
-        
-    Logic:
-        - If y[i-1] != 0: Use next fitted value, but replace 0 with 1 (avoid div by zero)
-        - If y[i-1] == 0 and we've seen intervals: Carry forward previous value
-        - If y[i-1] == 0 and no intervals yet: Use 1 (avoid division by zero)
-    """
-    n = y.size
-    out = jnp.full_like(y, jnp.nan)
-    
-    def body_fn(i, state):
-        out_arr, fitted_idx = state
-        
-        # If previous value was non-zero, advance fitted index
-        fitted_idx = jnp.where(
-            y[i - 1] != 0,
-            fitted_idx + 1,
-            fitted_idx
-        )
-        
-        # Determine output value based on conditions
-        val = jax.lax.cond(
-            y[i - 1] != 0,
-            lambda: jnp.where(
-                fitted[fitted_idx] == 0,
-                1.0,  # Avoid division by zero
-                fitted[fitted_idx]
-            ),
-            lambda: jax.lax.cond(
-                fitted_idx > 0,
-                lambda: out_arr[i - 1],  # Carry forward previous
-                lambda: 1.0  # No intervals seen yet, use 1
-            )
-        )
-        
-        out_arr = out_arr.at[i].set(val)
-        return out_arr, fitted_idx
-    
-    out, _ = jax.lax.fori_loop(1, n, body_fn, (out, 0))
-    return out
-
-
-@jax.jit
-def _demand(x: jnp.ndarray) -> jnp.ndarray:
-    """
-    Extract positive (non-zero) elements from array.
-    Used by Croston-family models for intermittent demand.
-    
-    Args:
-        x: Input array
-        
-    Returns:
-        Fixed-size array with non-zero values packed at start, rest filled with NaN
-        
-    Example:
-        >>> x = jnp.array([0., 5., 0., 3., 0.])
-        >>> _demand(x)
-        array([5., 3., nan, nan, nan])
-        
-    Note:
-        Returns fixed-size array (same size as input) for JIT compatibility.
-        Non-zero values are packed at the start, remaining positions filled with NaN.
-    """
-    # Get indices where x > 0, with fill_value for padding
-    indices = jnp.where(x > 0, size=x.size, fill_value=-1)[0]
-    
-    # Create result array: gather values where indices are valid, else NaN
-    result = jnp.where(
-        indices >= 0,
-        jnp.where(indices < x.size, x[jnp.clip(indices, 0, x.size-1)], jnp.nan),
-        jnp.nan
-    )
-    return result
-
-
-@jax.jit
-def _intervals(x: jnp.ndarray) -> jnp.ndarray:
-    """
-    Compute intervals between non-zero elements.
-    Used by Croston-family models for intermittent demand.
-    
-    Args:
-        x: Input array
-        
-    Returns:
-        Fixed-size array with intervals packed at start, rest filled with NaN
-        
-    Example:
-        >>> x = jnp.array([0., 5., 0., 0., 3., 0., 2.])
-        >>> _intervals(x)
-        array([1., 3., 2., nan, nan, nan, nan])  # First interval at position 1, then gap of 3, then gap of 2
-        
-    Note:
-        Returns fixed-size array (same size as input) for JIT compatibility.
-        Intervals are packed at the start, remaining positions filled with NaN.
-    """
-    # Get indices of non-zero elements, with fill_value for padding
-    nonzero_idxs = jnp.where(x != 0, size=x.size, fill_value=-1)[0]
-    
-    # Compute positions (1-indexed)
-    positions = jnp.where(nonzero_idxs >= 0, nonzero_idxs + 1, -1)
-    
-    # Compute intervals using diff with prepend
-    intervals = jnp.diff(positions, prepend=0)
-    
-    # Mask out invalid intervals (where positions were -1)
-    valid_mask = positions >= 0
-    result = jnp.where(valid_mask, intervals.astype(x.dtype), jnp.nan)
-    
-    return result
-
-
-def _expand_fitted_demand(fitted: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
-    """
-    Expand demand fitted values back to original series length.
-    Used by Croston-family models.
-    
-    Args:
-        fitted: SES fitted values for demand (length = num_nonzero + 1)
-        y: Original time series
-        
-    Returns:
-        Fitted values expanded to match y's length
-        
-    Logic:
-        - If y[i-1] > 0: Use next fitted value (demand occurred)
-        - If y[i-1] == 0 and we've seen demand: Carry forward previous value
-        - If y[i-1] == 0 and no demand yet: Use naive forecast (y[i-1])
-    """
-    n = y.size
-    out = jnp.full_like(y, jnp.nan)
-    
-    def body_fn(i, state):
-        out_arr, fitted_idx = state
-        
-        # If previous value was positive, advance fitted index
-        fitted_idx = jnp.where(
-            y[i - 1] > 0,
-            fitted_idx + 1,
-            fitted_idx
-        )
-        
-        # Determine output value based on conditions
-        val = jax.lax.cond(
-            y[i - 1] > 0,
-            lambda: fitted[fitted_idx],  # Use new fitted value
-            lambda: jax.lax.cond(
-                fitted_idx > 0,
-                lambda: out_arr[i - 1],  # Carry forward previous
-                lambda: y[i - 1]  # Use naive (no demand seen yet)
-            )
-        )
-        
-        out_arr = out_arr.at[i].set(val)
-        return out_arr, fitted_idx
-    
-    out, _ = jax.lax.fori_loop(1, n, body_fn, (out, 0))
-    return out
-
-
-def _expand_fitted_intervals(fitted: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
-    """
-    Expand interval fitted values back to original series length.
-    Used by Croston-family models.
-    
-    Args:
-        fitted: SES fitted values for intervals (length = num_nonzero + 1)
-        y: Original time series
-        
-    Returns:
-        Fitted intervals expanded to match y's length (avoids division by zero)
-        
-    Logic:
-        - If y[i-1] != 0: Use next fitted value, but replace 0 with 1 (avoid div by zero)
-        - If y[i-1] == 0 and we've seen intervals: Carry forward previous value
-        - If y[i-1] == 0 and no intervals yet: Use 1 (avoid division by zero)
-    """
-    n = y.size
-    out = jnp.full_like(y, jnp.nan)
-    
-    def body_fn(i, state):
-        out_arr, fitted_idx = state
-        
-        # If previous value was non-zero, advance fitted index
-        fitted_idx = jnp.where(
-            y[i - 1] != 0,
-            fitted_idx + 1,
-            fitted_idx
-        )
-        
-        # Determine output value based on conditions
-        val = jax.lax.cond(
-            y[i - 1] != 0,
-            lambda: jnp.where(
-                fitted[fitted_idx] == 0,
-                1.0,  # Avoid division by zero
-                fitted[fitted_idx]
-            ),
-            lambda: jax.lax.cond(
-                fitted_idx > 0,
-                lambda: out_arr[i - 1],  # Carry forward previous
-                lambda: 1.0  # No intervals seen yet, use 1
-            )
-        )
-        
-        out_arr = out_arr.at[i].set(val)
-        return out_arr, fitted_idx
-    
-    out, _ = jax.lax.fori_loop(1, n, body_fn, (out, 0))
-    return out
-
-def _conformal_method(self):
-        return _get_conformal_method(self.prediction_intervals.method)
-
-def _store_cs(self, y, X):
     if self.prediction_intervals is not None:
         self._cs = self.conformity_scores(y, X)
 
-def _add_conformal_intervals(self, fcst, y, X, level):
+
+def _add_conformal_intervals(
+    self,
+    fcst: dict,
+    y: Optional[jnp.ndarray],
+    X: Optional[jnp.ndarray],
+    level: Optional[List[int]],
+) -> dict:
+    """Add conformal prediction intervals to a forecast dict.
+
+    If y is provided, computes fresh conformal scores; otherwise uses stored scores.
+
+    Args:
+        self: A forecaster instance.
+        fcst: Forecast dict to augment.
+        y: Training series (None to use stored scores).
+        X: Optional exogenous variables.
+        level: Confidence levels (0-100).
+
+    Returns:
+        Updated forecast dict with interval keys.
+    """
     if self.prediction_intervals is not None and level is not None:
         cs = self.conformity_scores(y, X) if y is not None else self._cs
         conformal_fn = _conformal_method(self)
@@ -1047,425 +435,91 @@ def _add_conformal_intervals(self, fcst, y, X, level):
         return res
     return fcst
 
-def _add_predict_conformal_intervals(self, fcst, level):
-    from utils import _add_conformal_intervals
-    return _add_conformal_intervals(self,fcst=fcst, y=None, X=None, level=level)
 
-def is_constant(x):
-    return jnp.all(x[0] == x)
-
-def seasonal_decompose(y: jnp.ndarray, model: str = "additive", period: int = 1):
-    """
-    Classical seasonal decomposition using centered moving average.
-    Returns a dict with 'trend', 'seasonal', and 'resid' like statsmodels.
-    """
-    n = len(y)
-
-    # 1. Centered MA filter (even period gets half-weights at endpoints)
-    if period % 2 == 0:
-        kernel = jnp.concatenate([
-            jnp.array([0.5]),
-            jnp.ones(period - 1),
-            jnp.array([0.5]),
-        ]) / period
-    else:
-        kernel = jnp.ones(period) / period
-
-    # 2. Convolve with 'valid' mode, then NaN-pad edges
-    valid = jnp.convolve(y, kernel, mode='valid')
-    pad_before = (n - valid.shape[0]) // 2
-    pad_after = n - valid.shape[0] - pad_before
-    trend = jnp.concatenate([
-        jnp.full(pad_before, jnp.nan),
-        valid,
-        jnp.full(pad_after, jnp.nan),
-    ])
-
-    # 3. Detrend
-    if model == "additive":
-        detrended = y - trend
-    else:
-        detrended = y / trend
-
-    # 4. NaN-aware seasonal averaging per period position
-    n_full = ((n + period - 1) // period) * period
-    padded = jnp.concatenate([detrended, jnp.full(n_full - n, jnp.nan)])
-    period_avgs = jnp.nanmean(padded.reshape(-1, period), axis=0)
-
-    # 5. Normalize: multiplicative averages to 1.0, additive sums to 0.0
-    if model == "additive":
-        period_avgs = period_avgs - jnp.nanmean(period_avgs)
-    else:
-        period_avgs = period_avgs / jnp.nanmean(period_avgs)
-
-    # 6. Tile to full length
-    seasonal = jnp.tile(period_avgs, n // period + 1)[:n]
-
-    # 7. Residuals
-    if model == "additive":
-        resid = y - trend - seasonal
-    else:
-        resid = y / (trend * seasonal)
-
-    return {"trend": trend, "seasonal": seasonal, "resid": resid}
-
-def acf(x: jnp.ndarray, nlags: int) -> jnp.ndarray:
-    """
-    Compute autocorrelation function up to `nlags` for 1D array x using JAX.
-    Equivalent to statsmodels.tsa.stattools.acf(x, nlags=nlags).
-    """
-    x = x - jnp.mean(x)
-    n = x.shape[0]
-    denom = jnp.dot(x, x)
-    acf_vals = jnp.array([jnp.dot(x[: n - lag], x[lag:]) / denom for lag in range(nlags + 1)])
-    return acf_vals
-
-
-def _intervals(y: jnp.ndarray) -> jnp.ndarray:
-    """
-    Return intervals between non-zero observations as a float32 array of length len(y).
-    The valid intervals are placed at the front of the returned array and the rest
-    are padded with 0.0 to ensure a stable shape/dtype for JAX control-flow.
-    """
-    n = y.size
-    nz_idx = jnp.where(y != 0)[0]  # indices of non-zero entries (int32)
-
-    def no_nz():
-        # no non-zero values: return zero-padded float32 array length n
-        return jnp.zeros((n,), dtype=jnp.float32)
-
-    def some_nz():
-        # diffs are integers; cast to float32 and pad with zeros up to length n
-        diffs = jnp.diff(nz_idx).astype(jnp.float32)  # shape (k-1,) if k>=1 else (0,)
-        k = diffs.size
-        pad_len = n - k
-        pad = jnp.zeros((pad_len,), dtype=jnp.float32)
-        return jnp.concatenate([diffs, pad], axis=0)
-
-    return lax.cond(nz_idx.size == 0, no_nz, some_nz)
-
-
-def _chunk_sums(array: jnp.ndarray, chunk_size: int) -> jnp.ndarray:
-    r"""Splits an array into chunks and returns the sum of each chunk.
-    Incomplete chunks are discarded"""
-    n_chunks = array.size // chunk_size
-    n_elems = n_chunks * chunk_size
-    return array[:n_elems].reshape(n_chunks, chunk_size).sum(axis=1)
-
-@jit
-def _ses_sse(alpha: float, x: jnp.ndarray) -> float:
-    r"""Compute the residual sum of squares for a simple exponential smoothing fit.
+def _add_predict_conformal_intervals(
+    self,
+    fcst: dict,
+    level: Optional[List[int]],
+) -> dict:
+    """Add conformal intervals for the predict() path (uses stored scores).
 
     Args:
-        alpha (float): Smoothing parameter.
-        x (numpy.array): Clean time series of shape (n, ).
+        self: A fitted forecaster instance.
+        fcst: Forecast dict to augment.
+        level: Confidence levels (0-100).
 
     Returns:
-        sse (float): Residual sum of squares for the fit.
+        Updated forecast dict with interval keys.
     """
-    complement = 1 - alpha
-    forecast = x[0]
-    sse = 0.0
-
-    for i in range(1, len(x)):
-        forecast = alpha * x[i - 1] + complement * forecast
-        sse += (x[i] - forecast) ** 2
-
-    return sse
-
-def _optimized_ses_forecast(
-    x: jnp.ndarray, bounds: Tuple[float, float] = (0.1, 0.3), n_grid: int = 50
-) -> Tuple[float, jnp.ndarray]:
-    alphas = jnp.linspace(bounds[0], bounds[1], n_grid)
-
-    def sse_for_alpha(alpha):
-        return _ses_sse(alpha, x)
-
-    sses = jax.vmap(sse_for_alpha)(alphas)
-    best_idx = jnp.argmin(sses)
-    best_alpha = alphas[best_idx]
-
-    forecast, fitted = _ses_forecast(x, best_alpha)
-    return forecast, fitted
-
-def _chunk_forecast(y, aggregation_level):
-    lost_remainder_data = len(y) % aggregation_level
-    y_cut = y[lost_remainder_data:]
-    aggregation_sums = _chunk_sums(y_cut, aggregation_level)
-    sums_forecast, _ = _optimized_ses_forecast(aggregation_sums)
-    return sums_forecast
-
-@jit
-# def _expand_fitted_intervals(fitted: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
-def _expand_fitted_intervals_c(fitted: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
-    out = jnp.empty_like(y)
-    # out[0] = jnp.nan
-    out = out.at[0].set(jnp.nan)
-    fitted_idx = 0
-    for i in range(1, y.size):
-        if y[i - 1] != 0:
-            fitted_idx += 1
-            if fitted[fitted_idx] == 0:
-                # to avoid division by zero
-                out[i] = 1
-            else:
-                out[i] = fitted[fitted_idx]
-        elif fitted_idx > 0:
-            # if this entry is zero, the model didn't change
-            out[i] = out[i - 1]
-        else:
-            # if we haven't seen any intervals, use 1 to avoid division by zero
-            out[i] = 1
-    return out
+    return _add_conformal_intervals(self, fcst=fcst, y=None, X=None, level=level)
 
 
-def _intervals(y: jnp.ndarray) -> jnp.ndarray:
-    """
-    Return intervals between non-zero observations as a float32 array of length len(y).
-    The valid intervals are placed at the front of the returned array and the rest
-    are padded with 0.0 to ensure a stable shape/dtype for JAX control-flow.
-    """
-    n = y.size
-    nz_idx = jnp.where(y != 0)[0]  # indices of non-zero entries (int32)
+# ============================================================
+# SECTION 5 — SES Core
+# ============================================================
 
-    def no_nz():
-        # no non-zero values: return zero-padded float32 array length n
-        return jnp.zeros((n,), dtype=jnp.float32)
+@jax.jit
+def _ses_forecast_nan(x: jnp.ndarray, alpha: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Simple Exponential Smoothing forecast with NaN handling.
 
-    def some_nz():
-        # diffs are integers; cast to float32 and pad with zeros up to length n
-        diffs = jnp.diff(nz_idx).astype(jnp.float32)  # shape (k-1,) if k>=1 else (0,)
-        k = diffs.size
-        pad_len = n - k
-        pad = jnp.zeros((pad_len,), dtype=jnp.float32)
-        return jnp.concatenate([diffs, pad], axis=0)
-
-    return lax.cond(nz_idx.size == 0, no_nz, some_nz)
-
-
-def _chunk_sums(array: jnp.ndarray, chunk_size: int) -> jnp.ndarray:
-    r"""Splits an array into chunks and returns the sum of each chunk.
-    Incomplete chunks are discarded"""
-    n_chunks = array.size // chunk_size
-    n_elems = n_chunks * chunk_size
-    return array[:n_elems].reshape(n_chunks, chunk_size).sum(axis=1)
-
-@jit
-def _ses_sse(alpha: float, x: jnp.ndarray) -> float:
-    r"""Compute the residual sum of squares for a simple exponential smoothing fit.
+    Skips NaN values in computation — useful for padded arrays from Croston models.
 
     Args:
-        alpha (float): Smoothing parameter.
-        x (numpy.array): Clean time series of shape (n, ).
+        x: Input array (may contain NaNs).
+        alpha: Smoothing parameter.
 
     Returns:
-        sse (float): Residual sum of squares for the fit.
+        Tuple of (forecast, fitted) arrays.
     """
     complement = 1 - alpha
-    forecast = x[0]
-    sse = 0.0
+    n = x.size
+    fitted = jnp.full_like(x, jnp.nan)
 
-    for i in range(1, len(x)):
-        forecast = alpha * x[i - 1] + complement * forecast
-        sse += (x[i] - forecast) ** 2
+    # Find first non-NaN value
+    is_valid = ~jnp.isnan(x)
+    first_valid_idx = jnp.argmax(is_valid)
+    first_valid_val = x[first_valid_idx]
+    fitted = fitted.at[first_valid_idx].set(first_valid_val)
 
-    return sse
-
-def _optimized_ses_forecast(
-    x: jnp.ndarray, bounds: Tuple[float, float] = (0.1, 0.3), n_grid: int = 50
-) -> Tuple[float, jnp.ndarray]:
-    alphas = jnp.linspace(bounds[0], bounds[1], n_grid)
-
-    def sse_for_alpha(alpha):
-        return _ses_sse(alpha, x)
-
-    sses = jax.vmap(sse_for_alpha)(alphas)
-    best_idx = jnp.argmin(sses)
-    best_alpha = alphas[best_idx]
-
-    forecast, fitted = _ses_forecast(x, best_alpha)
-    return forecast, fitted
-
-def _chunk_forecast(y, aggregation_level):
-    lost_remainder_data = len(y) % aggregation_level
-    y_cut = y[lost_remainder_data:]
-    aggregation_sums = _chunk_sums(y_cut, aggregation_level)
-    sums_forecast, _ = _optimized_ses_forecast(aggregation_sums)
-    return sums_forecast
-
-@jit
-# def _expand_fitted_intervals(fitted: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
-def _expand_fitted_intervals_c(fitted: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
-    out = jnp.empty_like(y)
-    # out[0] = jnp.nan
-    out = out.at[0].set(jnp.nan)
-    fitted_idx = 0
-    for i in range(1, y.size):
-        if y[i - 1] != 0:
-            fitted_idx += 1
-            if fitted[fitted_idx] == 0:
-                # to avoid division by zero
-                out[i] = 1
-            else:
-                out[i] = fitted[fitted_idx]
-        elif fitted_idx > 0:
-            # if this entry is zero, the model didn't change
-            out[i] = out[i - 1]
-        else:
-            # if we haven't seen any intervals, use 1 to avoid division by zero
-            out[i] = 1
-    return out
-
-
-def _intervals(y: jnp.ndarray) -> jnp.ndarray:
-    """
-    Return intervals between non-zero observations as a float32 array of length len(y).
-    The valid intervals are placed at the front of the returned array and the rest
-    are padded with 0.0 to ensure a stable shape/dtype for JAX control-flow.
-    """
-    n = y.size
-    nz_idx = jnp.where(y != 0)[0]  # indices of non-zero entries (int32)
-
-    def no_nz():
-        # no non-zero values: return zero-padded float32 array length n
-        return jnp.zeros((n,), dtype=jnp.float32)
-
-    def some_nz():
-        # diffs are integers; cast to float32 and pad with zeros up to length n
-        diffs = jnp.diff(nz_idx).astype(jnp.float32)  # shape (k-1,) if k>=1 else (0,)
-        k = diffs.size
-        pad_len = n - k
-        pad = jnp.zeros((pad_len,), dtype=jnp.float32)
-        return jnp.concatenate([diffs, pad], axis=0)
-
-    return lax.cond(nz_idx.size == 0, no_nz, some_nz)
-
-
-def _chunk_sums(array: jnp.ndarray, chunk_size: int) -> jnp.ndarray:
-    r"""Splits an array into chunks and returns the sum of each chunk.
-    Incomplete chunks are discarded"""
-    n_chunks = array.size // chunk_size
-    n_elems = n_chunks * chunk_size
-    return array[:n_elems].reshape(n_chunks, chunk_size).sum(axis=1)
-
-@jit
-def _ses_sse(alpha: float, x: jnp.ndarray) -> float:
-    r"""Compute the residual sum of squares for a simple exponential smoothing fit.
-
-    Args:
-        alpha (float): Smoothing parameter.
-        x (numpy.array): Clean time series of shape (n, ).
-
-    Returns:
-        sse (float): Residual sum of squares for the fit.
-    """
-    complement = 1 - alpha
-    forecast = x[0]
-    sse = 0.0
-
-    for i in range(1, len(x)):
-        forecast = alpha * x[i - 1] + complement * forecast
-        sse += (x[i] - forecast) ** 2
-
-    return sse
-
-def _optimized_ses_forecast(
-    x: jnp.ndarray, bounds: Tuple[float, float] = (0.1, 0.3), n_grid: int = 50
-) -> Tuple[float, jnp.ndarray]:
-    alphas = jnp.linspace(bounds[0], bounds[1], n_grid)
-
-    def sse_for_alpha(alpha):
-        return _ses_sse(alpha, x)
-
-    sses = jax.vmap(sse_for_alpha)(alphas)
-    best_idx = jnp.argmin(sses)
-    best_alpha = alphas[best_idx]
-
-    forecast, fitted = _ses_forecast(x, best_alpha)
-    return forecast, fitted
-
-def _chunk_forecast(y, aggregation_level):
-    lost_remainder_data = len(y) % aggregation_level
-    y_cut = y[lost_remainder_data:]
-    aggregation_sums = _chunk_sums(y_cut, aggregation_level)
-    sums_forecast, _ = _optimized_ses_forecast(aggregation_sums)
-    return sums_forecast
-
-@jit
-def _expand_fitted_intervals(fitted: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
-    n = y.size
-    out = jnp.full_like(y, jnp.nan)
-    
-    def body_fn(i, state):
-        out_arr, fitted_idx = state
-        
-        # If previous value was non-zero, advance fitted index
-        fitted_idx = jnp.where(
-            y[i - 1] != 0,
-            fitted_idx + 1,
-            fitted_idx
-        )
-        
-        # Determine output value based on conditions
-        val = jax.lax.cond(
-            y[i - 1] != 0,
-            lambda: jnp.where(
-                fitted[fitted_idx] == 0,
-                1.0,  # Avoid division by zero
-                fitted[fitted_idx]
-            ),
-            lambda: jax.lax.cond(
-                fitted_idx > 0,
-                lambda: out_arr[i - 1],  # Carry forward previous
-                lambda: 1.0  # No intervals seen yet, use 1
+    def body_fun(i, fitted_arr):
+        val = x[i]
+        prev_fitted = fitted_arr[i - 1]
+        new_fitted = jnp.where(
+            jnp.isnan(val),
+            jnp.nan,
+            jnp.where(
+                jnp.isnan(prev_fitted),
+                val,
+                alpha * val + complement * prev_fitted
             )
         )
-        
-        out_arr = out_arr.at[i].set(val)
-        return out_arr, fitted_idx
-    
-    out, _ = jax.lax.fori_loop(1, n, body_fn, (out, 0))
-    return out
+        fitted_arr = fitted_arr.at[i].set(new_fitted)
+        return fitted_arr
+
+    fitted = jax.lax.fori_loop(first_valid_idx + 1, n, body_fun, fitted)
+
+    # Forecast from last non-NaN fitted value
+    last_valid_idx = n - 1 - jnp.argmax(is_valid[::-1])
+    forecast = fitted[last_valid_idx]
+
+    # Set first fitted to NaN to match original behavior
+    fitted = fitted.at[first_valid_idx].set(jnp.nan)
+    return forecast, fitted
 
 
-# JAX-only IMAPA with SES + bounded golden-section search
-import warnings
-
-jax.config.update("jax_enable_x64", True)
-
-
-# ---------------------------
-# Small helpers
-# ---------------------------
-
-def _repeat_val_(val: float, h: int) -> jnp.ndarray:
-    return jnp.full((h,), jnp.asarray(val, dtype=val.dtype))
-
-def _intervals(x: jnp.ndarray) -> jnp.ndarray:
-    """Intervals between nonzero elements (match numpy reference)."""
-    idx = jnp.where(x != 0)[0]
-    padded = jnp.concatenate([jnp.array([0], dtype=idx.dtype), idx + 1])
-    diffs = jnp.diff(padded)
-    return diffs.astype(x.dtype)
-
-def _chunk_sums(array: jnp.ndarray, chunk_size: int) -> jnp.ndarray:
-    """Split into equal chunks and sum each chunk. Incomplete tail discarded."""
-    n = array.size
-    n_chunks = n // chunk_size
-    n_elems = n_chunks * chunk_size
-    trimmed = array[:n_elems]
-    if n_chunks == 0:
-        return jnp.zeros((0,), dtype=array.dtype)
-    idx = jnp.arange(0, n_elems, chunk_size)
-    return jnp.add.reduceat(trimmed, idx)
-
-
-# ---------------------------
-# SES core
-# ---------------------------
 @jax.jit
 def _ses_sse(alpha: jnp.ndarray, x: jnp.ndarray) -> jnp.ndarray:
-    """Residual sum of squares for simple exponential smoothing."""
+    """Residual sum of squares for simple exponential smoothing (JIT-compiled).
+
+    Uses lax.fori_loop for efficient JAX compilation.
+
+    Args:
+        alpha: Smoothing parameter.
+        x: Clean time series of shape (n,).
+
+    Returns:
+        SSE scalar value.
+    """
     x = ensure_float(x)
     dtype = x.dtype
     alpha = jnp.asarray(alpha, dtype=dtype)
@@ -1479,12 +533,22 @@ def _ses_sse(alpha: jnp.ndarray, x: jnp.ndarray) -> jnp.ndarray:
         return (forecast_new, sse + err * err)
 
     init_state = (x[0], jnp.asarray(0.0, dtype=dtype))
-    forecast, sse = lax.fori_loop(1, n, body_fun, init_state)
+    _, sse = lax.fori_loop(1, n, body_fun, init_state)
     return sse
+
 
 @jax.jit
 def _ses_forecast(x: jnp.ndarray, alpha: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """One-step ahead forecast and in-sample fitted values for SES."""
+    """One-step ahead forecast and in-sample fitted values for SES (JIT-compiled).
+
+    Args:
+        x: Clean time series of shape (n,).
+        alpha: Smoothing parameter.
+
+    Returns:
+        Tuple of (forecast, fitted) where forecast is the next-step prediction
+        and fitted is the in-sample array with fitted[0] = NaN.
+    """
     x = ensure_float(x)
     dtype = x.dtype
     alpha = jnp.asarray(alpha, dtype=dtype)
@@ -1505,9 +569,19 @@ def _ses_forecast(x: jnp.ndarray, alpha: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.
     fitted = fitted.at[0].set(jnp.asarray(jnp.nan, dtype=dtype))
     return forecast, fitted
 
+
 @jax.jit
 def _ses_sse_masked(alpha: jnp.ndarray, x: jnp.ndarray, n_eff: jnp.ndarray) -> jnp.ndarray:
-    """SSE for SES over the first n_eff elements of a padded array."""
+    """SSE for SES over the first n_eff elements of a padded array (JIT-compiled).
+
+    Args:
+        alpha: Smoothing parameter.
+        x: Padded time series of shape (n,).
+        n_eff: Number of effective (non-padding) elements.
+
+    Returns:
+        SSE scalar value computed only over valid elements.
+    """
     x = ensure_float(x)
     dtype = x.dtype
     alpha = jnp.asarray(alpha, dtype=dtype)
@@ -1525,14 +599,24 @@ def _ses_sse_masked(alpha: jnp.ndarray, x: jnp.ndarray, n_eff: jnp.ndarray) -> j
         return lax.cond(i < n_eff, do_update, lambda: (forecast, sse))
 
     init_state = (x[0], jnp.asarray(0.0, dtype=dtype))
-    forecast, sse = lax.fori_loop(1, n, body_fun, init_state)
+    _, sse = lax.fori_loop(1, n, body_fun, init_state)
     return sse
+
 
 @jax.jit
 def _ses_forecast_last_masked(
     x: jnp.ndarray, alpha: jnp.ndarray, n_eff: jnp.ndarray
 ) -> jnp.ndarray:
-    """One-step SES forecast over the first n_eff elements of a padded array."""
+    """One-step SES forecast over the first n_eff elements of a padded array.
+
+    Args:
+        x: Padded time series.
+        alpha: Smoothing parameter.
+        n_eff: Number of effective (non-padding) elements.
+
+    Returns:
+        One-step forecast scalar.
+    """
     x = ensure_float(x)
     dtype = x.dtype
     alpha = jnp.asarray(alpha, dtype=dtype)
@@ -1549,35 +633,42 @@ def _ses_forecast_last_masked(
     return forecast
 
 
-# ---------------------------
-# Golden-section (SciPy "bounded") optimizer
-# ---------------------------
-
 def _golden_bounded_minimize(
-    f,
+    f: Callable,
     a: float,
     b: float,
-    dtype=jnp.float64,
-    xatol: float | None = None,
+    dtype: jnp.dtype = jnp.float64,
+    xatol: Optional[float] = None,
     maxiter: int = 1000,
-    early_stop_eps: float | None = None,
+    early_stop_eps: Optional[float] = None,
     early_stop_patience: int = 50,
-):
-    """
-    Deterministic golden-section search matching SciPy's "bounded" behavior.
-    All arithmetic in `dtype` (use float64 to mimic SciPy).
-    Returns (x*, f(x*)).
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Deterministic golden-section search matching SciPy's 'bounded' behavior.
+
+    All arithmetic performed in the specified dtype. Uses lax.while_loop
+    and lax.cond for full JIT compatibility.
+
+    Args:
+        f: Objective function to minimize.
+        a: Lower bound of search interval.
+        b: Upper bound of search interval.
+        dtype: Arithmetic dtype (float64 for SciPy-matching precision).
+        xatol: Absolute tolerance; defaults to 1e-12 (float64) or 1e-7 (float32).
+        maxiter: Maximum number of iterations.
+        early_stop_eps: Early stopping threshold; defaults to xatol.
+        early_stop_patience: Iterations without improvement before stopping.
+
+    Returns:
+        Tuple of (x_star, f_star) — the minimizer and its objective value.
     """
     if xatol is None:
-        # SciPy's bounded uses absolute tolerance; we use a tight default in float64
         xatol = 1e-12 if dtype == jnp.float64 else 1e-7
 
     a = jnp.asarray(a, dtype=dtype)
     b = jnp.asarray(b, dtype=dtype)
-    # Bounds are assumed valid in JIT contexts.
 
     invphi = (jnp.sqrt(jnp.asarray(5.0, dtype=dtype)) - 1.0) / 2.0   # ~0.6180339887
-    invphi2 = 1.0 - invphi                                           # ~0.3819660113
+    invphi2 = 1.0 - invphi                                            # ~0.3819660113
 
     xatol_arr = jnp.asarray(xatol, dtype=dtype)
     if early_stop_eps is None:
@@ -1640,24 +731,27 @@ def _golden_bounded_minimize(
     return jnp.asarray(xstar, dtype=dtype), jnp.asarray(fstar, dtype=dtype)
 
 
-# ---------------------------
-# Optimized SES forecast (search in float64 via golden-section)
-# ---------------------------
 def _optimized_ses_forecast(
     x: jnp.ndarray, bounds: Tuple[float, float] = (0.1, 0.3)
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """
-    Compute one-step SES forecast with alpha chosen by golden-section minimization of SSE.
+    """SES forecast with alpha chosen by golden-section minimization of SSE.
 
-    Heuristic:
-      - If input is float32 AND (sequence is degenerate (<=2 nonzero) OR has any negatives),
-        run BOTH the optimizer and SES recursion in float32 to match NumPy reference.
+    Heuristic dtype policy:
+      - If input is float32 AND (sequence is degenerate (<=2 nonzero) OR has
+        any negatives), run BOTH the optimizer and SES recursion in float32 to
+        match NumPy reference.
       - Otherwise, run both in float64 for numerical stability.
+
+    Args:
+        x: Clean time series.
+        bounds: (lower, upper) bounds for alpha search.
+
+    Returns:
+        Tuple of (forecast, fitted) arrays in the original input dtype.
     """
     x = ensure_float(x)
     out_dtype = x.dtype
 
-    # Detect tricky cases that are sensitive to fp32 rounding in NumPy
     nonzero_cnt = jnp.sum(x != 0)
     has_neg = jnp.any(x < 0)
     prefer_fp32 = (out_dtype == jnp.float32) & ((nonzero_cnt <= 2) | has_neg)
@@ -1668,27 +762,36 @@ def _optimized_ses_forecast(
     def obj(a):
         return _ses_sse(a, x_run)
 
-    # Slightly looser xatol for fp32 (closer to SciPy bounded behavior in fp32)
     xatol = 1e-8 if run_dtype == jnp.float32 else 1e-13
 
     alpha_star, _ = _golden_bounded_minimize(
         obj, bounds[0], bounds[1], dtype=run_dtype, xatol=xatol, maxiter=5000
     )
 
-    # Run SES recursion in the same dtype we optimized in (to match NumPy path),
-    # then cast outputs back to the original dtype of the series.
     forecast_run, fitted_run = _ses_forecast(x_run, alpha_star)
-
     forecast = forecast_run.astype(out_dtype)
     fitted = fitted_run.astype(out_dtype)
     return forecast, fitted
+
 
 def _optimized_ses_forecast_masked(
     x: jnp.ndarray,
     n_eff: jnp.ndarray,
     bounds: Tuple[float, float] = (0.1, 0.3),
 ) -> jnp.ndarray:
-    """SES forecast over the first n_eff elements of a padded array."""
+    """SES forecast over the first n_eff elements of a padded array.
+
+    Uses golden-section search to optimize alpha, then computes forecast
+    over the effective portion of the array.
+
+    Args:
+        x: Padded time series.
+        n_eff: Number of effective (non-padding) elements.
+        bounds: (lower, upper) bounds for alpha search.
+
+    Returns:
+        One-step forecast scalar in the original input dtype.
+    """
     x = ensure_float(x)
     out_dtype = x.dtype
 
@@ -1715,14 +818,488 @@ def _optimized_ses_forecast_masked(
     )
 
 
+# ============================================================
+# SECTION 6 — Aggregation / Chunking
+# ============================================================
 
-# ---------------------------
-# IMAPA
-# ---------------------------
+@_partial(jax.jit, static_argnums=(1, 2))
+def _window_average_core(y: jnp.ndarray, window_size: int, h: int) -> jnp.ndarray:
+    """JIT-able core: average the last ``window_size`` values, repeat to length h.
 
-@partial(jax.jit, static_argnames=("max_k",))
+    Args:
+        y: Input time series.
+        window_size: Number of trailing values to average (static).
+        h: Forecast horizon (static).
+
+    Returns:
+        Constant forecast array of length h.
+    """
+    n = y.shape[0]
+    start = jnp.maximum(0, n - window_size)
+    tail = lax.dynamic_slice(y, (start,), (window_size,))
+    wavg = jnp.mean(tail)
+    return jnp.full((h,), wavg, dtype=y.dtype)
+
+
+def _window_average(
+    y: jnp.ndarray,
+    h: int,
+    fitted: bool,
+    window_size: int,
+) -> Dict[str, jnp.ndarray]:
+    """Window average forecast.
+
+    Args:
+        y: Time series.
+        h: Forecasting horizon.
+        fitted: Whether to return fitted values (not implemented).
+        window_size: Window size for averaging.
+
+    Returns:
+        Dict with 'mean' key containing constant forecast of length h.
+
+    Raises:
+        NotImplementedError: If fitted=True.
+    """
+    if fitted:
+        raise NotImplementedError("return fitted")
+    if y.size < window_size:
+        return {"mean": jnp.full((h,), jnp.nan, dtype=y.dtype)}
+    mean = _window_average_core(y, window_size, h)
+    return {"mean": mean}
+
+
+def _chunk_sums(array: jnp.ndarray, chunk_size: int) -> jnp.ndarray:
+    """Split array into equal chunks and sum each. Incomplete tail discarded.
+
+    Uses jnp.add.reduceat for efficiency.
+
+    Args:
+        array: Input array.
+        chunk_size: Size of each chunk.
+
+    Returns:
+        Array of chunk sums.
+    """
+    n = array.size
+    n_chunks = n // chunk_size
+    n_elems = n_chunks * chunk_size
+    trimmed = array[:n_elems]
+    if n_chunks == 0:
+        return jnp.zeros((0,), dtype=array.dtype)
+    idx = jnp.arange(0, n_elems, chunk_size)
+    return jnp.add.reduceat(trimmed, idx)
+
+
+def _chunk_forecast(y: jnp.ndarray, aggregation_level: int) -> jnp.ndarray:
+    """Compute SES forecast on aggregated (chunked) time series.
+
+    Args:
+        y: Input time series.
+        aggregation_level: Chunk size for temporal aggregation.
+
+    Returns:
+        One-step forecast for the aggregated series.
+    """
+    lost_remainder_data = len(y) % aggregation_level
+    y_cut = y[lost_remainder_data:]
+    aggregation_sums = _chunk_sums(y_cut, aggregation_level)
+    sums_forecast, _ = _optimized_ses_forecast(aggregation_sums)
+    return sums_forecast
+
+
+# ============================================================
+# SECTION 7 — Intermittent Demand Helpers
+# ============================================================
+
+@jax.jit
+def _demand(x: jnp.ndarray) -> jnp.ndarray:
+    """Extract positive (non-zero) elements from array (JIT-compiled).
+
+    Used by Croston-family models for intermittent demand.
+    Returns fixed-size array (same size as input) for JIT compatibility.
+    Non-zero values are packed at the start, remaining positions filled with NaN.
+
+    Args:
+        x: Input array.
+
+    Returns:
+        Fixed-size array with non-zero values packed at start, rest NaN.
+
+    Example:
+        >>> x = jnp.array([0., 5., 0., 3., 0.])
+        >>> _demand(x)
+        array([5., 3., nan, nan, nan])
+    """
+    indices = jnp.where(x > 0, size=x.size, fill_value=-1)[0]
+    result = jnp.where(
+        indices >= 0,
+        jnp.where(indices < x.size, x[jnp.clip(indices, 0, x.size - 1)], jnp.nan),
+        jnp.nan
+    )
+    return result
+
+
+@jax.jit
+def _intervals_c(x: jnp.ndarray) -> jnp.ndarray:
+    """Compute intervals between non-zero elements (Croston variant, JIT-compiled).
+
+    Returns fixed-size NaN-padded array for JIT compatibility.
+    Used by Croston-family models.
+
+    Args:
+        x: Input array.
+
+    Returns:
+        Fixed-size array with intervals packed at start, rest NaN.
+
+    Example:
+        >>> x = jnp.array([0., 5., 0., 0., 3., 0., 2.])
+        >>> _intervals_c(x)
+        array([1., 3., 2., nan, nan, nan, nan])
+    """
+    nonzero_idxs = jnp.where(x != 0, size=x.size, fill_value=-1)[0]
+    positions = jnp.where(nonzero_idxs >= 0, nonzero_idxs + 1, -1)
+    intervals = jnp.diff(positions, prepend=0)
+    valid_mask = positions >= 0
+    result = jnp.where(valid_mask, intervals.astype(x.dtype), jnp.nan)
+    return result
+
+
+def _intervals(x: jnp.ndarray) -> jnp.ndarray:
+    """Intervals between nonzero elements (IMAPA variant).
+
+    Unlike ``_intervals_c``, returns a compact array of diffs (no NaN padding)
+    and prepends the position of the first nonzero element.
+
+    Args:
+        x: Input array.
+
+    Returns:
+        Float array of inter-arrival intervals.
+    """
+    idx = jnp.where(x != 0)[0]
+    padded = jnp.concatenate([jnp.array([0], dtype=idx.dtype), idx + 1])
+    diffs = jnp.diff(padded)
+    return diffs.astype(x.dtype)
+
+
+def _expand_fitted_demand(fitted: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
+    """Expand demand fitted values back to original series length (JIT-compiled).
+
+    Used by Croston-family models. Uses lax.fori_loop for JIT compatibility.
+
+    Logic:
+        - If y[i-1] > 0: Use next fitted value (demand occurred).
+        - If y[i-1] == 0 and we've seen demand: Carry forward previous value.
+        - If y[i-1] == 0 and no demand yet: Use naive forecast (y[i-1]).
+
+    Args:
+        fitted: SES fitted values for demand (length = num_nonzero + 1).
+        y: Original time series.
+
+    Returns:
+        Fitted values expanded to match y's length.
+    """
+    n = y.size
+    out = jnp.full_like(y, jnp.nan)
+
+    def body_fn(i, state):
+        out_arr, fitted_idx = state
+        fitted_idx = jnp.where(y[i - 1] > 0, fitted_idx + 1, fitted_idx)
+        val = jax.lax.cond(
+            y[i - 1] > 0,
+            lambda: fitted[fitted_idx],
+            lambda: jax.lax.cond(
+                fitted_idx > 0,
+                lambda: out_arr[i - 1],
+                lambda: y[i - 1]
+            )
+        )
+        out_arr = out_arr.at[i].set(val)
+        return out_arr, fitted_idx
+
+    out, _ = jax.lax.fori_loop(1, n, body_fn, (out, 0))
+    return out
+
+
+@jit
+def _expand_fitted_intervals(fitted: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
+    """Expand interval fitted values back to original series length (JIT-compiled).
+
+    Used by Croston-family models. Uses lax.fori_loop for JIT compatibility.
+    Avoids division by zero by replacing zero fitted values with 1.
+
+    Logic:
+        - If y[i-1] != 0: Use next fitted value (replace 0 with 1).
+        - If y[i-1] == 0 and we've seen intervals: Carry forward previous value.
+        - If y[i-1] == 0 and no intervals yet: Use 1.
+
+    Args:
+        fitted: SES fitted values for intervals (length = num_nonzero + 1).
+        y: Original time series.
+
+    Returns:
+        Fitted intervals expanded to match y's length.
+    """
+    n = y.size
+    out = jnp.full_like(y, jnp.nan)
+
+    def body_fn(i, state):
+        out_arr, fitted_idx = state
+        fitted_idx = jnp.where(
+            y[i - 1] != 0,
+            fitted_idx + 1,
+            fitted_idx
+        )
+        val = jax.lax.cond(
+            y[i - 1] != 0,
+            lambda: jnp.where(
+                fitted[fitted_idx] == 0,
+                1.0,
+                fitted[fitted_idx]
+            ),
+            lambda: jax.lax.cond(
+                fitted_idx > 0,
+                lambda: out_arr[i - 1],
+                lambda: 1.0
+            )
+        )
+        out_arr = out_arr.at[i].set(val)
+        return out_arr, fitted_idx
+
+    out, _ = jax.lax.fori_loop(1, n, body_fn, (out, 0))
+    return out
+
+
+# ============================================================
+# SECTION 8 — Seasonal & Decomposition
+# ============================================================
+
+def _seasonal_exponential_smoothing(
+    y: jnp.ndarray,
+    h: int,
+    fitted: bool,
+    season_length: int,
+    alpha: float,
+) -> Dict[str, jnp.ndarray]:
+    """Seasonal exponential smoothing forecast.
+
+    Applies SES independently to each seasonal sub-series, then tiles the
+    forecasts to cover horizon h.
+
+    Args:
+        y: Input time series.
+        h: Forecast horizon.
+        fitted: Whether to return in-sample fitted values.
+        season_length: Seasonal period.
+        alpha: Smoothing parameter for SES.
+
+    Returns:
+        Dict with 'mean' and optionally 'fitted' keys.
+    """
+    n = y.size
+    if n < season_length:
+        return {"mean": jnp.full(h, jnp.nan, dtype=y.dtype)}
+
+    season_vals = jnp.full((season_length,), jnp.nan, dtype=y.dtype)
+    fitted_vals = jnp.full_like(y, jnp.nan)
+
+    for i in range(season_length):
+        init_idx = i + n % season_length
+        x = y[init_idx::season_length]
+
+        forecast, fitted_season = _ses_forecast(x, alpha)
+
+        season_vals = season_vals.at[i].set(forecast)
+
+        for k in range(fitted_season.size):
+            fitted_vals = fitted_vals.at[init_idx + k * season_length].set(fitted_season[k])
+
+    out = _repeat_val_seas(season_vals, h)
+    fcst = {"mean": out}
+    if fitted:
+        fcst["fitted"] = fitted_vals
+    return fcst
+
+
+def _seasonal_naive(
+    y: jnp.ndarray,
+    h: int,
+    season_length: int,
+    fitted: bool = False,
+) -> Dict[str, jnp.ndarray]:
+    """JAX implementation of seasonal-naive forecast.
+
+    Repeats the last season_length observations as the forecast.
+
+    Args:
+        y: 1-D array-like (length T). Converted to float32.
+        h: Forecast horizon (int >= 1).
+        season_length: Seasonal period m (int >= 1).
+        fitted: If True, also return in-sample fitted values.
+
+    Returns:
+        Dict with 'mean' (shape (h,)) and optionally 'fitted' (shape (T,)).
+
+    Raises:
+        ValueError: If y is not 1-D, season_length <= 0, T < season_length, or h < 1.
+    """
+    y_j = jnp.asarray(y, dtype=jnp.float32).squeeze()
+    if y_j.ndim != 1:
+        raise ValueError("y must be a 1-D array")
+    T = y_j.shape[0]
+    m = int(season_length)
+    if m <= 0:
+        raise ValueError("season_length must be a positive integer")
+    if T < m:
+        raise ValueError(f"Series length T={T} must be at least season_length={m}")
+    if not isinstance(h, int) or h < 1:
+        raise ValueError("h must be a positive integer")
+
+    last_m = y_j[-m:]
+    idx = jnp.arange(h) % m
+    mean = last_m[idx]
+    out = {"mean": mean}
+
+    if fitted:
+        fitted = jnp.full((T,), jnp.nan, dtype=jnp.float32)
+        vals = y_j[: T - m]
+        positions = jnp.arange(m, T)
+        fitted = fitted.at[positions].set(vals)
+        out["fitted"] = fitted
+
+    return out
+
+
+def seasonal_decompose(
+    y: jnp.ndarray,
+    model: str = "additive",
+    period: int = 1,
+) -> Dict[str, jnp.ndarray]:
+    """Classical seasonal decomposition using centered moving average.
+
+    Uses mode='valid' convolution with NaN-padding and half-weights for even
+    periods (proper centered MA), NaN-aware seasonal averaging, and correct
+    normalization.
+
+    Args:
+        y: Input time series array.
+        model: Decomposition type, 'additive' or 'multiplicative'.
+        period: Seasonal period length.
+
+    Returns:
+        Dict with 'trend', 'seasonal', and 'resid' keys.
+    """
+    n = len(y)
+
+    # Centered MA filter (even period gets half-weights at endpoints)
+    if period % 2 == 0:
+        kernel = jnp.concatenate([
+            jnp.array([0.5]),
+            jnp.ones(period - 1),
+            jnp.array([0.5]),
+        ]) / period
+    else:
+        kernel = jnp.ones(period) / period
+
+    # Convolve with 'valid' mode, then NaN-pad edges
+    valid = jnp.convolve(y, kernel, mode='valid')
+    pad_before = (n - valid.shape[0]) // 2
+    pad_after = n - valid.shape[0] - pad_before
+    trend = jnp.concatenate([
+        jnp.full(pad_before, jnp.nan),
+        valid,
+        jnp.full(pad_after, jnp.nan),
+    ])
+
+    # Detrend
+    if model == "additive":
+        detrended = y - trend
+    else:
+        detrended = y / trend
+
+    # NaN-aware seasonal averaging per period position
+    n_full = ((n + period - 1) // period) * period
+    padded = jnp.concatenate([detrended, jnp.full(n_full - n, jnp.nan)])
+    period_avgs = jnp.nanmean(padded.reshape(-1, period), axis=0)
+
+    # Normalize: multiplicative averages to 1.0, additive sums to 0.0
+    if model == "additive":
+        period_avgs = period_avgs - jnp.nanmean(period_avgs)
+    else:
+        period_avgs = period_avgs / jnp.nanmean(period_avgs)
+
+    # Tile to full length
+    seasonal = jnp.tile(period_avgs, n // period + 1)[:n]
+
+    # Residuals
+    if model == "additive":
+        resid = y - trend - seasonal
+    else:
+        resid = y / (trend * seasonal)
+
+    return {"trend": trend, "seasonal": seasonal, "resid": resid}
+
+
+@_partial(jax.jit, static_argnums=(1, 2))
+def _linear_extrapolate_tail(y: jnp.ndarray, tail_window: int, h: int) -> jnp.ndarray:
+    """Fit a linear trend to the last ``tail_window`` observations and extrapolate.
+
+    Args:
+        y: Input time series.
+        tail_window: Number of trailing observations to use (static).
+        h: Forecast horizon (static).
+
+    Returns:
+        Extrapolated forecast of length h.
+    """
+    n = y.shape[0]
+    start = jnp.maximum(0, n - tail_window)
+    seg = jax.lax.dynamic_slice(y, (start,), (tail_window,))
+    m = jnp.minimum(tail_window, n)
+    t = jnp.arange(tail_window)
+    t_mean = jnp.mean(t)
+    y_mean = jnp.mean(seg)
+    cov = jnp.mean((t - t_mean) * (seg - y_mean))
+    var = jnp.mean((t - t_mean) ** 2) + 1e-12
+    slope = cov / var
+    intercept = y_mean - slope * t_mean
+    t_fore = t_mean + (jnp.arange(h) + 1)
+    return intercept + slope * t_fore
+
+
+# ============================================================
+# SECTION 9 — IMAPA
+# ============================================================
+
+def _repeat_val_(val: jnp.ndarray, h: int) -> jnp.ndarray:
+    """Repeat a scalar JAX value h times (internal IMAPA helper).
+
+    Args:
+        val: Scalar JAX array.
+        h: Number of repetitions.
+
+    Returns:
+        Array of length h filled with val.
+    """
+    return jnp.full((h,), jnp.asarray(val, dtype=val.dtype))
+
+
+@_partial(jax.jit, static_argnames=("max_k",))
 def _imapa_aggregate_jit(y: jnp.ndarray, max_k: int) -> jnp.ndarray:
-    """JIT-friendly aggregation loop with padded sums and masked SES."""
+    """JIT-friendly aggregation loop with padded sums and masked SES.
+
+    For each aggregation level k = 1..max_k, chunks the series, sums chunks,
+    fits SES, and stores the per-observation forecast.
+
+    Args:
+        y: Input time series.
+        max_k: Maximum aggregation level (static).
+
+    Returns:
+        Array of per-k forecasts (shape (max_k,)), NaN where no chunks.
+    """
     dtype = y.dtype
     n = y.shape[0]
     forecasts = jnp.full((max_k,), jnp.asarray(jnp.nan, dtype=dtype))
@@ -1752,61 +1329,31 @@ def _imapa_aggregate_jit(y: jnp.ndarray, max_k: int) -> jnp.ndarray:
 
     return lax.fori_loop(1, max_k + 1, body, forecasts)
 
+
 def _imapa(
     y: jnp.ndarray,
     h: int,
     fitted: bool,
-) -> Dict:
-    """
-    IMAPA forecaster in pure JAX (intermittent demand).
+) -> Dict[str, jnp.ndarray]:
+    """IMAPA forecaster in pure JAX (intermittent demand).
 
-    What it does:
-        1) Detects inter-arrival spacing of non-zero observations in `y` and
-           computes a mean interval.
-        2) Uses that mean (rounded) as the maximum aggregation level K.
-        3) For each aggregation level k = 1..K:
-            - Drops a short remainder (so length is divisible by k).
-            - Chunks and sums the series into length-k blocks.
-            - Fits Single Exponential Smoothing (SES) to the aggregated series,
-              selecting alpha via a bounded golden-section search on SSE.
-            - Scales the one-step SES forecast back by 1/k.
-        4) Averages the per-k forecasts to produce a single constant-mean forecast
-           of length `h`. Optionally computes in-sample fitted values by
-           refitting on prefixes (O(T²) warning).
+    Detects inter-arrival spacing, computes mean interval as max aggregation
+    level K, then for each k = 1..K: chunks, sums, fits SES with golden-section
+    alpha optimization, and scales back by 1/k. Averages per-k forecasts for
+    the final constant-mean forecast.
 
-    How it differs from a typical NumPy reference:
-        - Pure JAX: vectorized core math and JIT-friendly loops; no SciPy optimizer.
-        - Optimizer: uses a deterministic golden-section search (SciPy-like
-          “bounded” behavior) implemented in JAX instead of `scipy.optimize`.
-        - Dtype policy: inputs are normalized with `ensure_float` (ints -> fp32).
-          SES optimization/recursion may run in fp64 for stability except for
-          very sparse or sign-changing fp32 inputs, where we mirror fp32 end-to-end
-          to match NumPy paths more closely.
-        - Guard rails: handles all-zeros fast path and skips empty chunk sets.
-
-    Limitations:
-        - Fitted values: computed by recursive refits on prefixes, which is
-          O(T²) and expensive; intended for testing/debugging, not production.
-        - JIT boundaries: the outer Python loops over aggregation levels and
-          prefix refits are not fully fused; very large T or K can impact speed.
-        - Sensitivity in edge cases: extremely short, single-spike, or highly
-          negative/alternating sequences can be sensitive to dtype/tolerance;
-          the fp32/fp64 heuristic mitigates this but tiny deltas vs NumPy can
-          still occur if tolerances are set extremely tight.
-        - Assumes non-seasonal SES per aggregation. If strong seasonality exists
-          after aggregation, this model intentionally keeps the constant-mean
-          IMAPA assumption.
+    Args:
+        y: Input time series.
+        h: Forecast horizon.
+        fitted: Whether to compute in-sample fitted values (O(T^2), expensive).
 
     Returns:
-        dict with:
-          - "mean": (h,) constant forecast replicated across horizon
-          - optionally "fitted": (T,) in-sample values with first element NaN
-
+        Dict with 'mean' (shape (h,)) and optionally 'fitted' (shape (T,)).
     """
     # All zeros shortcut
     if bool(jnp.all(y == 0)):
         out_dtype = y.dtype if y.dtype in (jnp.float32, jnp.float64) else jnp.float32
-        res = {"mean": jnp.zeros((h,), dtype=out_dtype)}  # Keep this as-is
+        res = {"mean": jnp.zeros((h,), dtype=out_dtype)}
         if fitted:
             f = jnp.zeros_like(ensure_float(y)).astype(out_dtype)
             f = f.at[0].set(jnp.asarray(jnp.nan, dtype=out_dtype))
@@ -1824,7 +1371,7 @@ def _imapa(
 
     forecasts = _imapa_aggregate_jit(y, max_aggregation_level)
 
-    # Mean of finite forecasts (there shouldn't be NaNs normally, but guard anyway)
+    # Mean of finite forecasts
     finite_mask = jnp.isfinite(forecasts)
     forecast = jnp.where(
         finite_mask.any(),
@@ -1846,20 +1393,74 @@ def _imapa(
         res["fitted"] = fitted_vals
 
     return res
-@_partial(jax.jit, static_argnums=(1, 2))
-def _linear_extrapolate_tail(y: jnp.ndarray, tail_window: int, h: int) -> jnp.ndarray:
-    n = y.shape[0]
-    start = jnp.maximum(0, n - tail_window)
-    # Use dynamic_slice with STATIC size for JIT compatibility
-    # tail_window is static, so we can use it directly
-    seg = jax.lax.dynamic_slice(y, (start,), (tail_window,))
-    # If n < tail_window, we'll have padded values - need to handle this
-    m = jnp.minimum(tail_window, n)
-    t = jnp.arange(tail_window)
-    t_mean = jnp.mean(t); y_mean = jnp.mean(seg)
-    cov = jnp.mean((t - t_mean) * (seg - y_mean))
-    var = jnp.mean((t - t_mean) ** 2) + 1e-12
-    slope = cov / var
-    intercept = y_mean - slope * t_mean
-    t_fore = t_mean + (jnp.arange(h) + 1)
-    return intercept + slope * t_fore
+
+
+# ============================================================
+# SECTION 10 — Miscellaneous
+# ============================================================
+
+def is_constant(x: jnp.ndarray) -> jnp.ndarray:
+    """Check if all elements of an array are equal.
+
+    Args:
+        x: Input array.
+
+    Returns:
+        Boolean scalar.
+    """
+    return jnp.all(x[0] == x)
+
+
+def acf(x: jnp.ndarray, nlags: int) -> jnp.ndarray:
+    """Compute autocorrelation function up to ``nlags`` for a 1-D array.
+
+    Equivalent to statsmodels.tsa.stattools.acf(x, nlags=nlags).
+
+    Args:
+        x: Input 1-D array.
+        nlags: Number of lags to compute.
+
+    Returns:
+        Array of ACF values from lag 0 to nlags (length nlags+1).
+    """
+    x = x - jnp.mean(x)
+    n = x.shape[0]
+    denom = jnp.dot(x, x)
+    acf_vals = jnp.array([jnp.dot(x[: n - lag], x[lag:]) / denom for lag in range(nlags + 1)])
+    return acf_vals
+
+
+@jax.jit
+def calculate_information_criteria(
+    residuals: jnp.ndarray,
+    n_params: int,
+    n: int,
+) -> Dict[str, jnp.ndarray]:
+    """Calculate AIC, BIC, and AICc from residuals (JIT-compiled).
+
+    Args:
+        residuals: Model residuals.
+        n_params: Number of estimated parameters.
+        n: Number of observations.
+
+    Returns:
+        Dict with 'loglik', 'aic', 'bic', 'aicc' as JAX arrays.
+    """
+    sse = jnp.sum(residuals ** 2)
+    lik = n * jnp.log(sse + 1e-10)
+
+    aic = lik + 2 * n_params
+    bic = lik + jnp.log(n) * n_params
+    denom = n - n_params - 1
+    aicc = jnp.where(
+        denom > 0,
+        aic + (2 * n_params * (n_params + 1)) / denom,
+        jnp.inf
+    )
+
+    return {
+        'loglik': -0.5 * lik,
+        'aic': aic,
+        'bic': bic,
+        'aicc': aicc,
+    }
