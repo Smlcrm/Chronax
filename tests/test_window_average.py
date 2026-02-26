@@ -8,15 +8,14 @@ import jax.numpy as jnp
 from functools import partial
 from jax import lax
 
-from conformal_intervals import (
+from chronax.utils import (
     ConformalIntervals,
 )
 
-from base_forecaster import BaseForecaster
+from chronax.models.base_forecaster import BaseForecaster
+from chronax.utils import _repeat_val, _window_average, ensure_float
 
-from utils import _repeat_val, _window_average, ensure_float
-
-from window_average import WindowAverage
+from chronax.models import WindowAverage
 
 # =========================
 # Test Cases

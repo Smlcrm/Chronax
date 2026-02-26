@@ -1,6 +1,6 @@
 import jax.numpy as jnp
-from ets_model import ETS
-from conformal_intervals import ConformalIntervals
+from chronax.models import ETS
+from chronax.utils import ConformalIntervals
 # -------------------------------------------------------------------
 # Coverage Tests (run this file directly)
 # -------------------------------------------------------------------

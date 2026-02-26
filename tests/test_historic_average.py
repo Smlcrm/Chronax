@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 
-from historic_average import HistoricAverage
+from chronax.models import HistoricAverage
 
 # ---------- Test ----------
 

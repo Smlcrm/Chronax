@@ -1,7 +1,7 @@
 import jax.numpy as jnp
-from conformal_intervals import ConformalIntervals
-from base_forecaster import BaseForecaster
-from holt_winters import HoltWinters
+from chronax.utils import ConformalIntervals
+from chronax.models.base_forecaster import BaseForecaster
+from chronax.models import HoltWinters
 
 def test_holt_winters():
     """Comprehensive test suite for Holt-Winters model."""

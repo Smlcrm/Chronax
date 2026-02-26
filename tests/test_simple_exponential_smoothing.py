@@ -3,10 +3,10 @@ import jax
 import jax.numpy as jnp
 from functools import partial as _partial
 
-from base_forecaster import BaseForecaster
-from conformal_intervals import ConformalIntervals
-import utils
-from simple_exponential_smoothing import SimpleExponentialSmoothing
+from chronax.models.base_forecaster import BaseForecaster
+from chronax.utils import ConformalIntervals
+from chronax import utils
+from chronax.models import SimpleExponentialSmoothing
 
 if __name__ == "__main__":
     print("=" * 80)

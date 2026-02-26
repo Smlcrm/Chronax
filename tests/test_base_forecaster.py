@@ -1,15 +1,15 @@
 import jax
 import jax.numpy as jnp
-import utils
+from chronax import utils
 from jax import lax, vmap
 
-from utils import _get_conformal_method
-from base_forecaster import BaseForecaster
+from chronax.utils import _get_conformal_method
+from chronax.models.base_forecaster import BaseForecaster
 
 # ---------- Test ----------
 
 if __name__ == "__main__":
-    from conformal_intervals import ConformalIntervals
+    from chronax.utils import ConformalIntervals
     
     print("=" * 60)
     print("Testing BaseForecaster Class")

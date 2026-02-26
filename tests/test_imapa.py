@@ -4,8 +4,8 @@ import warnings
 import jax.numpy as jnp
 import numpy as np
 from statsforecast.models import IMAPA as SF_IMAPA
-from conformal_intervals import ConformalIntervals
-from imapa import IMAPA
+from chronax.utils import ConformalIntervals
+from chronax.models import IMAPA
 
 
 # ============== Helpers ==============
