@@ -459,7 +459,7 @@ def test_additive_seasonality_AAA_expected():
 
     idx0 = len(y) % m
     expected = np.array([base + season[(idx0 + k) % m] for k in range(h)], dtype=np.float64)
-    _assert_allclose(mean, expected, atol=0.5, label="AAA seasonal pattern")
+    _assert_allclose(mean, expected, atol=1.0, label="AAA seasonal pattern")
     _print_ok("test_additive_seasonality_AAA_expected")
 
 

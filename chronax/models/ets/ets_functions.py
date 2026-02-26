@@ -1699,6 +1699,15 @@ def ets_f(
     if season_forced:
         m = 1
     auto_model = isinstance(model, str) and ("Z" in model)
+    # Parse model string early so errortype/trendtype/seasontype are
+    # available for the optax_steps heuristic below.
+    # When model is a dict (forward_ets path), these stay None and the
+    # isinstance check in the optax_steps block will pick the default branch.
+    errortype = trendtype = seasontype = None
+    if isinstance(model, str):
+        errortype, trendtype, seasontype = model
+        if season_forced:
+            seasontype = "N"
     if auto_model and m > 1 and (n / max(m, 1)) < 2:
         m_infer = _infer_season_length(y, max_m=min(24, n // 2))
         if m_infer != m and m_infer > 1:
@@ -1733,7 +1742,7 @@ def ets_f(
         raise NotImplementedError("`blambda` not None")
     if nmse < 1 or nmse > 30:
         raise ValueError("nmse out of range")
-    if auto_model and bounds == "both":
+    if bounds == "both":
         bounds = "admissible"
     if lower is None:
         lower = jnp.array([0.0001, 0.0001, 0.0001, _PHI_LOWER], dtype=jnp.float64)
@@ -1839,9 +1848,7 @@ def ets_f(
             n_params=np_,
         )
 
-    errortype, trendtype, seasontype = model
-    if season_forced:
-        seasontype = "N"
+    # errortype, trendtype, seasontype already parsed above (early parse block)
     if errortype not in ["M", "A", "Z"]:
         raise ValueError("Invalid error type")
     if trendtype not in ["N", "A", "M", "Z"]:
@@ -2053,6 +2060,11 @@ def ets_f(
         candidates = [c for _, c in quick_scores[:4]]
 
     t_select_start = time.perf_counter() if timing_enabled else 0.0
+    # For non-auto (fixed-spec) models there is only one candidate, so
+    # skip the selection_mode=True fast path and go straight to a full fit.
+    # selection_mode=True uses _calc_roll_nohist which returns NaN for some
+    # model specs (e.g. AAN, AAA), causing the selection to fail.
+    use_selection_mode = auto_model
     for etype, ttype, stype, dtype in candidates:
         init_key = (ttype, stype)
         if init_key in init_state_cache:
@@ -2088,7 +2100,7 @@ def ets_f(
             bucket_size=bucket_size,
             stabilize=selection_stabilize,
             pure_sigmoid=auto_model,
-            selection_mode=True,
+            selection_mode=use_selection_mode,
             init_state_override=init_state_override,
         )
         fit_ic = fit[ic]
@@ -2115,10 +2127,15 @@ def ets_f(
     if best is None:
         raise ValueError("No admissible ETS model found")
     t_select_end = time.perf_counter() if timing_enabled else 0.0
+    # For auto_model, the selection loop used selection_mode=True (fast path)
+    # so we need a final re-fit with selection_mode=False to get full results
+    # (fitted values, residuals, states). For non-auto models, the selection
+    # loop already used selection_mode=False, so the result is complete.
     if auto_model:
         init_key = (best_t, best_s)
         init_state_override = init_state_cache.get(init_key)
-        t_opt_start = time.perf_counter() if timing_enabled else 0.0
+    t_opt_start = time.perf_counter() if timing_enabled else 0.0
+    if auto_model:
         best = etsmodel(
             y,
             m,
@@ -2149,7 +2166,7 @@ def ets_f(
             pure_sigmoid=auto_model,
             init_state_override=init_state_override,
         )
-        t_opt_end = time.perf_counter() if timing_enabled else 0.0
+    t_opt_end = time.perf_counter() if timing_enabled else 0.0
     if best is None or jnp.isinf(best_ic):
         raise Exception("no model able to be fitted")
     best["method"] = f"ETS({best_e},{best_t}{'d' if best_d else ''},{best_s})"
