@@ -7,26 +7,17 @@ import pytest
 import time
 from typing import Optional
 
-# --- Mock BaseForecaster for standalone testing if not present ---
-try:
-    from base_forecaster import BaseForecaster
-except ImportError:
-    class BaseForecaster:
-        def fit(self, y, X=None): raise NotImplementedError
-        def predict(self, h, X=None, level=None): raise NotImplementedError
-
+# --- BaseForecaster from models package ---
+from chronax.models.base_forecaster import BaseForecaster
 # =============================================================================
 # IMPORTS (Separated as requested)
 # =============================================================================
 
 # 1. High-Level Wrappers (Classes)
-from auto_arima import (
-    ARIMA, 
-    AutoARIMA
-)
+from chronax.models import ARIMA, AutoARIMA
 
 # 2. Low-Level Functions (Math & Logic)
-from auto_arima import (
+from chronax.models.arima.auto_arima import (
     diff, 
     partrans, 
     invpartrans, 

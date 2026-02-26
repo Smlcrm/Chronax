@@ -57,8 +57,8 @@ from typing import Any, Callable, Tuple
 # --- New Imports ---
 import tensorflow as tf  # Import TensorFlow for cross-validation
 
-# Import all JAX loss functions from the new module
-from loss_functions import *
+# Import all JAX loss functions from the utils package
+from chronax.utils.loss_functions import *
 
 # --- Fixtures --- #
 

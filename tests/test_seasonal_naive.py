@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 from jax import jit
 from typing import Optional, List, Dict, Union
-from utils import (
+from chronax.utils import (
     _seasonal_naive,
     _repeat_val_seas,
     ensure_float,
@@ -14,9 +14,9 @@ from utils import (
     _add_conformal_distribution_intervals,
     _get_conformal_method,
 )
-from conformal_intervals import ConformalIntervals
-from base_forecaster import BaseForecaster
-from seasonal_naive import SeasonalNaive
+from chronax.utils import ConformalIntervals
+from chronax.models.base_forecaster import BaseForecaster
+from chronax.models import SeasonalNaive
    
 # Test Cases
 def test_seasonal_naive():

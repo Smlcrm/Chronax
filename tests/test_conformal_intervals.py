@@ -1,6 +1,6 @@
 import pytest
 
-from conformal_intervals import ConformalIntervals
+from chronax.utils import ConformalIntervals
 
 
 # =========================

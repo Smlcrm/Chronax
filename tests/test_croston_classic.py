@@ -2,11 +2,11 @@ import jax
 import jax.numpy as jnp
 from functools import partial as _partial
 from typing import Optional, List, Dict
-import utils
-from base_forecaster import BaseForecaster
-from conformal_intervals import ConformalIntervals
+from chronax import utils
+from chronax.models.base_forecaster import BaseForecaster
+from chronax.utils import ConformalIntervals
 
-from croston_classic import CrostonClassic
+from chronax.models import CrostonClassic
 
 
 

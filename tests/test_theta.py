@@ -1,7 +1,7 @@
 
 import jax.numpy as jnp
-from conformal_intervals import ConformalIntervals
-from theta_model import Theta, AutoTheta
+from chronax.utils import ConformalIntervals
+from chronax.models import Theta, AutoTheta
 
 
 

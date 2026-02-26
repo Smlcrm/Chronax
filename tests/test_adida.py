@@ -1,6 +1,6 @@
 import jax.numpy as jnp
-from adida import ADIDA
-from conformal_intervals import ConformalIntervals
+from chronax.models import ADIDA
+from chronax.utils import ConformalIntervals
 
 # Test Cases
 def test_adida():

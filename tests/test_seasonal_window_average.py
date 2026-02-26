@@ -1,11 +1,10 @@
 import jax
 import jax.numpy as jnp
 from jax import lax
-
-import utils
-from base_forecaster import BaseForecaster
-from conformal_intervals import ConformalIntervals
-from seasonal_window_average import SeasonalWindowAverage
+from chronax import utils
+from chronax.models.base_forecaster import BaseForecaster
+from chronax.utils import ConformalIntervals
+from chronax.models import SeasonalWindowAverage
 
 
 if __name__ == "__main__":

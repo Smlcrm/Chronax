@@ -1,10 +1,9 @@
-
-from tbats_model import AutoTBATS, TBATS
-from conformal_intervals import ConformalIntervals
+from chronax.models import AutoTBATS, TBATS
+from chronax.utils import ConformalIntervals
 
 import warnings
 from typing import Dict, Tuple
-from utils import ensure_float as _ensure_float, calculate_sigma as _calculate_sigma, _add_fitted_pi, _calculate_intervals
+from chronax.utils import ensure_float as _ensure_float, calculate_sigma as _calculate_sigma, _add_fitted_pi, _calculate_intervals
 
 
 import numpy as np
@@ -164,7 +163,7 @@ Covers:
 # -----------------------------
 # Your JAX implementation
 # -----------------------------
-from tbats_core import (
+from chronax.models.tbats.tbats_core import (
     tbats_selection as jax_tbats_selection,  # kept for multi-season test
     tbats_forecast as jax_tbats_forecast,
     compute_sigmah as jax_compute_sigmah,
@@ -690,7 +689,7 @@ def test_predict_in_sample_interval_shapes():
 # Extra Full-Coverage Tests
 # =========================
 
-from tbats_core import _boxcox, _inv_boxcox, tbats_selection as _sel, tbats_forecast as _fc, compute_sigmah as _sig
+from chronax.models.tbats.tbats_core import _boxcox, _inv_boxcox, tbats_selection as _sel, tbats_forecast as _fc, compute_sigmah as _sig
 
 def _roundtrip_ok(x: np.ndarray, lam: float, tol: float = 1e-6) -> bool:
     y = _boxcox(jnp.asarray(x), lam)
@@ -1177,7 +1176,7 @@ def test_boxcox_lambda_edge_behavior_and_roundtrip():
     lam = m.model_.get("BoxCox_lambda", None)
     assert lam is not None and np.isfinite(lam)
     # Roundtrip check on the forecast mean value (smoke)
-    from tbats_core import _boxcox as _bc, _inv_boxcox as _ibc
+    from chronax.models.tbats.tbats_core import _boxcox as _bc, _inv_boxcox as _ibc
     bc = _bc(r["mean"], lam)
     inv = _ibc(bc, lam)
     assert np.allclose(np.asarray(r["mean"]), np.asarray(inv), rtol=1e-6, atol=1e-6)
@@ -1188,7 +1187,7 @@ def test_boxcox_lambda_edge_behavior_and_roundtrip():
 
 def test_find_harmonics_small_and_prime_periods():
     """find_harmonics behaves on small and prime periods."""
-    from tbats_core import find_harmonics
+    from chronax.models.tbats.tbats_core import find_harmonics
     n = 120
     y = jnp.array(5 + 2*jnp.sin(2*jnp.pi*jnp.arange(n)/5) + 0.5*jnp.sin(2*jnp.pi*jnp.arange(n)/11),
                   dtype=jnp.float32)
@@ -1259,7 +1258,7 @@ def test_optimizer_reproducibility_same_data_same_result():
 
 def test_tbats_core_forecast_exposes_mean_bc_when_boxcox_active():
     """tbats_core.tbats_forecast returns mean_bc if λ is used; otherwise None/absent."""
-    from tbats_core import tbats_selection as _sel, tbats_forecast as _fc
+    from chronax.models.tbats.tbats_core import tbats_selection as _sel, tbats_forecast as _fc
     # Positive skewed series to encourage BC
     n = 120
     y = jnp.array(np.exp(0.02*np.arange(n)) * (1 + 0.1*np.sin(2*np.pi*np.arange(n)/12)) + 1.0,
@@ -1292,7 +1291,7 @@ def test_predict_in_sample_levels_shapes_and_keys():
 
 def test_model_selection_picks_lowest_aic_deterministically():
     """tbats_selection returns the candidate with minimal AIC (recomputed)."""
-    from tbats_core import tbats_model as _model, tbats_selection as _sel, find_harmonics as _fh
+    from chronax.models.tbats.tbats_core import tbats_model as _model, tbats_selection as _sel, find_harmonics as _fh
     # Build a dataset where trend helps a bit
     np.random.seed(123)
     n = 160

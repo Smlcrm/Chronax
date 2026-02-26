@@ -4,7 +4,7 @@ import time
 from typing import Union, Tuple
 
 # Assumes your AutoMFLES class is in a file named auto_mfles.py
-from auto_mfles import AutoMFLES 
+from chronax.models import AutoMFLES
 
 def generate_dummy_data(n: int = 100, include_x: bool = False) -> Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]]:
     """Helper to generate synthetic time series data for testing.

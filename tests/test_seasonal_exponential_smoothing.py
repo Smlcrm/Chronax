@@ -1,8 +1,8 @@
 
 import jax
 import jax.numpy as jnp
-from conformal_intervals import ConformalIntervals
-from seasonal_exponential_smoothing import SeasonalExponentialSmoothing, _seasonal_exponential_smoothing
+from chronax.utils import ConformalIntervals
+from chronax.models import SeasonalExponentialSmoothing, _seasonal_exponential_smoothing
 
 def test_seasonal_exponential_smoothing():
     y = jnp.arange(36.0)

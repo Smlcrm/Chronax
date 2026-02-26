@@ -1,6 +1,6 @@
 import jax.numpy as jnp
-from holt import Holt
-from conformal_intervals import ConformalIntervals
+from chronax.models import Holt
+from chronax.utils import ConformalIntervals
 
 def test_holt():
     """Comprehensive test suite for Holt model."""
