@@ -111,6 +111,7 @@ class ETS(BaseForecaster):
         alias: str = "ETS",
         prediction_intervals: Optional[ConformalIntervals] = None,
     ) -> None:
+        """Initialize a fixed-spec ETS estimator."""
         self.season_length: int = season_length
         self.model: str = model
         if damped is None:

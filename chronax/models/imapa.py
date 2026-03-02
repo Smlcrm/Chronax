@@ -99,6 +99,7 @@ class IMAPA(BaseForecaster):
         alias: str = "IMAPA",
         conformal_params: Optional[ConformalIntervals] = None,
     ) -> None:
+        """Initialize the IMAPA estimator configuration."""
         self.alias: str = alias
         self.conformal_params: Optional[ConformalIntervals] = conformal_params
         self.only_conformal_intervals: bool = True

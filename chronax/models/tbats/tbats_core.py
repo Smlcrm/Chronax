@@ -24,7 +24,7 @@ import os
 import time
 import warnings
 from functools import lru_cache, partial
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -107,6 +107,7 @@ def _guerrero_lambda(y: jnp.ndarray, season_length: int, lower: float, upper: fl
     lambdas = jnp.unique(jnp.concatenate([lambdas, jnp.asarray([1.0], dtype=lambdas.dtype)]))
 
     def cv_for_lambda(lam: jnp.ndarray) -> jnp.ndarray:
+        """Compute the Guerrero coefficient-of-variation score for one lambda."""
         # _boxcox_raw is safe here: caller passes already-positive y_pos
         yt = _boxcox_raw(y_trim.ravel(), lam).reshape(n_periods, season_length)
         stds = jnp.std(yt, axis=1)
@@ -165,10 +166,12 @@ def _select_harmonics_fast(
     wout = jnp.asarray(0, dtype=jnp.int32)
     stopped = jnp.asarray(False)
 
-    def body(h, state):
+    def body(h: int, state: tuple[jnp.ndarray, ...]) -> tuple[jnp.ndarray, ...]:
+        """Evaluate one harmonic count candidate and update the running best."""
         best_aic, k_best, aic_prev, wout, stopped = state
 
-        def do_step(state_in):
+        def do_step(state_in: tuple[jnp.ndarray, ...]) -> tuple[jnp.ndarray, ...]:
+            """Run the AIC computation for an active harmonic-count candidate."""
             best_aic_in, k_best_in, aic_prev_in, wout_in, stopped_in = state_in
             mask = (jnp.arange(2 * max_h) < (2 * h)).astype(X_full.dtype)
             X = X_full * mask
@@ -290,7 +293,7 @@ def _build_seasonal_blocks_cached(
 
 
 def _build_seasonal_blocks(
-    seasonal_periods: jnp.ndarray, k_vector: jnp.ndarray, dtype,
+    seasonal_periods: jnp.ndarray, k_vector: jnp.ndarray, dtype: Any,
 ) -> jnp.ndarray:
     """Public entry: converts arrays → tuples then delegates to the cached builder."""
     sp = tuple(int(x) for x in list(seasonal_periods))
@@ -305,7 +308,15 @@ def _build_seasonal_blocks(
 
 # ── Initial construction ───────────────────────────────────────────────
 
-def make_w(phi, k_vector, ar_coeffs, ma_coeffs, tau: int, beta, dtype) -> jnp.ndarray:
+def make_w(
+    phi: Optional[float],
+    k_vector: jnp.ndarray,
+    ar_coeffs: Optional[jnp.ndarray],
+    ma_coeffs: Optional[jnp.ndarray],
+    tau: int,
+    beta: Optional[float],
+    dtype: Any,
+) -> jnp.ndarray:
     """Build the observation row-vector w^T  (shape ``(1, d)``)."""
     adj_phi = 1 if beta is not None else 0
     p = 0 if ar_coeffs is None else int(ar_coeffs.shape[0])
@@ -329,7 +340,15 @@ def make_w(phi, k_vector, ar_coeffs, ma_coeffs, tau: int, beta, dtype) -> jnp.nd
     return w
 
 
-def make_g(k_vector, alpha, beta, p: int, q: int, tau: int, dtype) -> Tuple[jnp.ndarray, jnp.ndarray]:
+def make_g(
+    k_vector: jnp.ndarray,
+    alpha: jnp.ndarray,
+    beta: Optional[jnp.ndarray],
+    p: int,
+    q: int,
+    tau: int,
+    dtype: Any,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Build the gain vector g  (shape ``(d, 1)``) and the gamma-bold row."""
     adj_phi = 1 if beta is not None else 0
     d = 1 + adj_phi + tau + p + q
@@ -343,8 +362,16 @@ def make_g(k_vector, alpha, beta, p: int, q: int, tau: int, dtype) -> Tuple[jnp.
 
 
 def make_F(
-    phi, tau: int, alpha, beta, ar_coeffs, ma_coeffs,
-    gamma_bold, seasonal_periods, k_vector, dtype,
+    phi: Optional[float],
+    tau: int,
+    alpha: jnp.ndarray,
+    beta: Optional[jnp.ndarray],
+    ar_coeffs: Optional[jnp.ndarray],
+    ma_coeffs: Optional[jnp.ndarray],
+    gamma_bold: jnp.ndarray,
+    seasonal_periods: Sequence[int] | jnp.ndarray,
+    k_vector: jnp.ndarray,
+    dtype: Any,
     seasonal_blocks: Optional[jnp.ndarray] = None,
 ) -> jnp.ndarray:
     """Build the transition matrix F."""
@@ -429,7 +456,17 @@ def make_F(
 
 # ── In-place updates (used during optimisation) ───────────────────────
 
-def update_w(w, phi, tau: int, ar_coeffs, ma_coeffs, p: int, q: int, beta, dtype) -> jnp.ndarray:
+def update_w(
+    w: jnp.ndarray,
+    phi: Optional[float],
+    tau: int,
+    ar_coeffs: Optional[jnp.ndarray],
+    ma_coeffs: Optional[jnp.ndarray],
+    p: int,
+    q: int,
+    beta: Optional[jnp.ndarray],
+    dtype: Any,
+) -> jnp.ndarray:
     """Return *w* with the phi entry updated."""
     adj_phi = 1 if beta is not None else 0
     if adj_phi:
@@ -438,7 +475,16 @@ def update_w(w, phi, tau: int, ar_coeffs, ma_coeffs, p: int, q: int, beta, dtype
     return w
 
 
-def update_g(g, gamma_bold, alpha, beta, k_vector, gamma_one_v, gamma_two_v, dtype) -> jnp.ndarray:
+def update_g(
+    g: jnp.ndarray,
+    gamma_bold: jnp.ndarray,
+    alpha: jnp.ndarray,
+    beta: Optional[jnp.ndarray],
+    k_vector: jnp.ndarray,
+    gamma_one_v: jnp.ndarray,
+    gamma_two_v: jnp.ndarray,
+    dtype: Any,
+) -> jnp.ndarray:
     """Return *g* with alpha, beta and seasonal gains updated."""
     adj_phi = 1 if beta is not None else 0
     g = g.at[0, 0].set(alpha)
@@ -465,7 +511,19 @@ def update_g(g, gamma_bold, alpha, beta, k_vector, gamma_one_v, gamma_two_v, dty
     return g
 
 
-def update_F(F, phi, alpha, beta, gamma_bold, ar_coeffs, ma_coeffs, p: int, q: int, tau: int, dtype) -> jnp.ndarray:
+def update_F(
+    F: jnp.ndarray,
+    phi: Optional[float],
+    alpha: jnp.ndarray,
+    beta: Optional[jnp.ndarray],
+    gamma_bold: jnp.ndarray,
+    ar_coeffs: Optional[jnp.ndarray],
+    ma_coeffs: Optional[jnp.ndarray],
+    p: int,
+    q: int,
+    tau: int,
+    dtype: Any,
+) -> jnp.ndarray:
     """Return *F* with phi, alpha, beta and ARMA entries updated."""
     phi_eff = jnp.asarray(0.0 if phi is None else phi, dtype=dtype)
     adj = 1 if beta is not None else 0
@@ -512,7 +570,8 @@ def _calc_filter_impl(
     w0 = w[0]
     g0 = g[:, 0]
 
-    def step(x_prev, y_t):
+    def step(x_prev: jnp.ndarray, y_t: jnp.ndarray) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray]]:
+        """Advance the innovations filter by one observation."""
         yhat_t = jnp.dot(w0, x_prev)
         e_t = y_t - yhat_t
         x_t = F @ x_prev + g0 * e_t
@@ -577,6 +636,7 @@ def _run_lbfgs_optim(
     dtype = jnp.float64
 
     def obj(u: jnp.ndarray) -> jnp.ndarray:
+        """Evaluate the TBATS objective for one unconstrained parameter vector."""
         theta = jnp.where(jnp.isfinite(u * scale_vec), u * scale_vec, 0.0)
 
         idx = 0
@@ -626,7 +686,8 @@ def _run_lbfgs_optim(
     opt_state0 = _TBATS_SOLVER.init(u0)
     val_and_grad_fn = jax.value_and_grad(obj)
 
-    def _optim_step(carry, _):
+    def _optim_step(carry: tuple[jnp.ndarray, Any, jnp.ndarray, jnp.ndarray], _: jnp.ndarray) -> tuple[tuple[jnp.ndarray, Any, jnp.ndarray, jnp.ndarray], None]:
+        """Run one L-BFGS update while tracking the best iterate seen."""
         u, opt_state, best_u, best_loss = carry
         loss, grads = val_and_grad_fn(u)
         grads = jnp.where(jnp.isfinite(grads), grads, 0.0)
@@ -863,9 +924,15 @@ def tbats_model_generator(
 
 
 def tbats_model(
-    y, seasonal_periods, k_vector,
-    use_boxcox, bc_lower, bc_upper,
-    use_trend, use_damped_trend, use_arma_errors,
+    y: jnp.ndarray,
+    seasonal_periods: Sequence[int],
+    k_vector: jnp.ndarray,
+    use_boxcox: bool,
+    bc_lower: float,
+    bc_upper: float,
+    use_trend: bool,
+    use_damped_trend: bool,
+    use_arma_errors: bool,
 ) -> Dict:
     """Convenience wrapper: fit a single TBATS spec with no ARMA."""
     best = tbats_model_generator(
@@ -998,7 +1065,8 @@ def tbats_selection(
 @partial(jax.jit, static_argnames=("h",))
 def _tbats_forecast_core(F: jnp.ndarray, w: jnp.ndarray, x0: jnp.ndarray, h: int) -> jnp.ndarray:
     """JIT-compiled multi-step forecast for a single initial state."""
-    def step(x, _):
+    def step(x: jnp.ndarray, _: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """Advance the TBATS state one forecast step ahead."""
         y_next = jnp.dot(w, x)
         x_next = F @ x
         return x_next, y_next
@@ -1032,7 +1100,8 @@ def _compute_sigmah_core(
     """JIT-compiled parametric forecast standard deviations."""
     var0 = jnp.asarray(1.0, dtype=F.dtype)
 
-    def body(carry, _):
+    def body(carry: tuple[jnp.ndarray, jnp.ndarray], _: jnp.ndarray) -> tuple[tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
+        """Accumulate one additional forecast-variance step."""
         Fpow, var_acc = carry
         Fpow_next = F @ Fpow
         cj = jnp.dot(jnp.dot(w, Fpow_next), g)

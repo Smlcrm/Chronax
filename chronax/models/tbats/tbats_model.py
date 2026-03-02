@@ -123,6 +123,7 @@ class AutoTBATS(BaseForecaster):
         alias: str = "AutoTBATS",
         conformal_params: Optional[ConformalIntervals] = None,
     ) -> None:
+        """Initialize the AutoTBATS estimator configuration."""
         if isinstance(season_length, int):
             season_length = [season_length]
         self.season_length: List[int] = list(season_length)
@@ -536,6 +537,7 @@ class TBATS(AutoTBATS):
         alias: str = "TBATS",
         conformal_params: Optional[ConformalIntervals] = None,
     ) -> None:
+        """Initialize a fixed-configuration TBATS estimator."""
         super().__init__(
             season_length=season_length,
             use_boxcox=use_boxcox,

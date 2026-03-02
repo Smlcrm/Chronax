@@ -161,6 +161,7 @@ class _TemplateCache:
     """
 
     def __init__(self) -> None:
+        """Initialize the in-memory template cache."""
         self._cache: dict[tuple[int, int, str, str], jnp.ndarray] = {}
 
     def get_init_state(
@@ -554,10 +555,12 @@ def _etssimulate_jit(
 
     y = jnp.zeros((h,), dtype=dt)
 
-    def step(i, carry):
+    def step(i: int, carry: tuple[Any, ...]) -> tuple[Any, ...]:
+        """Advance one simulated step for a single ETS sample path."""
         l, b, s, y, alive = carry
 
-        def do_alive(carry_inner):
+        def do_alive(carry_inner: tuple[Any, ...]) -> tuple[Any, ...]:
+            """Update the simulated state while the path remains valid."""
             l_i, b_i, s_i, y_i, _ = carry_inner
             oldl = l_i
             oldb = b_i
@@ -575,12 +578,14 @@ def _etssimulate_jit(
             )
             invalid = jnp.abs(f[0] - _ets.NA) < _ets.TOL
 
-            def on_invalid(args):
+            def on_invalid(args: tuple[Any, ...]) -> tuple[Any, ...]:
+                """Mark the simulated path as invalid and stop future updates."""
                 l_j, b_j, s_j, y_j = args
                 y_j = y_j.at[0].set(_ets.NA)
                 return l_j, b_j, s_j, y_j, False
 
-            def on_valid(args):
+            def on_valid(args: tuple[Any, ...]) -> tuple[Any, ...]:
+                """Apply the normal simulation update for a valid forecast step."""
                 l_j, b_j, s_j, y_j = args
                 if error == _ets.Component.Additive:
                     y_val = f[0] + e[i]
@@ -608,7 +613,8 @@ def _etssimulate_jit(
 
             return lax.cond(invalid, on_invalid, on_valid, (l_i, b_i, s_i, y_i))
 
-        def do_dead(carry_inner):
+        def do_dead(carry_inner: tuple[Any, ...]) -> tuple[Any, ...]:
+            """Keep the simulated path unchanged after it has terminated."""
             return carry_inner
 
         return lax.cond(alive, do_alive, do_dead, carry)
@@ -751,7 +757,7 @@ def initparam(
     upper: jnp.ndarray,
     m: int,
     bounds: str,
-):
+) -> tuple[dict[str, float], jnp.ndarray, jnp.ndarray]:
     """
     Initialize (and lightly sanitize) smoothing parameters and bounds.
 
@@ -862,7 +868,7 @@ def _polyroots_power_basis(coeff_power_inc: jnp.ndarray) -> jnp.ndarray:
     return evals
 
 
-def admissible(alpha: float, beta: float, gamma: float, phi: float, m: int):
+def admissible(alpha: float, beta: float, gamma: float, phi: float, m: int) -> bool:
     """
     Check ETS smoothing parameters against standard admissibility conditions.
 
@@ -919,7 +925,7 @@ def check_param(
     upper: jnp.ndarray,
     bounds: str,
     m: int,
-):
+) -> bool:
     """
     Validate smoothing parameters against box bounds and (optionally) admissibility.
 
@@ -961,7 +967,9 @@ def check_param(
     return True
 
 
-def fourier(x, period, K, h=None):
+def fourier(
+    x: Any, period: list[int], K: list[int], h: Optional[int] = None
+) -> jnp.ndarray:
     """
     Build a simple Fourier design matrix for seasonality.
 
@@ -1059,6 +1067,7 @@ def _seasonal_decompose_jax(
     n_full = n_periods * m_eff
 
     def _seasonal_from_matrix() -> jnp.ndarray:
+        """Compute a repeated seasonal template from full seasonal blocks."""
         mat = detrended[:n_full].reshape((n_periods, m_eff))
         pat = jnp.mean(mat, axis=0)
         rep = jnp.tile(pat, n // m_eff + 1)[:n]
@@ -1075,7 +1084,7 @@ def _seasonal_decompose_jax(
     return {"seasonal": seasonal, "trend": trend}
 
 
-def initstate(y, m, trendtype, seasontype):
+def initstate(y: jnp.ndarray, m: int, trendtype: str, seasontype: str) -> jnp.ndarray:
     """
     Initialize ETS states (level [+ trend] [+ seasonal]) from data.
 
@@ -1238,7 +1247,7 @@ def pegelsresid_C(
     gamma: float,
     phi: float,
     nmse: int,
-):
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, float]:
     """
     Roll out ETS residuals, AMSE, and likelihood from an initialized state.
 
@@ -1293,29 +1302,29 @@ def pegelsresid_C(
 
 
 def optimize_ets_target_fn(
-    x0,
-    par,
-    y,
-    init_state,
-    errortype,
-    trendtype,
-    seasontype,
-    damped,
-    par_noopt,
-    lowerb,
-    upperb,
-    opt_crit,
-    nmse,
-    bounds,
-    m,
-    pnames,
-    pnames2,
-    pad_to=None,
-    bucket_size=None,
-    maxit=1_000,
-    optax_steps=300,
-    optax_lr=1e-2,
-    optax_clip=1.0,
+    x0: Any,
+    par: dict[str, float],
+    y: jnp.ndarray,
+    init_state: jnp.ndarray,
+    errortype: str,
+    trendtype: str,
+    seasontype: str,
+    damped: bool,
+    par_noopt: dict[str, float],
+    lowerb: jnp.ndarray,
+    upperb: jnp.ndarray,
+    opt_crit: str,
+    nmse: int,
+    bounds: str,
+    m: int,
+    pnames: Any,
+    pnames2: Any,
+    pad_to: Optional[int] = None,
+    bucket_size: Optional[int] = None,
+    maxit: int = 1_000,
+    optax_steps: int = 300,
+    optax_lr: float = 1e-2,
+    optax_clip: float = 1.0,
     early_stop_patience: int = 20,
     early_stop_min_delta: float = 1e-6,
     adaptive_tol: bool = True,
@@ -1324,7 +1333,7 @@ def optimize_ets_target_fn(
     pure_sigmoid: bool = False,
     opt_init_state: bool = False,
     init_state_opt: jnp.ndarray | None = None,
-):
+) -> Any:
     """
     Build and solve the ETS optimization problem via `_ets.optimize_bfgs_smoothing`.
 
@@ -1410,7 +1419,10 @@ def optimize_ets_target_fn(
     if seasontype == "N":
         gamma = 0.0
 
-    def _pad_for_jit(y_arr, pad_to_val, bucket_size_val):
+    def _pad_for_jit(
+        y_arr: jnp.ndarray, pad_to_val: Optional[int], bucket_size_val: Optional[int]
+    ) -> tuple[jnp.ndarray, int]:
+        """Pad the series for shape-stable JIT execution when requested."""
         n_obs = int(y_arr.shape[0])
         if pad_to_val is None and bucket_size_val is None:
             return y_arr, n_obs
@@ -1500,16 +1512,16 @@ def etsmodel(
     early_stop_min_delta: float = 1e-6,
     adaptive_tol: bool = True,
     is_final_model: bool = False,
-    control=None,
-    seed=None,
+    control: Any = None,
+    seed: Any = None,
     trace: bool = False,
-    pad_to=None,
-    bucket_size=None,
+    pad_to: Optional[int] = None,
+    bucket_size: Optional[int] = None,
     stabilize: bool = True,
     pure_sigmoid: bool = False,
     selection_mode: bool = False,
     init_state_override: jnp.ndarray | None = None,
-):
+) -> dict[str, Any]:
     """Fit a *single* ETS specification to the data and return a result dict.
 
     Pipeline
@@ -1818,37 +1830,37 @@ def is_constant(x: jnp.ndarray) -> bool:
 
 
 def ets_f(
-    y,
-    m,
-    model="ZZZ",
-    damped=None,
-    alpha=None,
-    beta=None,
-    gamma=None,
-    phi=None,
-    additive_only=None,
-    blambda=None,
-    biasadj=None,
-    lower=None,
-    upper=None,
-    opt_crit="lik",
-    nmse=3,
-    bounds="both",
-    ic="aicc",
-    restrict=True,
-    allow_multiplicative_trend=False,
-    use_initial_values=False,
-    maxit=2_000,
-    optax_steps=None,
-    optax_lr=1e-2,
-    optax_clip=1.0,
+    y: jnp.ndarray,
+    m: int,
+    model: str | dict[str, Any] = "ZZZ",
+    damped: Optional[bool] = None,
+    alpha: Optional[float] = None,
+    beta: Optional[float] = None,
+    gamma: Optional[float] = None,
+    phi: Optional[float] = None,
+    additive_only: Optional[bool] = None,
+    blambda: Any = None,
+    biasadj: Any = None,
+    lower: Optional[jnp.ndarray] = None,
+    upper: Optional[jnp.ndarray] = None,
+    opt_crit: str = "lik",
+    nmse: int = 3,
+    bounds: str = "both",
+    ic: str = "aicc",
+    restrict: bool = True,
+    allow_multiplicative_trend: bool = False,
+    use_initial_values: bool = False,
+    maxit: int = 2_000,
+    optax_steps: Optional[int] = None,
+    optax_lr: float = 1e-2,
+    optax_clip: float = 1.0,
     early_stop_patience: int = 20,
     early_stop_min_delta: float = 1e-6,
     allow_extended_iterations: bool = False,
     adaptive_tol: bool = True,
-    pad_to=None,
-    bucket_size=None,
-):
+    pad_to: Optional[int] = None,
+    bucket_size: Optional[int] = None,
+) -> dict[str, Any]:
     """Top-level ETS entry-point: automatic model selection **and** fitting.
 
     When *model* is a three-character string (e.g. ``"ZZZ"``), every ``"Z"``
@@ -2172,7 +2184,8 @@ def ets_f(
     evals = 0
     stop_search = False
     candidates = []
-    def _maybe_add_candidate(etype, ttype, stype, dtype):
+    def _maybe_add_candidate(etype: str, ttype: str, stype: str, dtype: bool) -> None:
+        """Append an admissible candidate spec to the local search grid."""
         if force_additive_error and etype == "M":
             return
         if restrict:
@@ -2228,7 +2241,8 @@ def ets_f(
         priority = ["ANN", "AAN", "ANA", "AAA", "MAN", "MNM", "MAM", "AAM", "MMM"]
         priority_index = {k: i for i, k in enumerate(priority)}
 
-        def _rank(c):
+        def _rank(c: tuple[str, str, str, bool]) -> tuple[float, str]:
+            """Rank candidate ETS specifications for selection ordering."""
             et, tt, st, dt = c
             key = f"{et}{tt}{st}"
             base = priority_index.get(key, len(priority))
@@ -2408,7 +2422,13 @@ def ets_f(
     return best
 
 
-def pegelsfcast_C(h, obj, npaths=None, level=None, bootstrap=None):
+def pegelsfcast_C(
+    h: int,
+    obj: dict[str, Any],
+    npaths: Optional[int] = None,
+    level: Optional[list[int]] = None,
+    bootstrap: Optional[bool] = None,
+) -> jnp.ndarray:
     """
     One-step call to produce the mean forecast path from a fitted model dict.
 
@@ -2440,7 +2460,9 @@ def pegelsfcast_C(h, obj, npaths=None, level=None, bootstrap=None):
 
 
 @partial(jax.jit, static_argnames=("h",))
-def _compute_sigmah(pf, h, sigma, cvals):
+def _compute_sigmah(
+    pf: jnp.ndarray, h: int, sigma: float, cvals: jnp.ndarray
+) -> jnp.ndarray:
     """
     Helper for multiplicative-error variance recursion used in intervals.
 
@@ -2463,7 +2485,8 @@ def _compute_sigmah(pf, h, sigma, cvals):
     theta = jnp.zeros((h,), dtype=pf.dtype)
     theta = theta.at[0].set(pf[0] ** 2)
 
-    def body(k, theta_acc):
+    def body(k: int, theta_acc: jnp.ndarray) -> jnp.ndarray:
+        """Advance the multiplicative-error variance recursion."""
         sum_val = jnp.dot(cvals[:k] ** 2, theta_acc[:k][::-1])
         return theta_acc.at[k].set(pf[k] ** 2 + sigma * sum_val)
 
@@ -2473,19 +2496,19 @@ def _compute_sigmah(pf, h, sigma, cvals):
 
 @partial(jax.jit, static_argnames=("h", "season_length", "trend", "damped"))
 def _class3models(
-    h,
-    sigma,
-    last_state,
-    season_length,
-    error,
-    trend,
-    seasonality,
-    damped,
-    alpha,
-    beta,
-    gamma,
-    phi,
-):
+    h: int,
+    sigma: float,
+    last_state: jnp.ndarray,
+    season_length: int,
+    error: str,
+    trend: str,
+    seasonality: str,
+    damped: str,
+    alpha: float,
+    beta: float,
+    gamma: float,
+    phi: float,
+) -> jnp.ndarray:
     """
     Analytical variance for Class 3 (multiplicative seasonality) ETS cases.
 
@@ -2529,7 +2552,8 @@ def _class3models(
     vecMh = Mh.flatten()
     vecMh_col = vecMh.reshape(vecMh.shape[0], 1)
 
-    def body(i, carry):
+    def body(i: int, carry: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        """Advance the analytical variance recursion for one horizon step."""
         Vh_acc, mu_acc, var_acc = carry
         mu_i = jnp.squeeze(H1 @ (Mh @ H2.T))
         var_i = jnp.squeeze((1 + sigma) * (H21 @ (Vh_acc @ H21.T))) + sigma * (mu_i ** 2)
@@ -2553,7 +2577,12 @@ def _class3models(
     return var
 
 
-def _compute_pred_intervals(model: Dict[str, Any], forecasts: Dict[str, jnp.ndarray], h: int, level):
+def _compute_pred_intervals(
+    model: Dict[str, Any],
+    forecasts: Dict[str, jnp.ndarray],
+    h: int,
+    level: list[int],
+) -> dict[str, jnp.ndarray]:
     """
     Compute prediction intervals for ETS forecasts.
 
@@ -2682,7 +2711,8 @@ def _compute_pred_intervals(model: Dict[str, Any], forecasts: Dict[str, jnp.ndar
         key = jrand.PRNGKey(1)
         e = jrand.normal(key, shape=(nsim, h)) * math.sqrt(sigma)
 
-        def run_sim(e_k):
+        def run_sim(e_k: jnp.ndarray) -> jnp.ndarray:
+            """Simulate one future path for fallback interval estimation."""
             return _etssimulate_jit(
                 last_state,
                 season_length,
@@ -2714,7 +2744,9 @@ def _compute_pred_intervals(model: Dict[str, Any], forecasts: Dict[str, jnp.ndar
     return pi
 
 
-def forecast_ets(obj, h, level=None):
+def forecast_ets(
+    obj: dict[str, Any], h: int, level: Optional[list[int]] = None
+) -> dict[str, jnp.ndarray]:
     """
     Convenience wrapper: produce forecasts (and optional PI) from fitted model.
 

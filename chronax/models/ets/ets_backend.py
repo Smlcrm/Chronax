@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from enum import Enum
 from functools import lru_cache, partial
-from typing import NamedTuple, Tuple
+from typing import Any, Callable, NamedTuple, Tuple
 import os
 
 import jax
@@ -148,7 +148,7 @@ def _get_objective_closure(
     pure_sigmoid: bool,
     opt_init_state: bool,
     n_state: int,
-):
+) -> Callable[..., jnp.float64]:
     """Return a cached objective closure for a specific ETS model structure.
 
     JAX only traces / compiles the objective once per unique combination of
@@ -196,6 +196,7 @@ def _get_objective_closure(
         lower: jnp.ndarray,
         upper: jnp.ndarray,
     ) -> jnp.float64:
+        """Evaluate the scalar ETS objective for a fixed structural configuration."""
         return _objective_smoothing_only(
             p,
             y,
@@ -355,7 +356,10 @@ def update(
     l_new, b_new, s_new : updated states
     """
     # Multiplicative trend helper: branch on |phi-1|<TOL
-    def mul_trend_case(phi, old_l, old_b):
+    def mul_trend_case(
+        phi: jnp.float64, old_l: jnp.float64, old_b: jnp.float64
+    ) -> Tuple[jnp.float64, jnp.float64]:
+        """Compute the multiplicative-trend carry-over terms."""
         cond = jnp.abs(phi - 1.0) < TOL
         phi_b_local = jnp.where(cond, old_b, old_b ** phi)
         q_local = jnp.where(cond, old_l * old_b, old_l * phi_b_local)
@@ -586,7 +590,8 @@ def _calc_roll(
     # Maintain a compact (n+1, n_states) view for cheaper per-step updates
     x_states = x_local[: (n + 1) * n_states].reshape((n + 1, n_states))
 
-    def step(carry, y_i):
+    def step(carry: tuple[Any, ...], y_i: jnp.float64) -> tuple[tuple[Any, ...], jnp.float64]:
+        """Advance the full-history rollout by one observation."""
         (i, x_states, a_local, denom, l, b, s_vec, lik, lik2, f_buf) = carry
 
         old_l = l
@@ -744,11 +749,13 @@ def _calc_roll_nohist(
     lik2 = jnp.array(0.0, jnp.float64)
     f_buf = jnp.zeros(30, dtype=jnp.float64)
 
-    def step(carry, y_i):
+    def step(carry: tuple[Any, ...], y_i: jnp.float64) -> tuple[tuple[Any, ...], jnp.float64]:
+        """Advance the no-history rollout by one observation."""
         (i, a_local, denom, l, b, s_vec, lik, lik2, f_buf) = carry
         active = i < n_eff
 
-        def do_active(args):
+        def do_active(args: tuple[Any, ...]) -> tuple[tuple[Any, ...], jnp.float64]:
+            """Process an active observation in the padded rollout."""
             (i, a_local, denom, l, b, s_vec, lik, lik2, f_buf, y_i) = args
             old_l = l
             if has_trend:
@@ -812,7 +819,8 @@ def _calc_roll_nohist(
             i = i + 1
             return (i, a_local, denom, l, b, s_vec, lik, lik2, f_buf), ei
 
-        def do_inactive(args):
+        def do_inactive(args: tuple[Any, ...]) -> tuple[tuple[Any, ...], jnp.float64]:
+            """Skip padded observations once the active series is exhausted."""
             (i, a_local, denom, l, b, s_vec, lik, lik2, f_buf, _) = args
             i = i + 1
             return (i, a_local, denom, l, b, s_vec, lik, lik2, f_buf), jnp.asarray(0.0, dtype=jnp.float64)
@@ -1301,6 +1309,7 @@ def optimize_bfgs_smoothing(
 
     # Thin wrapper capturing data arrays so optax only passes/differentiates p.
     def _core_obj(p: jnp.ndarray) -> jnp.float64:
+        """Evaluate the cached objective closure against the captured data arrays."""
         return core_obj(
             p,
             y,
@@ -1388,12 +1397,13 @@ def optimize_bfgs_smoothing(
             ),
         )
 
-        def _run_lbfgs(x0_in):
+        def _run_lbfgs(x0_in: jnp.ndarray) -> tuple[jnp.ndarray, jnp.float64]:
             """Run the full L-BFGS loop inside lax.scan (JIT-friendly)."""
             lbfgs_state = lbfgs_solver.init(x0_in)
             vg_fn = jax.value_and_grad(_core_obj)
 
-            def _step(carry, _):
+            def _step(carry: tuple[Any, ...], _: jnp.ndarray) -> tuple[tuple[Any, ...], None]:
+                """Run one L-BFGS update and track the best point seen so far."""
                 p, state, best_p, best_loss = carry
                 loss, grads = vg_fn(p)
                 grads = jnp.where(jnp.isfinite(grads), grads, 0.0)  # sanitise grads
