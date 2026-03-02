@@ -1,7 +1,15 @@
-"""
-tbats_model.py — User-facing AutoTBATS / TBATS forecaster classes.
+"""User-facing AutoTBATS and TBATS forecaster classes.
 
-Wraps :mod:`tbats_core` and inherits from :class:`BaseForecaster`.
+This module provides:
+
+* :class:`AutoTBATS` — automatic TBATS model selection across Box–Cox,
+  trend, damping, and ARMA configurations.
+* :class:`TBATS` — fixed-configuration TBATS with sensible defaults
+  (Box–Cox on, trend on, damping off, no ARMA).
+
+Both classes wrap the low-level routines in :mod:`tbats_core` and inherit
+the common ``fit`` / ``predict`` / ``forecast`` interface from
+:class:`BaseForecaster`.
 """
 
 from __future__ import annotations
@@ -35,7 +43,11 @@ config.update("jax_enable_x64", True)
 # ── Utility ────────────────────────────────────────────────────────────
 
 def _clamp_bc_domain(v: jnp.ndarray, lam: float, eps: float = 1e-9) -> jnp.ndarray:
-    """Clamp *v* to the valid domain of the inverse Box-Cox transform."""
+    """Clamp *v* to the valid domain of the inverse Box–Cox transform.
+
+    For ``λ > 0`` the inverse requires ``1 + λ·v > 0``; for ``λ < 0`` it
+    requires ``1 + λ·v < 0``.  The log case (``λ ≈ 0``) has no constraint.
+    """
     if jnp.abs(lam) < 1e-8:
         return v  # log case — exp is defined everywhere
     thresh = -1.0 / lam
@@ -45,11 +57,59 @@ def _clamp_bc_domain(v: jnp.ndarray, lam: float, eps: float = 1e-9) -> jnp.ndarr
 
 
 class AutoTBATS(BaseForecaster):
-    """
-    AutoTBATS forecaster with automatic model selection.
+    """Automatic TBATS forecaster with model selection.
+
+    TBATS decomposes a time series into **level**, **trend**, and one or more
+    **seasonal** components represented by trigonometric (Fourier) terms,
+    with optional **Box–Cox** variance stabilisation and **ARMA** residual
+    modelling.
+
+    ``AutoTBATS`` evaluates a grid of configurations (Box–Cox on/off, trend
+    on/off, damped trend on/off, ARMA on/off) and selects the model that
+    minimises AIC.
+
+    Parameters
+    ----------
+    season_length : int or list of int
+        Seasonal period(s).  Pass a single ``int`` for one seasonal cycle
+        (e.g. ``12`` for monthly) or a ``list`` for multi-seasonality
+        (e.g. ``[7, 365]`` for daily data with weekly + annual cycles).
+    use_boxcox : bool or None, default ``None``
+        Whether to apply a Box–Cox transformation.  ``None`` tries both
+        on and off during model selection.
+    bc_lower_bound : float, default ``-1.0``
+        Lower bound for the Box–Cox λ parameter.
+    bc_upper_bound : float, default ``2.0``
+        Upper bound for the Box–Cox λ parameter.
+    use_trend : bool or None, default ``None``
+        Whether to include a trend component.  ``None`` tries both.
+    use_damped_trend : bool or None, default ``None``
+        Whether to damp the trend.  ``None`` tries both.
+    use_arma_errors : bool, default ``False``
+        Whether to add ARMA structure on the residuals.
+    alias : str, default ``"AutoTBATS"``
+        Display name for the model.
+    conformal_params : ConformalIntervals or None, default ``None``
+        Configuration for conformal prediction intervals.
+
+    Attributes
+    ----------
+    model_ : dict or None
+        Full model state after :meth:`fit`, including estimated
+        parameters, fitted values, residuals, AIC, Box–Cox λ, etc.
+    only_conformal_intervals : bool
+        ``False`` — this model supports **both** native Gaussian intervals
+        and conformal intervals.
+
+    Examples
+    --------
+    >>> tbats = AutoTBATS(season_length=12, use_boxcox=False)
+    >>> tbats.fit(y_train)
+    >>> tbats.predict(h=12, level=[80, 95])
+    {'mean': Array([...]), 'lo-80': ..., 'hi-95': ..., ...}
     """
 
-    uses_exog = False
+    uses_exog: bool = False
 
     def __init__(
         self,
@@ -62,26 +122,53 @@ class AutoTBATS(BaseForecaster):
         use_arma_errors: bool = False,
         alias: str = "AutoTBATS",
         conformal_params: Optional[ConformalIntervals] = None,
-    ):
+    ) -> None:
+        """Initialize the AutoTBATS estimator configuration."""
         if isinstance(season_length, int):
             season_length = [season_length]
-        self.season_length = list(season_length)
-        self.use_boxcox = use_boxcox
-        self.bc_lower_bound = bc_lower_bound
-        self.bc_upper_bound = bc_upper_bound
-        self.use_trend = use_trend
-        self.use_damped_trend = use_damped_trend
-        self.use_arma_errors = use_arma_errors
+        self.season_length: List[int] = list(season_length)
+        self.use_boxcox: Optional[bool] = use_boxcox
+        self.bc_lower_bound: float = bc_lower_bound
+        self.bc_upper_bound: float = bc_upper_bound
+        self.use_trend: Optional[bool] = use_trend
+        self.use_damped_trend: Optional[bool] = use_damped_trend
+        self.use_arma_errors: bool = use_arma_errors
 
-        self.alias = alias
-        self.conformal_params = conformal_params
+        self.alias: str = alias
+        self.conformal_params: Optional[ConformalIntervals] = conformal_params
         self.model_: Optional[Dict[str, Any]] = None
-        self._cs = None
-        self.only_conformal_intervals = False
+        self._cs: Optional[jnp.ndarray] = None
+        self.only_conformal_intervals: bool = False
 
-    def fit(self, y: jnp.ndarray, X: Optional[jnp.ndarray] = None):
-        """
-        Fit the TBATS model to training data.
+    def fit(
+        self,
+        y: jnp.ndarray,
+        X: Optional[jnp.ndarray] = None,
+    ) -> "AutoTBATS":
+        """Fit the TBATS model to training data.
+
+        Runs the full model-selection grid (Box–Cox, trend, damping, ARMA)
+        and stores the winning configuration in :attr:`model_`.
+
+        Parameters
+        ----------
+        y : jnp.ndarray
+            One-dimensional time series of shape ``(n,)``.  Must be finite;
+            if ``use_boxcox`` is enabled, values must be strictly positive.
+        X : jnp.ndarray or None
+            Ignored — present for API compatibility.
+
+        Returns
+        -------
+        AutoTBATS
+            ``self``, for method chaining.
+
+        Raises
+        ------
+        ValueError
+            If *y* contains ``NaN`` or ``Inf`` values.
+        RuntimeWarning
+            If the sample is short relative to the largest seasonal period.
         """
         y = _ensure_float(y)
 
@@ -123,7 +210,36 @@ class AutoTBATS(BaseForecaster):
 
         return self
         
-    def predict_in_sample(self, level: Optional[Tuple[int]] = None):
+    def predict_in_sample(
+        self,
+        level: Optional[Tuple[int, ...]] = None,
+    ) -> Dict[str, jnp.ndarray]:
+        """Return in-sample fitted values (and optional prediction intervals).
+
+        Fitted values live on the model (working) scale.  When Box–Cox was
+        used during :meth:`fit`, they are automatically back-transformed to
+        the **original** scale before being returned.
+
+        Parameters
+        ----------
+        level : tuple of int or None
+            Confidence levels in ``[0, 100]``.  When provided, symmetric
+            intervals are built around the fitted values using the residual
+            standard error, and monotonicity (``lo ≤ fitted ≤ hi``) is
+            enforced.
+
+        Returns
+        -------
+        dict
+            ``{"fitted": jnp.ndarray}`` of shape ``(n,)``.  When *level* is
+            given, also contains ``"lo-{level}"`` and ``"hi-{level}"``
+            keys.
+
+        Raises
+        ------
+        RuntimeError
+            If called before :meth:`fit`.
+        """
         if getattr(self, "model_", None) is None:
             raise RuntimeError("TBATS model is not fitted yet. Call `fit(y)` before `predict_in_sample()`.")
 
@@ -171,14 +287,33 @@ class AutoTBATS(BaseForecaster):
         X: Optional[jnp.ndarray] = None,
         level: Optional[List[int]] = None,
     ) -> Dict[str, jnp.ndarray]:
-        """
-        Predict with the fitted TBATS model.
+        """Generate *h*-step-ahead forecasts from the fitted model.
 
-        - Requires tbats_core.tbats_forecast to return:
-            {"mean": original-scale mean, "mean_bc": transform-scale mean or None}
-        - When Box–Cox is active, PIs are built on the transform scale centered at mean_bc,
-        then inverted. The returned 'mean' is aligned to inv_boxcox(mean_bc).
-        - Finally, we enforce lo ≤ mean ≤ hi to avoid ULP issues when σ(h)≈0.
+        When Box–Cox is active, prediction intervals are built on the
+        **transform** scale (centred at ``mean_bc``) and then inverted back
+        to the original scale.  Monotonicity (``lo ≤ mean ≤ hi``) is
+        enforced to handle ULP edge cases when σ(h) ≈ 0.
+
+        Parameters
+        ----------
+        h : int
+            Forecast horizon.
+        X : jnp.ndarray or None
+            Ignored — present for API compatibility.
+        level : list of int or None
+            Confidence levels in ``[0, 100]`` for prediction intervals.
+
+        Returns
+        -------
+        dict
+            Always contains ``"mean"`` of shape ``(h,)``.  When *level* is
+            given, also contains ``"lo-{level}"`` and ``"hi-{level}"``
+            keys.
+
+        Raises
+        ------
+        RuntimeError
+            If called before :meth:`fit`.
         """
         if getattr(self, "model_", None) is None:
             raise RuntimeError("TBATS model is not fitted yet. Call `fit(y)` before `predict(h)`.")
@@ -225,12 +360,46 @@ class AutoTBATS(BaseForecaster):
         self,
         y: jnp.ndarray,
         h: int,
-        X: Optional[jnp.ndarray] = None,        # API parity; ignored
-        X_future: Optional[jnp.ndarray] = None, # API parity; ignored
+        X: Optional[jnp.ndarray] = None,
+        X_future: Optional[jnp.ndarray] = None,
         level: Optional[List[int]] = None,
         fitted: bool = False,
     ) -> Dict[str, jnp.ndarray]:
-        """Stateless forecast (fit on `y`, then predict `h`)."""
+        """Stateless fit-and-predict in a single call.
+
+        Runs the full model-selection grid on *y*, produces *h*-step-ahead
+        forecasts, and (optionally) returns in-sample fitted values and
+        prediction intervals.  The fitted model is stored in :attr:`model_`
+        as a side effect for downstream inspection.
+
+        Parameters
+        ----------
+        y : jnp.ndarray
+            One-dimensional time series of shape ``(n,)``.
+        h : int
+            Forecast horizon.
+        X : jnp.ndarray or None
+            Ignored — present for API compatibility.
+        X_future : jnp.ndarray or None
+            Ignored — present for API compatibility.
+        level : list of int or None
+            Confidence levels in ``[0, 100]`` for prediction intervals.
+        fitted : bool, default ``False``
+            If ``True``, include in-sample fitted values (back-transformed
+            when Box–Cox is active) in the output under ``"fitted"``.
+
+        Returns
+        -------
+        dict
+            Always contains ``"mean"`` of shape ``(h,)``.  Optionally
+            includes ``"fitted"``, ``"lo-{level}"``, ``"hi-{level}"``,
+            ``"fitted-lo-{level}"``, and ``"fitted-hi-{level}"``.
+
+        Raises
+        ------
+        ValueError
+            If *y* contains ``NaN`` or ``Inf`` values.
+        """
         y = _ensure_float(y)
 
         if self.use_boxcox is True:
@@ -312,8 +481,48 @@ class AutoTBATS(BaseForecaster):
 
 
 class TBATS(AutoTBATS):
-    """
-    TBATS model with fixed configuration.
+    """Fixed-configuration TBATS forecaster.
+
+    A convenience subclass of :class:`AutoTBATS` with sensible defaults for
+    a single, fully specified TBATS configuration:
+
+    * Box–Cox **on** (``use_boxcox=True``)
+    * Trend **on** (``use_trend=True``)
+    * Damping **off** (``use_damped_trend=False``)
+    * ARMA errors **off** (``use_arma_errors=False``)
+
+    Because the configuration is fixed, no model-selection grid is
+    evaluated — :meth:`fit` trains a single candidate model.
+
+    Parameters
+    ----------
+    season_length : int or list of int
+        Seasonal period(s).
+    use_boxcox : bool or None, default ``True``
+        Apply Box–Cox transformation.
+    bc_lower_bound : float, default ``-1.0``
+        Lower bound for the Box–Cox λ parameter.
+    bc_upper_bound : float, default ``2.0``
+        Upper bound for the Box–Cox λ parameter.
+    use_trend : bool or None, default ``True``
+        Include a trend component.
+    use_damped_trend : bool or None, default ``False``
+        Damp the trend toward zero.
+    use_arma_errors : bool, default ``False``
+        Add ARMA structure on the residuals.
+    alias : str, default ``"TBATS"``
+        Display name for the model.
+    conformal_params : ConformalIntervals or None, default ``None``
+        Configuration for conformal prediction intervals.
+
+    See Also
+    --------
+    AutoTBATS : Automatic model selection across TBATS configurations.
+
+    Examples
+    --------
+    >>> model = TBATS(season_length=12)
+    >>> out = model.forecast(y_train, h=12, level=[80, 95])
     """
 
     def __init__(
@@ -327,7 +536,8 @@ class TBATS(AutoTBATS):
         use_arma_errors: bool = False,
         alias: str = "TBATS",
         conformal_params: Optional[ConformalIntervals] = None,
-    ):
+    ) -> None:
+        """Initialize a fixed-configuration TBATS estimator."""
         super().__init__(
             season_length=season_length,
             use_boxcox=use_boxcox,
