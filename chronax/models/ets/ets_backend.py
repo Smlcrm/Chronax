@@ -1,18 +1,25 @@
-# ets_srcv2.py — ETS core simulation and optax-based parameter optimization.
-#
-# This module provides the low-level building blocks for Exponential Smoothing
-# (ETS) models.  It is consumed by ets_functions.py (model selection) and
-# auto_ets.py (public API).
-#
-# Optimizer architecture (inside optimize_bfgs_smoothing):
-#   Phase 1 — Adam warm-up   (first-order, ~15-30 steps, Python loop)
-#   Phase 2 — L-BFGS refine  (second-order, 30 steps via lax.scan → one XLA kernel)
-#
-# Only optax is used for optimization — no jaxopt or scipy dependency.
+"""ETS core simulation and optax-based parameter optimization in JAX.
+
+This module provides the low-level building blocks for Exponential Smoothing
+(ETS) models.  It is consumed by ``ets_functions.py`` (model selection) and
+``auto_ets.py`` (public API).
+
+Key components
+--------------
+* **State primitives** — :func:`update` (one-step ETS recursion) and
+  :func:`forecast` (multi-step ahead prediction from a given state).
+* **Rollout helpers** — :func:`calc_full` and :func:`calc` iterate through
+  an entire series, producing residuals, AMSE, and a likelihood-style scalar.
+* **Optimizer** — :func:`optimize_bfgs_smoothing` runs a two-phase strategy:
+
+  - *Phase 1*: Adam warm-up (first-order, ~15–30 steps in a Python loop).
+  - *Phase 2*: L-BFGS refinement (second-order, 30 steps via ``lax.scan``
+    compiled into a single XLA kernel).
+
+Only ``optax`` is used for optimization — no ``jaxopt`` or ``scipy``
+dependency.
+"""
 from __future__ import annotations
-"""
-ETS core simulation and an optax-based optimizer in JAX.
-"""
 
 from enum import Enum
 from functools import lru_cache, partial
@@ -40,17 +47,25 @@ _init_jax_compilation_cache()
 # Constants
 # ---------------------------
 HUGE_N: float = 1e10
-"""A very large sentinel value used to avoid division by ~0 in multiplicative cases."""
+"""Sentinel replacing near-zero denominators in multiplicative ETS formulas."""
 
 NA: float = -99999.0
-"""Legacy sentinel value; retained for parity with upstream behavior."""
+"""Legacy sentinel for missing / invalid values; retained for upstream parity."""
 
-TOL: float = 1e-10    # near-zero guard for conditional branches (e.g. phi ≈ 1)
-EPS: float = 1e-3     # clipping margin for legacy sigmoid param transform
-EPS_PURE: float = 2e-2  # clipping margin for pure-sigmoid param transform
+TOL: float = 1e-10
+"""Near-zero guard for conditional branches (e.g. |φ − 1| < TOL)."""
 
-PHI_LOWER: float = 0.8   # default lower bound for trend-damping φ
-PHI_UPPER: float = 0.98  # default upper bound for trend-damping φ
+EPS: float = 1e-3
+"""Clipping margin used by the *legacy* sigmoid parameter transform."""
+
+EPS_PURE: float = 2e-2
+"""Clipping margin used by the *pure* sigmoid parameter transform."""
+
+PHI_LOWER: float = 0.8
+"""Default lower bound for the trend-damping parameter φ."""
+
+PHI_UPPER: float = 0.98
+"""Default upper bound for the trend-damping parameter φ."""
 
 
 class Component(Enum):
@@ -117,8 +132,6 @@ class OptimResult(NamedTuple):
     nfev: int
 
 
-# Cached closure factory — JAX only traces/compiles the objective once per
-# unique model structure (error/trend/season/which-params-are-free).
 @lru_cache(maxsize=128)
 def _get_objective_closure(
     error: Component,
@@ -136,6 +149,40 @@ def _get_objective_closure(
     opt_init_state: bool,
     n_state: int,
 ):
+    """Return a cached objective closure for a specific ETS model structure.
+
+    JAX only traces / compiles the objective once per unique combination of
+    structural flags (error, trend, season, which parameters are free, etc.).
+    The returned callable accepts *data*-level arrays and produces a scalar
+    loss — ready for ``jax.value_and_grad``.
+
+    Parameters
+    ----------
+    error, trend, season : Component
+        Model structure flags (baked into the closure at creation time).
+    opt_crit : Criterion
+        Which loss metric to minimise (likelihood, MSE, …).
+    n_mse : int
+        AMSE horizon cap (≤ 30).
+    m : int
+        Seasonal period.
+    opt_alpha, opt_beta, opt_gamma, opt_phi : bool
+        Which smoothing parameters are free (True) vs. fixed (False).
+    clip_multiplicative_errors : bool
+        Whether to clamp multiplicative residuals to ``[-2, 2]``.
+    pure_sigmoid : bool
+        Use the cleaner independent sigmoid parameterisation.
+    opt_init_state : bool
+        If ``True``, the tail of ``p`` holds optimisable initial states.
+    n_state : int
+        Number of initial-state parameters appended to ``p``.
+
+    Returns
+    -------
+    Callable
+        ``_obj(p, y, init_state, n_obs, alpha, beta, gamma, phi, lower,
+        upper) -> jnp.float64`` — the scalar objective.
+    """
     # Inner callable receives data-level arrays; all structure config is baked in.
     def _obj(
         p: jnp.ndarray,
@@ -179,12 +226,13 @@ def _get_objective_closure(
     return _obj
 
 
-# ---------------------------
-# Core state update (NumPy logic)
-# ---------------------------
-_COMP_NOTHING = int(Component.Nothing.value)
-_COMP_ADD = int(Component.Additive.value)
-_COMP_MUL = int(Component.Multiplicative.value)
+# ---------------------------------------------------------------------------
+# Integer aliases for Component values — used inside ``lax.select`` branches
+# where Python-level enum comparison is not possible.
+# ---------------------------------------------------------------------------
+_COMP_NOTHING: int = int(Component.Nothing.value)
+_COMP_ADD: int = int(Component.Additive.value)
+_COMP_MUL: int = int(Component.Multiplicative.value)
 
 
 @partial(jax.jit, static_argnames=("has_trend", "has_season", "m"))
@@ -194,7 +242,26 @@ def _unpack_state(
     has_season: bool,
     m: int,
 ) -> Tuple[jnp.float64, jnp.float64, jnp.ndarray]:
-    """Unpack level/trend/season from packed ETS state."""
+    """Unpack level, trend, and seasonal vector from a packed ETS state array.
+
+    Parameters
+    ----------
+    state : jnp.ndarray
+        Flat state vector ``[level (, trend) (, season_1 … season_m)]``.
+    has_trend, has_season : bool
+        Whether the model contains a trend / seasonal component.
+    m : int
+        Seasonal period (used only when ``has_season`` is True).
+
+    Returns
+    -------
+    l : jnp.float64
+        Current level.
+    b : jnp.float64
+        Current trend (``0.0`` if ``has_trend`` is False).
+    s_vec : jnp.ndarray
+        Seasonal vector of length ``max(m, 24)`` (zero-padded when no season).
+    """
     n_s = max(m, 24)
     l = state[0]
     b = state[1] if has_trend else jnp.asarray(0.0, dtype=state.dtype)
@@ -214,7 +281,26 @@ def _pack_state_row(
     has_season: bool,
     m: int,
 ) -> jnp.ndarray:
-    """Pack one ETS state row from level/trend/season."""
+    """Pack level, trend, and seasonal values into a single flat state row.
+
+    Parameters
+    ----------
+    l : jnp.float64
+        Level value.
+    b : jnp.float64
+        Trend value (ignored when ``has_trend`` is False).
+    s_vec : jnp.ndarray
+        Seasonal vector (first ``m`` entries are used).
+    has_trend, has_season : bool
+        Whether the model has a trend / seasonal component.
+    m : int
+        Seasonal period.
+
+    Returns
+    -------
+    jnp.ndarray
+        Flat state row of length ``m * has_season + has_trend + 1``.
+    """
     dtype = jnp.asarray(l).dtype
     n_states = m * int(has_season) + int(has_trend) + 1
     row = jnp.zeros((n_states,), dtype=dtype)
@@ -595,11 +681,45 @@ def _calc_roll_nohist(
     clip_multiplicative_errors: bool = True,
     fcst_h: int = 1,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.float64]:
-    """
-    Rollout computing residuals/objective without storing state history.
+    """Rollout computing residuals and objective *without* storing state history.
 
-    This mirrors `_calc_roll` but skips all state history writes, returning
-    only residuals, rolling MSEs, and the likelihood-like scalar.
+    This mirrors :func:`_calc_roll` but skips all state-history writes,
+    making it cheaper for model-selection passes where only the scalar
+    objective is needed.
+
+    Parameters
+    ----------
+    state0 : jnp.ndarray
+        Initial state vector (level [+ trend] [+ m seasonal entries]).
+    e : jnp.ndarray
+        Pre-allocated residual buffer (length ``n``).
+    a_mse : jnp.ndarray
+        Rolling MSE buffer (length ≥ ``min(n_mse, 30)``).
+    n_mse : int
+        Maximum AMSE horizon (capped at 30).
+    y : jnp.ndarray
+        Observations (length ``n``).
+    n_obs : jnp.ndarray
+        Number of *active* observations (``≤ n``; allows padded series).
+    error, trend, season : Component
+        Model structure flags.
+    alpha, beta, gamma, phi : jnp.float64
+        Smoothing parameters.
+    m : int
+        Seasonal period.
+    clip_multiplicative_errors : bool
+        Clamp multiplicative residuals to ``[-2, 2]``.
+    fcst_h : int
+        Per-step forecast horizon used for AMSE (``1`` for pure likelihood).
+
+    Returns
+    -------
+    e_out : jnp.ndarray
+        Residuals for each time step.
+    a_local : jnp.ndarray
+        Rolling horizon MSE estimates.
+    lik : jnp.float64
+        Likelihood-style objective value.
     """
     n = y.shape[0]
     n_eff = jnp.minimum(n_obs, n)
@@ -832,7 +952,36 @@ def _transform_smoothing_params(
     upper: jnp.ndarray,
     pure_sigmoid: bool = False,
 ) -> Tuple[jnp.float64, jnp.float64, jnp.float64, jnp.float64]:
-    """Map unconstrained parameter vector → valid (α, β, γ, φ) via sigmoid."""
+    """Map an unconstrained parameter vector to valid (α, β, γ, φ) via sigmoid.
+
+    Two modes are supported:
+
+    * **Legacy mode** (``pure_sigmoid=False``): scaled sigmoid with safety
+      clipping to ``[eps, 1-eps]`` and additional ``[PHI_LOWER, PHI_UPPER]``
+      clipping for φ.
+    * **Pure-sigmoid mode** (``pure_sigmoid=True``): each parameter is
+      independently mapped through ``sigmoid → scale → shift``, producing
+      cleaner gradients.
+
+    Parameters
+    ----------
+    p : jnp.ndarray
+        Unconstrained optimiser variables (length depends on which params
+        are free).
+    opt_alpha, opt_beta, opt_gamma, opt_phi : bool
+        Which smoothing parameters are being optimised.
+    alpha, beta, gamma, phi : float
+        Current / default values for fixed parameters.
+    lower, upper : jnp.ndarray
+        Box-constraint bounds (length 4).
+    pure_sigmoid : bool
+        Select the parameterisation mode (see above).
+
+    Returns
+    -------
+    tuple[jnp.float64, jnp.float64, jnp.float64, jnp.float64]
+        ``(alpha, beta, gamma, phi)`` in the constrained domain.
+    """
     idx = 0
     lower = jnp.asarray(lower, dtype=jnp.float64)
     upper = jnp.asarray(upper, dtype=jnp.float64)
@@ -918,7 +1067,54 @@ def _objective_smoothing_only(
     opt_init_state: bool = False,
     n_state: int = 0,
 ) -> jnp.float64:
-    """Innermost objective: transform params → run no-history rollout → return scalar loss."""
+    """Innermost objective: transform params → run no-history rollout → scalar loss.
+
+    This is the function that ``jax.value_and_grad`` differentiates through.
+    It:
+
+    1. Transforms unconstrained ``p`` → constrained (α, β, γ, φ) via
+       :func:`_transform_smoothing_params`.
+    2. Optionally splits initial-state parameters from the tail of ``p``.
+    3. Runs :func:`_calc_roll_nohist` to obtain residuals, AMSE, and
+       likelihood in a single forward pass (no state-history storage).
+    4. Returns the scalar objective selected by ``opt_crit`` (likelihood,
+       MSE, AMSE, σ², or MAE).
+
+    Parameters
+    ----------
+    p : jnp.ndarray
+        Unconstrained parameter vector (free smoothing params, optionally
+        followed by initial-state params).
+    y : jnp.ndarray
+        Observed time series.
+    init_state : jnp.ndarray
+        Initial ETS state (may be overridden when ``opt_init_state`` is True).
+    error, trend, season : Component
+        Model structure flags (static for JIT).
+    opt_crit : Criterion
+        Which loss to return.
+    n_mse, m, n_obs : int
+        AMSE horizon, seasonal period, and active observation count.
+    opt_alpha … opt_phi : bool
+        Which parameters are optimised.
+    alpha … phi : float
+        Default / fixed values for non-optimised parameters.
+    lower, upper : jnp.ndarray
+        Box-constraint bounds.
+    clip_multiplicative_errors : bool
+        Clamp multiplicative residuals to ``[-2, 2]``.
+    pure_sigmoid : bool
+        Parameterisation mode.
+    opt_init_state : bool
+        Whether the tail of ``p`` holds initial-state params.
+    n_state : int
+        Count of initial-state params appended to ``p``.
+
+    Returns
+    -------
+    jnp.float64
+        Scalar loss value.
+    """
     # Optionally split off initial-state params from the tail of p.
     if opt_init_state and n_state > 0:
         p_smooth = p[:-n_state]
@@ -978,21 +1174,18 @@ def _objective_smoothing_only(
 
 
 
-# ---------------------------------------------------------------------------
-# Two-phase optax optimizer: Adam warm-up → L-BFGS refinement
-# ---------------------------------------------------------------------------
 def optimize_bfgs_smoothing(
-    x0: jnp.ndarray,        # initial unconstrained parameter vector
-    y: jnp.ndarray,          # observed time series (float64)
-    init_state: jnp.ndarray, # initial ETS state (level, trend, seasonal)
+    x0: jnp.ndarray,
+    y: jnp.ndarray,
+    init_state: jnp.ndarray,
     error: Component,
     trend: Component,
     season: Component,
-    opt_crit: Criterion,     # which loss to minimize (lik, mse, amse, sigma, mae)
-    n_mse: int,              # horizon cap for rolling MSE (≤ 30)
-    m: int,                  # seasonal period
-    n_obs: int,              # active observation count (may be < len(y) if padded)
-    opt_alpha: bool,         # True → optimize alpha; False → keep fixed
+    opt_crit: Criterion,
+    n_mse: int,
+    m: int,
+    n_obs: int,
+    opt_alpha: bool,
     opt_beta: bool,
     opt_gamma: bool,
     opt_phi: bool,
@@ -1000,20 +1193,87 @@ def optimize_bfgs_smoothing(
     beta: float,
     gamma: float,
     phi: float,
-    lower: jnp.ndarray,     # box-constraint lower bounds for smoothing params
-    upper: jnp.ndarray,     # box-constraint upper bounds for smoothing params
-    steps: int,              # total iteration budget (Adam uses a fraction)
-    lr: float,               # base learning rate for Adam warm-up
-    clip_norm: float,        # (unused — kept for caller API compatibility)
-    early_stop_patience: int = 20,   # (unused — kept for API compat; lax.scan is fixed-length)
-    early_stop_min_delta: float = 1e-6,  # (unused — kept for API compat)
-    adaptive_tol: bool = True,       # (unused — kept for API compat)
-    is_final_model: bool = False,    # (unused — kept for API compat)
-    clip_multiplicative_errors: bool = True,  # clamp multiplicative residuals to [-2,2]
-    pure_sigmoid: bool = False,      # use cleaner sigmoid parameterization
-    opt_init_state: bool = False,    # if True, tail of x0 holds optimizable init states
-    n_state: int = 0,                # number of init-state params appended to x0
+    lower: jnp.ndarray,
+    upper: jnp.ndarray,
+    steps: int,
+    lr: float,
+    clip_norm: float,
+    early_stop_patience: int = 20,
+    early_stop_min_delta: float = 1e-6,
+    adaptive_tol: bool = True,
+    is_final_model: bool = False,
+    clip_multiplicative_errors: bool = True,
+    pure_sigmoid: bool = False,
+    opt_init_state: bool = False,
+    n_state: int = 0,
 ) -> OptimResult:
+    """Two-phase optax optimiser: Adam warm-up → L-BFGS refinement.
+
+    Finds the unconstrained parameter vector that minimises the ETS objective
+    selected by *opt_crit*.  The search proceeds in two stages:
+
+    1. **Adam warm-up** — a short burst of momentum-based first-order steps
+       (15–30 iterations depending on series length) that moves ``x0`` into
+       a reasonable basin.
+    2. **L-BFGS refinement** — 30 quasi-Newton steps compiled via
+       ``lax.scan`` into a single XLA kernel for minimal dispatch overhead.
+
+    The best parameter vector seen across *both* phases is returned.
+
+    Parameters
+    ----------
+    x0 : jnp.ndarray
+        Initial unconstrained parameter vector.
+    y : jnp.ndarray
+        Observed time series (float64).
+    init_state : jnp.ndarray
+        Initial ETS state (level, trend, seasonal).
+    error, trend, season : Component
+        Model structure flags.
+    opt_crit : Criterion
+        Which loss to minimise (likelihood, MSE, AMSE, σ², MAE).
+    n_mse : int
+        Horizon cap for rolling MSE (≤ 30).
+    m : int
+        Seasonal period.
+    n_obs : int
+        Active observation count (may be ``< len(y)`` if padded).
+    opt_alpha, opt_beta, opt_gamma, opt_phi : bool
+        ``True`` → optimise the corresponding smoothing parameter;
+        ``False`` → keep it fixed at the supplied value.
+    alpha, beta, gamma, phi : float
+        Current / default values for the four smoothing parameters.
+    lower, upper : jnp.ndarray
+        Box-constraint bounds for smoothing parameters (length 4).
+    steps : int
+        Total iteration budget (Adam uses a fraction of this).
+    lr : float
+        Base learning rate for the Adam warm-up phase.
+    clip_norm : float
+        *(Unused — kept for caller API compatibility.)*
+    early_stop_patience : int
+        *(Unused — ``lax.scan`` runs a fixed number of iterations.)*
+    early_stop_min_delta : float
+        *(Unused — kept for API compatibility.)*
+    adaptive_tol : bool
+        *(Unused — kept for API compatibility.)*
+    is_final_model : bool
+        *(Unused — kept for API compatibility.)*
+    clip_multiplicative_errors : bool
+        Clamp multiplicative residuals to ``[-2, 2]``.
+    pure_sigmoid : bool
+        Use the cleaner independent sigmoid parameterisation.
+    opt_init_state : bool
+        If ``True``, the tail of ``x0`` holds optimisable initial states.
+    n_state : int
+        Number of initial-state parameters appended to ``x0``.
+
+    Returns
+    -------
+    OptimResult
+        Named tuple with fields ``success``, ``status``, ``message``,
+        ``x`` (best params), ``fun`` (best loss), ``nit``, ``nfev``.
+    """
     # ── Input normalisation ───────────────────────────────────────────
     x0 = jnp.asarray(x0, dtype=jnp.float64)
     y = jnp.asarray(y, dtype=jnp.float64)

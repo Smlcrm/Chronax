@@ -48,85 +48,88 @@ from chronax.utils import _repeat_val, _window_average, ensure_float, calculate_
 jax.config.update("jax_enable_x64", True)
 
 class IMAPA(BaseForecaster):
-    r"""IMAPA model (Intermittent Multiple Aggregation Prediction Algorithm).
+    """Intermittent Multiple Aggregation Prediction Algorithm (IMAPA).
 
-    IMAPA aggregates the series at multiple frequencies, fits SES at each
-    aggregated level, and then combines (typically by averaging) the resulting
-    forecasts to better capture intermittent-demand dynamics.
+    IMAPA is designed for **intermittent demand** time series — data where many
+    observations are zero or near-zero and demand occurs sporadically.  It
+    improves on simple exponential smoothing by:
 
-    This JAX implementation is API-compatible with your forecasting framework
-    and aims for parity with StatsForecast.IMAPA on *point forecasts*, while
-    intentionally differing in how prediction intervals are produced.
+    1. **Aggregating** the original series at multiple temporal resolutions
+       (levels 1, 2, …, K) to reduce sparsity.
+    2. **Fitting SES** independently at each aggregation level.
+    3. **Back-mapping** each level's forecast to the original time scale
+       (dividing by the aggregation factor) and averaging across all levels.
 
-    Differences vs StatsForecast.IMAPA (by design):
-      - **JAX semantics**: stricter array truthiness rules and dtype handling
-        (float32/float64) may introduce tiny numeric diffs.
-      - **Intervals**: `only_conformal_intervals=True`. Out-of-the-box forecast
-        intervals are generated via the conformal toolbox rather than an
-        analytic/native model variance. Fitted intervals are constructed as
-        symmetric ±z·σ bands around fitted values.
-      - **NaNs at early indices**: because of multi-aggregation/back-mapping,
-        the first few fitted points can be NaN. Tests handle this by masking
-        NaNs in assertions.
-      - **Conformity-score caching**: `predict(..., level=...)` requires that
-        `fit(..., conformal_params=...)` was called first so `_cs` is cached.
+    Point forecasts are designed for parity with ``StatsForecast.IMAPA``.
+    Prediction intervals are **conformal** (distribution-free), produced via
+    the library's :class:`ConformalIntervals` machinery.
 
-    Args:
-        alias: Custom name for the model (used downstream for logging/labels).
-        conformal_params: If provided, enables conformal prediction intervals
-            and caches conformity scores during `fit(...)`.
+    Parameters
+    ----------
+    alias : str, default ``"IMAPA"``
+        Display name for the model (used in logging and labels).
+    conformal_params : ConformalIntervals or None, default ``None``
+        Configuration for conformal prediction intervals.  When provided,
+        conformity scores are cached at :meth:`fit` time so that
+        :meth:`predict` can emit intervals without recomputation.
 
-    Attributes:
-        model_: Dict produced by `utils._imapa(...)` after `fit(...)`.
-        _cs: Cached conformity scores (computed only if `conformal_params` is set).
-        only_conformal_intervals: True to indicate this class emits conformal PIs.
+    Attributes
+    ----------
+    model_ : dict or None
+        Dictionary produced by ``utils._imapa(…)`` after :meth:`fit`.
+        Contains the key ``"mean"`` (scalar SES forecast before repeating).
+    only_conformal_intervals : bool
+        Always ``True`` — this model only supports conformal intervals.
+
+    References
+    ----------
+    Syntetos, A. A. & Boylan, J. E. (2021). *Intermittent Demand Forecasting:
+    Context, Methods and Applications.* John Wiley & Sons.
+
+    Examples
+    --------
+    >>> model = IMAPA()
+    >>> model.fit(y_train)
+    >>> model.predict(h=6)
+    {'mean': Array([...], dtype=float64)}
     """
+
     def __init__(
         self,
         alias: str = "IMAPA",
         conformal_params: Optional[ConformalIntervals] = None,
-    ):
-        """IMAPA model.
-
-        Intermittent Multiple Aggregation Prediction Algorithm: Similar to ADIDA, but instead of
-        using a single aggregation level, it considers multiple in order to capture different
-        dynamics of the data. Uses the optimized SES to generate the forecasts at the new levels
-        and then combines them using a simple average.
-
-        References:
-            - [Syntetos, A. A., & Boylan, J. E. (2021). Intermittent demand forecasting: Context, methods and applications. John Wiley & Sons.](https://www.ifors.org/intermittent-demand-forecasting-context-methods-and-applications/).
-
-        Args:
-            alias (str, optional): Custom name of the model. Defaults to "IMAPA".
-            prediction_intervals (Optional[ConformalIntervals], optional): Information to compute conformal prediction intervals.
-                By default, the model will compute the native prediction intervals. Defaults to None.
-        """
-        self.alias = alias
-        self.conformal_params = conformal_params
-        self.only_conformal_intervals = True
+    ) -> None:
+        self.alias: str = alias
+        self.conformal_params: Optional[ConformalIntervals] = conformal_params
+        self.only_conformal_intervals: bool = True
         self._cs: Optional[jnp.ndarray] = None
-        # (Optional) also predeclare model_ so you can give a clearer error in predict()
         self.model_: Optional[Dict[str, jnp.ndarray]] = None
 
     def fit(
         self,
         y: jnp.ndarray,
         X: Optional[jnp.ndarray] = None,
-    ):
+    ) -> "IMAPA":
         """Fit IMAPA to a univariate time series.
 
-        Notes on behavior vs StatsForecast.IMAPA:
-            - Casting to float is enforced via `ensure_float` (JAX-friendly).
-            - If `conformal_params` is provided, this method also computes and
-              caches `_cs` so that `predict(..., level=...)` can emit conformal
-              intervals without recomputation.
+        Aggregates ``y`` at multiple temporal levels, fits SES at each level,
+        and stores the resulting model state in :attr:`model_`.  If
+        ``conformal_params`` was provided at construction, conformity scores
+        are also computed and cached so that :meth:`predict` can emit
+        intervals without re-fitting.
 
-        Args:
-            y: Clean time series of shape (t,).
-            X: Unused placeholder for API compatibility.
+        Parameters
+        ----------
+        y : jnp.ndarray
+            One-dimensional time series of shape ``(n,)``.
+        X : jnp.ndarray or None
+            Ignored — present for API compatibility with
+            :class:`BaseForecaster`.
 
-        Returns:
-            self
+        Returns
+        -------
+        IMAPA
+            ``self``, for method chaining (e.g. ``model.fit(y).predict(h)``).
         """
         y = ensure_float(y)
         self.model_ = _imapa(y=y, h=1, fitted=False)
@@ -143,7 +146,36 @@ class IMAPA(BaseForecaster):
         h: int,
         X: Optional[jnp.ndarray] = None,
         level: Optional[List[int]] = None,
-    ):
+    ) -> Dict[str, jnp.ndarray]:
+        """Forecast *h* steps ahead using the fitted IMAPA state.
+
+        SES produces **flat multi-step forecasts** — every future step equals
+        the same scalar value stored in ``model_["mean"]``.
+
+        Parameters
+        ----------
+        h : int
+            Forecast horizon (number of future steps).
+        X : jnp.ndarray or None
+            Ignored — present for API compatibility.
+        level : list of int or None
+            Confidence levels in ``[0, 100]`` for conformal prediction
+            intervals.  Requires that the model was constructed with
+            ``conformal_params`` and that :meth:`fit` has been called.
+
+        Returns
+        -------
+        dict
+            ``{"mean": jnp.ndarray}`` of shape ``(h,)``.  When *level* is
+            provided, also contains ``"lo-{level}"`` and ``"hi-{level}"``
+            keys for each requested confidence level.
+
+        Raises
+        ------
+        ValueError
+            If called before :meth:`fit`, or if *level* is provided without
+            cached conformity scores.
+        """
         # Guard: must have fit() first
         if self.model_ is None:
             raise ValueError("Call fit(...) before predict().")
@@ -173,29 +205,29 @@ class IMAPA(BaseForecaster):
         )
 
 
-    def predict_in_sample(self, level: Optional[List[int]] = None):
-        """Forecast `h` steps ahead using the fitted IMAPA state.
+    def predict_in_sample(
+        self,
+        level: Optional[List[int]] = None,
+    ) -> Dict[str, jnp.ndarray]:
+        """Return in-sample fitted values (and optional prediction intervals).
 
-        If `level` is None, returns point forecasts only. If `level` is set, this
-        emits **conformal** prediction intervals using cached conformity scores
-        produced at `fit(...)` time.
+        Re-runs the IMAPA aggregation/back-mapping pipeline with
+        ``fitted=True`` to produce one-step-ahead fitted values for the
+        training data.  Early indices may be ``NaN`` due to insufficient
+        aggregation history.
 
-        Differences vs StatsForecast.IMAPA:
-            - Requires `fit(..., conformal_params=...)` beforehand to have `_cs`.
-            - Intervals are conformal, not analytic; widths may differ from
-              StatsForecast's interval conventions even when means match.
+        Parameters
+        ----------
+        level : list of int or None
+            Confidence levels in ``[0, 100]``.  When provided, symmetric
+            ±z·σ intervals are appended around the fitted values.
 
-        Args:
-            h: Forecast horizon.
-            X: Unused placeholder for API compatibility.
-            level: Confidence levels in [0, 100] for conformal PIs.
-
-        Returns:
-            Dict with `"mean"` and, if `level` provided, `"lo-*"`, `"hi-*"` keys.
-
-        Raises:
-            ValueError: if called before `fit(...)`, or if `level` is provided
-                        without cached conformity scores.
+        Returns
+        -------
+        dict
+            ``{"fitted": jnp.ndarray}`` of shape ``(n,)``.  When *level* is
+            provided, also contains ``"fitted-lo-{level}"`` and
+            ``"fitted-hi-{level}"`` keys.
         """
         fitted = _imapa(y=self._y, h=1, fitted=True)["fitted"]
         res = {"fitted": fitted}
@@ -212,23 +244,43 @@ class IMAPA(BaseForecaster):
         X_future: Optional[jnp.ndarray] = None,
         level: Optional[List[int]] = None,
         fitted: bool = False,
-    ):
-        """Memory Efficient IMAPA predictions.
+    ) -> Dict[str, jnp.ndarray]:
+        """Stateless fit-and-predict in a single call.
 
-        This method avoids memory burden due from object storage.
-        It is analogous to `fit_predict` without storing information.
-        It assumes you know the forecast horizon in advance.
+        Equivalent to calling :meth:`fit` followed by :meth:`predict`, but
+        **no persistent model state** is stored on the instance.  This is
+        ideal for cross-validation loops and batch evaluation pipelines.
 
-        Args:
-            y (np.ndarray): Clean time series of shape (n, ).
-            h (int): Forecast horizon.
-            X (Optional[np.ndarray], optional): Optional insample exogenous of shape (t, n_x). Defaults to None.
-            X_future (Optional[np.ndarray], optional): Optional exogenous of shape (h, n_x). Defaults to None.
-            level (Optional[List[int]], optional): Confidence levels (0-100) for prediction intervals. Defaults to None.
-            fitted (bool, optional): Whether or not to return insample predictions. Defaults to False.
+        Parameters
+        ----------
+        y : jnp.ndarray
+            One-dimensional time series of shape ``(n,)``.
+        h : int
+            Forecast horizon.
+        X : jnp.ndarray or None
+            Ignored — present for API compatibility.
+        X_future : jnp.ndarray or None
+            Ignored — present for API compatibility.
+        level : list of int or None
+            Confidence levels in ``[0, 100]`` for conformal prediction
+            intervals.  Requires ``conformal_params`` to have been set at
+            construction time.
+        fitted : bool, default ``False``
+            If ``True``, the returned dict also includes ``"fitted"``
+            (in-sample one-step-ahead predictions of shape ``(n,)``).
 
-        Returns:
-            dict: Dictionary with entries `mean` for point predictions and `level_*` for probabilistic predictions.
+        Returns
+        -------
+        dict
+            Always contains ``"mean"`` of shape ``(h,)``.  Optionally
+            ``"fitted"`` (shape ``(n,)``), ``"lo-{level}"``,
+            ``"hi-{level}"``, ``"fitted-lo-{level}"``, and
+            ``"fitted-hi-{level}"`` when *level* and/or *fitted* are set.
+
+        Raises
+        ------
+        Exception
+            If *level* is provided but ``conformal_params`` was not set.
         """
         y = ensure_float(y)
         res = _imapa(y=y, h=h, fitted=fitted)

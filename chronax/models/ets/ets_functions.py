@@ -1,16 +1,22 @@
-# ets.py (JAX version)
-"""
-High-level ETS (Exponential Smoothing) model API in JAX.
+"""High-level ETS (Exponential Smoothing) model-selection and fitting API in JAX.
 
-This module wires together:
-- low-level ETS kernels and an Optax Adam optimizer (from `_ets`),
-- parameter initialization and admissibility checks,
-- state initialization via simple regression/Fourier or seasonal decomposition,
-- full model selection / fitting (AICc, etc.),
-- forecasting and analytical/simulation-based prediction intervals.
+This module wires together the following components into a single entry-point
+(:func:`ets_f`) that performs automatic or fixed-specification ETS fitting:
 
-The goal is functional parity with NumPy/statsmodels-style ETS flows while
-keeping kernels JIT-friendly and deterministic.
+* **Low-level kernels** — state update, forecast, and rollout routines from
+  :mod:`ets_backend` (imported as ``_ets``).
+* **Parameter initialisation** — :func:`initparam` picks sensible starting
+  values for (α, β, γ, φ) and adjusts box bounds.
+* **State initialisation** — :func:`initstate` seeds level / trend / seasonal
+  states via OLS regression, Fourier decomposition, or seasonal averages.
+* **Admissibility** — :func:`check_param` and :func:`admissible` enforce
+  classical ETS constraints and characteristic-polynomial root checks.
+* **Model selection** — :func:`ets_f` iterates over candidate
+  (error, trend, season, damped) tuples, fits each via :func:`etsmodel`,
+  and picks the winner by AICc (or AIC / BIC).
+* **Forecasting** — :func:`forecast_ets` / :func:`pegelsfcast_C` produce
+  mean paths, while :func:`_compute_pred_intervals` adds analytical or
+  simulation-based prediction intervals.
 """
 
 __all__ = ['ets_f']
@@ -46,6 +52,34 @@ def _estimate_ets_iterations(
     season_type: str,
     allow_extended: bool = False,
 ) -> int:
+    """Heuristically choose the number of optax optimisation steps.
+
+    The iteration budget is determined by a weighted combination of data
+    *complexity* signals:
+
+    * **Noise score** — coefficient of variation of first-differences.
+    * **Trend difficulty** — ``1 − R²`` of a simple linear fit.
+    * **Seasonality difficulty** — ``1 − ACF(m)`` of the detrended series.
+    * **Model complexity** — extra budget for multiplicative components.
+    * **Coverage penalty** — boost when fewer than 3 full seasonal cycles
+      are available.
+
+    Parameters
+    ----------
+    y : jnp.ndarray
+        Observed series.
+    m : int
+        Seasonal period.
+    error_type, trend_type, season_type : str
+        ETS component flags (``"A"`` / ``"M"`` / ``"N"``).
+    allow_extended : bool
+        If ``True``, the upper cap is raised from 350 to 600 iterations.
+
+    Returns
+    -------
+    int
+        Recommended number of optimisation steps (between 50 and 350 / 600).
+    """
     y = jnp.asarray(y, dtype=jnp.float64)
     n = int(y.shape[0])
     if n < 3:
@@ -111,17 +145,28 @@ def _estimate_ets_iterations(
     return max(min_iters, min(max_iters, iterations))
 
 
-# Global cache for expensive strength calculations
+# ---------------------------------------------------------------------------
+# Caches — avoid redundant computation for repeated (y, m, structure) combos
+# ---------------------------------------------------------------------------
 _strength_cache: dict[tuple[int, int], tuple[float, float]] = {}
+"""Module-level cache for ``(_trend_strength, _seasonal_strength)`` pairs."""
 
 
 class _TemplateCache:
+    """In-memory cache for initial ETS state vectors.
+
+    Keyed on ``(hash(y), m, trendtype, seasontype)`` so that the same
+    initial state is reused across candidate models that share a trend /
+    season structure during model selection.
+    """
+
     def __init__(self) -> None:
         self._cache: dict[tuple[int, int, str, str], jnp.ndarray] = {}
 
     def get_init_state(
         self, y: jnp.ndarray, m: int, trendtype: str, seasontype: str
     ) -> jnp.ndarray:
+        """Return the cached initial state, computing it on first access."""
         try:
             y_hash = hash(jnp.asarray(y).tobytes())
         except Exception:
@@ -139,9 +184,11 @@ _template_cache = _TemplateCache()
 
 
 def _get_cached_strengths(y: jnp.ndarray, m: int) -> tuple[float, float]:
-    """
-    Cached version of trend and seasonal strength calculations.
-    Returns (trend_strength, seasonal_strength).
+    """Return ``(trend_strength, seasonal_strength)``, caching the result.
+
+    On the first call for a given ``(y, m)`` pair the strengths are computed
+    via :func:`_trend_strength` and :func:`_seasonal_strength` and stored in
+    ``_strength_cache``; subsequent calls return the cached values.
     """
     try:
         y_hash = hash(y.tobytes())
@@ -161,8 +208,21 @@ def _get_cached_strengths(y: jnp.ndarray, m: int) -> tuple[float, float]:
 
 
 def _aicc(aic: float, n: int, k: int) -> float:
-    """
-    Small-sample AICc with enhanced penalty for tiny datasets.
+    """Small-sample corrected AIC (AICc) with extra penalty for tiny datasets.
+
+    Parameters
+    ----------
+    aic : float
+        Uncorrected AIC value.
+    n : int
+        Number of observations.
+    k : int
+        Number of free parameters (including σ²).
+
+    Returns
+    -------
+    float
+        AICc value; ``inf`` when the correction denominator is non-positive.
     """
     if k <= 0:
         return aic
@@ -180,7 +240,7 @@ def _aicc(aic: float, n: int, k: int) -> float:
 
 
 def _trend_strength(y: jnp.ndarray) -> float:
-    """Calculate trend strength using detrended residuals (FIXED)"""
+    """Calculate trend strength as ``|slope| / std(residuals)``."""
     y = jnp.asarray(y, dtype=jnp.float64)
     n = int(y.shape[0])
     t = jnp.arange(n, dtype=jnp.float64)
@@ -197,7 +257,7 @@ def _trend_strength(y: jnp.ndarray) -> float:
 
 
 def _seasonal_strength(y: jnp.ndarray, m: int) -> float:
-    """Calculate seasonal strength using detrended data (FIXED)"""
+    """Calculate seasonal strength as ``std(seasonal_means) / std(detrended)``."""
     y = jnp.asarray(y, dtype=jnp.float64)
     if m <= 1 or y.shape[0] < 2 * m:
         return 0.0
@@ -236,8 +296,21 @@ def _prepare_init_state(
 
 
 def _compute_ic(lik: float, n: int, k: int) -> tuple[float, float, float]:
-    """
-    Compute AIC/BIC/AICc from the scalar objective `lik`.
+    """Compute AIC, BIC, and AICc from the likelihood-style scalar *lik*.
+
+    Parameters
+    ----------
+    lik : float
+        Gaussian log-likelihood proxy (as returned by the rollout).
+    n : int
+        Number of observations.
+    k : int
+        Number of free parameters (including σ²).
+
+    Returns
+    -------
+    tuple[float, float, float]
+        ``(AIC, BIC, AICc)``.
     """
     aic = float(lik) + 2 * k
     bic = float(lik) + math.log(n) * k
@@ -284,7 +357,26 @@ def _choose_unified_components(
     m: int,
     allow_multiplicative_trend: bool,
 ) -> tuple[str, str, str]:
-    """Unified heuristic for component selection (FIXED THRESHOLDS)"""
+    """Heuristic pre-selection of ETS (error, trend, season) components.
+
+    Uses coefficient-of-variation, trend-strength, and seasonal-strength
+    scores to narrow the full model grid down to a single ``(E, T, S)``
+    triple before the main candidate-selection loop.
+
+    Parameters
+    ----------
+    y : jnp.ndarray
+        Observed series.
+    m : int
+        Seasonal period.
+    allow_multiplicative_trend : bool
+        If ``True``, ``"M"`` trend is a possible output.
+
+    Returns
+    -------
+    tuple[str, str, str]
+        ``(error, trend, season)`` each in ``{"A", "M", "N"}``.
+    """
     y = jnp.asarray(y, dtype=jnp.float64)
     n = int(y.shape[0])
     positive = float(jnp.min(y)) > 0
@@ -318,6 +410,7 @@ def _choose_unified_components(
 
 
 def _inv_sigmoid_scaled(val: float, low: float, high: float) -> float:
+    """Inverse of the legacy scaled-sigmoid transform: constrained → unconstrained."""
     z = (val - low) / (high - low)
     z = jnp.clip(z, 1e-4, 1.0 - 1e-4)
     return float(jnp.log(z / (1.0 - z)))
@@ -334,6 +427,33 @@ def _transform_smoothing_params_unconstrained(
     upper: jnp.ndarray,
     pure_sigmoid: bool = False,
 ) -> tuple[float, float, float, float]:
+    """Decode optimised smoothing parameters from unconstrained space.
+
+    This is the Python-side mirror of
+    :func:`ets_backend._transform_smoothing_params` used *after*
+    optimisation to recover human-readable parameter values from the
+    raw optimiser output.
+
+    Parameters
+    ----------
+    p : jnp.ndarray
+        Unconstrained parameter vector (only the entries named in
+        *opt_names* are consumed).
+    opt_names : list[str]
+        Ordered list of parameter names being optimised, e.g.
+        ``["alpha", "beta"]``.
+    alpha, beta, gamma, phi : float
+        Current / default values for parameters *not* in *opt_names*.
+    lower, upper : jnp.ndarray
+        Box-constraint bounds (length 4).
+    pure_sigmoid : bool
+        Which parameterisation mode was used during optimisation.
+
+    Returns
+    -------
+    tuple[float, float, float, float]
+        ``(alpha, beta, gamma, phi)`` in constrained space.
+    """
     idx = 0
     lower = jnp.asarray(lower, dtype=jnp.float64)
     upper = jnp.asarray(upper, dtype=jnp.float64)
@@ -511,8 +631,33 @@ def etssimulate(
     y: jnp.ndarray,
     e: jnp.ndarray,
 ) -> jnp.ndarray:
-    """
-    Simulate h-step future sample paths from a given ETS state.
+    """Simulate *h*-step future sample paths from a given ETS state.
+
+    Thin convenience wrapper around the JIT-compiled
+    :func:`_etssimulate_jit`; the ``y`` argument is unused (output is
+    returned from the inner function).
+
+    Parameters
+    ----------
+    x : jnp.ndarray
+        State vector (level [+ trend] [+ seasonal]).
+    m : int
+        Seasonal period.
+    error, trend, season : _ets.Component
+        Model structure flags.
+    alpha, beta, gamma, phi : float
+        Smoothing parameters.
+    h : int
+        Forecast horizon.
+    y : jnp.ndarray
+        Pre-allocated output buffer (*unused* — kept for API parity).
+    e : jnp.ndarray
+        Innovation draws of length ``h`` (e.g. from ``N(0, σ)``).
+
+    Returns
+    -------
+    jnp.ndarray
+        Simulated future path of length ``h``.
     """
     y = _etssimulate_jit(
         x,
@@ -874,7 +1019,26 @@ def _seasonal_decompose_jax(
     m: int,
     multiplicative: bool,
 ) -> Dict[str, jnp.ndarray]:
-    """Lightweight JAX-native seasonal decomposition for initialization."""
+    """Lightweight JAX-native seasonal decomposition for ETS state initialisation.
+
+    Computes a centred moving-average trend proxy and derives seasonal
+    patterns from the de-trended residuals (additive) or ratios
+    (multiplicative).
+
+    Parameters
+    ----------
+    y : jnp.ndarray
+        Observed series.
+    m : int
+        Seasonal period.
+    multiplicative : bool
+        If ``True``, decompose as ``y / trend``; otherwise ``y − trend``.
+
+    Returns
+    -------
+    dict[str, jnp.ndarray]
+        ``{"seasonal": …, "trend": …}`` arrays aligned with ``y``.
+    """
     y = jnp.asarray(y, dtype=jnp.float64)
     n = y.shape[0]
     m_eff = max(int(m), 1)
@@ -1006,8 +1170,21 @@ def initstate(y, m, trendtype, seasontype):
 
 
 def switch(x: str) -> _ets.Component:
-    """
-    Map string flags {"N","A","M"} to `_ets.Component` enum.
+    """Map a single-character component string to the :class:`ets_backend.Component` enum.
+
+    Parameters
+    ----------
+    x : str
+        One of ``"N"`` (Nothing), ``"A"`` (Additive), ``"M"`` (Multiplicative).
+
+    Returns
+    -------
+    _ets.Component
+
+    Raises
+    ------
+    ValueError
+        If *x* is not a recognised flag.
     """
     if x == "N":
         return _ets.Component.Nothing
@@ -1019,10 +1196,21 @@ def switch(x: str) -> _ets.Component:
 
 
 def switch_criterion(x: str) -> _ets.Criterion:
-    """
-    Map objective string to `_ets.Criterion` enum.
+    """Map an objective string to the :class:`ets_backend.Criterion` enum.
 
-    Accepted values: {"lik","mse","amse","sigma","mae"}.
+    Parameters
+    ----------
+    x : str
+        One of ``"lik"``, ``"mse"``, ``"amse"``, ``"sigma"``, ``"mae"``.
+
+    Returns
+    -------
+    _ets.Criterion
+
+    Raises
+    ------
+    ValueError
+        If *x* is not a recognised objective name.
     """
     if x == "lik":
         return _ets.Criterion.Likelihood
@@ -1322,26 +1510,54 @@ def etsmodel(
     selection_mode: bool = False,
     init_state_override: jnp.ndarray | None = None,
 ):
-    """
-    Fit a *single* ETS structure to the data and return a stats-like result dict.
+    """Fit a *single* ETS specification to the data and return a result dict.
 
-    This function:
-    1) initializes or accepts smoothing params via `initparam`,
-    2) checks ranges/admissibility via `check_param`,
-    3) builds initial states via `initstate`,
-    4) optimizes smoothing+state vector with `_ets.optimize`,
-    5) re-runs the rollout to compute likelihood, residuals, fitted values,
-    6) computes information criteria (AIC, BIC, AICc), sigma2, and aggregates
-       outputs in a dictionary.
+    Pipeline
+    --------
+    1. Initialise / sanitise smoothing parameters via :func:`initparam`.
+    2. Check ranges and admissibility via :func:`check_param`.
+    3. Build initial states via :func:`initstate` (cached).
+    4. Optimise the smoothing + (optional) state vector with
+       :func:`ets_backend.optimize_bfgs_smoothing`.
+    5. Re-run the full rollout to obtain likelihood, residuals, and fitted
+       values.
+    6. Compute information criteria (AIC, BIC, AICc) and σ².
+
+    Parameters
+    ----------
+    y : jnp.ndarray
+        Observed time series.
+    m : int
+        Seasonal period.
+    errortype, trendtype, seasontype : str
+        Fixed structure flags (``"A"`` / ``"M"`` / ``"N"``).
+    damped : bool
+        Whether the trend is damped.
+    alpha, beta, gamma, phi : float
+        Starting / fixed smoothing parameters (``NaN`` → optimise).
+    lower, upper : jnp.ndarray
+        Box-constraint bounds (length 4).
+    opt_crit : str
+        Optimisation objective (``"lik"`` / ``"mse"`` / ``"amse"`` /
+        ``"sigma"`` / ``"mae"``).
+    nmse : int
+        AMSE horizon (1–30).
+    bounds : str
+        Bound mode (``"both"`` / ``"usual"`` / ``"admissible"``).
+    maxit : int
+        Maximum iterations passed to the optimiser.
+    optax_steps : int | None
+        Explicit number of optax steps (``None`` → auto-estimate).
+    selection_mode : bool
+        If ``True``, skip state-history storage (fast path for model
+        selection; ``fitted`` and ``states`` will be ``None``).
 
     Returns
     -------
     dict
-        Modeled fields include:
-        - "loglik", "aic", "bic", "aicc", "mse", "amse", "sigma2"
-        - "fit" (opt result), "residuals", "fitted"
-        - "components" (e.g., "AAd" flags), "m", "nstate", "states"
-        - "par" (alpha,beta,gamma,phi + initial states), "n_params"
+        Keys: ``loglik``, ``aic``, ``bic``, ``aicc``, ``mse``, ``amse``,
+        ``sigma2``, ``fit``, ``residuals``, ``fitted``, ``components``,
+        ``m``, ``nstate``, ``states``, ``par``, ``n_params``.
     """
     if seasontype == "N":
         m = 1
@@ -1595,15 +1811,8 @@ def etsmodel(
     )
 
 
-def is_constant(x):
-    """
-    Quick check for a constant series.
-
-    Returns
-    -------
-    bool
-        True if all entries equal the first entry.
-    """
+def is_constant(x: jnp.ndarray) -> bool:
+    """Return ``True`` if every element of *x* equals the first element."""
     x = jnp.asarray(x)
     return bool(jnp.all(x[0] == x))
 
@@ -1640,58 +1849,77 @@ def ets_f(
     pad_to=None,
     bucket_size=None,
 ):
-    """
-    Top-level ETS interface: model selection + fitting.
+    """Top-level ETS entry-point: automatic model selection **and** fitting.
+
+    When *model* is a three-character string (e.g. ``"ZZZ"``), every ``"Z"``
+    is expanded into a grid of candidate component types.  Each candidate is
+    fitted via :func:`etsmodel` and scored by the chosen information
+    criterion; the winner is returned.
+
+    When *model* is a ``dict`` (a previously-fitted result), this function
+    acts as a **forward** step — rolling the stored parameters over new
+    data without re-optimisation.
 
     Parameters
     ----------
     y : array-like
-        Time series (float64).
+        Time series (cast to float64 internally).
     m : int
-        Seasonal period.
-    model : str or dict
-        - If str like "ZZZ", expands to grids:
-          error in {"A","M"}, trend in {"N","A"[,"M" if allowed]}, season in {"N","A","M"},
-          damped in {True, False} if None.
-        - If dict (a previously-fitted object), forecast forward using stored params.
-    damped : Optional[bool]
-        If None, both damped and undamped are tried for trend != "N".
-    alpha, beta, gamma, phi : Optional[float]
-        Provide to fix values (set the others to NaN to optimize).
-    additive_only : Optional[bool]
-        If True, forbids multiplicative forms.
-    blambda, biasadj : unused
-        Not implemented here (Box-Cox/bias adjustment).
-    lower, upper : Optional[array]
-        Bounds for (alpha, beta, gamma, phi); defaults applied if None.
-    opt_crit : {"lik","mse","amse","sigma","mae"}
-        Optimization criterion.
+        Seasonal period (``1`` for non-seasonal data).
+    model : str | dict
+        ``"ZZZ"`` for full auto-selection, a fixed spec like ``"AAN"``
+        for a single fit, or a previously-fitted dict for the forward path.
+    damped : bool | None
+        ``None`` → try both damped and undamped; ``True`` / ``False`` →
+        fix the choice.
+    alpha, beta, gamma, phi : float | None
+        ``None`` → optimise; provide a float to fix the value.
+    additive_only : bool | None
+        If ``True``, forbid all multiplicative component types.
+    blambda, biasadj
+        *(Not implemented — Box-Cox / bias-adjustment placeholders.)*
+    lower, upper : array-like | None
+        Box bounds for ``[α, β, γ, φ]``; sensible defaults applied when
+        ``None``.
+    opt_crit : str
+        Optimisation objective (``"lik"`` / ``"mse"`` / ``"amse"`` /
+        ``"sigma"`` / ``"mae"``).
     nmse : int
-        Horizon for AMSE tracking (1..30).
-    bounds : {"both","usual","admissible"}
-        Bound/admissibility behavior.
-    ic : {"aicc","aic","bic"}
-        Information criterion used to pick the best among candidates.
+        AMSE tracking horizon (1–30).
+    bounds : str
+        Bound mode (``"both"`` / ``"usual"`` / ``"admissible"``).
+    ic : str
+        Information criterion for model selection (``"aicc"`` / ``"aic"``
+        / ``"bic"``).
     restrict : bool
-        Apply standard ETS combination restrictions (forbid certain mixes).
+        Apply standard ETS combination restrictions (e.g. forbid MMA).
     allow_multiplicative_trend : bool
-        If True and model="ZZZ", includes "M" trend in the grid.
+        Include ``"M"`` trend in the candidate grid.
     use_initial_values : bool
-        Reserved; not used here.
+        *(Reserved — not used.)*
     maxit : int
-        Maximum iterations budget (passed to optimizer).
+        Maximum iteration budget passed to the optimiser.
+    optax_steps : int | None
+        Explicit optax step count (``None`` → auto-estimated from data).
 
     Returns
     -------
     dict
-        Best fitted model dictionary (see `etsmodel` return schema) with an
-        added "method" key like "ETS(A,Ad,M)".
+        Best-fitted model dictionary (see :func:`etsmodel`) with an added
+        ``"method"`` key, e.g. ``"ETS(A,Ad,M)"``.
+
+    Raises
+    ------
+    ValueError
+        If no admissible model can be found, or if parameter bounds are
+        inconsistent.
 
     Notes
     -----
-    - When `model` is a dict, this function acts as a *forward* function (no re-fit).
-    - When `y` is constant, it falls back to ANN with alpha≈1 to mimic
-      standard implementations.
+    * Constant series fall back to ``ANN`` with ``α ≈ 1``.
+    * The candidate grid is aggressively pruned using heuristic
+      strength scores and early-stopping so that cold-start latency
+      remains low even for ``"ZZZ"`` on long series.
     """
     y = jnp.asarray(y, dtype=jnp.float64)
     n = len(y)
@@ -2514,20 +2742,25 @@ def forecast_ets(obj, h, level=None):
     return out
 
 
-def forward_ets(fitted_model, y):
-    """
-    Reuse a previously fitted ETS model dictionary to roll forward on new data.
+def forward_ets(fitted_model: dict, y: jnp.ndarray) -> dict:
+    """Roll a previously fitted ETS model forward on *new* data.
+
+    The stored model structure and smoothing parameters are reused — no
+    re-optimisation takes place.  Internally this calls :func:`ets_f`
+    with ``model=fitted_model`` which triggers the dict-input branch.
 
     Parameters
     ----------
     fitted_model : dict
-        Output of `ets_f` / `etsmodel` with learned params & states.
+        Output of :func:`ets_f` / :func:`etsmodel` (must contain
+        ``"m"``, ``"components"``, ``"par"``, ``"fit"``, ``"n_params"``).
     y : array-like
-        New time series segment to append/continue the fit.
+        New time series segment.
 
     Returns
     -------
     dict
-        New fitted model dict (same schema), reusing structure & params.
+        Fresh model dict with updated residuals, fitted values, and states
+        computed on *y*, but the same structure and parameters.
     """
     return ets_f(y=y, m=fitted_model["m"], model=fitted_model)
