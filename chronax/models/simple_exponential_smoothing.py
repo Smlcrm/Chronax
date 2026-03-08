@@ -128,6 +128,8 @@ class SimpleExponentialSmoothing(BaseForecaster):
         h: int,
         X: jnp.ndarray | None = None,
         X_future: jnp.ndarray | None = None,
+        level: list[int | float] | None = None,
+        fitted: bool = False,
     ) -> dict:
         r"""Memory-efficient stateless fit+predict in one call.
 
@@ -140,6 +142,8 @@ class SimpleExponentialSmoothing(BaseForecaster):
             h (int): Forecast horizon (number of steps ahead).
             X (jnp.ndarray | None): In-sample exogenous variables (unused; included for API compatibility). Default is None.
             X_future (jnp.ndarray | None): Future exogenous variables (unused; included for API compatibility). Default is None.
+            level (list[int | float] | None): Confidence levels (unused; included for BaseForecaster compliance). Default is None.
+            fitted (bool): Whether to return fitted values (unused; included for BaseForecaster compliance). Default is False.
 
         Returns:
             dict: Dictionary containing ``"mean"``, point forecasts of shape (h,), all equal to the final smoothed level.

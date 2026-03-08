@@ -900,6 +900,8 @@ class AutoCES(BaseForecaster):
         h: int,
         X: Optional[jnp.ndarray] = None,
         X_future: Optional[jnp.ndarray] = None,
+        level: Optional[List[int]] = None,
+        fitted: bool = False,
     ) -> Dict:
         """Stateless fit+forecast: fit if not already done, then generate forecasts.
 
@@ -910,9 +912,9 @@ class AutoCES(BaseForecaster):
             y (jnp.ndarray): Input time series of shape (n,). Used only if not fitted.
             h (int): Forecast horizon (number of steps ahead).
             X (Optional[jnp.ndarray]): Exogenous variables (unused). Default is None.
-
-            X_future (Optional[jnp.ndarray]): Future exogenous variables (unused).
-                Default is None.
+            X_future (Optional[jnp.ndarray]): Future exogenous variables (unused). Default is None.
+            level (Optional[List[int]]): Confidence levels (unused; included for BaseForecaster compliance). Default is None.
+            fitted (bool): Whether to return fitted values (unused; included for BaseForecaster compliance). Default is False.
 
         Returns:
             Dict: Dictionary with key "mean" containing forecasts of shape (h,).

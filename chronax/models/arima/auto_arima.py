@@ -3248,7 +3248,7 @@ class AutoARIMA(BaseForecaster):
         
         return self
     
-    def forecast(self, h: int, y: jnp.ndarray, X: Optional[jnp.ndarray] = None) -> Dict[str, jnp.ndarray]:
+    def forecast(self, h: int, y: jnp.ndarray, X: Optional[jnp.ndarray] = None, X_future: Optional[jnp.ndarray] = None, level: Optional[list] = None, fitted: bool = False) -> Dict[str, jnp.ndarray]:
         """
         Produce fast forecasts from history with cached-order optimization.
 
@@ -3261,6 +3261,9 @@ class AutoARIMA(BaseForecaster):
             h (int): Forecast horizon.
             y (jnp.ndarray): Input history series.
             X (jnp.ndarray | None, optional): Optional exogenous matrix.
+            X_future (jnp.ndarray | None, optional): Future exogenous regressors (unused; included for BaseForecaster compliance). Default is None.
+            level (list | None, optional): Confidence levels (unused; included for BaseForecaster compliance). Default is None.
+            fitted (bool, optional): Whether to return fitted values (unused; included for BaseForecaster compliance). Default is False.
 
         Returns:
             dict[str, jnp.ndarray]: Forecast dictionary containing `mean`.
@@ -3595,7 +3598,7 @@ class ARIMA(BaseForecaster):
         
         return self
 
-    def forecast(self, h: int, y: jnp.ndarray, X: Optional[jnp.ndarray] = None) -> Dict[str, jnp.ndarray]:
+    def forecast(self, h: int, y: jnp.ndarray, X: Optional[jnp.ndarray] = None, X_future: Optional[jnp.ndarray] = None, level: Optional[list] = None, fitted: bool = False) -> Dict[str, jnp.ndarray]:
         """
         Fit the fixed-order model on the given series and return h-step forecasts in one shot.
 
@@ -3614,6 +3617,9 @@ class ARIMA(BaseForecaster):
             h (int): Forecast horizon.
             y (jnp.ndarray): Training series (used only for this call).
             X (Optional[jnp.ndarray]): Exogenous regressors; not used in current fast path.
+            X_future (Optional[jnp.ndarray]): Future exogenous regressors (unused; included for BaseForecaster compliance). Default is None.
+            level (list | None, optional): Confidence levels (unused; included for BaseForecaster compliance). Default is None.
+            fitted (bool, optional): Whether to return fitted values (unused; included for BaseForecaster compliance). Default is False.
 
         Returns:
             Dict[str, jnp.ndarray]: {"mean": array of shape (h,)}.

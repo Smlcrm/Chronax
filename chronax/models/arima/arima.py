@@ -259,7 +259,7 @@ class ARIMA(BaseForecaster):
         
         return self
 
-    def forecast(self, h: int, y: jnp.ndarray, X: Optional[jnp.ndarray] = None) -> Dict[str, jnp.ndarray]:
+    def forecast(self, h: int, y: jnp.ndarray, X: Optional[jnp.ndarray] = None, X_future: Optional[jnp.ndarray] = None, level: Optional[list] = None, fitted: bool = False) -> Dict[str, jnp.ndarray]:
         """
         Fit and forecast in one call.
 
@@ -272,6 +272,9 @@ class ARIMA(BaseForecaster):
             h (int): Forecast horizon.
             y (jnp.ndarray): Source training series.
             X (jnp.ndarray | None, optional): Exogenous regressors. The fast path currently does not use exogenous variables.
+            X_future (jnp.ndarray | None, optional): Future exogenous regressors (unused; included for BaseForecaster compliance). Default is None.
+            level (list | None, optional): Confidence levels (unused; included for BaseForecaster compliance). Default is None.
+            fitted (bool, optional): Whether to return fitted values (unused; included for BaseForecaster compliance). Default is False.
 
         Returns:
             dict[str, jnp.ndarray]: Forecast dictionary containing `mean`.

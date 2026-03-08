@@ -281,7 +281,9 @@ class MSTL(BaseForecaster):
         y: jnp.ndarray,
         h: int,
         X: jnp.ndarray | None = None,
-        X_future: jnp.ndarray | None = None
+        X_future: jnp.ndarray | None = None,
+        level: int | tuple[int, ...] | None = None,
+        fitted: bool = False,
     ) -> dict:
         """
         Fit and forecast in one step, used for conformity score computation.
@@ -295,11 +297,13 @@ class MSTL(BaseForecaster):
             h (int): Forecast horizon (number of steps ahead).
             X (jnp.ndarray | None): Exogenous variables for training period (not used by MSTL). Default is None.
             X_future (jnp.ndarray | None): Exogenous variables for forecast period (not used by MSTL). Default is None.
+            level (int | tuple[int, ...] | None): Confidence levels for prediction intervals. Default is None.
+            fitted (bool): Whether to return fitted values. Default is False.
 
         Returns:
             dict: Forecast dictionary with same structure as predict() output.
         """
-        return self.new().fit(y, X).predict(h, X)
+        return self.new().fit(y, X).predict(h, X, level=level)
 
 
 # =========================

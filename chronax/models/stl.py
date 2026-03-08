@@ -329,6 +329,8 @@ class STL(BaseForecaster):
         h: int,
         X: jnp.ndarray | None = None,
         X_future: jnp.ndarray | None = None,
+        level: int | tuple[int, ...] | None = None,
+        fitted: bool = False,
     ) -> dict:
         """
         Generate forecasts on fresh data for conformity score computation.
@@ -342,13 +344,15 @@ class STL(BaseForecaster):
             h (int): Forecast horizon (number of steps ahead to predict).
             X (jnp.ndarray | None, optional): Exogenous variables for fitting (not used by STL). Defaults to None.
             X_future (jnp.ndarray | None, optional): Future exogenous variables for prediction (not used by STL). Defaults to None.
+            level (int | tuple[int, ...] | None, optional): Confidence levels for prediction intervals. Defaults to None.
+            fitted (bool, optional): Whether to return fitted values. Defaults to False.
 
         Returns:
             dict: Dictionary containing:
 
                 - mean (jnp.ndarray): Point forecasts, shape (h,).
         """
-        return self.new().fit(y, X).predict(h, X)
+        return self.new().fit(y, X).predict(h, X, level=level)
 
 
 # =========================
