@@ -24,7 +24,7 @@ Confidence Intervals
 Instance Attributes
 1. alias: model name, declared on initialization
 2. conformal_params: optional conformal_intervals object to enable conformal interval computation
-3. model_: dictionary storing fitted artifacts, e.g. mean, fitted values, sigma, n
+3. ``model_``: dictionary storing fitted artifacts, e.g. mean, fitted values, sigma, n
 
 Class Attributes
 - uses_exog: whether the model supports exogenous variables (False for HistoricAverage)
@@ -100,8 +100,7 @@ class HistoricAverage(BaseForecaster):
 
         Args:
             y (jnp.ndarray): Clean time series of shape (t,).
-            X (jnp.ndarray | None): Exogenous variables (unused; included for
-                API compatibility). Default is None.
+            X (jnp.ndarray | None): Exogenous variables (unused; included for API compatibility). Default is None.
 
         Returns:
             HistoricAverage: Self (fitted model instance).
@@ -133,13 +132,12 @@ class HistoricAverage(BaseForecaster):
 
         Args:
             h (int): Forecast horizon (number of steps ahead).
-            X (jnp.ndarray | None): Exogenous variables (unused; included for
-                API compatibility). Default is None.
-            level (list[int] | None): Confidence levels (0–100) for prediction
-                intervals, e.g. [80, 95]. If None, only point forecasts are returned.
+            X (jnp.ndarray | None): Exogenous variables (unused; included for API compatibility). Default is None.
+            level (list[int] | None): Confidence levels (0-100) for prediction intervals, e.g. [80, 95]. If None, only point forecasts are returned.
 
         Returns:
             dict: Dictionary containing:
+
                 - "mean": Point forecasts of shape (h,), all equal to the historical mean.
                 - "lo-{l}" / "hi-{l}": Interval bounds for each level l
                   (only present when level is not None).
@@ -169,11 +167,11 @@ class HistoricAverage(BaseForecaster):
         σ_h = σ · √(1 + 1/n).
 
         Args:
-            level (list[int] | None): Confidence levels (0–100) for fitted
-                prediction intervals, e.g. [80, 95]. Default is None.
+            level (list[int] | None): Confidence levels (0-100) for fitted prediction intervals, e.g. [80, 95]. Default is None.
 
         Returns:
             dict: Dictionary containing:
+
                 - "fitted": In-sample predictions of shape (t,).
                 - "fitted-lo-{l}" / "fitted-hi-{l}": Fitted interval bounds for
                   each level l (only present when level is not None).
@@ -199,17 +197,14 @@ class HistoricAverage(BaseForecaster):
         Args:
             y (jnp.ndarray): Clean time series of shape (t,).
             h (int): Forecast horizon (number of steps ahead).
-            X (jnp.ndarray | None): In-sample exogenous variables (unused;
-                included for API compatibility). Default is None.
-            X_future (jnp.ndarray | None): Future exogenous variables (unused;
-                included for API compatibility). Default is None.
-            level (list[int] | None): Confidence levels (0–100) for prediction
-                intervals, e.g. [80, 95]. Default is None.
-            fitted (bool): Whether to include in-sample fitted values in the output.
-                Default is False.
+            X (jnp.ndarray | None): In-sample exogenous variables (unused; included for API compatibility). Default is None.
+            X_future (jnp.ndarray | None): Future exogenous variables (unused; included for API compatibility). Default is None.
+            level (list[int] | None): Confidence levels (0-100) for prediction intervals, e.g. [80, 95]. Default is None.
+            fitted (bool): Whether to include in-sample fitted values in the output. Default is False.
 
         Returns:
             dict: Dictionary containing:
+
                 - "mean": Point forecasts of shape (h,), all equal to the historical mean.
                 - "fitted": In-sample fitted values of shape (t,) (only if fitted=True).
                 - "lo-{l}" / "hi-{l}": Forecast interval bounds for each level l

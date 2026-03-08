@@ -48,36 +48,20 @@ class MSTL(BaseForecaster):
     and weekly patterns.
 
     Args:
-        period (int | list[int]): Seasonal period(s) to extract. Can be a single
-            integer or list of integers. Periods are sorted in ascending order internally.
-            For example, [7, 365] for weekly and yearly seasonality.
-        iterate (int): Number of outer refinement iterations to improve decomposition.
-            Ignored when only a single period is specified. Default is 2.
-        s_window (int | list[int] | None): Seasonal smoother window size(s), one per
-            period. Must be odd. If None, defaults to [11, 15, 19, 23, 27, 31] for
-            the first periods. If a single int, uses the same window for all periods.
-        seasonal_deg (int): Polynomial degree (0 or 1) for seasonal LOESS smoother.
-            Default is 0.
-        trend_deg (int): Polynomial degree (0 or 1) for trend LOESS smoother.
-            Default is 1.
-        seasonal_jump (int): Jump step for seasonal LOESS to speed up computation.
-            Minimum value is 1. Default is 1.
-        trend_jump (int): Jump step for trend LOESS to speed up computation.
-            Minimum value is 1. Default is 1.
-        inner (int): Number of inner STL iterations performed for each period
-            extraction. Default is 1.
-        trend_window (int | None): Trend smoother window size. Must be odd. If None,
-            derived automatically from the largest period as (2 * largest_period + 1) | 1.
-        low_pass (int | None): Low-pass filter window for seasonal stabilization.
-            Must be odd if specified.
-        tail_window (int | None): Number of tail points to use for linear trend
-            extrapolation in forecasting. If None, defaults to min(n, 2*largest_period+1)
-            when periods exist, or max(5, n//10) otherwise.
-        fitted (bool): Whether to include decomposition components (trend, seasonals,
-            remainder) in predict_in_sample output. Default is True.
+        period (int | list[int]): Seasonal period(s) to extract. Can be a single integer or list of integers. Periods are sorted in ascending order internally. For example, [7, 365] for weekly and yearly seasonality.
+        iterate (int): Number of outer refinement iterations to improve decomposition. Ignored when only a single period is specified. Default is 2.
+        s_window (int | list[int] | None): Seasonal smoother window size(s), one per period. Must be odd. If None, defaults to [11, 15, 19, 23, 27, 31] for the first periods. If a single int, uses the same window for all periods.
+        seasonal_deg (int): Polynomial degree (0 or 1) for seasonal LOESS smoother. Default is 0.
+        trend_deg (int): Polynomial degree (0 or 1) for trend LOESS smoother. Default is 1.
+        seasonal_jump (int): Jump step for seasonal LOESS to speed up computation. Minimum value is 1. Default is 1.
+        trend_jump (int): Jump step for trend LOESS to speed up computation. Minimum value is 1. Default is 1.
+        inner (int): Number of inner STL iterations performed for each period extraction. Default is 1.
+        trend_window (int | None): Trend smoother window size. Must be odd. If None, derived automatically from the largest period as (2 * largest_period + 1) | 1.
+        low_pass (int | None): Low-pass filter window for seasonal stabilization. Must be odd if specified.
+        tail_window (int | None): Number of tail points to use for linear trend extrapolation in forecasting. If None, defaults to min(n, 2*largest_period+1) when periods exist, or max(5, n//10) otherwise.
+        fitted (bool): Whether to include decomposition components (trend, seasonals, remainder) in predict_in_sample output. Default is True.
         alias (str): Model name identifier. Default is "MSTL".
-        conformal_params (ConformalIntervals | None): Configuration for conformal
-            prediction intervals. If None, no intervals are computed.
+        conformal_params (ConformalIntervals | None): Configuration for conformal prediction intervals. If None, no intervals are computed.
     """
     uses_exog = False
 
@@ -140,17 +124,15 @@ class MSTL(BaseForecaster):
         Fit MSTL decomposition to the input time series.
 
         Performs iterative STL decomposition to extract multiple seasonal components,
-        trend, and remainder. The decomposition is stored in self.model_ for use in
-        prediction methods.
+        trend, and remainder. The decomposition is stored in ``self.model_`` for use
+        in prediction methods.
 
         Args:
-            y (jnp.ndarray): Input time series data. Will be reshaped to 1D and
-                converted to float.
-            X (jnp.ndarray | None): Exogenous variables (not used by MSTL, included
-                for interface conformity). Default is None.
+            y (jnp.ndarray): Input time series data. Will be reshaped to 1D and converted to float.
+            X (jnp.ndarray | None): Exogenous variables (not used by MSTL, included for interface conformity). Default is None.
 
         Returns:
-            MSTL: Self, with model_ attribute populated containing:
+            MSTL: Self, with ``model_`` attribute populated containing:
                 - "y": Original input series
                 - "trend": Extracted trend component
                 - "seasonals": 2D array of shape (n_periods, n) with seasonal components
@@ -219,20 +201,17 @@ class MSTL(BaseForecaster):
 
         Args:
             X (jnp.ndarray | None): Exogenous variables (not used by MSTL). Default is None.
-            level (list[int | float] | None): Confidence levels for conformal prediction
-                intervals (e.g., [90, 95]). If None, no intervals are computed.
+            level (list[int | float] | None): Confidence levels for conformal prediction intervals (e.g., [90, 95]). If None, no intervals are computed.
 
         Returns:
             dict: Dictionary containing:
+
                 - "mean": Fitted values (trend + all seasonals)
                 - "fitted": Same as "mean" (included if self.fitted is True)
                 - "trend": Extracted trend component (if self.fitted is True)
-                - "seasonal" or "seasonal{p}": Seasonal component(s). Single period uses
-                  "seasonal", multiple periods use "seasonal{p}" where p is the period length.
-                  (included if self.fitted is True)
+                - "seasonal" or "seasonal{p}": Seasonal component(s). Single period uses "seasonal", multiple periods use "seasonal{p}" where p is the period length. (included if self.fitted is True)
                 - "remainder": Residual component (if self.fitted is True)
-                - "lo-{level}" and "hi-{level}": Conformal prediction interval bounds
-                  for each specified level (if level is provided)
+                - "lo-{level}" and "hi-{level}": Conformal prediction interval bounds for each specified level (if level is provided)
         """
         y = self.model_["y"]
         trend = self.model_["trend"]
@@ -262,16 +241,14 @@ class MSTL(BaseForecaster):
 
         Args:
             h (int): Forecast horizon (number of steps ahead).
-            X (jnp.ndarray | None): Exogenous variables for forecast period (not used
-                by MSTL). Default is None.
-            level (list[int | float] | None): Confidence levels for conformal prediction
-                intervals (e.g., [90, 95]). If None, no intervals are computed.
+            X (jnp.ndarray | None): Exogenous variables for forecast period (not used by MSTL). Default is None.
+            level (list[int | float] | None): Confidence levels for conformal prediction intervals (e.g., [90, 95]). If None, no intervals are computed.
 
         Returns:
             dict: Dictionary containing:
+
                 - "mean": Point forecasts (extrapolated trend + repeated seasonals)
-                - "lo-{level}" and "hi-{level}": Conformal prediction interval bounds
-                  for each specified level (if level is provided)
+                - "lo-{level}" and "hi-{level}": Conformal prediction interval bounds for each specified level (if level is provided)
         """
         h = int(h)
         y = self.model_["y"]
@@ -316,10 +293,8 @@ class MSTL(BaseForecaster):
         Args:
             y (jnp.ndarray): Input time series data.
             h (int): Forecast horizon (number of steps ahead).
-            X (jnp.ndarray | None): Exogenous variables for training period (not used
-                by MSTL). Default is None.
-            X_future (jnp.ndarray | None): Exogenous variables for forecast period
-                (not used by MSTL). Default is None.
+            X (jnp.ndarray | None): Exogenous variables for training period (not used by MSTL). Default is None.
+            X_future (jnp.ndarray | None): Exogenous variables for forecast period (not used by MSTL). Default is None.
 
         Returns:
             dict: Forecast dictionary with same structure as predict() output.

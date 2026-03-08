@@ -3004,7 +3004,7 @@ class AutoARIMA(BaseForecaster):
 
     Attributes:
         uses_exog (bool): Whether exogenous features are supported.
-        model_ (dict[str, Any] | None): Fitted model payload after `fit`.
+        ``model_`` (dict[str, Any] | None): Fitted model payload after ``fit``.
         standardize (bool): Whether to normalize series before optimization.
         _cached_order (tuple[int, int, int] | None): Cached best non-seasonal order.
         _cached_seasonal_order (tuple[int, int, int] | None): Cached best seasonal order.

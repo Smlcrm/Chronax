@@ -854,15 +854,12 @@ class MFLES(BaseForecaster):
 
     Args:
         verbose (int): Verbosity level (currently reserved, unused). Default is 1.
-        robust (bool | None): If True, uses Siegel repeated medians for trend fitting.
-            If False, uses OLS. If None, auto-detects based on residual variability.
-            Default is None.
+        robust (bool | None): If True, uses Siegel repeated medians for trend fitting. If False, uses OLS. If None, auto-detects based on residual variability. Default is None.
         alias (str): Model name identifier. Default is "MFLES".
-        conformal_params (ConformalIntervals | None): Conformal prediction configuration
-            for generating prediction intervals. Default is None.
+        conformal_params (ConformalIntervals | None): Conformal prediction configuration for generating prediction intervals. Default is None.
 
     Attributes:
-        model_ (dict): Populated after fit(); contains fitted values and all components.
+        ``model_`` (dict): Populated after fit(); contains fitted values and all components.
         multiplicative (bool): Whether the last fit used multiplicative (log-space) mode.
         penalty (float | None): R²-based trend dampening scalar (set during fit).
         trend_penalty (bool): Whether trend damping is applied during predict().
@@ -919,61 +916,31 @@ class MFLES(BaseForecaster):
 
         Args:
             y (jnp.ndarray): Input time series of shape (n,).
-            seasonal_period (int | list[int] | None): Seasonal period(s) for Fourier
-                features. Pass a list for multiple seasonalities. None disables
-                seasonality. Default is None.
-            X (jnp.ndarray | None): Exogenous design matrix of shape (n, p).
-                Default is None.
-            fourier_order (int | None): Fixed Fourier order for all periods.
-                None uses the auto-heuristic (5 / 10 / 15 based on period length).
-                Default is None.
-            ma (int | list[int] | None): Moving-average window(s) for residual
-                smoothing cadence. None defaults to [1]. Default is None.
-            alpha (float): LASSO regularization strength for changepoint trend.
-                Default is 1.0.
-            decay (float): Unused legacy parameter (kept for API compatibility).
-                Default is -1.
-            n_changepoints (float | int): Number of changepoint knots. A float < 1
-                is treated as a fraction of series length (e.g. 0.25 → 25% of n).
-                An int specifies knots directly. None or 0 disables changepoints.
-                Default is 0.25.
-            seasonal_lr (float): Learning rate multiplier applied to seasonal updates.
-                Default is 0.9.
-            rs_lr (float): Learning rate multiplier for residual-smoothing updates.
-                Default is 1.0.
-            exogenous_lr (float): Learning rate multiplier for exogenous updates.
-                Default is 1.0.
+            seasonal_period (int | list[int] | None): Seasonal period(s) for Fourier features. Pass a list for multiple seasonalities. None disables seasonality. Default is None.
+            X (jnp.ndarray | None): Exogenous design matrix of shape (n, p). Default is None.
+            fourier_order (int | None): Fixed Fourier order for all periods. None uses the auto-heuristic (5 / 10 / 15 based on period length). Default is None.
+            ma (int | list[int] | None): Moving-average window(s) for residual smoothing cadence. None defaults to [1]. Default is None.
+            alpha (float): LASSO regularization strength for changepoint trend. Default is 1.0.
+            decay (float): Unused legacy parameter (kept for API compatibility). Default is -1.
+            n_changepoints (float | int): Number of changepoint knots. A float < 1 is treated as a fraction of series length (e.g. 0.25 = 25% of n). An int specifies knots directly. None or 0 disables changepoints. Default is 0.25.
+            seasonal_lr (float): Learning rate multiplier applied to seasonal updates. Default is 0.9.
+            rs_lr (float): Learning rate multiplier for residual-smoothing updates. Default is 1.0.
+            exogenous_lr (float): Learning rate multiplier for exogenous updates. Default is 1.0.
             exogenous_estimator: Unused legacy parameter. Default is None.
             exogenous_params (dict): Unused legacy parameter. Default is {}.
-            linear_lr (float): Learning rate multiplier for trend updates.
-                Default is 0.9.
-            cov_threshold (float): CoV proxy threshold for auto robust-mode detection.
-                Set to -1 to effectively disable. Default is 0.7.
-            moving_medians (bool): If True, initialises fitted values with period-wise
-                medians instead of zeros. Default is False.
+            linear_lr (float): Learning rate multiplier for trend updates. Default is 0.9.
+            cov_threshold (float): CoV proxy threshold for auto robust-mode detection. Set to -1 to effectively disable. Default is 0.7.
+            moving_medians (bool): If True, initialises fitted values with period-wise medians instead of zeros. Default is False.
             max_rounds (int): Maximum number of fitting iterations. Default is 50.
             min_alpha (float): Minimum SES alpha in the ensemble grid. Default is 0.05.
             max_alpha (float): Maximum SES alpha in the ensemble grid. Default is 1.0.
-            round_penalty (float): Improvement threshold fraction required before
-                accepting a residual-smoothing update. Default is 0.0001.
-            trend_penalty (bool): If True, dampens trend slope by the R² penalty
-                computed on the first trend iteration. Default is True.
-            multiplicative (bool | None): If True, fits in log-space (multiplicative
-                seasonality). If None, auto-detected: True when seasonal_period is set
-                and all values are positive. Default is None.
-            changepoints (bool): If True, enables piecewise linear trend via LASSO.
-                Default is True.
-            smoother (bool): Used only when ses_mode="adaptive": True selects SES
-                ensemble, False selects rolling mean. Default is False.
-            ses_mode (str): Residual smoothing strategy. One of:
-                - "off": no residual smoothing
-                - "lite": rolling mean (StatsForecast default)
-                - "full": SES ensemble
-                - "adaptive": controlled by the `smoother` flag
-                Default is "lite".
-            seasonality_weights (bool): If True, applies recency-weighted OLS for
-                Fourier seasonal fitting. Auto-enabled for multiplicative single-period
-                series. Default is False.
+            round_penalty (float): Improvement threshold fraction required before accepting a residual-smoothing update. Default is 0.0001.
+            trend_penalty (bool): If True, dampens trend slope by the R-squared penalty computed on the first trend iteration. Default is True.
+            multiplicative (bool | None): If True, fits in log-space (multiplicative seasonality). If None, auto-detected: True when seasonal_period is set and all values are positive. Default is None.
+            changepoints (bool): If True, enables piecewise linear trend via LASSO. Default is True.
+            smoother (bool): Used only when ses_mode="adaptive": True selects SES ensemble, False selects rolling mean. Default is False.
+            ses_mode (str): Residual smoothing strategy. One of ``"off"`` (no residual smoothing), ``"lite"`` (rolling mean, StatsForecast default), ``"full"`` (SES ensemble), or ``"adaptive"`` (controlled by the ``smoother`` flag). Default is "lite".
+            seasonality_weights (bool): If True, applies recency-weighted OLS for Fourier seasonal fitting. Auto-enabled for multiplicative single-period series. Default is False.
             gradient_strategy (bool): Legacy flag (currently unused). Default is False.
 
         Returns:
@@ -1261,10 +1228,10 @@ class MFLES(BaseForecaster):
         return self._finalize_fit(fitted, multiplicative)
 
     def _finalize_fit(self, fitted_tr: jnp.ndarray, multiplicative: bool) -> "MFLES":
-        """Reverse scaling on fitted values and populate model_ dict.
+        """Reverse scaling on fitted values and populate ``model_`` dict.
 
         Converts fitted values from transformed space (log or standardised)
-        back to the original scale and stores all components in `self.model_`.
+        back to the original scale and stores all components in ``self.model_``.
 
         Args:
             fitted_tr (jnp.ndarray): Fitted values in transformed space of shape (n,).
@@ -1303,15 +1270,12 @@ class MFLES(BaseForecaster):
 
         Args:
             h (int): Forecast horizon (number of steps ahead).
-            X (jnp.ndarray | None): Future exogenous matrix of shape (h, p).
-                Required only if the model was fitted with exogenous variables.
-                Default is None.
-            level (list[int | float] | None): Confidence levels (0–100) for conformal
-                prediction intervals, e.g. [80, 95]. Requires `conformal_params` to
-                be set. Default is None.
+            X (jnp.ndarray | None): Future exogenous matrix of shape (h, p). Required only if the model was fitted with exogenous variables. Default is None.
+            level (list[int | float] | None): Confidence levels (0-100) for conformal prediction intervals, e.g. [80, 95]. Requires ``conformal_params`` to be set. Default is None.
 
         Returns:
             dict: Dictionary containing:
+
                 - "mean": Point forecasts of shape (h,).
                 - "lo-{l}" / "hi-{l}": Conformal interval bounds for each level l
                   (only present when level is not None).
@@ -1355,7 +1319,7 @@ class MFLES(BaseForecaster):
         seasonal_period: int | list[int] | None = None,
         **fit_kwargs,
     ) -> dict:
-        """Stateless fit+predict in one call (convenience wrapper).
+        r"""Stateless fit+predict in one call (convenience wrapper).
 
         Creates a fresh model copy, fits it on `y`, and immediately generates
         forecasts. Does not store any state on `self`.
@@ -1363,18 +1327,14 @@ class MFLES(BaseForecaster):
         Args:
             y (jnp.ndarray): Input time series of shape (n,).
             h (int): Forecast horizon.
-            X (jnp.ndarray | None): In-sample exogenous matrix of shape (n, p).
-                Default is None.
-            X_future (jnp.ndarray | None): Future exogenous matrix of shape (h, p).
-                Default is None.
-            level (list[int | float] | None): Confidence levels for conformal intervals.
-                Default is None.
-            seasonal_period (int | list[int] | None): Seasonal period(s) passed to fit.
-                Default is None.
-            **fit_kwargs: Any additional keyword arguments forwarded to fit().
+            X (jnp.ndarray | None): In-sample exogenous matrix of shape (n, p). Default is None.
+            X_future (jnp.ndarray | None): Future exogenous matrix of shape (h, p). Default is None.
+            level (list[int | float] | None): Confidence levels for conformal intervals. Default is None.
+            seasonal_period (int | list[int] | None): Seasonal period(s) passed to fit. Default is None.
+            \**fit_kwargs: Any additional keyword arguments forwarded to fit().
 
         Returns:
-            dict: Same output as predict() — "mean" and optional interval keys.
+            dict: Same output as predict() -- "mean" and optional interval keys.
         """
         return self.new().fit(y, X=X, seasonal_period=seasonal_period, **fit_kwargs).predict(h, X=X_future, level=level)
 
@@ -1396,24 +1356,16 @@ class MFLES(BaseForecaster):
 
         Args:
             y (jnp.ndarray): Full time series used for cross-validation.
-            seasonal_period (int | list[int] | None): Seasonal period(s) passed to fit()
-                in each fold. Also drives the default candidate grid when params=None.
+            seasonal_period (int | list[int] | None): Seasonal period(s) passed to fit() in each fold. Also drives the default candidate grid when params is None.
             n_steps (int): Number of rolling validation windows to evaluate.
-            test_size (int): Number of observations held out as the test horizon in
-                each window.
-            step_size (int): Step (in observations) between successive validation
-                windows. Default is 1.
-            metric (str): Error metric to minimise. One of "mse", "mae", "mape",
-                "smape". Default is "smape".
-            X (jnp.ndarray | None): Exogenous matrix of shape (n, p) aligned with y.
-                Sliced appropriately for each fold. Default is None.
-            params (list[dict] | None): Explicit list of fit() kwarg dicts to evaluate.
-                If None, a default grid is constructed based on seasonal_period.
-                Default is None.
+            test_size (int): Number of observations held out as the test horizon in each window.
+            step_size (int): Step (in observations) between successive validation windows. Default is 1.
+            metric (str): Error metric to minimise. One of "mse", "mae", "mape", "smape". Default is "smape".
+            X (jnp.ndarray | None): Exogenous matrix of shape (n, p) aligned with y. Sliced appropriately for each fold. Default is None.
+            params (list[dict] | None): Explicit list of fit() kwarg dicts to evaluate. If None, a default grid is constructed based on seasonal_period. Default is None.
 
         Returns:
-            dict: The best-performing hyperparameter dictionary (suitable as **kwargs
-                to fit()).
+            dict: The best-performing hyperparameter dictionary (suitable as ``**kwargs`` to fit()).
         """
         y = utils.ensure_float(jnp.asarray(y).reshape(-1))
         metric_fn = _metric2fn[metric]

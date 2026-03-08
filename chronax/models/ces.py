@@ -820,14 +820,17 @@ class AutoCES(BaseForecaster):
     Args:
         season_length (int): Seasonal period m. Use 1 for non-seasonal data.
             Default is 1.
+
         model (str): Variant selector passed to auto_ces(). "Z" for automatic
             selection; "N", "S", "P", or "F" to fix the variant. Default is "Z".
+
         alias (str): Model name for display / repr. Default is "CES".
+
         conformal_params (Optional[ConformalIntervals]): Conformal prediction
             configuration for generating prediction intervals. Default is None.
 
     Attributes:
-        model_ (dict | None): Populated after fit(); contains fitted values,
+        ``model_`` (dict | None): Populated after fit(); contains fitted values,
             residuals, states, parameters, and information criteria from
             ces_fit_single(). None before first fit.
     """
@@ -864,6 +867,7 @@ class AutoCES(BaseForecaster):
 
         Args:
             y (jnp.ndarray): Input time series of shape (n,).
+
             X (Optional[jnp.ndarray]): Exogenous variables (unused; kept for API
                 compatibility). Default is None.
 
@@ -899,13 +903,14 @@ class AutoCES(BaseForecaster):
     ) -> Dict:
         """Stateless fit+forecast: fit if not already done, then generate forecasts.
 
-        If model_ is None, fits the model on y first. Otherwise uses existing state.
+        If ``model_`` is None, fits the model on y first. Otherwise uses existing state.
         Does not support conformal intervals (use predict() after fit() for that).
 
         Args:
             y (jnp.ndarray): Input time series of shape (n,). Used only if not fitted.
             h (int): Forecast horizon (number of steps ahead).
             X (Optional[jnp.ndarray]): Exogenous variables (unused). Default is None.
+
             X_future (Optional[jnp.ndarray]): Future exogenous variables (unused).
                 Default is None.
 
@@ -940,9 +945,11 @@ class AutoCES(BaseForecaster):
 
         Args:
             h (int): Forecast horizon (number of steps ahead).
+
             X (Optional[jnp.ndarray]): Exogenous variables (unused; kept for API
                 compatibility). Default is None.
-            level (Optional[List[int]]): Confidence levels (0–100) for conformal
+
+            level (Optional[List[int]]): Confidence levels (0-100) for conformal
                 prediction intervals, e.g. [90, 95]. Requires conformal_params to
                 be set. Default is None.
 

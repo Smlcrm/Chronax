@@ -39,8 +39,7 @@ class AutoETS(BaseForecaster):
         damped (bool, optional): A parameter that 'dampens' the trend.
         phi (float, optional): Smoothing parameter for trend damping. Only used when `damped=True`.
         alias (str, default="AutoETS"): Custom name of the model.
-        prediction_intervals (Optional[ConformalIntervals], optional): Information to compute conformal prediction intervals.
-            By default, the model will compute the native prediction intervals.
+        prediction_intervals (Optional[ConformalIntervals], optional): Information to compute conformal prediction intervals. By default, the model will compute the native prediction intervals.
 
     Notes:
         This implementation is a mirror of Hyndman's [forecast::ets](https://github.com/robjhyndman/forecast).
