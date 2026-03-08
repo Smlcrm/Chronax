@@ -12,6 +12,13 @@ Base Class
    :members:
    :undoc-members:
 
+Multi-Series
+------------
+
+.. autoclass:: chronax.models.BatchedForecaster
+   :members:
+   :undoc-members:
+
 Automatic Models
 ----------------
 
