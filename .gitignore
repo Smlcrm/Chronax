@@ -121,4 +121,9 @@ prof/
 *.prof
     __pycache__/
     .pytest_cache/
-    
+
+# Sphinx build output
+docs/_build/
+
+# Claude Code
+CLAUDE.md
