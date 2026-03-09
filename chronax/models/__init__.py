@@ -46,6 +46,8 @@ from .ces import AutoCES
 from .tsb import TSB
 from .randomWalkWithDrift import RandomWalkWithDrift
 
+from .batched_forecaster import BatchedForecaster
+
 __all__ = [
     "ARIMA",
     "AutoARIMA",
@@ -76,5 +78,6 @@ __all__ = [
     "AutoCES",
     "TSB",
     "RandomWalkWithDrift",
+    "BatchedForecaster",
 ]
 

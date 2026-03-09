@@ -23,7 +23,7 @@ Instance Attributes:
     - alpha: smoothing parameter (0 ≤ α ≤ 1)
     - alias: model identifier string
     - conformal_params: optional ConformalIntervals object for prediction intervals
-    - model_: dict storing fitted values and conformity scores post-fit
+    - ``model_``: dict storing fitted values and conformity scores post-fit
 
 Methods:
     - fit(y, X): fits the model and computes conformity scores if conformal_params is set
@@ -107,8 +107,7 @@ class SimpleExponentialSmoothing(BaseForecaster):
 
         Args:
             y (jnp.ndarray): Clean time series of shape (t,).
-            X (jnp.ndarray | None): Exogenous variables (unused; included for
-                API compatibility). Default is None.
+            X (jnp.ndarray | None): Exogenous variables (unused; included for API compatibility). Default is None.
 
         Returns:
             SimpleExponentialSmoothing: Self (fitted model instance).
@@ -129,6 +128,8 @@ class SimpleExponentialSmoothing(BaseForecaster):
         h: int,
         X: jnp.ndarray | None = None,
         X_future: jnp.ndarray | None = None,
+        level: list[int | float] | None = None,
+        fitted: bool = False,
     ) -> dict:
         r"""Memory-efficient stateless fit+predict in one call.
 
@@ -139,14 +140,13 @@ class SimpleExponentialSmoothing(BaseForecaster):
         Args:
             y (jnp.ndarray): Clean time series of shape (t,).
             h (int): Forecast horizon (number of steps ahead).
-            X (jnp.ndarray | None): In-sample exogenous variables (unused;
-                included for API compatibility). Default is None.
-            X_future (jnp.ndarray | None): Future exogenous variables (unused;
-                included for API compatibility). Default is None.
+            X (jnp.ndarray | None): In-sample exogenous variables (unused; included for API compatibility). Default is None.
+            X_future (jnp.ndarray | None): Future exogenous variables (unused; included for API compatibility). Default is None.
+            level (list[int | float] | None): Confidence levels (unused; included for BaseForecaster compliance). Default is None.
+            fitted (bool): Whether to return fitted values (unused; included for BaseForecaster compliance). Default is False.
 
         Returns:
-            dict: Dictionary containing:
-                - "mean": Point forecasts of shape (h,), all equal to the final smoothed level.
+            dict: Dictionary containing ``"mean"``, point forecasts of shape (h,), all equal to the final smoothed level.
         """
         y = utils.ensure_float(y)
         mod = _ses(y=y, alpha=self.alpha, h=h, fitted=False)
@@ -165,20 +165,14 @@ class SimpleExponentialSmoothing(BaseForecaster):
 
         Args:
             h (int): Forecast horizon (number of steps ahead).
-            X (jnp.ndarray | None): Exogenous variables (unused; included for
-                API compatibility). Default is None.
-            level (list[int] | None): Confidence levels (0–100) for prediction
-                intervals, e.g. [80, 95]. Requires `conformal_params` to be set.
-                Default is None.
+            X (jnp.ndarray | None): Exogenous variables (unused; included for API compatibility). Default is None.
+            level (list[int] | None): Confidence levels (0--100) for prediction intervals, e.g. [80, 95]. Requires ``conformal_params`` to be set. Default is None.
 
         Returns:
-            dict: Dictionary containing:
-                - "mean": Point forecasts of shape (h,).
-                - "lo-{l}" / "hi-{l}": Conformal interval bounds for each level l
-                  (only present when level is not None).
+            dict: Dictionary containing ``"mean"`` (point forecasts of shape (h,)) and optionally ``"lo-{l}"`` / ``"hi-{l}"`` (conformal interval bounds for each level l, only present when level is not None).
 
         Raises:
-            ValueError: If level is requested but `conformal_params` is None.
+            ValueError: If level is requested but ``conformal_params`` is None.
             ValueError: If level is requested but the model has not been fitted yet.
         """
         mean = utils._repeat_val(val=self.model_["mean"][0], h=h)

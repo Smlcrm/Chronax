@@ -215,8 +215,8 @@ def cfe(y: Array, y_pred: Array) -> Array:
 
   Args:
       y (Array): Observed values, typically a 1D time series.
-      y_pred (Array): Predicted values; same length/shape as `y` for
-          meaningful interpretation.
+      y_pred (Array): Predicted values; same length/shape as ``y`` for
+      meaningful interpretation.
 
   Returns:
       Array: Cumulative sum of (y - y_pred), same shape as the flattened
@@ -317,7 +317,7 @@ def mean_absolute_percentage_error(y: Array, y_pred: Array) -> Array:
   Compute the mean absolute percentage error (MAPE).
 
   Detailed Description:
-      Computes the mean of |y - y_pred| / (|y| + eps), with a small epsilon
+      Computes the mean of ``|y - y_pred|`` / (``|y|`` + eps), with a small epsilon
       to avoid division by zero. MAPE is scale-independent and expressed as
       a proportion (e.g. 0.05 for 5% average error). It is undefined or
       unstable when true values are zero or very small.
@@ -325,7 +325,8 @@ def mean_absolute_percentage_error(y: Array, y_pred: Array) -> Array:
   Args:
       y (Array): Observed or true values. Should be non-zero for meaningful
           interpretation; zeros are stabilized with 1e-8.
-      y_pred (Array): Predicted values; broadcast-compatible with `y`.
+
+      y_pred (Array): Predicted values; broadcast-compatible with ``y``.
 
   Returns:
       Array: Scalar mean absolute percentage error (fraction, not percentage).
@@ -353,7 +354,7 @@ def symmetric_mean_absolute_percentage_error(y: Array, y_pred: Array) -> Array:
   Compute the symmetric mean absolute percentage error (SMAPE).
 
   Detailed Description:
-      Computes the mean of |y - y_pred| / (|y| + |y_pred|), which is
+      Computes the mean of ``|y - y_pred|`` / (``|y|`` + ``|y_pred|``), which is
       symmetric in actual and predicted and bounded between 0 and 1. Unlike
       MAPE, it remains defined when actuals or predictions are zero (except
       when both are zero at the same point). Commonly used in forecasting
@@ -389,8 +390,8 @@ def mean_absolute_scaled_error(y: Array, y_pred: Array, y_seasonal: Array) -> Ar
   Compute the mean absolute scaled error (MASE) using a seasonal naive baseline.
 
   Detailed Description:
-      Scales the mean absolute error of the model (|y - y_pred|) by the mean
-      absolute error of a seasonal naive forecast (|y - y_seasonal|). Values
+      Scales the mean absolute error of the model (``|y - y_pred|``) by the mean
+      absolute error of a seasonal naive forecast (``|y - y_seasonal|``). Values
       below 1.0 indicate the model outperforms the naive baseline; above 1.0
       indicates worse performance. MASE is scale-independent and comparable
       across series with different units.
@@ -399,7 +400,7 @@ def mean_absolute_scaled_error(y: Array, y_pred: Array, y_seasonal: Array) -> Ar
       y (Array): Observed values (typically out-of-sample).
       y_pred (Array): Model predictions; same shape as `y`.
       y_seasonal (Array): Seasonal naive baseline (e.g. previous season same
-          period); same shape as `y`. Often y_seasonal[t] = y[t - period].
+      period); same shape as ``y``. Often y_seasonal[t] = y[t - period].
 
   Returns:
       Array: Scalar MASE. Ratio of model MAE to baseline MAE; denominator
@@ -428,8 +429,8 @@ def relative_mean_absolute_error(y: Array, y_pred: Array, y_base: Array) -> Arra
   Compute the relative mean absolute error (RelMAE) against an arbitrary baseline.
 
   Detailed Description:
-      Divides the mean absolute error of the model (|y - y_pred|) by the mean
-      absolute error of a baseline forecast (|y - y_base|). Values below 1.0
+      Divides the mean absolute error of the model (``|y - y_pred|``) by the mean
+      absolute error of a baseline forecast (``|y - y_base|``). Values below 1.0
       mean the model beats the baseline; above 1.0 means the baseline is
       better. The baseline can be naive, seasonal naive, or another model's
       forecasts, enabling flexible pairwise comparison.
@@ -465,7 +466,7 @@ def normalized_deviation(y: Array, y_pred: Array) -> Array:
   Compute the normalized total absolute deviation by total observed value.
 
   Detailed Description:
-      Divides the sum of absolute errors (|y - y_pred|) by the sum of
+      Divides the sum of absolute errors (``|y - y_pred|``) by the sum of
       observed values (y). Yields a scale-independent ratio interpretable as
       total absolute error per unit of total demand/volume. Used in
       inventory and demand contexts where total volume is the natural scale.
@@ -475,7 +476,7 @@ def normalized_deviation(y: Array, y_pred: Array) -> Array:
       y_pred (Array): Predicted values; same shape as `y`.
 
   Returns:
-      Array: Scalar ratio. Sum(|y - y_pred|) / Sum(y). No explicit
+      Array: Scalar ratio. Sum(``|y - y_pred|``) / Sum(y). No explicit
           denominator stabilization; caller should ensure sum(y) > 0.
 
   Raises:
@@ -582,11 +583,11 @@ def quantile_loss(y: jnp.ndarray, y_pred: jnp.ndarray, q: float) -> jnp.ndarray:
         interval estimation.
 
     Args:
-        y (jnp.ndarray): True observed values; typically shape (N,) or
-            broadcast-compatible.
-        y_pred (jnp.ndarray): Predicted quantile values; same shape as `y`.
-        q (float): Quantile level in (0, 1), e.g. 0.5 for median, 0.1 for
-            lower tail, 0.9 for upper tail.
+        y (jnp.ndarray): True observed values; typically shape (N,)
+            or broadcast-compatible.
+
+        y_pred (jnp.ndarray): Predicted quantile values; same shape as ``y``.
+        q (float): Quantile level in (0, 1), e.g. 0.5 for median, 0.1 for lower tail, 0.9 for upper tail.
 
     Returns:
         jnp.ndarray: Scalar mean pinball loss. Same dtype as inputs.
@@ -624,12 +625,12 @@ def scaled_quantile_loss(y: jnp.ndarray, y_pred: jnp.ndarray, q: float, y_season
     Args:
         y (jnp.ndarray): Test (out-of-sample) actual values; shape (N,) or
             compatible.
+
         y_pred (jnp.ndarray): Test (out-of-sample) quantile predictions for
-            level q; same shape as `y`.
+            level q; same shape as ``y``.
+
         q (float): Quantile level in (0, 1).
-        y_seasonal (jnp.ndarray): In-sample seasonal baseline (e.g. previous
-            season same period); same shape as `y`. Used to compute
-            denominator MAE.
+        y_seasonal (jnp.ndarray): In-sample seasonal baseline (e.g. previous season same period); same shape as ``y``. Used to compute denominator MAE.
 
     Returns:
         jnp.ndarray: Scalar SQL. Quantile loss / (MAE of baseline); denominator
@@ -670,8 +671,10 @@ def multi_quantile_loss(y: jnp.ndarray, y_pred: jnp.ndarray, quantiles: jnp.ndar
     Args:
         y (jnp.ndarray): True values. May be (N,) expanded to (N, Q) or (N, Q)
             directly; must broadcast with y_pred.
+
         y_pred (jnp.ndarray): Predicted quantiles; shape (N, Q) for N samples
             and Q quantile levels.
+
         quantiles (jnp.ndarray): Quantile levels, shape (Q,), e.g. [0.1, 0.5, 0.9].
 
     Returns:
@@ -708,11 +711,9 @@ def scaled_multi_quantile_loss(y: jnp.ndarray, y_pred_quantiles: jnp.ndarray, qu
 
     Args:
         y (jnp.ndarray): Actual out-of-sample values; (N,) or compatible.
-        y_pred_quantiles (jnp.ndarray): Predicted quantiles for each level;
-            shape (N, Q).
+        y_pred_quantiles (jnp.ndarray): Predicted quantiles for each level; shape (N, Q).
         quantiles (jnp.ndarray): Quantile levels, shape (Q,).
-        y_seasonal (jnp.ndarray): Seasonal naive baseline; same length as `y`.
-            Used as denominator MAE.
+        y_seasonal (jnp.ndarray): Seasonal naive baseline; same length as ``y``. Used as denominator MAE.
 
     Returns:
         jnp.ndarray: Scalar SMQL. MQL / (MAE of baseline); denominator
@@ -749,9 +750,8 @@ def coverage(y: jnp.ndarray, y_lo: jnp.ndarray, y_hi: jnp.ndarray) -> jnp.ndarra
 
     Args:
         y (jnp.ndarray): True target values; shape (N,) or compatible.
-        y_lo (jnp.ndarray): Lower bound of the prediction interval (e.g.
-            5th percentile); same shape as `y`.
-        y_hi (jnp.ndarray): Upper bound (e.g. 95th percentile); same shape as `y`.
+        y_lo (jnp.ndarray): Lower bound of the prediction interval (e.g. 5th percentile); same shape as ``y``.
+        y_hi (jnp.ndarray): Upper bound (e.g. 95th percentile); same shape as ``y``.
 
     Returns:
         jnp.ndarray: Scalar in [0, 1]. Proportion of points with
@@ -787,8 +787,7 @@ def calibration(y: jnp.ndarray, y_pred: jnp.ndarray) -> jnp.ndarray:
 
     Args:
         y (jnp.ndarray): True target values; shape (N,) or compatible.
-        y_pred (jnp.ndarray): Predicted quantile values (e.g. median or
-            other level); same shape as `y`.
+        y_pred (jnp.ndarray): Predicted quantile values (e.g. median or other level); same shape as ``y``.
 
     Returns:
         jnp.ndarray: Scalar in [0, 1]. Proportion of points with y <= y_pred.
@@ -815,20 +814,19 @@ def scaled_crps(y: jnp.ndarray,y_pred: jnp.ndarray,quantiles: jnp.ndarray,) -> j
 
     Detailed Description:
         Uses the multi-quantile loss (MQL) as a discrete approximation to the
-        CRPS, then scales by (2 * MQL * N) / (sum of |y|) so the result is
+        CRPS, then scales by (2 * MQL * N) / (sum of ``|y|``) so the result is
         scale-independent and comparable across series. Larger values indicate
         worse probabilistic forecasts. The formula rewards sharpness and
         calibration of the predictive distribution represented by the quantiles.
 
     Args:
         y (jnp.ndarray): True observed values; shape (N,).
-        y_pred (jnp.ndarray): Predicted quantiles for each observation; shape
-            (N, Q) for Q quantile levels.
+        y_pred (jnp.ndarray): Predicted quantiles for each observation; shape (N, Q) for Q quantile levels.
         quantiles (jnp.ndarray): Quantile levels, shape (Q,), e.g. [0.1, 0.5, 0.9].
 
     Returns:
-        jnp.ndarray: Scalar scaled CRPS. Denominator uses sum(|y|) with
-        epsilon stabilization to avoid division by zero.
+        jnp.ndarray: Scalar scaled CRPS. Denominator uses sum(``|y|``)
+            with epsilon stabilization to avoid division by zero.
 
     Raises:
         None.

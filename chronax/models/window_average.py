@@ -40,8 +40,7 @@ class WindowAverage(BaseForecaster):
     Args:
         window_size (int): Size of truncated series on which average is estimated.
         alias (str): Custom name of the model.
-        conformal_params (Optional[ConformalIntervals]): Information to compute conformal prediction intervals.
-            This is required for generating future prediction intervals.
+        conformal_params (Optional[ConformalIntervals]): Information to compute conformal prediction intervals. This is required for generating future prediction intervals.
     """
 
     def __init__(self, window_size: int, alias: str = "WindowAverage",

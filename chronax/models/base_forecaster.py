@@ -1,51 +1,62 @@
 """
 BaseForecaster defines the shared interface and common infrastructure for all models in Chronax.
 
-Instance Attributes:
-1. alias; model name, declared in model's __init__
-2. conformal_params; a conformal_intervals object, in statsforecast previously named prediction_intervals
-3. model_; stores fitted model post-training
+Instance Attributes
+-------------------
+1. ``alias`` -- model name, declared in model's ``__init__``
+2. ``conformal_params`` -- a conformal_intervals object, in statsforecast
+   previously named prediction_intervals
+3. ``model_`` -- stores fitted model post-training
 
-Class Attributes:
-1. uses_exog; boolean representing model's exogenous variable handling
+Class Attributes
+----------------
+1. ``uses_exog`` -- boolean representing model's exogenous variable handling
 
-Methods:
-1. new() returns a shallow copy of the object, used internally to clone a model without mutating state.
+Methods
+-------
+1. ``new()`` returns a shallow copy of the object, used internally to clone
+   a model without mutating state.
 
-2. __repr__ returns the model's alias for easy identification.
+2. ``__repr__`` returns the model's alias for easy identification.
 
-3. fit(y, X=None) [abstractmethod]
-   Must be implemented by every subclass. Fits the model to univariate time series y,
-   sets self.model_, and returns self. X is optional exogenous input.
+3. ``fit(y, X=None)`` [abstractmethod]
+   Must be implemented by every subclass. Fits the model to univariate time
+   series y, sets ``self.model_``, and returns self. X is optional exogenous input.
 
-4. predict(h, X=None, level=None) [abstractmethod]
+4. ``predict(h, X=None, level=None)`` [abstractmethod]
    Must be implemented by every subclass. Generates h-step-ahead forecasts,
    returning a dict with at least {"mean": jnp.ndarray}. Optionally adds
    confidence intervals when level is provided.
 
-5. forecast(y, h, X=None, X_future=None, level=None, fitted=False) [abstractmethod]
-   Must be implemented by every subclass. Stateless fit+predict on y, forecasting h steps ahead.
-   Implementations differ significantly across models (fitted values, model-specific kwargs, etc.).
-   Subclasses may extend the signature with additional optional parameters.
+5. ``forecast(y, h, X=None, X_future=None, level=None, fitted=False)`` [abstractmethod]
+   Must be implemented by every subclass. Stateless fit+predict on y,
+   forecasting h steps ahead. Implementations differ significantly across
+   models (fitted values, model-specific kwargs, etc.). Subclasses may extend
+   the signature with additional optional parameters.
 
-6. forward(y, h, X=None, X_future=None, level=None, fitted=False) [concrete, overridable]
-   Updates the model on new data y and forecasts h steps ahead. Default delegates to forecast().
-   Subclasses with warm-start re-estimation (e.g. Holt, HoltWinters, ETS) override this.
+6. ``forward(y, h, X=None, X_future=None, level=None, fitted=False)`` [concrete, overridable]
+   Updates the model on new data y and forecasts h steps ahead. Default
+   delegates to forecast(). Subclasses with warm-start re-estimation
+   (e.g. Holt, HoltWinters, ETS) override this.
 
-7. conformity_scores(y, X=None) computes the model's conformity score on y as a 2D JAX array.
-   A model's conformity score is the absolute difference between forecasted and actual values
-   across h positions and n_windows. Uses vmap for parallelization over windows.
+7. ``conformity_scores(y, X=None)`` computes the model's conformity score on
+   y as a 2D JAX array. A model's conformity score is the absolute difference
+   between forecasted and actual values across h positions and n_windows.
+   Uses vmap for parallelization over windows.
 
-8. add_confidence_intervals(fcst, cs, level, method) [staticmethod]
-   Adds conformal prediction intervals to a forecast dict using pre-computed conformity scores.
+8. ``add_confidence_intervals(fcst, cs, level, method)`` [staticmethod]
+   Adds conformal prediction intervals to a forecast dict using pre-computed
+   conformity scores.
 
-Notes:
--  Exogenous variable support is model-specific, not framework-level.
-   The boolean uses_exog must be overridden in the model's implementation.
--  Known signature inconsistencies in subclasses (future fixes):
-   Naive and RandomWalkWithDrift use reversed (h, y) order in forecast/forward.
-   RandomWalkWithDrift.predict is missing the X parameter.
-   AutoCES.forecast is missing level and fitted parameters.
+Notes
+-----
+- Exogenous variable support is model-specific, not framework-level.
+  The boolean uses_exog must be overridden in the model's implementation.
+
+- Known signature inconsistencies in subclasses (future fixes):
+  Naive and RandomWalkWithDrift use reversed (h, y) order in forecast/forward.
+  RandomWalkWithDrift.predict is missing the X parameter.
+  AutoCES.forecast is missing level and fitted parameters.
 """
 import jax
 import jax.numpy as jnp
@@ -85,7 +96,7 @@ class BaseForecaster(ABC):
     def fit(self, y: jnp.ndarray, X: jnp.ndarray | None = None) -> "BaseForecaster":
         """
         Fit the model to univariate time series y.
-        Must set self.model_ and return self.
+        Must set ``self.model_`` and return self.
         """
 
     @abstractmethod

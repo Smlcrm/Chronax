@@ -93,7 +93,7 @@ class ARIMA(BaseForecaster):
         include_mean (bool): Whether to include intercept/drift term.
         method (str): Optimization method selector (for example `CSS`, `ML`).
         alias (str): Display name for external reporting.
-        model_ (dict[str, Any] | None): Fitted model payload after `fit`.
+        ``model_`` (dict[str, Any] | None): Fitted model payload after ``fit``.
         standardize (bool): Whether to standardize data before fitting.
         _y_mean (jnp.ndarray | None): Cached training mean for de-normalization.
         _y_std (jnp.ndarray | None): Cached training std for de-normalization.
@@ -212,8 +212,7 @@ class ARIMA(BaseForecaster):
 
         Args:
             y (jnp.ndarray): Training target series.
-            X (jnp.ndarray | None, optional): Optional exogenous matrix aligned
-                with `y`.
+            X (jnp.ndarray | None, optional): Optional exogenous matrix aligned with ``y``.
 
         Returns:
             ARIMA: The fitted estimator instance.
@@ -223,7 +222,7 @@ class ARIMA(BaseForecaster):
                 fails irrecoverably.
 
         Side Effects:
-            Mutates `model_`, `y_train_`, and cached normalization statistics.
+            Mutates ``model_``, ``y_train_``, and cached normalization statistics.
 
         Example:
             >>> model = ARIMA(order=(1, 1, 1))
@@ -260,7 +259,7 @@ class ARIMA(BaseForecaster):
         
         return self
 
-    def forecast(self, h: int, y: jnp.ndarray, X: Optional[jnp.ndarray] = None) -> Dict[str, jnp.ndarray]:
+    def forecast(self, h: int, y: jnp.ndarray, X: Optional[jnp.ndarray] = None, X_future: Optional[jnp.ndarray] = None, level: Optional[list] = None, fitted: bool = False) -> Dict[str, jnp.ndarray]:
         """
         Fit and forecast in one call.
 
@@ -272,8 +271,10 @@ class ARIMA(BaseForecaster):
         Args:
             h (int): Forecast horizon.
             y (jnp.ndarray): Source training series.
-            X (jnp.ndarray | None, optional): Exogenous regressors. The fast
-                path currently does not use exogenous variables.
+            X (jnp.ndarray | None, optional): Exogenous regressors. The fast path currently does not use exogenous variables.
+            X_future (jnp.ndarray | None, optional): Future exogenous regressors (unused; included for BaseForecaster compliance). Default is None.
+            level (list | None, optional): Confidence levels (unused; included for BaseForecaster compliance). Default is None.
+            fitted (bool, optional): Whether to return fitted values (unused; included for BaseForecaster compliance). Default is False.
 
         Returns:
             dict[str, jnp.ndarray]: Forecast dictionary containing `mean`.
@@ -364,8 +365,7 @@ class ARIMA(BaseForecaster):
         Args:
             h (int): Number of future steps to predict.
             X (jnp.ndarray | None, optional): Optional exogenous future matrix.
-            level (int | tuple[int, ...] | None, optional): Confidence levels
-                for interval generation.
+            level (int | tuple[int, ...] | None, optional): Confidence levels for interval generation.
 
         Returns:
             dict[str, jnp.ndarray]: Dictionary containing `mean` and optional

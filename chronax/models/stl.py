@@ -175,29 +175,18 @@ class STL(BaseForecaster):
 
     Args:
         period (int): Seasonal period length (e.g., 7 for weekly, 12 for monthly with yearly seasonality).
-        seasonal (int | None, optional): Seasonal smoother window size (must be odd). If None, defaults to
-            max(7, 2*period+1) made odd. Larger values produce smoother seasonal components.
-        trend (int | None, optional): Trend smoother window size (must be odd). If None, defaults to
-            2*period+1 made odd. Larger values produce smoother trends.
-        low_pass (int | None, optional): Low-pass filter window size for seasonal component (must be odd if provided).
-            Defaults to None (no low-pass filtering). When set, stabilizes seasonal component.
-        seasonal_deg (int, optional): Polynomial degree for seasonal LOESS (0=local constant, 1=local linear).
-            Defaults to 0.
-        trend_deg (int, optional): Polynomial degree for trend LOESS (0=local constant, 1=local linear).
-            Defaults to 1.
-        seasonal_jump (int, optional): Jump (stride) for seasonal LOESS anchor points to speed computation.
-            Defaults to 1 (no jumping).
-        trend_jump (int, optional): Jump (stride) for trend LOESS anchor points to speed computation.
-            Defaults to 1 (no jumping).
-        inner (int, optional): Number of inner loop iterations for iterative refinement of seasonal and trend.
-            Defaults to 1. Higher values may improve decomposition quality.
-        tail_window (int | None, optional): Number of trailing points to use for trend extrapolation.
-            If None, defaults to min(n, 2*period+1).
-        fitted (bool, optional): Whether to include fitted values and decomposition components in predict_in_sample
-            output. Defaults to True.
+        seasonal (int | None, optional): Seasonal smoother window size (must be odd). If None, defaults to max(7, 2*period+1) made odd. Larger values produce smoother seasonal components.
+        trend (int | None, optional): Trend smoother window size (must be odd). If None, defaults to 2*period+1 made odd. Larger values produce smoother trends.
+        low_pass (int | None, optional): Low-pass filter window size for seasonal component (must be odd if provided). Defaults to None (no low-pass filtering). When set, stabilizes seasonal component.
+        seasonal_deg (int, optional): Polynomial degree for seasonal LOESS (0=local constant, 1=local linear). Defaults to 0.
+        trend_deg (int, optional): Polynomial degree for trend LOESS (0=local constant, 1=local linear). Defaults to 1.
+        seasonal_jump (int, optional): Jump (stride) for seasonal LOESS anchor points to speed computation. Defaults to 1 (no jumping).
+        trend_jump (int, optional): Jump (stride) for trend LOESS anchor points to speed computation. Defaults to 1 (no jumping).
+        inner (int, optional): Number of inner loop iterations for iterative refinement of seasonal and trend. Defaults to 1. Higher values may improve decomposition quality.
+        tail_window (int | None, optional): Number of trailing points to use for trend extrapolation. If None, defaults to min(n, 2*period+1).
+        fitted (bool, optional): Whether to include fitted values and decomposition components in predict_in_sample output. Defaults to True.
         alias (str, optional): Model alias name for identification. Defaults to "STL".
-        conformal_params (ConformalIntervals | None, optional): Conformal prediction configuration for generating
-            prediction intervals. Defaults to None (no intervals).
+        conformal_params (ConformalIntervals | None, optional): Conformal prediction configuration for generating prediction intervals. Defaults to None (no intervals).
     """
     uses_exog = False
 
@@ -241,8 +230,7 @@ class STL(BaseForecaster):
 
         Args:
             y (jnp.ndarray): Input time series to decompose, shape (n,).
-            X (jnp.ndarray | None, optional): Exogenous variables (not used by STL, included for API compatibility).
-                Defaults to None.
+            X (jnp.ndarray | None, optional): Exogenous variables (not used by STL, included for API compatibility). Defaults to None.
 
         Returns:
             STL: Self (fitted model instance).
@@ -274,13 +262,12 @@ class STL(BaseForecaster):
         Generate in-sample fitted values and decomposition components.
 
         Args:
-            X (jnp.ndarray | None, optional): Exogenous variables (not used by STL, included for API compatibility).
-                Defaults to None.
-            level (list[int | float] | None, optional): Confidence levels for prediction intervals (e.g., [90, 95]).
-                If provided, conformal prediction intervals are computed. Defaults to None.
+            X (jnp.ndarray | None, optional): Exogenous variables (not used by STL, included for API compatibility). Defaults to None.
+            level (list[int | float] | None, optional): Confidence levels for prediction intervals (e.g., [90, 95]). If provided, conformal prediction intervals are computed. Defaults to None.
 
         Returns:
             dict: Dictionary containing:
+
                 - mean (jnp.ndarray): In-sample fitted values (trend + seasonal), shape (n,).
                 - fitted (jnp.ndarray): Same as mean, included if self.fitted=True.
                 - trend (jnp.ndarray): Trend component, shape (n,), included if self.fitted=True.
@@ -311,13 +298,12 @@ class STL(BaseForecaster):
 
         Args:
             h (int): Forecast horizon (number of steps ahead to predict).
-            X (jnp.ndarray | None, optional): Exogenous variables (not used by STL, included for API compatibility).
-                Defaults to None.
-            level (list[int | float] | None, optional): Confidence levels for prediction intervals (e.g., [90, 95]).
-                If provided, conformal prediction intervals are computed. Defaults to None.
+            X (jnp.ndarray | None, optional): Exogenous variables (not used by STL, included for API compatibility). Defaults to None.
+            level (list[int | float] | None, optional): Confidence levels for prediction intervals (e.g., [90, 95]). If provided, conformal prediction intervals are computed. Defaults to None.
 
         Returns:
             dict: Dictionary containing:
+
                 - mean (jnp.ndarray): Point forecasts, shape (h,).
                 - lo-{level} (jnp.ndarray): Lower prediction interval for each level, if level is provided.
                 - hi-{level} (jnp.ndarray): Upper prediction interval for each level, if level is provided.
@@ -343,6 +329,8 @@ class STL(BaseForecaster):
         h: int,
         X: jnp.ndarray | None = None,
         X_future: jnp.ndarray | None = None,
+        level: int | tuple[int, ...] | None = None,
+        fitted: bool = False,
     ) -> dict:
         """
         Generate forecasts on fresh data for conformity score computation.
@@ -355,14 +343,16 @@ class STL(BaseForecaster):
             y (jnp.ndarray): Time series to fit, shape (n,).
             h (int): Forecast horizon (number of steps ahead to predict).
             X (jnp.ndarray | None, optional): Exogenous variables for fitting (not used by STL). Defaults to None.
-            X_future (jnp.ndarray | None, optional): Future exogenous variables for prediction (not used by STL).
-                Defaults to None.
+            X_future (jnp.ndarray | None, optional): Future exogenous variables for prediction (not used by STL). Defaults to None.
+            level (int | tuple[int, ...] | None, optional): Confidence levels for prediction intervals. Defaults to None.
+            fitted (bool, optional): Whether to return fitted values. Defaults to False.
 
         Returns:
             dict: Dictionary containing:
+
                 - mean (jnp.ndarray): Point forecasts, shape (h,).
         """
-        return self.new().fit(y, X).predict(h, X)
+        return self.new().fit(y, X).predict(h, X, level=level)
 
 
 # =========================

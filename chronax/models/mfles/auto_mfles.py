@@ -17,6 +17,7 @@ import threading  # Added for thread-safe tracking
 
 # Assumes mfles.py is in the same directory
 from .mfles import MFLES
+from chronax.models.base_forecaster import BaseForecaster
 
 # =============================================================================
 # 1. JAX JIT KERNELS (Compute Heavy / GPU)
@@ -443,9 +444,12 @@ def optimize_grid_threaded(
 # 4. CLASS WRAPPER
 # =============================================================================
 
-class AutoMFLES:
-    """The AutoMFLES user class which automatically explores configurations, standardizes 
-    data handling, and builds predictive bounds mapping down into an MFLES base-estimator.
+class AutoMFLES(BaseForecaster):
+    """Automated MFLES wrapper with parallelized grid-search hyperparameter optimization.
+
+    Inherits from BaseForecaster, providing the standard ``fit()`` / ``predict()`` /
+    ``forecast()`` interface. Internally wraps an MFLES base-estimator, automatically
+    selecting optimal hyperparameters via time-series cross-validation.
     """
 
     def __init__(
@@ -586,4 +590,41 @@ class AutoMFLES:
         if level is not None and self.prediction_intervals is None:
             res = add_gaussian_intervals(res, level, self.sigma_)
 
+        return res
+
+    def forecast(
+        self,
+        y: jnp.ndarray,
+        h: int,
+        X: jnp.ndarray | None = None,
+        X_future: jnp.ndarray | None = None,
+        level: list[int | float] | None = None,
+        fitted: bool = False,
+    ) -> dict:
+        """Stateless fit+predict in one call.
+
+        Parameters
+        ----------
+        y : jnp.ndarray
+            Input time series.
+        h : int
+            Forecast horizon.
+        X : jnp.ndarray or None, default None
+            In-sample exogenous variables.
+        X_future : jnp.ndarray or None, default None
+            Future exogenous variables.
+        level : list[int | float] or None, default None
+            Confidence levels for prediction intervals.
+        fitted : bool, default False
+            Whether to return in-sample fitted values.
+
+        Returns
+        -------
+        dict
+            Keys: 'mean', and optionally 'lo-{lv}', 'hi-{lv}', 'fitted'.
+        """
+        self.fit(y, X=X)
+        res = self.predict(h=h, X=X_future, level=level)
+        if fitted:
+            res['fitted'] = self.model_['fitted']
         return res

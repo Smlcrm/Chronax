@@ -26,7 +26,7 @@ Instance Attributes
 3. season_length: number of observations per seasonal cycle (e.g., 24 for hourly/daily)
 4. window_size: number of recent complete cycles to average (e.g., 7 for weekly)
 5. only_conformal_intervals: flag indicating no native intervals exist (always True)
-6. model_: dictionary storing the fitted seasonal pattern of length season_length
+6. ``model_``: dictionary storing the fitted seasonal pattern of length season_length
 
 Class Attributes
 - uses_exog: whether the model supports exogenous variables (False for SeasonalWindowAverage)
@@ -155,7 +155,7 @@ class SeasonalWindowAverage(BaseForecaster):
         alias: Model name
         prediction_intervals: ConformalIntervals object (REQUIRED for intervals)
         only_conformal_intervals: Flag indicating no native intervals (always True)
-        model_: Dictionary storing fitted seasonal pattern
+        ``model_``: Dictionary storing fitted seasonal pattern
     
     Example:
         >>> # Hourly data with daily seasonality, averaging last 7 days
@@ -242,8 +242,7 @@ class SeasonalWindowAverage(BaseForecaster):
         Args:
             h: Forecast horizon (number of steps ahead)
             X: Ignored (no exogenous support)
-            level: Confidence levels (0-100) for prediction intervals (e.g., [80, 95])
-                   Requires prediction_intervals to be set
+            level: Confidence levels (0-100) for prediction intervals (e.g., [80, 95]). Requires prediction_intervals to be set.
             
         Returns:
             Dictionary with keys:

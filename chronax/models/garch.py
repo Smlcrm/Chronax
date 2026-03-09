@@ -36,11 +36,9 @@ Instance Attributes:
 Methods:
 1. __init__() - Initialize with ARCH/GARCH orders and optimization settings
 2. fit(y, X=None) - Fit model via LBFGSB optimization
-3. predict(h, X=None, level=None) - Deterministic h-step forecast
+3. predict(h, X=None, level=None, simulate=False, ...) - h-step forecast (deterministic or Monte Carlo)
 4. predict_in_sample(level=None) - Return fitted values with optional intervals
-5. predict_simulate(h, n_sims, seed, level) - Stochastic Monte Carlo forecast
-6. forecast(y, h, ...) - Stateless fit-and-predict
-7. forecast_simulate(y, h, n_sims, ...) - Stateless stochastic fit-and-predict
+5. forecast(y, h, ..., simulate=False, ...) - Stateless fit-and-predict (deterministic or Monte Carlo)
 
 Implementation Notes:
 - Notation: p = ARCH order, q = GARCH order (reversed from Bollerslev 1986)
@@ -1009,9 +1007,13 @@ class GARCH(BaseForecaster):
         self,
         h: int,
         X: jnp.ndarray | None = None,
-        level: list[int] | None = None
+        level: list[int] | None = None,
+        simulate: bool = False,
+        n_sims: int = 1000,
+        seed: int | None = None,
+        return_paths: bool = True,
     ) -> dict:
-        """Generate h-step deterministic forecasts.
+        """Generate h-step forecasts (deterministic or Monte Carlo).
 
         Parameters
         ----------
@@ -1020,16 +1022,67 @@ class GARCH(BaseForecaster):
         X : jnp.ndarray or None, default None
             Exogenous variables (unused).
         level : list[int] or None, default None
-            Confidence levels for prediction intervals.
+            Confidence levels for prediction intervals. When simulate=False,
+            intervals are analytical (normal quantiles). When simulate=True,
+            intervals are percentile-based from simulation paths.
+        simulate : bool, default False
+            Use Monte Carlo simulation instead of analytical forecasting.
+        n_sims : int, default 1000
+            Number of simulation paths (only used when simulate=True).
+        seed : int or None, default None
+            PRNG seed for reproducibility (only used when simulate=True).
+        return_paths : bool, default True
+            Include full simulation paths in output (only used when simulate=True).
 
         Returns
         -------
         dict
-            Keys: 'mean', 'sigma2', and optionally 'lo-{lv}', 'hi-{lv}'.
+            When simulate=False:
+                Keys: 'mean', 'sigma2', and optionally 'lo-{lv}', 'hi-{lv}'.
+            When simulate=True:
+                Keys: 'mean', 'median', 'sigma2_mean', 'sigma2_median',
+                and optionally 'paths', 'sigma2_paths', 'lo-{lv}', 'hi-{lv}'.
         """
         if self.model_ is None:
             raise RuntimeError("Model must be fitted before prediction. Call fit() first.")
         self._validate_h(h)
+
+        if simulate:
+            if not isinstance(n_sims, int) or n_sims < 1:
+                raise ValueError(f"n_sims must be a positive integer, got {n_sims}")
+
+            key = jax.random.PRNGKey(seed if seed is not None else 0)
+            paths, sigma2_paths = self._simulate_paths(
+                h, n_sims, key,
+                self.model_['omega'], self.model_['alpha'], self.model_['beta'],
+                self.model_['y_centered_last'], self.model_['sigma2_last'],
+                self.model_['init_var'], self.model_['y_mean']
+            )
+
+            res = {
+                'mean': jnp.mean(paths, axis=0),
+                'median': jnp.median(paths, axis=0),
+                'sigma2_mean': jnp.mean(sigma2_paths, axis=0),
+                'sigma2_median': jnp.median(sigma2_paths, axis=0),
+            }
+            if return_paths:
+                res['paths'] = paths
+                res['sigma2_paths'] = sigma2_paths
+
+            if level is not None:
+                level = sorted(level)
+                if n_sims < 30:
+                    raise ValueError(
+                        f"n_sims={n_sims} is too small for reliable percentile-based intervals. "
+                        "Use n_sims >= 30."
+                    )
+                for lv in level:
+                    lower_q = (100 - lv) / 2
+                    upper_q = 100 - lower_q
+                    res[f'lo-{lv}'] = jnp.percentile(paths, lower_q, axis=0)
+                    res[f'hi-{lv}'] = jnp.percentile(paths, upper_q, axis=0)
+
+            return res
 
         sigma2_forecast = self._forecast_sigma2(
             self.model_['omega'], self.model_['alpha'], self.model_['beta'],
@@ -1092,8 +1145,12 @@ class GARCH(BaseForecaster):
         fitted: bool = False,
         n_iters: int | None = None,
         actual_len: int | None = None,
+        simulate: bool = False,
+        n_sims: int = 1000,
+        seed: int | None = None,
+        return_paths: bool = True,
     ) -> dict:
-        """Stateless fit-and-predict.
+        """Stateless fit-and-predict (deterministic or Monte Carlo).
 
         Parameters
         ----------
@@ -1106,19 +1163,48 @@ class GARCH(BaseForecaster):
         X_future : jnp.ndarray or None, default None
             Future exogenous variables (unused).
         level : list[int] or None, default None
-            Confidence levels for prediction intervals.
+            Confidence levels for prediction intervals. When simulate=True,
+            forecast intervals are percentile-based from paths, while fitted
+            intervals remain analytical.
         fitted : bool, default False
             Whether to return in-sample fitted values.
         n_iters : int or None, default None
             Fixed iteration count. None estimates from data.
         actual_len : int or None, default None
             Actual data length for padded inputs.
+        simulate : bool, default False
+            Use Monte Carlo simulation instead of analytical forecasting.
+        n_sims : int, default 1000
+            Number of simulation paths (only used when simulate=True).
+        seed : int or None, default None
+            PRNG seed for reproducibility (only used when simulate=True).
+        return_paths : bool, default True
+            Include full simulation paths in output (only used when simulate=True).
 
         Returns
         -------
         dict
             Keys: 'mean', 'sigma2', and optionally intervals and fitted values.
+            When simulate=True, also includes 'median', 'sigma2_mean',
+            'sigma2_median', and optionally 'paths', 'sigma2_paths'.
         """
+        if simulate:
+            self.fit(y, X, n_iters=n_iters, actual_len=actual_len)
+            res = self.predict(h, X_future, level, simulate=True,
+                               n_sims=n_sims, seed=seed, return_paths=return_paths)
+
+            if fitted:
+                res['fitted'] = self.model_['fitted']
+                if level is not None:
+                    level = sorted(level)
+                    sigma_t = jnp.sqrt(self.model_['sigma2'])
+                    for lv in level:
+                        z = utils._jax_norm_ppf((100 + lv) / 200)
+                        res[f'fitted-lo-{lv}'] = self.model_['fitted'] - z * sigma_t
+                        res[f'fitted-hi-{lv}'] = self.model_['fitted'] + z * sigma_t
+
+            return res
+
         self._validate_h(h)
         y = utils.ensure_float(y)
 
@@ -1187,124 +1273,3 @@ class GARCH(BaseForecaster):
         paths, sigma2_paths = jax.vmap(simulate_single_path)(keys)
         return paths, sigma2_paths
 
-    def predict_simulate(
-        self, h: int, n_sims: int = 1000, seed: int | None = None,
-        X: jnp.ndarray | None = None, level: list[int] | None = None,
-        return_paths: bool = True
-    ) -> dict:
-        """Generate Monte Carlo simulation forecasts.
-
-        Parameters
-        ----------
-        h : int
-            Forecast horizon.
-        n_sims : int, default 1000
-            Number of simulation paths.
-        seed : int or None, default None
-            PRNG seed for reproducibility.
-        X : jnp.ndarray or None, default None
-            Exogenous variables (unused).
-        level : list[int] or None, default None
-            Confidence levels for percentile-based intervals.
-        return_paths : bool, default True
-            Whether to include full simulation paths in output.
-
-        Returns
-        -------
-        dict
-            Keys: 'mean', 'median', 'sigma2_mean', 'sigma2_median',
-            and optionally 'paths', 'sigma2_paths', 'lo-{lv}', 'hi-{lv}'.
-        """
-        if self.model_ is None:
-            raise RuntimeError("Model must be fitted before prediction. Call fit() first.")
-        self._validate_h(h)
-        if not isinstance(n_sims, int) or n_sims < 1:
-            raise ValueError(f"n_sims must be a positive integer, got {n_sims}")
-
-        key = jax.random.PRNGKey(seed if seed is not None else 0)
-        paths, sigma2_paths = self._simulate_paths(
-            h, n_sims, key,
-            self.model_['omega'], self.model_['alpha'], self.model_['beta'],
-            self.model_['y_centered_last'], self.model_['sigma2_last'],
-            self.model_['init_var'], self.model_['y_mean']
-        )
-
-        res = {
-            'mean': jnp.mean(paths, axis=0),
-            'median': jnp.median(paths, axis=0),
-            'sigma2_mean': jnp.mean(sigma2_paths, axis=0),
-            'sigma2_median': jnp.median(sigma2_paths, axis=0),
-        }
-        if return_paths:
-            res['paths'] = paths
-            res['sigma2_paths'] = sigma2_paths
-
-        if level is not None:
-            level = sorted(level)
-            if n_sims < 30:
-                raise ValueError(
-                    f"n_sims={n_sims} is too small for reliable percentile-based intervals. "
-                    "Use n_sims >= 30."
-                )
-            for lv in level:
-                lower_q = (100 - lv) / 2
-                upper_q = 100 - lower_q
-                res[f'lo-{lv}'] = jnp.percentile(paths, lower_q, axis=0)
-                res[f'hi-{lv}'] = jnp.percentile(paths, upper_q, axis=0)
-
-        return res
-
-    def forecast_simulate(
-        self, y: jnp.ndarray, h: int, n_sims: int = 1000,
-        seed: int | None = None, X: jnp.ndarray | None = None,
-        X_future: jnp.ndarray | None = None,
-        level: list[int] | None = None, fitted: bool = False,
-        return_paths: bool = True, n_iters: int | None = None,
-        actual_len: int | None = None,
-    ) -> dict:
-        """Stateless stochastic fit-and-predict.
-
-        Parameters
-        ----------
-        y : jnp.ndarray
-            Input time series (may be padded).
-        h : int
-            Forecast horizon.
-        n_sims : int, default 1000
-            Number of simulation paths.
-        seed : int or None, default None
-            PRNG seed for reproducibility.
-        X : jnp.ndarray or None, default None
-            Exogenous variables (unused).
-        X_future : jnp.ndarray or None, default None
-            Future exogenous variables (unused).
-        level : list[int] or None, default None
-            Confidence levels for prediction intervals.
-        fitted : bool, default False
-            Whether to return in-sample fitted values.
-        return_paths : bool, default True
-            Whether to include full simulation paths.
-        n_iters : int or None, default None
-            Fixed iteration count. None estimates from data.
-        actual_len : int or None, default None
-            Actual data length for padded inputs.
-
-        Returns
-        -------
-        dict
-            Simulation-based forecasts, intervals, and optionally paths.
-        """
-        self.fit(y, X, n_iters=n_iters, actual_len=actual_len)
-        res = self.predict_simulate(h, n_sims, seed, X_future, level, return_paths)
-
-        if fitted:
-            res['fitted'] = self.model_['fitted']
-            if level is not None:
-                level = sorted(level)
-                sigma_t = jnp.sqrt(self.model_['sigma2'])
-                for lv in level:
-                    z = utils._jax_norm_ppf((100 + lv) / 200)
-                    res[f'fitted-lo-{lv}'] = self.model_['fitted'] - z * sigma_t
-                    res[f'fitted-hi-{lv}'] = self.model_['fitted'] + z * sigma_t
-
-        return res
