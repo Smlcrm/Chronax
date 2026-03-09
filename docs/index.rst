@@ -24,8 +24,8 @@ From PyPI::
 
 For local development::
 
-   git clone https://github.com/Smlcrm/ml-library-chronax.git
-   cd ml-library-chronax
+   git clone https://github.com/Smlcrm/Chronax.git
+   cd Chronax
    pip install -e .
 
 Quick Start

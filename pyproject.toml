@@ -4,21 +4,21 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chronax"
-version = "0.1.0"
+version = "0.1.1"
 description = "A JAX-based time-series forecasting library."
 readme = "README.md"
 authors = [
     { name = "Simulacrum, Inc", email = "oss@simulacrum.ai" }
 ]
-license = { text = "MIT License" }
+license = "MIT"
 requires-python = ">=3.11"
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
+keywords = ["time-series", "forecasting", "jax", "arima", "ets", "machine-learning"]
 dependencies = [
     "jax>=0.4.0",
     "jaxlib>=0.4.0",
@@ -38,9 +38,9 @@ docs = [
 
 
 [project.urls]
-Homepage = "https://github.com/Smlcrm/ml-library-chronax"
-Repository = "https://github.com/Smlcrm/ml-library-chronax"
-Issues = "https://github.com/Smlcrm/ml-library-chronax/issues"
+Homepage = "https://github.com/Smlcrm/Chronax"
+Repository = "https://github.com/Smlcrm/Chronax"
+Issues = "https://github.com/Smlcrm/Chronax/issues"
 
 [tool.setuptools.packages.find]
 include = ["chronax", "chronax.*"]

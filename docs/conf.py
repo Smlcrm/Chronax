@@ -37,7 +37,7 @@ copybutton_prompt_is_regexp = True
 # HTML output
 html_theme = "pydata_sphinx_theme"
 html_theme_options = {
-    "github_url": "https://github.com/Smlcrm/ml-library-chronax",
+    "github_url": "https://github.com/Smlcrm/Chronax",
     "show_prev_next": False,
     "navbar_align": "left",
 }

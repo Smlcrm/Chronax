@@ -1,4 +1,4 @@
-![Simulacrum Logo](https://github.com/Smlcrm/assets/blob/main/Asset%201@4x-8.png?raw=true "Simulacrum — Chronax")
+![Simulacrum Logo](https://github.com/Smlcrm/Chronax/raw/prod/simulacrum.png "Simulacrum — Chronax")
 
 # chronax
 
@@ -42,14 +42,14 @@ pip install -i https://test.pypi.org/simple/ --extra-index-url https://pypi.org/
 Install directly from the latest commit:
 
 ```bash
-pip install git+https://github.com/Smlcrm/ml-library-chronax.git
+pip install git+https://github.com/Smlcrm/Chronax.git
 ```
 
 For local development:
 
 ```bash
-git clone https://github.com/Smlcrm/ml-library-chronax.git
-cd ml-library-chronax
+git clone https://github.com/Smlcrm/Chronax.git
+cd Chronax
 python -m venv .venv
 source .venv/bin/activate  # On Windows use: .venv\Scripts\activate
 pip install -e .
