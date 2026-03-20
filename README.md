@@ -301,6 +301,21 @@ Explore inline docstrings for detailed parameter and return-type information.
 
 ---
 
+## Citation
+
+If you use `chronax` in your research, please cite the library using the following BibTeX entry:
+
+```bibtex
+@software{chronax,
+  title = {Chronax: High-performance, JAX-accelerated time-series forecasting},
+  author = {Simulacrum},
+  url = {https://github.com/Smlcrm/Chronax},
+  year = {2026}
+}
+```
+
+---
+
 ## License
 
 MIT © Simulacrum, Inc.
