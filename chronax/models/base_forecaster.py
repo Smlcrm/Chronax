@@ -229,13 +229,14 @@ class BaseForecaster(ABC):
         # self._cs = cs
         return cs
 
+
     @staticmethod
     def add_confidence_intervals(
         fcst: dict,
         cs: jnp.ndarray,
         level: list[int | float],
-        method: str
-        ) -> dict:
+        method: str,
+    ) -> dict:
         """Add conformal prediction intervals to a forecast dict.
 
         Mutates and returns ``fcst`` with interval columns added in-place,

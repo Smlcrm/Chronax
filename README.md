@@ -134,31 +134,89 @@ for name, m in models.items():
 
 ## Available Models
 
-| Model | Class | Description |
-|-------|-------|-------------|
-| **AutoARIMA** | `AutoARIMA` | Automatic ARIMA with seasonal support |
-| **ARIMA** | `ARIMA` | Manual ARIMA specification |
-| **AutoETS** | `AutoETS` | Automatic Exponential Smoothing (Error, Trend, Seasonality) |
-| **ETS** | `ETS` | Manual ETS specification |
-| **AutoTheta** | `AutoTheta` | Automatic Theta method (STM, OTM, DSTM, DOTM) |
-| **Theta** | `Theta` | Standard Theta Method |
-| **TBATS** | `TBATS`, `AutoTBATS` | Trigonometric seasonality, Box-Cox, ARMA, Trend, Seasonality |
-| **MFLES** | `MFLES`, `AutoMFLES` | Multiple Frequency Locally Estimated Scatterplot Smoothing |
-| **AutoCES** | `AutoCES` | Complex Exponential Smoothing |
-| **GARCH** | `GARCH` | Generalized Autoregressive Conditional Heteroskedasticity |
-| **STL / MSTL** | `STL`, `MSTL` | Seasonal-Trend decomposition using LOESS |
-| **Holt** | `Holt` | Holt's linear trend method |
-| **Holt-Winters** | `HoltWinters` | Holt-Winters seasonal method |
-| **SES** | `SimpleExponentialSmoothing` | Simple Exponential Smoothing |
-| **Seasonal ES** | `SeasonalExponentialSmoothing` | Seasonal Exponential Smoothing |
-| **Naive** | `Naive`, `SeasonalNaive` | Naive and Seasonal Naive baselines |
-| **Window Avg** | `WindowAverage`, `SeasonalWindowAverage` | Moving average methods |
-| **Croston** | `CrostonClassic` | Intermittent demand forecasting |
-| **TSB** | `TSB` | Teunter-Syntetos-Babai method |
-| **ADIDA** | `ADIDA` | Aggregate-Disaggregate Intermittent Demand Approach |
-| **IMAPA** | `IMAPA` | Intermittent Multiple Aggregation Prediction Algorithm |
-| **RWD** | `RandomWalkWithDrift` | Random Walk with Drift |
-| **Historic Avg** | `HistoricAverage` | Simple historical average |
+### Automatic Forecasting
+
+Automatic model-selection wrappers that search over candidate configurations.
+
+| Model | Point Forecast | Probabilistic Forecast | Exogenous Regressors | Interval Type |
+|-------|----------------|------------------------|----------------------|---------------|
+| `AutoARIMA` | ✓ | ✓ | ✓ | Native |
+| `AutoETS` | ✓ | ✓ | — | Native + conformal |
+| `AutoTheta` | ✓ | ✓ | — | Monte Carlo + conformal |
+| `AutoMFLES` | ✓ | ✓ | ✓ | Gaussian approx. + conformal |
+| `AutoTBATS` | ✓ | ✓ | — | Conformal |
+| `AutoCES` | ✓ | ✓ | — | Conformal |
+
+### ARIMA Family
+
+Autoregressive integrated moving-average models for autocorrelated series.
+
+| Model | Point Forecast | Probabilistic Forecast | Exogenous Regressors | Interval Type |
+|-------|----------------|------------------------|----------------------|---------------|
+| `ARIMA` | ✓ | ✓ | ✓ | Native |
+
+### Theta Family
+
+Theta-method forecasters for trend and seasonality decomposition.
+
+| Model | Point Forecast | Probabilistic Forecast | Exogenous Regressors | Interval Type |
+|-------|----------------|------------------------|----------------------|---------------|
+| `Theta` | ✓ | ✓ | — | Monte Carlo + conformal |
+
+### Multiple Seasonalities & Decomposition
+
+Models designed for multiple seasonal patterns or explicit trend-seasonal decomposition.
+
+| Model | Point Forecast | Probabilistic Forecast | Exogenous Regressors | Interval Type |
+|-------|----------------|------------------------|----------------------|---------------|
+| `MFLES` | ✓ | ✓ | ✓ | Conformal |
+| `TBATS` | ✓ | ✓ | — | Conformal |
+| `MSTL` | ✓ | ✓ | — | Conformal |
+| `STL` | ✓ | ✓ | — | Conformal |
+
+### Volatility Models
+
+Models specialized for time-varying variance and heteroskedastic dynamics.
+
+| Model | Point Forecast | Probabilistic Forecast | Exogenous Regressors | Interval Type |
+|-------|----------------|------------------------|----------------------|---------------|
+| `GARCH` | ✓ | ✓ | — | Native + conformal |
+
+### Baseline Models
+
+Simple reference forecasters used as strong, interpretable baselines.
+
+| Model | Point Forecast | Probabilistic Forecast | Exogenous Regressors | Interval Type |
+|-------|----------------|------------------------|----------------------|---------------|
+| `HistoricAverage` | ✓ | ✓ | — | Native + conformal |
+| `Naive` | ✓ | ✓ | — | Native + conformal |
+| `SeasonalNaive` | ✓ | ✓ | — | Native + conformal |
+| `WindowAverage` | ✓ | ✓ | — | Conformal |
+| `SeasonalWindowAverage` | ✓ | ✓ | — | Conformal |
+| `RandomWalkWithDrift` | ✓ | ✓ | — | Native + conformal |
+
+### Exponential Smoothing
+
+Level, trend, and seasonal smoothing models with recursive state updates.
+
+| Model | Point Forecast | Probabilistic Forecast | Exogenous Regressors | Interval Type |
+|-------|----------------|------------------------|----------------------|---------------|
+| `ETS` | ✓ | ✓ | — | Native + conformal |
+| `Holt` | ✓ | ✓ | — | Native + conformal |
+| `HoltWinters` | ✓ | ✓ | — | Native + conformal |
+| `SimpleExponentialSmoothing` | ✓ | ✓ | — | Conformal |
+| `SeasonalExponentialSmoothing` | ✓ | ✓ | — | Conformal |
+
+### Sparse / Intermittent Demand
+
+Forecasters tailored to sparse series with many zeros or irregular demand arrivals.
+
+| Model | Point Forecast | Probabilistic Forecast | Exogenous Regressors | Interval Type |
+|-------|----------------|------------------------|----------------------|---------------|
+| `ADIDA` | ✓ | ✓ | — | Conformal |
+| `CrostonClassic` | ✓ | ✓ | — | Conformal |
+| `IMAPA` | ✓ | ✓ | — | Conformal |
+| `TSB` | ✓ | ✓ | — | Native + conformal |
 
 All models are importable from `chronax.models`.
 
@@ -240,6 +298,21 @@ python benchmarks/benchmark_suite.py
 | `chronax.utils.*` | Utilities — loss functions, plotting, conformal intervals |
 
 Explore inline docstrings for detailed parameter and return-type information.
+
+---
+
+## Citation
+
+If you use `chronax` in your research, please cite the library using the following BibTeX entry:
+
+```bibtex
+@software{chronax,
+  title = {Chronax: High-performance, JAX-accelerated time-series forecasting},
+  author = {Simulacrum},
+  url = {https://github.com/Smlcrm/Chronax},
+  year = {2026}
+}
+```
 
 ---
 
