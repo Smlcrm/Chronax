@@ -529,7 +529,7 @@ def _initparamtheta(initial_smoothed: float | None, alpha: float | None,
     Returns
     -------
     dict
-        Keys: 'initial_smoothed', 'alpha', 'theta' (float values),
+        Keys: 'initial_smoothed', 'alpha', 'theta' (JAX float32 scalars),
         'opt_level', 'opt_alpha', 'opt_theta' (bool flags).
     """
     if initial_smoothed is None:
@@ -585,10 +585,10 @@ def _run_theta_optimization(y: jnp.ndarray, model_type: int, par: dict) -> dict:
     Returns
     -------
     dict
-        Keys: 'mse' (float), 'residuals' (ndarray),
+        Keys: 'mse' (JAX scalar), 'residuals' (ndarray),
         'final_state' (ndarray of shape (5,)), 'par' (dict with
-        'initial_smoothed', 'alpha', 'theta'), 'n' (int),
-        'modeltype' (str), 'mean_y' (float), 'm' (int).
+        'initial_smoothed', 'alpha', 'theta' as JAX scalars), 'n' (int),
+        'modeltype' (str), 'mean_y' (JAX scalar), 'm' (int).
     """
     opt_level = par["opt_level"]
     opt_alpha = par["opt_alpha"]
