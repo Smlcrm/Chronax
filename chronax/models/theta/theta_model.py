@@ -533,7 +533,7 @@ def _initparamtheta(initial_smoothed: float | None, alpha: float | None,
         'opt_level', 'opt_alpha', 'opt_theta' (bool flags).
     """
     if initial_smoothed is None:
-        initial_smoothed = float(y[0]) / 2.0
+        initial_smoothed = y[0] / 2.0
         opt_level = True
     else:
         opt_level = False
@@ -555,9 +555,9 @@ def _initparamtheta(initial_smoothed: float | None, alpha: float | None,
             opt_theta = False
 
     return {
-        "initial_smoothed": float(initial_smoothed),
-        "alpha": float(alpha),
-        "theta": float(theta),
+        "initial_smoothed": jnp.asarray(initial_smoothed, dtype=jnp.float32),
+        "alpha": jnp.asarray(alpha, dtype=jnp.float32),
+        "theta": jnp.asarray(theta, dtype=jnp.float32),
         "opt_level": opt_level,
         "opt_alpha": opt_alpha,
         "opt_theta": opt_theta,
@@ -608,13 +608,15 @@ def _run_theta_optimization(y: jnp.ndarray, model_type: int, par: dict) -> dict:
             jnp.asarray(init_theta, dtype=jnp.float32),
         )
         return {
-            "mse": float(mse),
+            "mse": mse,
             "residuals": residuals,
             "final_state": final_state,
-            "par": {"initial_smoothed": init_level, "alpha": init_alpha, "theta": init_theta},
+            "par": {"initial_smoothed": jnp.asarray(init_level, dtype=jnp.float32),
+                    "alpha": jnp.asarray(init_alpha, dtype=jnp.float32),
+                    "theta": jnp.asarray(init_theta, dtype=jnp.float32)},
             "n": len(y),
             "modeltype": ModelType._name_map[int(model_type)],
-            "mean_y": float(jnp.mean(y_jax)),
+            "mean_y": jnp.mean(y_jax),
             "m": 1,
         }
 
@@ -645,17 +647,17 @@ def _run_theta_optimization(y: jnp.ndarray, model_type: int, par: dict) -> dict:
     )
 
     return {
-        "mse": float(mse),
+        "mse": mse,
         "residuals": residuals,
         "final_state": final_state,
         "par": {
-            "initial_smoothed": float(opt_level_val),
-            "alpha": float(opt_alpha_val),
-            "theta": float(opt_theta_val),
+            "initial_smoothed": opt_level_val,
+            "alpha": opt_alpha_val,
+            "theta": opt_theta_val,
         },
         "n": len(y),
         "modeltype": ModelType._name_map[int(model_type)],
-        "mean_y": float(jnp.mean(y_jax)),
+        "mean_y": jnp.mean(y_jax),
         "m": 1,  # set by caller
     }
 
@@ -882,26 +884,40 @@ def _forecast_from_model(obj: dict, h: int, level: list | None = None, n_samples
     last_state = obj["final_state"]
     alpha = obj["par"]["alpha"]
     theta = obj["par"]["theta"]
-    model_type = ModelType._from_name[obj["modeltype"]]
 
-    # Generate forecasts
-    forecasts = _forecast_theta(
-        last_state, int(model_type),
-        jnp.asarray(alpha, dtype=jnp.float32),
-        jnp.asarray(theta, dtype=jnp.float32),
-        n, h,
-    )
+    # Use stored int model_type if available (vmap-safe), fall back to string lookup
+    if "model_type_int" in obj:
+        model_type_int = obj["model_type_int"]
+    else:
+        model_type_int = ModelType._from_name[obj["modeltype"]]
+
+    # Generate forecasts — handle traced model_type_int under vmap
+    alpha_f32 = jnp.asarray(alpha, dtype=jnp.float32)
+    theta_f32 = jnp.asarray(theta, dtype=jnp.float32)
+    if isinstance(model_type_int, (jnp.ndarray, jax.Array)):
+        # Under vmap: compute all model types and select
+        # ModelType values are 1-4 (STM=1, OTM=2, DSTM=3, DOTM=4)
+        all_forecasts = jnp.stack([
+            _forecast_theta(last_state, mt, alpha_f32, theta_f32, n, h)
+            for mt in ModelType._all  # (1, 2, 3, 4)
+        ])
+        forecasts = all_forecasts[model_type_int - 1]  # convert 1-indexed to 0-indexed
+    else:
+        forecasts = _forecast_theta(
+            last_state, int(model_type_int), alpha_f32, theta_f32, n, h,
+        )
 
     res = {"mean": forecasts}
 
-    # Prediction intervals via Monte Carlo
+    # Prediction intervals via Monte Carlo (not called under vmap — level is None)
     if level is not None:
         sigma = jnp.std(obj["residuals"][3:], ddof=1)
+        mt_int = int(model_type_int) if not isinstance(model_type_int, (jnp.ndarray, jax.Array)) else 0
         samples = _compute_pi_samples(
             last_state,
-            int(model_type),
-            jnp.asarray(alpha, dtype=jnp.float32),
-            jnp.asarray(theta, dtype=jnp.float32),
+            mt_int,
+            alpha_f32,
+            theta_f32,
             sigma,
             n,
             jnp.asarray(obj["mean_y"], dtype=jnp.float32),
@@ -914,14 +930,16 @@ def _forecast_from_model(obj: dict, h: int, level: list | None = None, n_samples
             res[f"lo-{lv}"] = jnp.quantile(samples, min_q, axis=1)
             res[f"hi-{lv}"] = jnp.quantile(samples, max_q, axis=1)
 
-    # Recompose if seasonal decomposition was applied
-    if obj.get("decompose", False):
+    # Recompose if seasonal decomposition was applied (vmap-safe: traced boolean)
+    should_recompose = obj.get("decompose", False)
+    if isinstance(should_recompose, (jnp.ndarray, jax.Array)) or should_recompose:
         seas_forecast = _repeat_val_seas(obj["seas_forecast"]["mean"], h=h)
-        for key in res:
-            if obj["decomposition_type"] == "multiplicative":
-                res[key] = res[key] * seas_forecast
-            else:
-                res[key] = res[key] + seas_forecast
+        is_additive = obj.get("decomposition_type_is_additive", jnp.bool_(True))
+        for key in list(res.keys()):
+            recomp_add = res[key] + seas_forecast
+            recomp_mult = res[key] * seas_forecast
+            recomposed = jnp.where(is_additive, recomp_add, recomp_mult)
+            res[key] = jnp.where(should_recompose, recomposed, res[key])
 
     return res
 
@@ -933,6 +951,8 @@ def _auto_theta(y: jnp.ndarray, m: int, model: str | None = None,
 
     Tests all 4 model types (or a single specified one), selects by MSE.
     Handles seasonal decomposition if data has significant seasonality.
+
+    vmap-compatible: all data-dependent control flow uses JAX primitives.
 
     Parameters
     ----------
@@ -963,75 +983,114 @@ def _auto_theta(y: jnp.ndarray, m: int, model: str | None = None,
     NotImplementedError
         If the series has 3 or fewer observations.
     """
-    # Constant series shortcut
-    if is_constant(y):
-        return _fit_theta_model(
-            y, m, "STM", initial_smoothed=float(jnp.mean(y)) / 2.0,
-            alpha=0.5, theta=2.0,
-        )
-
-    # Seasonal decomposition test
-    decompose = False
-    if m >= 4 and len(y) >= 2 * m:
-        r = acf(y, nlags=m)[1:]
-        stat = jnp.sqrt((1.0 + 2.0 * jnp.sum(r[:-1] ** 2)) / len(y))
-        decompose = bool(jnp.abs(r[-1]) / stat > _jax_norm_ppf(0.95))
-
-    y_decompose = None
-    seas_forecast = None
-    data_positive = bool(jnp.min(y) > 0)
-
-    if decompose:
-        if decomposition_type == "multiplicative" and not data_positive:
-            decomposition_type = "additive"
-        y_decompose = seasonal_decompose(y, model=decomposition_type, period=m)['seasonal']
-        if decomposition_type == "multiplicative" and bool(jnp.any(y_decompose < 0.01)):
-            decomposition_type = "additive"
-            y_decompose = seasonal_decompose(y, model="additive", period=m)['seasonal']
-        if decomposition_type == "additive":
-            y = y - y_decompose
-        else:
-            y = y / y_decompose
-        seas_forecast = _seasonal_naive(y=y_decompose, h=m, season_length=m, fitted=False)
-
-    # Validate model type
+    # Validate model type (static check — OK under vmap)
     if model is not None and model not in ("STM", "OTM", "DSTM", "DOTM"):
         raise ValueError(f"Invalid model type: {model}.")
 
-    n = len(y)
+    n = len(y)  # static under vmap
     if n <= 3:
         raise NotImplementedError("Series too short (n <= 3)")
 
-    # Model selection
-    if model is None:
-        model_types = ["STM", "OTM", "DSTM", "DOTM"]
+    # --- Constant series model (always computed, selected via jnp.where at end) ---
+    y_is_constant = is_constant(y)
+    const_model = _fit_theta_model(
+        y, m, "STM", initial_smoothed=jnp.mean(y) / 2.0,
+        alpha=0.5, theta=2.0,
+    )
+
+    # --- Seasonal decomposition (traced booleans, precompute both paths) ---
+    if m >= 4 and n >= 2 * m:  # static shape checks
+        r = acf(y, nlags=m)[1:]
+        stat = jnp.sqrt((1.0 + 2.0 * jnp.sum(r[:-1] ** 2)) / n)
+        should_decompose = jnp.abs(r[-1]) / stat > _jax_norm_ppf(0.95)
     else:
-        model_types = [model]
+        should_decompose = jnp.bool_(False)
 
-    best_model = None
-    best_mse = float('inf')
-    for mtype in model_types:
-        fit = _fit_theta_model(
-            y, m, mtype, initial_smoothed=initial_smoothed,
-            alpha=alpha, theta=theta,
-        )
-        fit_mse = fit["mse"]
-        if not jnp.isnan(fit_mse) and fit_mse < best_mse:
-            best_model = fit
-            best_mse = fit_mse
+    data_positive = jnp.min(y) > 0
 
-    if best_model is None:
-        raise Exception("No model able to be fitted")
+    # Always compute additive decomposition
+    if m >= 4 and n >= 2 * m:  # static guard to avoid errors on short series
+        y_dec_add = seasonal_decompose(y, model="additive", period=m)['seasonal']
 
-    # Attach seasonal decomposition info
-    if decompose:
-        if decomposition_type == "multiplicative":
-            best_model["residuals"] = best_model["residuals"] * y_decompose
+        if decomposition_type == "multiplicative":  # static string from __init__
+            y_dec_mult = seasonal_decompose(y, model="multiplicative", period=m)['seasonal']
+            use_additive = ~data_positive | jnp.any(y_dec_mult < 0.01)
+            y_decompose = jnp.where(use_additive, y_dec_add, y_dec_mult)
+            is_additive = use_additive
         else:
-            best_model["residuals"] = best_model["residuals"] + y_decompose
-        best_model["decompose"] = True
-        best_model["decomposition_type"] = decomposition_type
-        best_model["seas_forecast"] = dict(seas_forecast)
+            y_decompose = y_dec_add
+            is_additive = jnp.bool_(True)
+
+        y_deseasonalized = jnp.where(is_additive, y - y_decompose, y / y_decompose)
+        y_final = jnp.where(should_decompose, y_deseasonalized, y)
+        seas_forecast = _seasonal_naive(y=y_decompose, h=m, season_length=m, fitted=False)
+    else:
+        y_final = y
+        y_decompose = jnp.zeros_like(y)
+        is_additive = jnp.bool_(True)
+        seas_forecast = {"mean": jnp.zeros(m, dtype=y.dtype)}
+
+    # --- Model selection (loop unrolls at trace time since model_types is static) ---
+    model_types = ["STM", "OTM", "DSTM", "DOTM"] if model is None else [model]
+    fits = [_fit_theta_model(y_final, m, mt, initial_smoothed=initial_smoothed,
+            alpha=alpha, theta=theta) for mt in model_types]
+
+    # Select best by MSE using JAX ops (no Python if on traced values)
+    mses = jnp.array([f["mse"] for f in fits])
+    mses_safe = jnp.where(jnp.isnan(mses), jnp.inf, mses)
+    best_idx = jnp.argmin(mses_safe)
+
+    # Select best model dict — stack numeric/array values, index by best_idx
+    ref = fits[0]
+    if len(fits) > 1:
+        best_model = {}
+        for k in ref:
+            v = ref[k]
+            if isinstance(v, dict):
+                # Handle nested dicts (e.g., "par")
+                best_model[k] = {
+                    pk: jnp.stack([f[k][pk] for f in fits])[best_idx]
+                    for pk in v
+                }
+            elif isinstance(v, (jnp.ndarray, jax.Array)):
+                best_model[k] = jnp.stack([f[k] for f in fits])[best_idx]
+            else:
+                # Static values (ints, strings) — same across fits
+                best_model[k] = v
+        # Store all model type ints for downstream forecast dispatch
+        model_type_ints = jnp.array([ModelType._from_name[mt] for mt in model_types])
+        best_model["model_type_int"] = model_type_ints[best_idx]
+    else:
+        best_model = fits[0]
+        best_model["model_type_int"] = jnp.int32(ModelType._from_name[model_types[0]])
+
+    # --- Apply decomposition info (always present for consistent pytree structure) ---
+    best_model["decompose"] = should_decompose
+    best_model["decomposition_type_is_additive"] = is_additive
+    best_model["seas_forecast"] = seas_forecast
+    # Recompose residuals conditionally
+    residuals_add = best_model["residuals"] + y_decompose
+    residuals_mult = best_model["residuals"] * y_decompose
+    residuals_recomposed = jnp.where(is_additive, residuals_add, residuals_mult)
+    best_model["residuals"] = jnp.where(should_decompose, residuals_recomposed, best_model["residuals"])
+
+    # --- Choose constant model vs selected model ---
+    def select_model(use_const, const_mod, sel_mod):
+        result = {}
+        for k in sel_mod:
+            if isinstance(sel_mod[k], (jnp.ndarray, jax.Array)):
+                result[k] = jnp.where(use_const, const_mod.get(k, sel_mod[k]), sel_mod[k])
+            else:
+                result[k] = sel_mod[k]
+        return result
+
+    # Ensure const_model has the same keys
+    const_model["decompose"] = jnp.bool_(False)
+    const_model["decomposition_type_is_additive"] = jnp.bool_(True)
+    const_model["seas_forecast"] = seas_forecast
+    const_model["model_type_int"] = jnp.int32(ModelType._from_name["STM"])
+
+    best_model = select_model(y_is_constant, const_model, best_model)
 
     return best_model
 

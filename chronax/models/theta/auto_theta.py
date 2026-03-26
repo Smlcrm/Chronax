@@ -102,6 +102,8 @@ class AutoTheta(BaseForecaster):
             model=self.model,
             decomposition_type=self.decomposition_type,
         )
+        if jnp.isnan(self.model_["mse"]):
+            raise Exception("No model able to be fitted")
         self.model_["fitted"] = y - self.model_["residuals"]
         _store_cs(self, y, X)
         return self

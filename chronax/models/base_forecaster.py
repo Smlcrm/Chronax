@@ -173,22 +173,23 @@ class BaseForecaster(ABC):
         def compute_window_scores(i_window):
             train_end = base_train_end + i_window * h
 
-            # Slice with STATIC maximum size (JAX-compatible)
+            # Slice with STATIC maximum size (JAX-compatible), then mask
+            # data beyond train_end with edge value to prevent data leakage
             y_train = lax.dynamic_slice(y_padded, (0,), (max_train_size,))
+            mask = jnp.arange(max_train_size) < train_end
+            y_train = jnp.where(mask, y_train, y_train[train_end - 1])
+
             y_test = lax.dynamic_slice(y_padded, (train_end,), (h,))
 
             if X_padded is not None:
                 X_train = lax.dynamic_slice(X_padded, (0, 0), (max_train_size, X_padded.shape[1]))
+                X_train = jnp.where(mask[:, None], X_train, X_train[train_end - 1])
                 X_test = lax.dynamic_slice(X_padded, (train_end, 0), (h, X_padded.shape[1]))
             else:
                 X_train = None
                 X_test = None
 
-            # Forecast uses padded data (valid data at [:train_end], padding at [train_end:])
-            # The padding is from 'edge' mode so won't cause issues for most models
             fcst_window = self.forecast(h=h, y=y_train, X=X_train, X_future=X_test)  # type: ignore[attr-defined]
-
-            # Compute scores (padding doesn't affect test set which is always valid)
             window_scores = jnp.abs(fcst_window['mean'].astype('float32') - y_test)
             return window_scores
 
@@ -196,23 +197,6 @@ class BaseForecaster(ABC):
         cs = vmap(compute_window_scores)(jnp.arange(n_windows))
         # self._cs = cs
         return cs
-        # cs_list = []
-        # for i_window in range(n_windows):
-        #     train_end = base_train_end + i_window * h
-        #     y_train = y[:train_end]
-        #     y_test  = y[train_end:train_end + h]
-        #     if X is not None:
-        #         X_train = X[:train_end]
-        #         X_test  = X[train_end:train_end + h]
-        #     else:
-        #         X_train = None
-        #         X_test = None
-        #     fcst_window = self.forecast(h=h, y=y_train, X=X_train, X_future=X_test)
-        #     window_scores = jnp.abs(fcst_window['mean'].astype('float32') - y_test)
-        #     cs_list.append(window_scores)
-
-        # cs = jnp.stack(cs_list)
-        # return cs
 
     # calculates confidence intervals at level(s) for forceasted values based on conformity_score
     @staticmethod
@@ -232,18 +216,14 @@ class BaseForecaster(ABC):
             # reverse lower cuts to match original order
             cuts_lower = cuts_lower[::-1]
             cuts = jnp.concatenate([cuts_lower, cuts_upper])
-            mean = fcst["mean"].reshape(1, -1)
-            cs_flat = cs.reshape(-1)
+            mean = fcst["mean"]
             # create forecast paths: mean ± conformity_scores
-            scores = jnp.vstack([
-                mean - cs_flat.reshape(-1, 1),  # lower paths
-                mean + cs_flat.reshape(-1, 1)   # upper paths
-            ])
-            quantiles = jnp.quantile(
-                scores,
-                cuts,
-                axis=0,
-            )
+            # cs has shape (K, h), mean has shape (h,)
+            scores = jnp.concatenate([
+                mean[None, :] - cs,  # (K, h)
+                mean[None, :] + cs,  # (K, h)
+            ], axis=0)              # (2K, h)
+            quantiles = jnp.quantile(scores, cuts, axis=0)  # (n_cuts, h)
             # column names
             lo_cols = [f"lo-{lv}" for lv in reversed(level)]
             hi_cols = [f"hi-{lv}" for lv in level]

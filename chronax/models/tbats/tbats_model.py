@@ -17,6 +17,7 @@ from __future__ import annotations
 import warnings
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import jax
 import jax.numpy as jnp
 from jax import config
 
@@ -202,9 +203,18 @@ class AutoTBATS(BaseForecaster):
             use_arma_errors=self.use_arma_errors,
         )
 
+        # Store fitted config so forecast() uses the same config under vmap
+        self._fitted_config = self.model_.get("_config", {
+            'use_boxcox': self.use_boxcox,
+            'use_trend': self.use_trend,
+            'use_damped_trend': self.use_damped_trend,
+        })
+
         # Pre-compute conformity scores if requested
         if self.conformal_params is not None:
+            saved_model = self.model_  # save before vmap (which overwrites via forecast)
             self._cs = self.conformity_scores(y=y, X=X)
+            self.model_ = saved_model  # restore concrete model after vmap
         else:
             self._cs = None
 
@@ -402,21 +412,40 @@ class AutoTBATS(BaseForecaster):
         """
         y = _ensure_float(y)
 
-        if self.use_boxcox is True:
-            y = _ensure_pos_strict(y)
+        # Validation: skip under vmap where values are traced
+        try:
+            if self.use_boxcox is True:
+                y = _ensure_pos_strict(y)
+            if jnp.any(jnp.isnan(y)) or jnp.any(jnp.isinf(y)):
+                raise ValueError("Input series contains NaN or Inf values")
+        except (jax.errors.ConcretizationTypeError, jax.errors.TracerBoolConversionError):
+            pass  # Under vmap, skip eager validation
 
-        if jnp.any(jnp.isnan(y)) or jnp.any(jnp.isinf(y)):
-            raise ValueError("Input series contains NaN or Inf values")
+        # When called under vmap (from conformity_scores), reuse the fitted
+        # model's configuration to ensure a single combo (fixed state-space
+        # dimension). This is correct: conformal scores measure how well a
+        # SPECIFIC model config performs across windows.
+        use_boxcox = self.use_boxcox
+        use_trend = self.use_trend
+        use_damped_trend = self.use_damped_trend
+        k_vector = None
+        if hasattr(self, '_fitted_config'):
+            use_boxcox = self._fitted_config['use_boxcox']
+            use_trend = self._fitted_config['use_trend']
+            use_damped_trend = self._fitted_config['use_damped_trend']
+        if hasattr(self, 'model_') and self.model_ is not None and 'k_vector' in self.model_:
+            k_vector = self.model_['k_vector']
 
         mod = _tbats_selection(
             y=y,
             seasonal_periods=self.season_length,
-            use_boxcox=self.use_boxcox,
+            use_boxcox=use_boxcox,
             bc_lower=self.bc_lower_bound,
             bc_upper=self.bc_upper_bound,
-            use_trend=self.use_trend,
-            use_damped_trend=self.use_damped_trend,
+            use_trend=use_trend,
+            use_damped_trend=use_damped_trend,
             use_arma_errors=self.use_arma_errors,
+            k_vector=k_vector,
         )
 
         self.model_ = mod
