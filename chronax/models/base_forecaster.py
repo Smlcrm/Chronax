@@ -69,29 +69,30 @@ from jax import lax, vmap
 from chronax.utils import _get_conformal_method
 
 class BaseForecaster(ABC):
+    """Abstract base class defining the shared interface for all Chronax forecasting models.
+
+    All models must implement ``fit``, ``predict``, and ``forecast``.
+    See module docstring for full attribute and method documentation.
+    """
+
     uses_exog = False
 
-    def new(self):
+    def new(self) -> "BaseForecaster":
+        """Return a shallow copy of this model instance.
+
+        Used internally to clone a model without mutating shared state.
+
+        Returns
+        -------
+        BaseForecaster
+            A new instance of the same type with a shallow-copied ``__dict__``.
+        """
         b = type(self).__new__(type(self))
         b.__dict__.update(self.__dict__)
         return b
-    
-    # slots implementation
-    # __slots__ = (
-    #     'alias', 
-    #     'conformal_params',
-    #     'model_'
-    #     )
-    # def new(self):
-    #     b = type(self).__new__(type(self))
-    #     for cls in type(self).__mro__: # __mro__ returns the chain of classes the object inherits
-    #         if hasattr(cls, '__slots__'): # safety check, class level
-    #             for attr in cls.__slots__:
-    #                 if hasattr(self, attr): # safety check, attribute level
-    #                     setattr(b, attr, getattr(self, attr))
-    #     return b
 
-    def __repr__(self):
+    def __repr__(self) -> str:
+        """Return the model's alias as its string representation."""
         return self.alias
 
     @abstractmethod
@@ -147,10 +148,32 @@ class BaseForecaster(ABC):
     ) -> jnp.ndarray:
         """Compute signed conformity scores via walk-forward cross-validation.
 
-        Returns a (n_windows, h) array of signed residuals (actual - forecast).
-        The interval construction method determines how these are used:
+        Scores are signed residuals (actual - forecast) across ``n_windows``
+        expanding windows of horizon ``h``. Uses ``vmap`` for parallelization.
+        The interval construction method determines how scores are used:
         ``conformal_distribution`` takes their absolute value for symmetric
         intervals; ``conformal_signed`` uses them directly for asymmetric intervals.
+
+        Parameters
+        ----------
+        y : jnp.ndarray
+            Univariate time series of observed values.
+        X : jnp.ndarray or None, optional
+            Exogenous features array, shape ``(n_samples, n_features)``. Only
+            used by models where ``uses_exog=True``.
+
+        Returns
+        -------
+        jnp.ndarray
+            2-D array of shape ``(n_windows, h)`` containing signed forecast
+            errors for each window and horizon step.
+
+        Raises
+        ------
+        ValueError
+            If ``conformal_params`` is ``None``.
+        ValueError
+            If the series is too short to form at least 2 windows.
         """
         if self.conformal_params is None:
             raise ValueError(
@@ -215,14 +238,30 @@ class BaseForecaster(ABC):
         ) -> dict:
         """Add conformal prediction intervals to a forecast dict.
 
-        Args:
-            fcst: Forecast dict containing 'mean' of shape (h,).
-            cs: Signed conformity scores of shape (n_windows, h).
-            level: Confidence levels (0-100), e.g. [80, 95].
-            method: 'conformal_distribution' (symmetric) or 'conformal_signed' (asymmetric).
+        Mutates and returns ``fcst`` with interval columns added in-place,
+        keyed as ``"lo-{level}"`` and ``"hi-{level}"`` for each requested level.
 
-        Returns:
-            Updated fcst dict with 'lo-{lv}' and 'hi-{lv}' keys added.
+        Parameters
+        ----------
+        fcst : dict
+            Forecast dictionary containing at least ``{"mean": jnp.ndarray}``.
+        cs : jnp.ndarray
+            Signed conformity scores, shape ``(n_windows, h)``.
+        level : list of int or float
+            Confidence levels, e.g. ``[80, 95]``.
+        method : str
+            ``"conformal_distribution"`` (symmetric, uses ``|scores|``) or
+            ``"conformal_signed"`` (asymmetric, uses raw signed scores).
+
+        Returns
+        -------
+        dict
+            The input ``fcst`` dict with interval arrays added.
+
+        Raises
+        ------
+        ValueError
+            If ``method`` is not a recognised conformal method.
         """
         def conformal_distribution_intervals(fcst, cs, level):
             level = sorted(level)
