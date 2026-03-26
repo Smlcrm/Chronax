@@ -328,13 +328,54 @@ def _add_conformal_distribution_intervals(
     cs: jnp.ndarray,
     level: Union[List[float], List[int]],
 ) -> dict:
-    """Add conformal intervals to forecast dict based on conformal scores.
+    """Add symmetric conformal intervals using absolute residuals.
 
-    Creates forecast paths from errors and calculates quantiles.
+    Takes the absolute value of signed conformity scores and constructs
+    2W forecast paths (mean +/- |scores|), producing intervals that are
+    always symmetric around the mean.
 
     Args:
         fcst: Forecast dict containing 'mean'.
-        cs: Conformal scores array.
+        cs: Signed conformal scores of shape (W, h).
+        level: Confidence levels (0-100).
+
+    Returns:
+        Updated fcst dict with 'lo-{lv}' and 'hi-{lv}' keys.
+    """
+    level = sorted(level)
+    alphas = jnp.array([100 - lv for lv in level], dtype=jnp.float32)
+    cuts_lower = (alphas / 200.0)[::-1]
+    cuts_upper = 1.0 - (alphas / 200.0)
+    cuts = jnp.concatenate([cuts_lower, cuts_upper])
+
+    mean = fcst["mean"].reshape(1, -1)
+    cs_abs = jnp.abs(cs)
+    scores = jnp.vstack([mean - cs_abs, mean + cs_abs])
+    quantiles = jnp.quantile(scores, cuts, axis=0)
+
+    lo_cols = [f"lo-{lv}" for lv in reversed(level)]
+    hi_cols = [f"hi-{lv}" for lv in level]
+    out_cols = lo_cols + hi_cols
+
+    for i, col in enumerate(out_cols):
+        fcst[col] = quantiles[i]
+
+    return fcst
+
+
+def _add_conformal_signed_intervals(
+    fcst: dict,
+    cs: jnp.ndarray,
+    level: Union[List[float], List[int]],
+) -> dict:
+    """Add asymmetric conformal intervals using signed residuals.
+
+    Uses raw signed conformity scores (actual - forecast) to construct
+    W plausible values per horizon, allowing asymmetric intervals.
+
+    Args:
+        fcst: Forecast dict containing 'mean'.
+        cs: Signed conformal scores array of shape (W, h).
         level: Sorted list of confidence levels (0-100).
 
     Returns:
@@ -347,7 +388,7 @@ def _add_conformal_distribution_intervals(
     cuts = jnp.concatenate([cuts_lower, cuts_upper])
 
     mean = fcst["mean"].reshape(1, -1)
-    scores = jnp.vstack([mean - cs, mean + cs])
+    scores = mean + cs
     quantiles = jnp.quantile(scores, cuts, axis=0)
 
     lo_cols = [f"lo-{lv}" for lv in reversed(level)]
@@ -364,7 +405,7 @@ def _get_conformal_method(method: str) -> Callable:
     """Look up a conformal prediction interval method by name.
 
     Args:
-        method: Method name (currently only 'conformal_distribution').
+        method: Method name ('conformal_distribution' or 'conformal_signed').
 
     Returns:
         The corresponding interval function.
@@ -374,6 +415,7 @@ def _get_conformal_method(method: str) -> Callable:
     """
     available_methods = {
         "conformal_distribution": _add_conformal_distribution_intervals,
+        "conformal_signed": _add_conformal_signed_intervals,
     }
     if method not in available_methods:
         raise ValueError(

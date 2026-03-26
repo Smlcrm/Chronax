@@ -39,14 +39,16 @@ Methods
    delegates to forecast(). Subclasses with warm-start re-estimation
    (e.g. Holt, HoltWinters, ETS) override this.
 
-7. ``conformity_scores(y, X=None)`` computes the model's conformity score on
-   y as a 2D JAX array. A model's conformity score is the absolute difference
-   between forecasted and actual values across h positions and n_windows.
+7. ``conformity_scores(y, X=None)`` computes signed conformity scores on y
+   as a 2D JAX array of shape (n_windows, h). Each score is (actual - forecast)
+   for a walk-forward cross-validation window. Positive = underprediction.
    Uses vmap for parallelization over windows.
 
 8. ``add_confidence_intervals(fcst, cs, level, method)`` [staticmethod]
    Adds conformal prediction intervals to a forecast dict using pre-computed
-   conformity scores.
+   signed conformity scores. Two methods are available:
+   - ``conformal_distribution``: symmetric intervals via mean +/- |scores| (2W paths)
+   - ``conformal_signed``: asymmetric intervals via mean + scores (W paths)
 
 Notes
 -----
@@ -143,7 +145,13 @@ class BaseForecaster(ABC):
         y: jnp.ndarray,
         X: jnp.ndarray | None = None,
     ) -> jnp.ndarray:
-         # safety checks
+        """Compute signed conformity scores via walk-forward cross-validation.
+
+        Returns a (n_windows, h) array of signed residuals (actual - forecast).
+        The interval construction method determines how these are used:
+        ``conformal_distribution`` takes their absolute value for symmetric
+        intervals; ``conformal_signed`` uses them directly for asymmetric intervals.
+        """
         if self.conformal_params is None:
             raise ValueError(
                 "The instance attribute conformal_params must be initialized as a conformal_intervals object."
@@ -190,7 +198,7 @@ class BaseForecaster(ABC):
                 X_test = None
 
             fcst_window = self.forecast(h=h, y=y_train, X=X_train, X_future=X_test)  # type: ignore[attr-defined]
-            window_scores = jnp.abs(fcst_window['mean'].astype('float32') - y_test)
+            window_scores = y_test - fcst_window['mean'].astype('float32')
             return window_scores
 
         # Use vmap for parallel processing across windows
@@ -198,7 +206,6 @@ class BaseForecaster(ABC):
         # self._cs = cs
         return cs
 
-    # calculates confidence intervals at level(s) for forceasted values based on conformity_score
     @staticmethod
     def add_confidence_intervals(
         fcst: dict,
@@ -206,33 +213,58 @@ class BaseForecaster(ABC):
         level: list[int | float],
         method: str
         ) -> dict:
-        
-        # we may consider storing the conformal method specific functions to another file for readability
+        """Add conformal prediction intervals to a forecast dict.
+
+        Args:
+            fcst: Forecast dict containing 'mean' of shape (h,).
+            cs: Signed conformity scores of shape (n_windows, h).
+            level: Confidence levels (0-100), e.g. [80, 95].
+            method: 'conformal_distribution' (symmetric) or 'conformal_signed' (asymmetric).
+
+        Returns:
+            Updated fcst dict with 'lo-{lv}' and 'hi-{lv}' keys added.
+        """
         def conformal_distribution_intervals(fcst, cs, level):
             level = sorted(level)
             alphas = jnp.array([100 - lv for lv in level])
             cuts_lower = alphas / 200.0
             cuts_upper = 1 - alphas / 200.0
-            # reverse lower cuts to match original order
             cuts_lower = cuts_lower[::-1]
             cuts = jnp.concatenate([cuts_lower, cuts_upper])
             mean = fcst["mean"]
-            # create forecast paths: mean ± conformity_scores
-            # cs has shape (K, h), mean has shape (h,)
+            cs_abs = jnp.abs(cs)
             scores = jnp.concatenate([
-                mean[None, :] - cs,  # (K, h)
-                mean[None, :] + cs,  # (K, h)
-            ], axis=0)              # (2K, h)
-            quantiles = jnp.quantile(scores, cuts, axis=0)  # (n_cuts, h)
-            # column names
+                mean[None, :] - cs_abs,
+                mean[None, :] + cs_abs,
+            ], axis=0)
+            quantiles = jnp.quantile(scores, cuts, axis=0)
             lo_cols = [f"lo-{lv}" for lv in reversed(level)]
             hi_cols = [f"hi-{lv}" for lv in level]
             out_cols = lo_cols + hi_cols
             for i, col in enumerate(out_cols):
                 fcst[col] = quantiles[i]
             return fcst
-        
-        allowed_methods = {"conformal_distribution" : conformal_distribution_intervals}
+
+        def conformal_signed_intervals(fcst, cs, level):
+            level = sorted(level)
+            alphas = jnp.array([100 - lv for lv in level])
+            cuts_lower = (alphas / 200.0)[::-1]
+            cuts_upper = 1 - alphas / 200.0
+            cuts = jnp.concatenate([cuts_lower, cuts_upper])
+            mean = fcst["mean"]
+            scores = mean[None, :] + cs
+            quantiles = jnp.quantile(scores, cuts, axis=0)
+            lo_cols = [f"lo-{lv}" for lv in reversed(level)]
+            hi_cols = [f"hi-{lv}" for lv in level]
+            out_cols = lo_cols + hi_cols
+            for i, col in enumerate(out_cols):
+                fcst[col] = quantiles[i]
+            return fcst
+
+        allowed_methods = {
+            "conformal_distribution": conformal_distribution_intervals,
+            "conformal_signed": conformal_signed_intervals,
+        }
         if method not in allowed_methods:
             raise ValueError(f"{method} is not valid. Choose from {str(allowed_methods)[1:-1]}")
         
