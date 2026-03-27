@@ -1329,6 +1329,7 @@ def _repeat_val_(val: jnp.ndarray, h: int) -> jnp.ndarray:
 
 
 @_partial(jax.jit, static_argnames=("max_k",))
+@_partial(jax.jit, static_argnames=("max_k",))
 def _imapa_aggregate_jit(y: jnp.ndarray, max_k: int) -> jnp.ndarray:
     """JIT-friendly aggregation loop with padded sums and masked SES.
 
@@ -1345,13 +1346,18 @@ def _imapa_aggregate_jit(y: jnp.ndarray, max_k: int) -> jnp.ndarray:
     return _imapa_aggregate_body(y, max_k, max_k)
 
 
+@_partial(jax.jit, static_argnames=("upper_bound",))
 def _imapa_aggregate_body(y: jnp.ndarray, max_k, upper_bound: int) -> jnp.ndarray:
-    """Core aggregation loop.
+    """JIT-compiled core aggregation loop, vmap-compatible.
+
+    Runs SES optimization for each aggregation level k = 1..max_k.
+    ``upper_bound`` is static (for array allocation and JIT specialization);
+    ``max_k`` may be traced under vmap (controls actual loop iterations).
 
     Args:
         y: Input time series.
-        max_k: Actual max aggregation level (may be traced under vmap).
-        upper_bound: Static upper bound for array allocation and loop count.
+        max_k: Actual max aggregation level (traced under vmap, concrete otherwise).
+        upper_bound: Static upper bound for array allocation (must be >= max_k).
 
     Returns:
         Array of per-k forecasts (shape (upper_bound,)), NaN where unused.
@@ -1385,7 +1391,7 @@ def _imapa_aggregate_body(y: jnp.ndarray, max_k, upper_bound: int) -> jnp.ndarra
         forecasts_arr = forecasts_arr.at[k - 1].set(fcast)
         return forecasts_arr
 
-    return lax.fori_loop(1, upper_bound + 1, body, forecasts)
+    return lax.fori_loop(1, max_k + 1, body, forecasts)
 
 
 def _imapa(
