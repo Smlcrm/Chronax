@@ -328,13 +328,54 @@ def _add_conformal_distribution_intervals(
     cs: jnp.ndarray,
     level: Union[List[float], List[int]],
 ) -> dict:
-    """Add conformal intervals to forecast dict based on conformal scores.
+    """Add symmetric conformal intervals using absolute residuals.
 
-    Creates forecast paths from errors and calculates quantiles.
+    Takes the absolute value of signed conformity scores and constructs
+    2W forecast paths (mean +/- |scores|), producing intervals that are
+    always symmetric around the mean.
 
     Args:
         fcst: Forecast dict containing 'mean'.
-        cs: Conformal scores array.
+        cs: Signed conformal scores of shape (W, h).
+        level: Confidence levels (0-100).
+
+    Returns:
+        Updated fcst dict with 'lo-{lv}' and 'hi-{lv}' keys.
+    """
+    level = sorted(level)
+    alphas = jnp.array([100 - lv for lv in level], dtype=jnp.float32)
+    cuts_lower = (alphas / 200.0)[::-1]
+    cuts_upper = 1.0 - (alphas / 200.0)
+    cuts = jnp.concatenate([cuts_lower, cuts_upper])
+
+    mean = fcst["mean"].reshape(1, -1)
+    cs_abs = jnp.abs(cs)
+    scores = jnp.vstack([mean - cs_abs, mean + cs_abs])
+    quantiles = jnp.quantile(scores, cuts, axis=0)
+
+    lo_cols = [f"lo-{lv}" for lv in reversed(level)]
+    hi_cols = [f"hi-{lv}" for lv in level]
+    out_cols = lo_cols + hi_cols
+
+    for i, col in enumerate(out_cols):
+        fcst[col] = quantiles[i]
+
+    return fcst
+
+
+def _add_conformal_signed_intervals(
+    fcst: dict,
+    cs: jnp.ndarray,
+    level: Union[List[float], List[int]],
+) -> dict:
+    """Add asymmetric conformal intervals using signed residuals.
+
+    Uses raw signed conformity scores (actual - forecast) to construct
+    W plausible values per horizon, allowing asymmetric intervals.
+
+    Args:
+        fcst: Forecast dict containing 'mean'.
+        cs: Signed conformal scores array of shape (W, h).
         level: Sorted list of confidence levels (0-100).
 
     Returns:
@@ -347,7 +388,7 @@ def _add_conformal_distribution_intervals(
     cuts = jnp.concatenate([cuts_lower, cuts_upper])
 
     mean = fcst["mean"].reshape(1, -1)
-    scores = jnp.vstack([mean - cs, mean + cs])
+    scores = mean + cs
     quantiles = jnp.quantile(scores, cuts, axis=0)
 
     lo_cols = [f"lo-{lv}" for lv in reversed(level)]
@@ -364,7 +405,7 @@ def _get_conformal_method(method: str) -> Callable:
     """Look up a conformal prediction interval method by name.
 
     Args:
-        method: Method name (currently only 'conformal_distribution').
+        method: Method name ('conformal_distribution' or 'conformal_signed').
 
     Returns:
         The corresponding interval function.
@@ -374,6 +415,7 @@ def _get_conformal_method(method: str) -> Callable:
     """
     available_methods = {
         "conformal_distribution": _add_conformal_distribution_intervals,
+        "conformal_signed": _add_conformal_signed_intervals,
     }
     if method not in available_methods:
         raise ValueError(
@@ -1287,6 +1329,7 @@ def _repeat_val_(val: jnp.ndarray, h: int) -> jnp.ndarray:
 
 
 @_partial(jax.jit, static_argnames=("max_k",))
+@_partial(jax.jit, static_argnames=("max_k",))
 def _imapa_aggregate_jit(y: jnp.ndarray, max_k: int) -> jnp.ndarray:
     """JIT-friendly aggregation loop with padded sums and masked SES.
 
@@ -1300,9 +1343,28 @@ def _imapa_aggregate_jit(y: jnp.ndarray, max_k: int) -> jnp.ndarray:
     Returns:
         Array of per-k forecasts (shape (max_k,)), NaN where no chunks.
     """
+    return _imapa_aggregate_body(y, max_k, max_k)
+
+
+@_partial(jax.jit, static_argnames=("upper_bound",))
+def _imapa_aggregate_body(y: jnp.ndarray, max_k, upper_bound: int) -> jnp.ndarray:
+    """JIT-compiled core aggregation loop, vmap-compatible.
+
+    Runs SES optimization for each aggregation level k = 1..max_k.
+    ``upper_bound`` is static (for array allocation and JIT specialization);
+    ``max_k`` may be traced under vmap (controls actual loop iterations).
+
+    Args:
+        y: Input time series.
+        max_k: Actual max aggregation level (traced under vmap, concrete otherwise).
+        upper_bound: Static upper bound for array allocation (must be >= max_k).
+
+    Returns:
+        Array of per-k forecasts (shape (upper_bound,)), NaN where unused.
+    """
     dtype = y.dtype
     n = y.shape[0]
-    forecasts = jnp.full((max_k,), jnp.asarray(jnp.nan, dtype=dtype))
+    forecasts = jnp.full((upper_bound,), jnp.asarray(jnp.nan, dtype=dtype))
 
     def body(k, forecasts_arr):
         n_chunks = n // k
@@ -1324,6 +1386,8 @@ def _imapa_aggregate_jit(y: jnp.ndarray, max_k: int) -> jnp.ndarray:
             lambda: jnp.asarray(jnp.nan, dtype=dtype),
             compute_forecast,
         )
+        # Mask iterations beyond actual max_k (original loop runs k=1..max_k inclusive)
+        fcast = jnp.where(k <= max_k, fcast, jnp.asarray(jnp.nan, dtype=dtype))
         forecasts_arr = forecasts_arr.at[k - 1].set(fcast)
         return forecasts_arr
 
@@ -1342,6 +1406,8 @@ def _imapa(
     alpha optimization, and scales back by 1/k. Averages per-k forecasts for
     the final constant-mean forecast.
 
+    vmap-compatible: all control flow uses JAX primitives (jnp.where, lax.cond).
+
     Args:
         y: Input time series.
         h: Forecast horizon.
@@ -1350,34 +1416,29 @@ def _imapa(
     Returns:
         Dict with 'mean' (shape (h,)) and optionally 'fitted' (shape (T,)).
     """
-    # All zeros shortcut
-    if bool(jnp.all(y == 0)):
-        out_dtype = y.dtype if y.dtype in (jnp.float32, jnp.float64) else jnp.float32
-        res = {"mean": jnp.zeros((h,), dtype=out_dtype)}
-        if fitted:
-            f = jnp.zeros_like(ensure_float(y)).astype(out_dtype)
-            f = f.at[0].set(jnp.asarray(jnp.nan, dtype=out_dtype))
-            res["fitted"] = f
-        return res
-
     y = ensure_float(y)
     dtype = y.dtype
+    all_zeros = jnp.all(y == 0)
 
-    y_intervals = _intervals(y)
-    mean_interval = jnp.mean(y_intervals)
-    max_aggregation_level = int(jnp.rint(mean_interval).item())
-    if max_aggregation_level < 1:
-        max_aggregation_level = 1
+    # Compute mean inter-arrival interval directly (vmap-safe, fixed-size ops)
+    nonzero_mask = y != 0
+    count_nonzero = jnp.sum(nonzero_mask)
+    indices = jnp.arange(y.size)
+    last_nonzero_pos = jnp.max(jnp.where(nonzero_mask, indices, -1))
+    mean_interval = (last_nonzero_pos + 1) / jnp.maximum(count_nonzero, 1)
 
-    forecasts = _imapa_aggregate_jit(y, max_aggregation_level)
+    max_aggregation_level = jnp.maximum(jnp.rint(mean_interval).astype(jnp.int32), 1)
 
-    # Mean of finite forecasts
-    finite_mask = jnp.isfinite(forecasts)
-    forecast = jnp.where(
-        finite_mask.any(),
-        jnp.mean(forecasts[finite_mask]),
-        jnp.asarray(0.0, dtype=dtype),
-    )
+    # Use static upper bound for array allocation; traced max_k for loop masking
+    upper_bound = y.shape[0]  # static under vmap
+    forecasts = _imapa_aggregate_body(y, max_aggregation_level, upper_bound)
+
+    # nanmean avoids boolean indexing (vmap-safe)
+    forecast = jnp.nanmean(forecasts)
+    forecast = jnp.where(jnp.isfinite(forecast), forecast, jnp.asarray(0.0, dtype=dtype))
+
+    # Mask to zero if all-zeros input
+    forecast = jnp.where(all_zeros, jnp.asarray(0.0, dtype=dtype), forecast)
 
     res: Dict = {"mean": _repeat_val_(val=forecast, h=h)}
 

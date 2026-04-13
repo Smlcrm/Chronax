@@ -728,24 +728,22 @@ def tbats_model_generator(
     dtype = jnp.float64
     y = jnp.asarray(y, dtype=dtype)
     
+    # Defaults for y_mu, y_sigma (always initialized)
+    y_mu = jnp.asarray(0.0, dtype=dtype)
+    y_sigma = jnp.asarray(1.0, dtype=dtype)
+
     # ── Box-Cox lambda estimation (Guerrero method) ────────────────────
     if use_boxcox:
         y_pos = _ensure_pos(y)
-        if jnp.any(y <= 0):
-            warnings.warn("Data contains zero/negative values; disabling Box-Cox.")
-            use_boxcox = False
-            lam = None
-            y_fit = y
-        else:
-            season_length = int(seasonal_periods[0]) if len(seasonal_periods) > 0 else 1
-            lam = _guerrero_lambda_cached(y_pos, season_length, bc_lower, bc_upper)
-            y_fit = _boxcox(y_pos, lam)
+        has_nonpositive = jnp.any(y <= 0)
+        season_length = int(seasonal_periods[0]) if len(seasonal_periods) > 0 else 1
+        lam_candidate = _guerrero_lambda_cached(y_pos, season_length, bc_lower, bc_upper)
+        # Use NaN sentinel when data has non-positive values (Box-Cox effectively disabled)
+        lam = jnp.where(has_nonpositive, jnp.asarray(jnp.nan, dtype=dtype), lam_candidate)
+        y_fit = jnp.where(has_nonpositive, y, _boxcox(y_pos, lam_candidate))
     else:
         lam = None
         y_fit = y
-
-        y_mu = jnp.asarray(0.0, dtype=dtype)
-        y_sigma = jnp.asarray(1.0, dtype=dtype)
 
     p = 0 if ar_coeffs is None else int(ar_coeffs.shape[0])
     q = 0 if ma_coeffs is None else int(ma_coeffs.shape[0])
@@ -777,13 +775,13 @@ def tbats_model_generator(
 
     # ── Seed state (level + trend + seasonal + ARMA) ───────────────────
     n = y_fit.shape[0]
-    level_init = float(jnp.mean(y_fit)) if n > 0 else 0.0
+    level_init = jnp.mean(y_fit) if n > 0 else jnp.asarray(0.0, dtype=dtype)
     
     x0_ls = jnp.zeros((1 + adj_phi + tau,), dtype=dtype)
     x0_ls = x0_ls.at[0].set(level_init)
     
     if use_trend and beta is not None and n > 1:
-        trend_init = float((y_fit[-1] - y_fit[0]) / (n - 1))
+        trend_init = (y_fit[-1] - y_fit[0]) / (n - 1)
         x0_ls = x0_ls.at[1].set(trend_init)
     
     x0_hat = jnp.concatenate([x0_ls, jnp.zeros(p + q, dtype=dtype)]) if (p or q) else x0_ls
@@ -827,38 +825,37 @@ def tbats_model_generator(
     _y_pos = y_pos if use_boxcox else y_fit
     _y_fit = y_fit if not use_boxcox else y_pos
 
-    try:
-        uhat = _run_lbfgs_optim(
-            u0, scale_vec, w, g, F, gamma_bold, k_vector,
-            x0_hat, x0_untransformed_pos, _y_fit, _y_pos, y_pos_log_sum,
-            jnp.asarray(bc_lower, dtype=dtype), jnp.asarray(bc_upper, dtype=dtype),
-            use_boxcox=use_boxcox, use_trend=use_trend,
-            use_damped_trend=use_damped_trend,
-            p=p, q=q, tau=tau, n_k=n_k,
-        )
-    except Exception as exc:
-        warnings.warn(f"Optimisation failed ({exc}); using initial parameters")
-        uhat = u0
+    uhat = _run_lbfgs_optim(
+        u0, scale_vec, w, g, F, gamma_bold, k_vector,
+        x0_hat, x0_untransformed_pos, _y_fit, _y_pos, y_pos_log_sum,
+        jnp.asarray(bc_lower, dtype=dtype), jnp.asarray(bc_upper, dtype=dtype),
+        use_boxcox=use_boxcox, use_trend=use_trend,
+        use_damped_trend=use_damped_trend,
+        p=p, q=q, tau=tau, n_k=n_k,
+    )
+    # Fallback to initial params if optimization produced non-finite values
+    uhat = jnp.where(jnp.all(jnp.isfinite(uhat)), uhat, u0)
 
     # ── Unpack optimised parameters ────────────────────────────────────
     optim_params = jnp.asarray(uhat, dtype=dtype) * scale_vec
     if use_boxcox:
         optim_params = optim_params.at[0].set(jnp.clip(optim_params[0], bc_lower, bc_upper))
 
+    # ── Unpack optimised parameters (keep as JAX scalars for vmap) ─────
     idx = 0
     if use_boxcox:
-        optim_lambda = float(optim_params[idx]); idx += 1
-        optim_alpha = float(optim_params[idx]); idx += 1
+        optim_lambda = optim_params[idx]; idx += 1
+        optim_alpha = optim_params[idx]; idx += 1
     else:
         optim_lambda = None
-        optim_alpha = float(optim_params[idx]); idx += 1
+        optim_alpha = optim_params[idx]; idx += 1
 
     if use_trend:
-        optim_beta = float(optim_params[idx]); idx += 1
+        optim_beta = optim_params[idx]; idx += 1
         if use_damped_trend and idx < optim_params.size:
-            optim_phi = float(optim_params[idx]); idx += 1
+            optim_phi = optim_params[idx]; idx += 1
         else:
-            optim_phi = 1.0
+            optim_phi = jnp.asarray(1.0, dtype=dtype)
     else:
         optim_beta = None
         optim_phi = None
@@ -884,21 +881,23 @@ def tbats_model_generator(
     fitted, errors, x_seq = _calc_filter(y_fit_final, w_final, g_final, F_final, x0_final)
     sigma2 = jnp.mean(errors * errors)
 
-    # ── Log-likelihood & AIC ───────────────────────────────────────────
+    # ── Log-likelihood & AIC (vmap-safe: all JAX ops) ─────────────────
     n_eff = errors.shape[0]
-    log_likelihood = float(n_eff * jnp.log(sigma2 + 1e-12))
-    if use_boxcox and lam is not None:
-        log_likelihood -= 2.0 * (lam - 1.0) * float(y_pos_log_sum)
+    log_likelihood = n_eff * jnp.log(sigma2 + 1e-12)
+    if use_boxcox:
+        # Guard with sentinel check: lam is NaN when Box-Cox was effectively disabled
+        bc_adjustment = 2.0 * (lam - 1.0) * y_pos_log_sum
+        log_likelihood = log_likelihood - jnp.where(jnp.isnan(lam), 0.0, bc_adjustment)
 
-    kval = int(optim_params.size + x0_final.shape[0])
-    if optim_lambda == 1:
-        kval -= 1
-    if optim_beta is not None and abs(optim_beta) < 1e-8:
-        kval -= 1
-    if optim_phi is not None and optim_phi == 1:
-        kval -= 1
+    kval = optim_params.size + x0_final.shape[0]  # static ints
+    if use_boxcox and optim_lambda is not None:
+        kval = kval - jnp.where(optim_lambda == 1, 1, 0)
+    if optim_beta is not None:
+        kval = kval - jnp.where(jnp.abs(optim_beta) < 1e-8, 1, 0)
+    if optim_phi is not None:
+        kval = kval - jnp.where(optim_phi == 1, 1, 0)
 
-    aic = float(log_likelihood) + 2 * kval
+    aic = log_likelihood + 2 * kval
 
     return {
         "fitted": fitted,
@@ -909,7 +908,7 @@ def tbats_model_generator(
         "F": F_final,
         "w_transpose": w_final,
         "g": g_final,
-        "x": x_seq,             # shape (1, d) — final state only
+        "x": x_seq,
         "k_vector": jnp.asarray(k_vector),
         "BoxCox_lambda": optim_lambda,
         "p": int(p),
@@ -965,6 +964,7 @@ def tbats_selection(
     use_arma_errors: bool,
     early_stop_patience: Optional[int] = None,
     early_stop_tol: float = 0.5,
+    k_vector: Optional[jnp.ndarray] = None,
 ) -> Dict:
     """Auto-select the best TBATS configuration via AIC comparison."""
     if use_trend is False and use_damped_trend is True:
@@ -973,13 +973,14 @@ def tbats_selection(
     t_sel0 = time.perf_counter()
     seasonal_periods = jnp.sort(jnp.asarray(seasonal_periods))
 
-    # ── Harmonic search per season ─────────────────────────────────────
-    ks: List[int] = []
-    z = y
-    for period in list(seasonal_periods):
-        k, z = find_harmonics(z, int(period))
-        ks.append(int(k))
-    k_vector = jnp.asarray(ks, dtype=jnp.int32)
+    # ── Harmonic search per season (skip if pre-computed for vmap) ─────
+    if k_vector is None:
+        ks: List[int] = []
+        z = y
+        for period in list(seasonal_periods):
+            k, z = find_harmonics(z, int(period))
+            ks.append(int(k))
+        k_vector = jnp.asarray(ks, dtype=jnp.int32)
     _tbats_debug(f"[TBATS][select] k_vector={list(k_vector)} "
                  f"time={time.perf_counter() - t_sel0:.4f}s")
 
@@ -1005,23 +1006,9 @@ def tbats_selection(
     # Pre-build seasonal blocks (shared across all candidates)
     seasonal_blocks = _build_seasonal_blocks(seasonal_periods, k_vector, y.dtype)
 
-    # ── Evaluate candidates ────────────────────────────────────────────
-    if early_stop_patience is None:
-        early_stop_patience = 0
-    if early_stop_tol is None:
-        early_stop_tol = 0.1
-
-    best: Dict = {"aic": jnp.inf}
-    best_aic = float("inf")
-    last_valid = None
-    no_improve = 0
-    
+    # ── Evaluate all candidates (no early stopping — vmap-compatible) ──
+    candidates = []
     for ci, (bcx, (trend, damped), arma) in enumerate(combos):
-        # Fast exit: patience-0 and we already have a valid model
-        if ci > 0 and early_stop_patience == 0 and math.isfinite(best_aic):
-            _tbats_debug(f"[TBATS][select] patience-0 fast exit after {ci} candidate(s)")
-            break
-
         t_cand = time.perf_counter()
         cand = tbats_model_generator(
             y, seasonal_periods, k_vector,
@@ -1032,28 +1019,40 @@ def tbats_selection(
         )
         _tbats_debug(
             f"[TBATS][select] bcx={bcx} trend={trend} damped={damped} arma={arma} "
-            f"aic={float(cand.get('aic', jnp.inf)):.4f} "
             f"time={time.perf_counter() - t_cand:.4f}s"
         )
+        candidates.append(cand)
 
-        if "w_transpose" in cand:
-            last_valid = cand
+    # Select best by AIC (vmap-safe when all candidates have same shapes,
+    # i.e., when combos is a single config)
+    if len(candidates) == 1:
+        best = candidates[0]
+    else:
+        # Multiple candidates: use Python-level AIC comparison.
+        # This path works outside vmap (concrete values).
+        # Under vmap, combos should be narrowed to a single config (see AutoTBATS.forecast).
+        best_aic = float("inf")
+        best = candidates[0]
+        best_combo = combos[0]
+        last_valid = None
+        last_valid_combo = combos[0]
+        for ci, cand in enumerate(candidates):
+            if "w_transpose" in cand:
+                last_valid = cand
+                last_valid_combo = combos[ci]
+            cand_aic = float(cand["aic"])
+            if math.isfinite(cand_aic) and cand_aic < best_aic:
+                best = cand
+                best_combo = combos[ci]
+                best_aic = cand_aic
+        if "w_transpose" not in best and last_valid is not None:
+            best = last_valid
+            best_combo = last_valid_combo
+        # Store winning config for vmap reuse
+        bcx, (trend, damped), arma = best_combo
+        best["_config"] = {"use_boxcox": bcx, "use_trend": trend, "use_damped_trend": damped}
 
-        cand_aic = float(cand["aic"])
-        if math.isfinite(cand_aic) and cand_aic < best_aic - float(early_stop_tol):
-            best = cand
-            best_aic = cand_aic
-            no_improve = 0
-        else:
-            no_improve += 1
-            if early_stop_patience is not None and no_improve > early_stop_patience:
-                _tbats_debug(f"[TBATS][select] early stopping after {no_improve} non-improving models")
-                break
-
-    if "w_transpose" not in best and last_valid is not None:
-        best = last_valid
-
-    _tbats_debug(f"[TBATS][select] done aic={float(best.get('aic', jnp.inf)):.4f} "
+    _tbats_debug(f"[TBATS][select] done "
                  f"time={time.perf_counter() - t_sel0:.4f}s")
     return best
 

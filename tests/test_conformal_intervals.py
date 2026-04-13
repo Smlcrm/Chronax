@@ -1,68 +1,78 @@
 import pytest
+import jax.numpy as jnp
 
 from chronax.utils import ConformalIntervals
+from chronax.models.base_forecaster import BaseForecaster
 
 
 # =========================
-# All 4 Test Cases
+# ConformalIntervals class tests
 # =========================
 
 def test_default_initialization():
-    """
-    Tests that the class initializes with the correct default values.
-    """
     ci = ConformalIntervals()
-    
     assert ci.n_windows == 2
     assert ci.h == 1
     assert ci.method == "conformal_distribution"
 
 def test_custom_initialization():
-    """
-    Tests that the class correctly stores custom (but valid) attributes.
-    """
-    ci = ConformalIntervals(n_windows=10, h=5, method="custom_method")
-    
+    ci = ConformalIntervals(n_windows=10, h=5, method="conformal_signed")
     assert ci.n_windows == 10
     assert ci.h == 5
-    assert ci.method == "custom_method"
+    assert ci.method == "conformal_signed"
 
-@pytest.mark.parametrize("invalid_windows", [
-    1, 
-    0, 
-    -1, 
-    -100
-])
+@pytest.mark.parametrize("invalid_windows", [1, 0, -1, -100])
 def test_invalid_n_windows_raises_value_error(invalid_windows):
-    """
-    Tests that instantiating with n_windows < 2 raises a ValueError.
-    """
-    # Use pytest.raises to check that the specific error is thrown
-    # The 'match' parameter checks that the error message contains the given string
     with pytest.raises(ValueError, match="at least two windows"):
         ConformalIntervals(n_windows=invalid_windows)
 
-def test_boundary_n_windows_succeeds():
-    """
-    Tests the boundary condition n_windows=2, which should be valid.
-    """
-    try:
-        ci = ConformalIntervals(n_windows=2)
-        # Check that the object was created and has the correct value
-        assert ci.n_windows == 2
-    except ValueError:
-        # If a ValueError is raised, fail the test
-        pytest.fail("ConformalIntervals(n_windows=2) raised ValueError unexpectedly")
+def test_invalid_method_raises_value_error():
+    with pytest.raises(ValueError, match="method must be one of"):
+        ConformalIntervals(method="invalid_method")
 
-if __name__ == "__main__":
-    # Call each test function.
-    # If any test fails, its 'assert' will raise an error
-    # and stop the script, printing the traceback.
-    
-    test_default_initialization()
-    test_custom_initialization()
-    test_invalid_n_windows_raises_value_error()
-    test_boundary_n_windows_succeeds()
-    
-    # If the script reaches this line, all tests passed.
-    print("All tests passed successfully.")
+def test_boundary_n_windows_succeeds():
+    ci = ConformalIntervals(n_windows=2)
+    assert ci.n_windows == 2
+
+
+# =========================
+# Interval construction tests
+# =========================
+
+def test_conformal_distribution_symmetric():
+    """conformal_distribution produces intervals symmetric around the mean."""
+    fcst = {"mean": jnp.array([10.0, 20.0, 30.0])}
+    cs = jnp.array([[1.0, 2.0, 3.0], [-0.5, -1.0, -1.5]])  # signed scores
+    result = BaseForecaster.add_confidence_intervals(fcst, cs, [80], "conformal_distribution")
+    assert "lo-80" in result and "hi-80" in result
+    assert jnp.allclose(result["mean"] - result["lo-80"], result["hi-80"] - result["mean"])
+
+def test_conformal_signed_allows_asymmetry():
+    """conformal_signed can produce asymmetric intervals when errors are skewed."""
+    fcst = {"mean": jnp.array([10.0, 20.0])}
+    # All positive residuals: model consistently underpredicts
+    cs = jnp.array([[2.0, 3.0], [4.0, 5.0], [6.0, 7.0]])
+    result = BaseForecaster.add_confidence_intervals(fcst, cs, [80], "conformal_signed")
+    assert "lo-80" in result and "hi-80" in result
+    # Intervals should be shifted above the mean
+    lo_dist = result["mean"] - result["lo-80"]
+    hi_dist = result["hi-80"] - result["mean"]
+    assert not jnp.allclose(lo_dist, hi_dist)
+
+def test_conformal_signed_keys_match_distribution():
+    """Both methods produce the same output keys."""
+    fcst_sym = {"mean": jnp.array([5.0, 5.0])}
+    fcst_sig = {"mean": jnp.array([5.0, 5.0])}
+    cs = jnp.array([[1.0, 1.0], [2.0, 2.0]])
+    level = [80, 95]
+    r1 = BaseForecaster.add_confidence_intervals(fcst_sym, cs, level, "conformal_distribution")
+    r2 = BaseForecaster.add_confidence_intervals(fcst_sig, cs, level, "conformal_signed")
+    expected_keys = {"mean", "lo-80", "hi-80", "lo-95", "hi-95"}
+    assert set(r1.keys()) == expected_keys
+    assert set(r2.keys()) == expected_keys
+
+def test_invalid_method_in_add_confidence_intervals():
+    fcst = {"mean": jnp.array([1.0])}
+    cs = jnp.array([[0.5]])
+    with pytest.raises(ValueError):
+        BaseForecaster.add_confidence_intervals(fcst, cs, [80], "invalid")
