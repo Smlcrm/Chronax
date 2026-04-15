@@ -44,12 +44,11 @@ from chronax import utils
 from chronax.utils import (
     ensure_float,
     _repeat_val_seas,
-    _add_conformal_distribution_intervals,
-    _get_conformal_method,
-    _conformal_method,
-    _store_cs,
-    _add_conformal_intervals,
-    _add_predict_conformal_intervals,
+)
+from chronax.utils.conformal_workflow import (
+    add_conformal_intervals,
+    add_predict_conformal_intervals,
+    store_conformity_scores,
 )
 
 
@@ -226,7 +225,7 @@ class SeasonalExponentialSmoothing(BaseForecaster):
             h=self.season_length,
         )
         self.model_ = mod
-        _store_cs(self, y=y, X=X)
+        store_conformity_scores(self, y=y, X=X)
         return self
 
     def predict(
@@ -257,7 +256,7 @@ class SeasonalExponentialSmoothing(BaseForecaster):
             return res
         level = sorted(level)
         if self.prediction_intervals is not None:
-            res = _add_predict_conformal_intervals(self, res, level)
+            res = add_predict_conformal_intervals(self, res, level)
         else:
             raise Exception("You must pass `prediction_intervals` to compute them.")
         return res
@@ -309,7 +308,7 @@ class SeasonalExponentialSmoothing(BaseForecaster):
             return res
         level = sorted(level)
         if self.prediction_intervals is not None:
-            res = _add_conformal_intervals(self, fcst=res, y=y, X=X, level=level)
+            res = add_conformal_intervals(self, fcst=res, y=y, X=X, level=level)
         else:
             raise Exception("You must pass `prediction_intervals` to compute them.")
         return res

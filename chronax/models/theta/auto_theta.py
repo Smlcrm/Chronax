@@ -25,9 +25,11 @@ from chronax.models.theta.theta_model import (
 from chronax.utils import (
     ensure_float,
     _add_fitted_pi,
-    _store_cs,
-    _add_conformal_intervals,
-    _add_predict_conformal_intervals,
+)
+from chronax.utils.conformal_workflow import (
+    add_conformal_intervals,
+    add_predict_conformal_intervals,
+    store_conformity_scores,
 )
 
 __all__ = ['AutoTheta', 'Theta']
@@ -112,7 +114,7 @@ class AutoTheta(BaseForecaster):
         if jnp.isnan(self.model_["mse"]):
             raise Exception("No model able to be fitted")
         self.model_["fitted"] = y - self.model_["residuals"]
-        _store_cs(self, y, X)
+        store_conformity_scores(self, y, X)
         return self
 
     def predict(
@@ -139,7 +141,7 @@ class AutoTheta(BaseForecaster):
         """
         fcst = _forecast_from_model(self.model_, h=h, level=level, n_samples=self.n_samples)
         if self.conformal_params is not None and level is not None:
-            fcst = _add_predict_conformal_intervals(self, fcst, level)
+            fcst = add_predict_conformal_intervals(self, fcst, level)
         return fcst
 
     def predict_in_sample(self, level: list | None = None) -> dict:
@@ -204,7 +206,7 @@ class AutoTheta(BaseForecaster):
         res = _forecast_from_model(mod, h, level=level, n_samples=self.n_samples)
 
         if self.conformal_params is not None and level is not None:
-            res = _add_conformal_intervals(self, fcst=res, y=y, X=X, level=level)
+            res = add_conformal_intervals(self, fcst=res, y=y, X=X, level=level)
 
         if fitted:
             res["fitted"] = y - mod["residuals"]
@@ -254,7 +256,7 @@ class AutoTheta(BaseForecaster):
         mod = _forward_theta(self.model_, y=y)
         res = _forecast_from_model(mod, h, level=level, n_samples=self.n_samples)
         if self.conformal_params is not None and level is not None:
-            res = _add_conformal_intervals(self, fcst=res, y=y, X=X, level=level)
+            res = add_conformal_intervals(self, fcst=res, y=y, X=X, level=level)
         if fitted:
             res["fitted"] = y - mod["residuals"]
         if level is not None and fitted:

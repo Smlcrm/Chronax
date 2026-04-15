@@ -8,11 +8,13 @@ from chronax.utils import (
     ensure_float,
     calculate_sigma,
     _add_fitted_pi,
-    _add_conformal_intervals,
-    _add_predict_conformal_intervals,
     _intervals,
     _expand_fitted_intervals,
-    _store_cs,
+)
+from chronax.utils.conformal_workflow import (
+    add_conformal_intervals,
+    add_predict_conformal_intervals,
+    store_conformity_scores,
 )
 from chronax.models.base_forecaster import BaseForecaster
 from typing import Callable, Dict, List, Optional, Tuple
@@ -244,7 +246,7 @@ def _fit_adida(
     model._y = y
     model.model_ = _adida_point(y=y, h=1)
     if model.prediction_intervals is not None:
-        _store_cs(model, y=y, X=X)
+        store_conformity_scores(model, y=y, X=X)
     return model
 
 
@@ -275,7 +277,7 @@ def _predict_with_intervals(
     res = _point_predict(model, h)
     if level is None:
         return res
-    return _add_predict_conformal_intervals(model, res, sorted(level))
+    return add_predict_conformal_intervals(model, res, sorted(level))
 
 
 def _forecast_core(
@@ -317,7 +319,7 @@ def _forecast_with_intervals(
     if level is None:
         return res
     level = sorted(level)
-    res = _add_conformal_intervals(model, fcst=res, y=y, X=X, level=level)
+    res = add_conformal_intervals(model, fcst=res, y=y, X=X, level=level)
     if fitted:
         sigma = calculate_sigma(y - res["fitted"], y.size)
         res = _add_fitted_pi(res=res, se=sigma, level=level)

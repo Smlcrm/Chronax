@@ -60,8 +60,9 @@ import jax
 import jax.numpy as jnp
 from jax import lax, jit
 
-from chronax.utils import ensure_float, calculate_information_criteria, _get_conformal_method, ConformalIntervals
+from chronax.utils import ensure_float, calculate_information_criteria, ConformalIntervals
 from chronax.models.base_forecaster import BaseForecaster
+from chronax.utils.conformal_workflow import add_confidence_intervals
 
 NONE = 0
 SIMPLE = 1
@@ -991,8 +992,12 @@ class AutoCES(BaseForecaster):
         
         if level is not None and self.conformal_params is not None:
             cs = self.conformity_scores(y=self.model_['fitted'], X=X)
-            conformal_fn = _get_conformal_method(self.conformal_params.method)
-            result = conformal_fn(fcst=result, cs=cs, level=level)
+            result = add_confidence_intervals(
+                fcst=result,
+                cs=cs,
+                level=level,
+                method=self.conformal_params.method,
+            )
         
         return result
 

@@ -9,13 +9,15 @@ from chronax.utils import (
     ensure_float,
     calculate_sigma,
     _calculate_intervals,
-    _store_cs,
-    _add_conformal_intervals,
-    _add_predict_conformal_intervals,
     _add_fitted_pi,
 )
 from chronax.utils import ConformalIntervals
 from chronax.models.base_forecaster import BaseForecaster, init_conformal_config
+from chronax.utils.conformal_workflow import (
+    add_conformal_intervals,
+    add_predict_conformal_intervals,
+    store_conformity_scores,
+)
 
 ForecastDict = Dict[str, jnp.ndarray]
 
@@ -81,7 +83,7 @@ class SeasonalNaive(BaseForecaster):
         residuals = y - mod["fitted"]
         mod["sigma"] = calculate_sigma(residuals, len(y) - self.season_length)
         self.model_ = mod
-        _store_cs(self, y=y, X=X)
+        store_conformity_scores(self, y=y, X=X)
         return self
 
     def predict(
@@ -109,7 +111,7 @@ class SeasonalNaive(BaseForecaster):
             return res
         level = sorted(level)
         if self.conformal_params is not None:
-            res = _add_predict_conformal_intervals(self, res, level)
+            res = add_predict_conformal_intervals(self, res, level)
         else:
             k = jnp.floor(jnp.arange(h) / self.season_length)
             sigma = self.model_["sigma"]
@@ -175,7 +177,7 @@ class SeasonalNaive(BaseForecaster):
         if level is not None:
             level = sorted(level)
             if self.conformal_params is not None:
-                res = _add_conformal_intervals(self, fcst=res, y=y, X=X, level=level)
+                res = add_conformal_intervals(self, fcst=res, y=y, X=X, level=level)
             else:
                 k = jnp.floor(jnp.arange(h) / self.season_length)
                 residuals = y - out["fitted"]

@@ -61,6 +61,7 @@ from jax import lax
 from chronax import utils
 from chronax.models.base_forecaster import BaseForecaster
 from chronax.utils import ConformalIntervals
+from chronax.utils.conformal_workflow import compute_conformity_scores
 
 
 # ============================================================================
@@ -1305,7 +1306,7 @@ class MFLES(BaseForecaster):
 
         out = {"mean": mean}
         if level:
-            cs = utils._compute_conformity_scores(self, self.model_["fitted"], X=None)
+            cs = compute_conformity_scores(self, self.model_["fitted"], X=None)
             out = self.add_confidence_intervals(out, cs, level, "conformal_distribution")
         return out
 
