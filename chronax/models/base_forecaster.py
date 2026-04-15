@@ -66,7 +66,7 @@ from chronax import utils
 from abc import ABC, abstractmethod
 from jax import lax, vmap
 
-from chronax.utils import _get_conformal_method
+from chronax.utils import _add_confidence_intervals
 
 class BaseForecaster(ABC):
     """Abstract base class defining the shared interface for all Chronax forecasting models.
@@ -264,51 +264,7 @@ class BaseForecaster(ABC):
         ValueError
             If ``method`` is not a recognised conformal method.
         """
-        def conformal_distribution_intervals(fcst, cs, level):
-            level = sorted(level)
-            alphas = jnp.array([100 - lv for lv in level])
-            cuts_lower = alphas / 200.0
-            cuts_upper = 1 - alphas / 200.0
-            cuts_lower = cuts_lower[::-1]
-            cuts = jnp.concatenate([cuts_lower, cuts_upper])
-            mean = fcst["mean"]
-            cs_abs = jnp.abs(cs)
-            scores = jnp.concatenate([
-                mean[None, :] - cs_abs,
-                mean[None, :] + cs_abs,
-            ], axis=0)
-            quantiles = jnp.quantile(scores, cuts, axis=0)
-            lo_cols = [f"lo-{lv}" for lv in reversed(level)]
-            hi_cols = [f"hi-{lv}" for lv in level]
-            out_cols = lo_cols + hi_cols
-            for i, col in enumerate(out_cols):
-                fcst[col] = quantiles[i]
-            return fcst
-
-        def conformal_signed_intervals(fcst, cs, level):
-            level = sorted(level)
-            alphas = jnp.array([100 - lv for lv in level])
-            cuts_lower = (alphas / 200.0)[::-1]
-            cuts_upper = 1 - alphas / 200.0
-            cuts = jnp.concatenate([cuts_lower, cuts_upper])
-            mean = fcst["mean"]
-            scores = mean[None, :] + cs
-            quantiles = jnp.quantile(scores, cuts, axis=0)
-            lo_cols = [f"lo-{lv}" for lv in reversed(level)]
-            hi_cols = [f"hi-{lv}" for lv in level]
-            out_cols = lo_cols + hi_cols
-            for i, col in enumerate(out_cols):
-                fcst[col] = quantiles[i]
-            return fcst
-
-        allowed_methods = {
-            "conformal_distribution": conformal_distribution_intervals,
-            "conformal_signed": conformal_signed_intervals,
-        }
-        if method not in allowed_methods:
-            raise ValueError(f"{method} is not valid. Choose from {str(allowed_methods)[1:-1]}")
-        
-        return allowed_methods[method](fcst, cs, level)
+        return _add_confidence_intervals(fcst=fcst, cs=cs, level=level, method=method)
 
 
 # ---------- Test ----------
