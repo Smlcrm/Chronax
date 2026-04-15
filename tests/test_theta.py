@@ -1,4 +1,5 @@
 import jax.numpy as jnp
+import pytest
 from chronax.utils import ConformalIntervals
 from chronax.models import Theta, AutoTheta
 
@@ -75,6 +76,18 @@ def test_autotheta_conformal_params():
     model.fit(y)
     out = model.predict(h=2, level=[80])
     assert "lo-80" in out and "hi-80" in out
+
+
+def test_autotheta_rejects_prediction_intervals_constructor_arg():
+    cfg = ConformalIntervals(n_windows=3, h=2, method="conformal_signed")
+    with pytest.raises(TypeError):
+        AutoTheta(prediction_intervals=cfg)
+
+
+def test_theta_rejects_prediction_intervals_constructor_arg():
+    cfg = ConformalIntervals(method="conformal_distribution")
+    with pytest.raises(TypeError):
+        Theta(prediction_intervals=cfg)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 import jax.numpy as jnp
+import pytest
 from chronax.models import ADIDA
 from chronax.utils import ConformalIntervals
 
@@ -32,6 +33,12 @@ def test_adida():
         assert len(forecast[f"hi-{lvl}"]) == 12, f"Upper interval {lvl}% has wrong length"
 
     print("Test passed!")
+
+
+def test_adida_rejects_prediction_intervals_constructor_arg():
+    cfg = ConformalIntervals(method="conformal_distribution")
+    with pytest.raises(TypeError):
+        ADIDA(prediction_intervals=cfg)
 
 
 if __name__ == "__main__":

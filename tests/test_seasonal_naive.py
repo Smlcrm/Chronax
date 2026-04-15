@@ -54,6 +54,12 @@ def test_seasonal_naive_conformal_params_path():
     assert "lo-80" in res and "hi-80" in res
 
 
+def test_seasonal_naive_rejects_prediction_intervals_constructor_arg():
+    cfg = ConformalIntervals(n_windows=3, h=2, method="conformal_distribution")
+    with pytest.raises(TypeError):
+        SeasonalNaive(season_length=12, prediction_intervals=cfg)
+
+
 if __name__ == "__main__":
     test_seasonal_naive()
     test_seasonal_naive_conformal_params_path()

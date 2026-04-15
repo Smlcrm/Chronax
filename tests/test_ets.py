@@ -198,7 +198,7 @@ if __name__ == "__main__":
         y = jnp.asarray(8.0 + 0.5 * rng.randn(n), dtype=jnp.float64)
 
         cfg = ConformalIntervals(n_windows=5, h=3, method="conformal_distribution")
-        et = ETS(season_length=1, model="ANN", max_iter=200, prediction_intervals=cfg)
+        et = ETS(season_length=1, model="ANN", max_iter=200, conformal_params=cfg)
 
         et.fit(y)
         assert getattr(et, "_cs") is not None
@@ -217,7 +217,7 @@ if __name__ == "__main__":
         y = jnp.asarray(5.0 + 0.5 * rng.randn(n), dtype=jnp.float64)
 
         cfg = ConformalIntervals(n_windows=4, h=2, method="conformal_distribution")
-        et = ETS(season_length=1, model="ANN", max_iter=200, prediction_intervals=cfg)
+        et = ETS(season_length=1, model="ANN", max_iter=200, conformal_params=cfg)
 
         out = et.forecast(y=y, h=6, level=[90], fitted=False)
         assert "mean" in out and out["mean"].shape == (6,)
