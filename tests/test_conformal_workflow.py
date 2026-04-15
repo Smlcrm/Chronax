@@ -1,5 +1,7 @@
 """Tests for ``chronax.utils.conformal_workflow`` orchestration helpers."""
 
+from pathlib import Path
+
 import jax.numpy as jnp
 import pytest
 
@@ -78,3 +80,11 @@ def test_add_conformal_intervals_requires_stored_scores_when_y_is_none():
     fcst = {"mean": jnp.ones(2, dtype=jnp.float32)}
     with pytest.raises(ValueError, match="Conformity scores are missing"):
         add_conformal_intervals(model=model, fcst=fcst, y=None, X=None, level=[80])
+
+
+def test_migration_doc_exists_and_mentions_breaking_change():
+    doc_path = Path("docs/migration/conformal-params.md")
+    assert doc_path.exists()
+    text = doc_path.read_text(encoding="utf-8")
+    assert "prediction_intervals" in text
+    assert "has been removed" in text

@@ -9,10 +9,11 @@ from typing import List, Optional, Union
 import jax
 import jax.numpy as jnp
 
+from chronax.utils.conformal_intervals import ConformalIntervals
 from chronax.utils.conformal_methods import get_conformal_method
 
 
-def resolve_conformal_params(model: object):
+def resolve_conformal_params(model: object) -> Optional[ConformalIntervals]:
     """Resolve and synchronize conformal config aliases on a model instance.
 
     Args:
@@ -32,6 +33,8 @@ def resolve_conformal_params(model: object):
     if conformal_params is not None and prediction_intervals is not None:
         # Keep BaseForecaster parity by preferring conformal_params when both exist.
         effective = conformal_params
+    if not isinstance(effective, ConformalIntervals):
+        raise TypeError("conformal_params must be a ConformalIntervals instance or None.")
 
     setattr(model, "conformal_params", effective)
     setattr(model, "prediction_intervals", effective)
@@ -54,7 +57,7 @@ def compute_conformity_scores(
         by horizon), matching the contract expected by conformal interval methods.
     """
     try:
-        return model.conformity_scores(y, X)
+        return jnp.asarray(model.conformity_scores(y, X), dtype=jnp.float32)
     except (jax.errors.TracerBoolConversionError, jax.errors.ConcretizationTypeError):
         conformal_cfg = resolve_conformal_params(model)
         if conformal_cfg is None:
