@@ -60,6 +60,14 @@ from chronax.utils.conformal_methods import (
     add_conformal_signed_intervals,
     get_conformal_method,
 )
+from chronax.utils.conformal_workflow import (
+    add_confidence_intervals as _add_confidence_intervals,
+    add_conformal_intervals as _add_conformal_intervals,
+    add_predict_conformal_intervals as _add_predict_conformal_intervals,
+    compute_conformity_scores as _compute_conformity_scores,
+    resolve_conformal_params as _resolve_conformal_config,
+    store_conformity_scores as _store_cs,
+)
 
 # Enable float64 precision — required by the golden-section SES optimizer.
 # Note: this affects the entire JAX session.
@@ -337,75 +345,6 @@ _add_conformal_signed_intervals = add_conformal_signed_intervals
 _get_conformal_method = get_conformal_method
 
 
-def _add_confidence_intervals(
-    fcst: dict,
-    cs: jnp.ndarray,
-    level: Union[List[float], List[int]],
-    method: str,
-) -> dict:
-    """Canonical conformal interval dispatcher used across the codebase."""
-    conformal_fn = _get_conformal_method(method)
-    return conformal_fn(fcst=fcst, cs=cs, level=level)
-
-
-def _resolve_conformal_config(self):
-    """Resolve and synchronize conformal config aliases on a model instance."""
-    conformal_params = getattr(self, "conformal_params", None)
-    prediction_intervals = getattr(self, "prediction_intervals", None)
-
-    if conformal_params is None and prediction_intervals is None:
-        return None
-
-    effective = conformal_params if conformal_params is not None else prediction_intervals
-    if conformal_params is not None and prediction_intervals is not None:
-        # Keep BaseForecaster parity by preferring conformal_params when both exist.
-        effective = conformal_params
-
-    setattr(self, "conformal_params", effective)
-    setattr(self, "prediction_intervals", effective)
-    return effective
-
-
-def _compute_conformity_scores(self, y: jnp.ndarray, X: Optional[jnp.ndarray]) -> jnp.ndarray:
-    """Compute conformity scores with a safe fallback for non-vmap-compatible models."""
-    try:
-        return self.conformity_scores(y, X)
-    except (jax.errors.TracerBoolConversionError, jax.errors.ConcretizationTypeError):
-        conformal_cfg = _resolve_conformal_config(self)
-        if conformal_cfg is None:
-            raise
-
-        n_windows = conformal_cfg.n_windows
-        h = conformal_cfg.h
-        y = ensure_float(y)
-        n_samples = y.size
-        n_windows = min(n_windows, (n_samples - 1) // h)
-        if n_windows < 2:
-            raise ValueError(
-                f"Conformal prediction requires at least {2 * h + 1:,} samples per window; series has {n_samples:,}."
-            )
-
-        test_size = n_windows * h
-        base_train_end = n_samples - test_size
-        window_scores = []
-
-        for i_window in range(int(n_windows)):
-            train_end = int(base_train_end + i_window * h)
-            y_train = y[:train_end]
-            y_test = y[train_end : train_end + h]
-            if X is not None:
-                X_train = X[:train_end]
-                X_test = X[train_end : train_end + h]
-            else:
-                X_train = None
-                X_test = None
-
-            fcst_window = self.forecast(h=h, y=y_train, X=X_train, X_future=X_test)
-            window_scores.append(y_test - fcst_window["mean"].astype("float32"))
-
-        return jnp.stack(window_scores, axis=0)
-
-
 def _conformal_method(self) -> Callable:
     """Retrieve the conformal method from a model's conformal config.
 
@@ -419,69 +358,6 @@ def _conformal_method(self) -> Callable:
     if conformal_cfg is None:
         raise ValueError("No conformal configuration is set on this model instance.")
     return _get_conformal_method(conformal_cfg.method)
-
-
-def _store_cs(self, y: jnp.ndarray, X: Optional[jnp.ndarray]) -> None:
-    """Compute and store conformal scores on the model instance.
-
-    Args:
-        self: A forecaster instance with prediction_intervals and conformity_scores.
-        y: Training time series.
-        X: Optional exogenous variables.
-    """
-    if _resolve_conformal_config(self) is not None:
-        self._cs = _compute_conformity_scores(self, y, X)
-
-
-def _add_conformal_intervals(
-    self,
-    fcst: dict,
-    y: Optional[jnp.ndarray],
-    X: Optional[jnp.ndarray],
-    level: Optional[List[int]],
-) -> dict:
-    """Add conformal prediction intervals to a forecast dict.
-
-    If y is provided, computes fresh conformal scores; otherwise uses stored scores.
-
-    Args:
-        self: A forecaster instance.
-        fcst: Forecast dict to augment.
-        y: Training series (None to use stored scores).
-        X: Optional exogenous variables.
-        level: Confidence levels (0-100).
-
-    Returns:
-        Updated forecast dict with interval keys.
-    """
-    conformal_cfg = _resolve_conformal_config(self)
-    if conformal_cfg is not None and level is not None:
-        if y is not None:
-            cs = _compute_conformity_scores(self, y, X)
-        else:
-            cs = getattr(self, "_cs", None)
-            if cs is None:
-                raise ValueError("Conformity scores are missing. Run fit first or provide y to recompute them.")
-        return _add_confidence_intervals(fcst=fcst, cs=cs, level=level, method=conformal_cfg.method)
-    return fcst
-
-
-def _add_predict_conformal_intervals(
-    self,
-    fcst: dict,
-    level: Optional[List[int]],
-) -> dict:
-    """Add conformal intervals for the predict() path (uses stored scores).
-
-    Args:
-        self: A fitted forecaster instance.
-        fcst: Forecast dict to augment.
-        level: Confidence levels (0-100).
-
-    Returns:
-        Updated forecast dict with interval keys.
-    """
-    return _add_conformal_intervals(self, fcst=fcst, y=None, X=None, level=level)
 
 
 # ============================================================
