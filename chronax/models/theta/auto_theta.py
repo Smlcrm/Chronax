@@ -15,7 +15,7 @@ References:
     their relationship to state space models". International Journal of Forecasting.
 """
 import jax.numpy as jnp
-from chronax.models.base_forecaster import BaseForecaster
+from chronax.models.base_forecaster import BaseForecaster, init_conformal_config
 from chronax.utils import ConformalIntervals
 from chronax.models.theta.theta_model import (
     _auto_theta,
@@ -49,10 +49,10 @@ class AutoTheta(BaseForecaster):
         Controlling theta model variant. None searches the best model.
     alias : str, default 'AutoTheta'
         Custom name of the model.
-    prediction_intervals : ConformalIntervals or None, default None
-        Configuration for conformal prediction intervals.
     conformal_params : ConformalIntervals or None, default None
-        Parameters for conformal prediction intervals.
+        Configuration for conformal prediction intervals (canonical).
+    prediction_intervals : ConformalIntervals or None, default None
+        Deprecated alias for ``conformal_params``.
     n_samples : int, default 200
         Number of Monte Carlo samples for prediction intervals.
     """
@@ -77,11 +77,12 @@ class AutoTheta(BaseForecaster):
         if prediction_intervals is not None and not isinstance(prediction_intervals, ConformalIntervals):
             raise TypeError("prediction_intervals must be a ConformalIntervals object.")
 
-        effective_cfg = conformal_params
-        if effective_cfg is None:
-            effective_cfg = prediction_intervals
-        if effective_cfg is None:
-            effective_cfg = ConformalIntervals()
+        resolved = init_conformal_config(
+            conformal_params=conformal_params,
+            prediction_intervals=prediction_intervals,
+            stacklevel=2,
+        )
+        effective_cfg = resolved if resolved is not None else ConformalIntervals()
 
         self.conformal_params = effective_cfg
         self.prediction_intervals = effective_cfg
@@ -137,7 +138,7 @@ class AutoTheta(BaseForecaster):
             Keys: 'mean' and optionally 'lo-{lv}', 'hi-{lv}'.
         """
         fcst = _forecast_from_model(self.model_, h=h, level=level, n_samples=self.n_samples)
-        if self.prediction_intervals is not None and level is not None:
+        if self.conformal_params is not None and level is not None:
             fcst = _add_predict_conformal_intervals(self, fcst, level)
         return fcst
 
@@ -202,7 +203,7 @@ class AutoTheta(BaseForecaster):
         )
         res = _forecast_from_model(mod, h, level=level, n_samples=self.n_samples)
 
-        if self.prediction_intervals is not None and level is not None:
+        if self.conformal_params is not None and level is not None:
             res = _add_conformal_intervals(self, fcst=res, y=y, X=X, level=level)
 
         if fitted:
@@ -252,7 +253,7 @@ class AutoTheta(BaseForecaster):
         y = ensure_float(y)
         mod = _forward_theta(self.model_, y=y)
         res = _forecast_from_model(mod, h, level=level, n_samples=self.n_samples)
-        if self.prediction_intervals is not None and level is not None:
+        if self.conformal_params is not None and level is not None:
             res = _add_conformal_intervals(self, fcst=res, y=y, X=X, level=level)
         if fitted:
             res["fitted"] = y - mod["residuals"]
@@ -275,8 +276,10 @@ class Theta(AutoTheta):
         Seasonal decomposition type: 'multiplicative' or 'additive'.
     alias : str, default 'Theta'
         Custom name of the model.
+    conformal_params : ConformalIntervals or None, default None
+        Configuration for conformal prediction intervals (canonical).
     prediction_intervals : ConformalIntervals or None, default None
-        Configuration for conformal prediction intervals.
+        Deprecated alias for ``conformal_params``.
     n_samples : int, default 200
         Number of Monte Carlo samples for prediction intervals.
     """
@@ -286,14 +289,21 @@ class Theta(AutoTheta):
         season_length: int = 1,
         decomposition_type: str = "multiplicative",
         alias: str = "Theta",
+        conformal_params: ConformalIntervals | None = None,
         prediction_intervals: ConformalIntervals | None = None,
         n_samples: int = 200,
     ):
+        effective = init_conformal_config(
+            conformal_params=conformal_params,
+            prediction_intervals=prediction_intervals,
+            stacklevel=2,
+        )
         super().__init__(
             season_length=season_length,
             model="STM",
             decomposition_type=decomposition_type,
             alias=alias,
-            prediction_intervals=prediction_intervals,
+            conformal_params=effective,
+            prediction_intervals=None,
             n_samples=n_samples,
         )

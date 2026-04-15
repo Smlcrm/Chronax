@@ -1,5 +1,6 @@
 import jax.numpy as jnp
 import numpy as np
+import pytest
 import time
 from typing import Union, Tuple
 
@@ -330,6 +331,14 @@ def test_auto_mfles_accepts_conformal_params_alias() -> None:
     res = model.predict(h=4, level=[80])
     assert "mean" in res and len(res["mean"]) == 4
     assert "lo-80" in res and "hi-80" in res
+
+
+def test_prediction_intervals_emits_deprecation_warning() -> None:
+    cfg = ConformalIntervals(n_windows=3, h=4, method="conformal_distribution")
+    with pytest.warns(DeprecationWarning, match="prediction_intervals is deprecated"):
+        model = AutoMFLES(test_size=4, n_windows=2, prediction_intervals=cfg)
+    assert model.conformal_params is cfg
+    assert model.prediction_intervals is cfg
 
 
 def test_auto_mfles_rejects_conflicting_conformal_configs() -> None:

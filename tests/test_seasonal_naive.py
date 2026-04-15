@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+import pytest
 from jax import jit
 from typing import Optional, List, Dict, Union
 from chronax.utils import (
@@ -45,10 +46,10 @@ def test_seasonal_naive():
         assert len(forecast[f"hi-{lvl}"]) == 12, f"Upper interval {lvl}% has wrong length"
 
 
-def test_seasonal_naive_conformal_alias_path():
+def test_seasonal_naive_conformal_params_path():
     y = jnp.arange(48.0)
     cfg = ConformalIntervals(n_windows=3, h=2, method="conformal_distribution")
-    model = SeasonalNaive(season_length=12, prediction_intervals=cfg).fit(y)
+    model = SeasonalNaive(season_length=12, conformal_params=cfg).fit(y)
 
     assert model.conformal_params is cfg
     assert model.prediction_intervals is cfg
@@ -56,7 +57,19 @@ def test_seasonal_naive_conformal_alias_path():
     res = model.predict(h=2, level=[80])
     assert "lo-80" in res and "hi-80" in res
 
+
+def test_seasonal_naive_prediction_intervals_emits_deprecation_warning():
+    y = jnp.arange(48.0)
+    cfg = ConformalIntervals(n_windows=3, h=2, method="conformal_distribution")
+    with pytest.warns(DeprecationWarning, match="prediction_intervals is deprecated"):
+        model = SeasonalNaive(season_length=12, prediction_intervals=cfg).fit(y)
+    assert model.conformal_params is cfg
+    assert model.prediction_intervals is cfg
+    res = model.predict(h=2, level=[80])
+    assert "lo-80" in res and "hi-80" in res
+
 if __name__ == "__main__":
     test_seasonal_naive()
-    test_seasonal_naive_conformal_alias_path()
+    test_seasonal_naive_conformal_params_path()
+    test_seasonal_naive_prediction_intervals_emits_deprecation_warning()
     print("Test passed!")

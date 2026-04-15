@@ -12,7 +12,7 @@ from chronax.utils import (
     _add_fitted_pi,
 )
 
-from chronax.models.base_forecaster import BaseForecaster
+from chronax.models.base_forecaster import BaseForecaster, init_conformal_config
 
 from .ets_functions import ets_f, forecast_ets, forward_ets, _infer_season_length
 _PHI_LOWER = 0.8
@@ -39,7 +39,8 @@ class AutoETS(BaseForecaster):
         damped (bool, optional): A parameter that 'dampens' the trend.
         phi (float, optional): Smoothing parameter for trend damping. Only used when `damped=True`.
         alias (str, default="AutoETS"): Custom name of the model.
-        prediction_intervals (Optional[ConformalIntervals], optional): Information to compute conformal prediction intervals. By default, the model will compute the native prediction intervals.
+        conformal_params (Optional[ConformalIntervals], optional): Conformal prediction configuration (canonical).
+        prediction_intervals (Optional[ConformalIntervals], optional): Deprecated alias for ``conformal_params``. By default, the model will compute the native prediction intervals.
 
     Notes:
         This implementation is a mirror of Hyndman's [forecast::ets](https://github.com/robjhyndman/forecast).
@@ -86,6 +87,7 @@ class AutoETS(BaseForecaster):
         early_stop_patience: int = 10,  # Optimized: More aggressive early stopping
         early_stop_min_delta: float = 1e-5,  # Optimized: Slightly relaxed for faster convergence
         alias: str = "AutoETS",
+        conformal_params: Optional[ConformalIntervals] = None,
         prediction_intervals: Optional[ConformalIntervals] = None,
     ) -> None:
         """Initialize the AutoETS estimator configuration."""
@@ -104,8 +106,13 @@ class AutoETS(BaseForecaster):
         self.early_stop_patience = early_stop_patience
         self.early_stop_min_delta = early_stop_min_delta
         self.alias = alias
-        self.prediction_intervals = prediction_intervals
-        self.conformal_params = prediction_intervals
+        effective = init_conformal_config(
+            conformal_params=conformal_params,
+            prediction_intervals=prediction_intervals,
+            stacklevel=2,
+        )
+        self.conformal_params = effective
+        self.prediction_intervals = effective
         self.optax_steps = self.max_iter
 
     def fit(

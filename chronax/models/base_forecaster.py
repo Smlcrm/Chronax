@@ -1,5 +1,4 @@
-"""
-BaseForecaster defines the shared interface and common infrastructure for all models in Chronax.
+"""BaseForecaster defines the shared interface and common infrastructure for all models in Chronax.
 
 Instance Attributes
 -------------------
@@ -60,13 +59,67 @@ Notes
   RandomWalkWithDrift.predict is missing the X parameter.
   AutoCES.forecast is missing level and fitted parameters.
 """
+from __future__ import annotations
+
+import warnings
+from abc import ABC, abstractmethod
+from typing import Any
+
 import jax
 import jax.numpy as jnp
-from chronax import utils
-from abc import ABC, abstractmethod
 from jax import lax, vmap
 
+from chronax import utils
 from chronax.utils import _add_confidence_intervals
+
+
+def init_conformal_config(
+    *,
+    conformal_params: Any | None,
+    prediction_intervals: Any | None,
+    stacklevel: int = 2,
+    both_must_be_identical: bool = False,
+) -> Any | None:
+    """Resolve canonical ``conformal_params`` vs legacy ``prediction_intervals`` for ``__init__``.
+
+    ``conformal_params`` is the supported name; ``prediction_intervals`` remains
+    accepted for one compatibility phase and triggers ``DeprecationWarning`` when
+    it is the sole source of configuration.
+
+    Parameters
+    ----------
+    conformal_params, prediction_intervals
+        Conformal interval configuration objects (typically ``ConformalIntervals``),
+        or ``None``.
+    stacklevel
+        ``warnings.warn`` stack level so the warning points at caller code.
+    both_must_be_identical
+        If true, require that when both arguments are set they refer to the same
+        object (used by ``AutoMFLES``).
+
+    Returns
+    -------
+    object or None
+        ``conformal_params`` if set, otherwise ``prediction_intervals``, else ``None``.
+    """
+    if (
+        both_must_be_identical
+        and conformal_params is not None
+        and prediction_intervals is not None
+        and conformal_params is not prediction_intervals
+    ):
+        raise ValueError(
+            "Pass only one conformal config (prediction_intervals or conformal_params), "
+            "or pass the same object to both."
+        )
+    if prediction_intervals is not None and conformal_params is None:
+        warnings.warn(
+            "prediction_intervals is deprecated; use conformal_params instead.",
+            DeprecationWarning,
+            stacklevel=stacklevel,
+        )
+    return conformal_params if conformal_params is not None else prediction_intervals
+
 
 class BaseForecaster(ABC):
     """Abstract base class defining the shared interface for all Chronax forecasting models.

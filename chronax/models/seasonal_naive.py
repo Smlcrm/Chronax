@@ -15,7 +15,7 @@ from chronax.utils import (
     _add_fitted_pi,
 )
 from chronax.utils import ConformalIntervals
-from chronax.models.base_forecaster import BaseForecaster
+from chronax.models.base_forecaster import BaseForecaster, init_conformal_config
 
 ForecastDict = Dict[str, jnp.ndarray]
 
@@ -25,6 +25,7 @@ class SeasonalNaive(BaseForecaster):
         self,
         season_length: int,
         alias: str = "SeasonalNaive",
+        conformal_params: Optional[ConformalIntervals] = None,
         prediction_intervals: Optional[ConformalIntervals] = None,
     ) -> None:
         """Seasonal naive model.
@@ -37,14 +38,20 @@ class SeasonalNaive(BaseForecaster):
         Args:
             season_length (int): Number of observations per unit of time. Ex: 24 Hourly data.
             alias (str): Custom name of the model.
-            prediction_intervals (Optional[ConformalIntervals]): Information to compute conformal prediction intervals.
+            conformal_params (Optional[ConformalIntervals]): Conformal prediction configuration.
+            prediction_intervals (Optional[ConformalIntervals]): Deprecated alias for ``conformal_params``.
                 By default, the model will compute the native prediction
                 intervals.
         """
         self.season_length = season_length
         self.alias = alias
-        self.prediction_intervals = prediction_intervals
-        self.conformal_params = prediction_intervals
+        effective = init_conformal_config(
+            conformal_params=conformal_params,
+            prediction_intervals=prediction_intervals,
+            stacklevel=2,
+        )
+        self.conformal_params = effective
+        self.prediction_intervals = effective
 
     def fit(
         self,
@@ -101,7 +108,7 @@ class SeasonalNaive(BaseForecaster):
         if level is None:
             return res
         level = sorted(level)
-        if self.prediction_intervals is not None:
+        if self.conformal_params is not None:
             res = _add_predict_conformal_intervals(self, res, level)
         else:
             k = jnp.floor(jnp.arange(h) / self.season_length)
@@ -167,7 +174,7 @@ class SeasonalNaive(BaseForecaster):
             res["fitted"] = out["fitted"]
         if level is not None:
             level = sorted(level)
-            if self.prediction_intervals is not None:
+            if self.conformal_params is not None:
                 res = _add_conformal_intervals(self, fcst=res, y=y, X=X, level=level)
             else:
                 k = jnp.floor(jnp.arange(h) / self.season_length)

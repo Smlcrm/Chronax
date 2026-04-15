@@ -17,7 +17,7 @@ import threading  # Added for thread-safe tracking
 
 # Assumes mfles.py is in the same directory
 from .mfles import MFLES
-from chronax.models.base_forecaster import BaseForecaster
+from chronax.models.base_forecaster import BaseForecaster, init_conformal_config
 
 # =============================================================================
 # 1. JAX JIT KERNELS (Compute Heavy / GPU)
@@ -476,10 +476,10 @@ class AutoMFLES(BaseForecaster):
             step_size (Optional[int], optional): Steps separating CV windows. Defaults to test_size.
             metric (str, optional): Assessed target loss metric. Defaults to 'smape'.
             verbose (bool, optional): Reporting status flag. Defaults to False.
-            prediction_intervals (Optional[Any], optional): Settings dictating conformal bound output.
+            prediction_intervals (Optional[Any], optional): Deprecated; use ``conformal_params``.
             alias (str, optional): Custom system tracking ID. Defaults to "AutoMFLES".
             n_jobs (int, optional): Authorized CPU Thread limits. Defaults to 4.
-            conformal_params (Optional[Any], optional): Alias for prediction_intervals.
+            conformal_params (Optional[Any], optional): Conformal prediction configuration (canonical).
             
         Raises:
             ValueError: If test_size or n_windows are <= 0.
@@ -495,14 +495,12 @@ class AutoMFLES(BaseForecaster):
         self.metric: str = metric
         self.verbose: bool = verbose
 
-        if prediction_intervals is not None and conformal_params is not None:
-            if prediction_intervals is not conformal_params:
-                raise ValueError(
-                    "Pass only one conformal config (prediction_intervals or conformal_params), "
-                    "or pass the same object to both."
-                )
-
-        effective_cfg = conformal_params if conformal_params is not None else prediction_intervals
+        effective_cfg = init_conformal_config(
+            conformal_params=conformal_params,
+            prediction_intervals=prediction_intervals,
+            stacklevel=2,
+            both_must_be_identical=True,
+        )
         self.prediction_intervals: Optional[Any] = effective_cfg
         self.conformal_params: Optional[Any] = effective_cfg
         self.alias: str = alias

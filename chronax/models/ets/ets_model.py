@@ -17,7 +17,7 @@ import os
 import jax.numpy as jnp
 
 from chronax.utils import ConformalIntervals, ensure_float, _add_fitted_pi, calculate_sigma
-from chronax.models.base_forecaster import BaseForecaster
+from chronax.models.base_forecaster import BaseForecaster, init_conformal_config
 from .ets_functions import ets_f, forecast_ets, forward_ets
 
 _PHI_LOWER: float = 0.8
@@ -80,9 +80,11 @@ class ETS(BaseForecaster):
         Gradient clipping threshold.
     alias : str, default ``"ETS"``
         Display name for the model.
-    prediction_intervals : ConformalIntervals or None, default ``None``
-        Configuration for conformal prediction intervals.  When provided,
+    conformal_params : ConformalIntervals or None, default ``None``
+        Conformal prediction configuration (canonical).  When provided,
         conformity scores are cached at :meth:`fit` time.
+    prediction_intervals : ConformalIntervals or None, default ``None``
+        Deprecated alias for ``conformal_params``.
 
     Attributes
     ----------
@@ -109,6 +111,7 @@ class ETS(BaseForecaster):
         optax_lr: float = 1e-2,
         optax_clip: float = 1.0,
         alias: str = "ETS",
+        conformal_params: Optional[ConformalIntervals] = None,
         prediction_intervals: Optional[ConformalIntervals] = None,
     ) -> None:
         """Initialize a fixed-spec ETS estimator."""
@@ -127,8 +130,13 @@ class ETS(BaseForecaster):
         self.optax_lr: float = optax_lr
         self.optax_clip: float = optax_clip
         self.alias: str = alias
-        self.prediction_intervals: Optional[ConformalIntervals] = prediction_intervals
-        self.conformal_params: Optional[ConformalIntervals] = prediction_intervals
+        effective = init_conformal_config(
+            conformal_params=conformal_params,
+            prediction_intervals=prediction_intervals,
+            stacklevel=2,
+        )
+        self.prediction_intervals: Optional[ConformalIntervals] = effective
+        self.conformal_params: Optional[ConformalIntervals] = effective
         self.optax_steps: Optional[int] = max_iter
 
     def fit(
