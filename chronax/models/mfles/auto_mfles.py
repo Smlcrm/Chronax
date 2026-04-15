@@ -463,7 +463,8 @@ class AutoMFLES(BaseForecaster):
         verbose: bool = False,
         prediction_intervals: Optional[Any] = None,
         alias: str = "AutoMFLES",
-        n_jobs: int = 4
+        n_jobs: int = 4,
+        conformal_params: Optional[Any] = None,
     ) -> None:
         """Initializes the AutoMFLES wrapper class.
         
@@ -478,6 +479,7 @@ class AutoMFLES(BaseForecaster):
             prediction_intervals (Optional[Any], optional): Settings dictating conformal bound output.
             alias (str, optional): Custom system tracking ID. Defaults to "AutoMFLES".
             n_jobs (int, optional): Authorized CPU Thread limits. Defaults to 4.
+            conformal_params (Optional[Any], optional): Alias for prediction_intervals.
             
         Raises:
             ValueError: If test_size or n_windows are <= 0.
@@ -492,7 +494,17 @@ class AutoMFLES(BaseForecaster):
         self.step_size: int = step_size if step_size is not None else test_size
         self.metric: str = metric
         self.verbose: bool = verbose
-        self.prediction_intervals: Optional[Any] = prediction_intervals
+
+        if prediction_intervals is not None and conformal_params is not None:
+            if prediction_intervals is not conformal_params:
+                raise ValueError(
+                    "Pass only one conformal config (prediction_intervals or conformal_params), "
+                    "or pass the same object to both."
+                )
+
+        effective_cfg = conformal_params if conformal_params is not None else prediction_intervals
+        self.prediction_intervals: Optional[Any] = effective_cfg
+        self.conformal_params: Optional[Any] = effective_cfg
         self.alias: str = alias
         self.n_jobs: int = n_jobs
         
@@ -544,7 +556,7 @@ class AutoMFLES(BaseForecaster):
         # Always fit the model with best params (fast after caching)
         model = MFLES(
             verbose=int(self.verbose),
-            conformal_params=self.prediction_intervals,
+            conformal_params=self.conformal_params,
             alias=self.alias,
         )
         
@@ -584,10 +596,10 @@ class AutoMFLES(BaseForecaster):
             if X.ndim == 1: X = X.reshape(-1, 1)
             X = _standardize_data(X, *self.scaling_stats_)
 
-        inner_level = level if self.prediction_intervals is not None else None
+        inner_level = level if self.conformal_params is not None else None
         res = self.model_["model"].predict(h=h, X=X, level=inner_level)
 
-        if level is not None and self.prediction_intervals is None:
+        if level is not None and self.conformal_params is None:
             res = add_gaussian_intervals(res, level, self.sigma_)
 
         return res

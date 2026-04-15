@@ -1305,7 +1305,7 @@ class MFLES(BaseForecaster):
 
         out = {"mean": mean}
         if level:
-            cs = self.conformity_scores(self.model_["fitted"])
+            cs = utils._compute_conformity_scores(self, self.model_["fitted"], X=None)
             out = self.add_confidence_intervals(out, cs, level, "conformal_distribution")
         return out
 

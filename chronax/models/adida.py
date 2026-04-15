@@ -34,14 +34,13 @@ def _interval_mean(y: jnp.ndarray) -> jnp.ndarray:
     """Compute the average interval between non-zero observations."""
     nonzero_mask = y != 0
     nonzero_count = jnp.count_nonzero(nonzero_mask)
-    if nonzero_count == 0:
-        return jnp.array(1.0, dtype=y.dtype)
 
     # mean(diff(nonzero_idxs + 1, prepend=0)) == (last_nonzero_idx + 1) / count_nonzero
     last_nonzero_idx = jnp.max(
         jnp.where(nonzero_mask, jnp.arange(y.shape[0], dtype=jnp.int32), 0)
     )
-    return (last_nonzero_idx.astype(y.dtype) + 1.0) / nonzero_count.astype(y.dtype)
+    interval_mean = (last_nonzero_idx.astype(y.dtype) + 1.0) / nonzero_count.astype(y.dtype)
+    return jnp.where(nonzero_count == 0, jnp.array(1.0, dtype=y.dtype), interval_mean)
 
 
 def _ses_sse(alpha: jnp.ndarray, x: jnp.ndarray) -> jnp.ndarray:

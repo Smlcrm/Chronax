@@ -5,6 +5,7 @@ from typing import Union, Tuple
 
 # Assumes your AutoMFLES class is in a file named auto_mfles.py
 from chronax.models import AutoMFLES
+from chronax.utils import ConformalIntervals
 
 def generate_dummy_data(n: int = 100, include_x: bool = False) -> Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray]]:
     """Helper to generate synthetic time series data for testing.
@@ -317,5 +318,35 @@ def test_auto_mfles() -> None:
     print("="*60)
 
 
+def test_auto_mfles_accepts_conformal_params_alias() -> None:
+    y = generate_dummy_data(n=48)
+    cfg = ConformalIntervals(n_windows=3, h=4, method="conformal_distribution")
+    model = AutoMFLES(test_size=4, n_windows=2, conformal_params=cfg)
+
+    assert model.conformal_params is cfg
+    assert model.prediction_intervals is cfg
+
+    model.fit(y)
+    res = model.predict(h=4, level=[80])
+    assert "mean" in res and len(res["mean"]) == 4
+    assert "lo-80" in res and "hi-80" in res
+
+
+def test_auto_mfles_rejects_conflicting_conformal_configs() -> None:
+    cfg_a = ConformalIntervals(n_windows=3, h=4, method="conformal_distribution")
+    cfg_b = ConformalIntervals(n_windows=3, h=4, method="conformal_signed")
+    try:
+        AutoMFLES(
+            test_size=4,
+            prediction_intervals=cfg_a,
+            conformal_params=cfg_b,
+        )
+        raise AssertionError("Expected ValueError for conflicting conformal configs")
+    except ValueError as e:
+        assert "Pass only one conformal config" in str(e)
+
+
 if __name__ == '__main__':
     test_auto_mfles()
+    test_auto_mfles_accepts_conformal_params_alias()
+    test_auto_mfles_rejects_conflicting_conformal_configs()
