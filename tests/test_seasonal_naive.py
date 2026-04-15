@@ -12,8 +12,6 @@ from chronax.utils import (
     _quantiles,
     _store_cs,
     _add_fitted_pi,
-    _add_conformal_distribution_intervals,
-    _get_conformal_method,
 )
 from chronax.utils import ConformalIntervals
 from chronax.models.base_forecaster import BaseForecaster

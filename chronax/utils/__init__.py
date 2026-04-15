@@ -6,6 +6,19 @@ functionality for models and benchmarks.
 """
 
 from .conformal_intervals import ConformalIntervals
+from .conformal_methods import (
+    add_conformal_distribution_intervals,
+    add_conformal_signed_intervals,
+    get_conformal_method,
+)
+from .conformal_workflow import (
+    add_confidence_intervals,
+    add_conformal_intervals,
+    add_predict_conformal_intervals,
+    compute_conformity_scores,
+    resolve_conformal_params,
+    store_conformity_scores,
+)
 from . import utils as _core_utils
 from . import plotting as _plotting
 from . import loss_functions as loss_functions  # keep metrics under chronax.utils.loss_functions
@@ -23,7 +36,19 @@ for _name in dir(_plotting):
         continue
     globals()[_name] = getattr(_plotting, _name)
 
-__all__ = ["ConformalIntervals", "loss_functions"]
+__all__ = [
+    "ConformalIntervals",
+    "add_conformal_distribution_intervals",
+    "add_conformal_signed_intervals",
+    "get_conformal_method",
+    "add_confidence_intervals",
+    "add_conformal_intervals",
+    "add_predict_conformal_intervals",
+    "compute_conformity_scores",
+    "resolve_conformal_params",
+    "store_conformity_scores",
+    "loss_functions",
+]
 __all__ += sorted(
     name
     for name in globals()

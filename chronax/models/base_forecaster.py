@@ -71,7 +71,7 @@ import jax.numpy as jnp
 from jax import lax, vmap
 
 from chronax import utils
-from chronax.utils import _add_confidence_intervals
+from chronax.utils.conformal_workflow import add_confidence_intervals
 
 
 class BaseForecaster(ABC):
@@ -270,7 +270,7 @@ class BaseForecaster(ABC):
         ValueError
             If ``method`` is not a recognised conformal method.
         """
-        return _add_confidence_intervals(fcst=fcst, cs=cs, level=level, method=method)
+        return add_confidence_intervals(fcst=fcst, cs=cs, level=level, method=method)
 
 
 # ---------- Test ----------

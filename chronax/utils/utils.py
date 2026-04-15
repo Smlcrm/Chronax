@@ -7,32 +7,24 @@ Sections
 2.  Data Extraction Helpers       extract_demand, extract_probability
 3.  Forecast Output Helpers       _repeat_val, _repeat_val_seas, _calculate_intervals,
                                    _add_fitted_pi, _add_fitted_pi_1
-4.  Conformal Interval Helpers    add_conformal_distribution_intervals, add_conformal_signed_intervals,
-                                   get_conformal_method, _add_conformal_distribution_intervals,
-                                   _add_conformal_signed_intervals, _get_conformal_method,
-                                   _conformal_method, _store_cs, _add_conformal_intervals,
-                                   _add_predict_conformal_intervals
-5.  SES Core                      _ses_forecast_nan, _ses_sse, _ses_forecast,
+4.  SES Core                      _ses_forecast_nan, _ses_sse, _ses_forecast,
                                    _ses_sse_masked, _ses_forecast_last_masked,
                                    _golden_bounded_minimize,
                                    _optimized_ses_forecast, _optimized_ses_forecast_masked
-6.  Aggregation / Chunking        _window_average_core, _window_average,
+5.  Aggregation / Chunking        _window_average_core, _window_average,
                                    _chunk_sums, _chunk_forecast
-7.  Intermittent Demand Helpers   _demand, _intervals_c, _intervals,
+6.  Intermittent Demand Helpers   _demand, _intervals_c, _intervals,
                                    _expand_fitted_demand, _expand_fitted_intervals
-8.  Seasonal & Decomposition      _seasonal_exponential_smoothing, _seasonal_naive,
+7.  Seasonal & Decomposition      _seasonal_exponential_smoothing, _seasonal_naive,
                                    seasonal_decompose, _linear_extrapolate_tail
-9.  IMAPA                         _imapa_aggregate_jit, _imapa
-10. Miscellaneous                 is_constant, acf, calculate_information_criteria
+8.  IMAPA                         _imapa_aggregate_jit, _imapa
+9.  Miscellaneous                 is_constant, acf, calculate_information_criteria
 
 Public API (imported by other modules)
 ---------------------------------------
 ensure_float, calculate_sigma, extract_demand, extract_probability,
 _repeat_val, _repeat_val_seas, _quantiles, _calculate_intervals,
 _add_fitted_pi, _add_fitted_pi_1,
-add_conformal_distribution_intervals, add_conformal_signed_intervals, get_conformal_method,
-_add_conformal_distribution_intervals, _get_conformal_method,
-_conformal_method, _store_cs, _add_conformal_intervals, _add_predict_conformal_intervals,
 _seasonal_naive, _seasonal_exponential_smoothing, _window_average,
 _intervals, _intervals_c, _expand_fitted_intervals, _expand_fitted_demand, _imapa,
 calculate_information_criteria, is_constant, acf, results
@@ -54,20 +46,6 @@ import jax.numpy as jnp
 import jax.random as jrandom
 from jax import jit, lax
 from jax.scipy.stats import norm
-
-from chronax.utils.conformal_methods import (
-    add_conformal_distribution_intervals,
-    add_conformal_signed_intervals,
-    get_conformal_method,
-)
-from chronax.utils.conformal_workflow import (
-    add_confidence_intervals as _add_confidence_intervals,
-    add_conformal_intervals as _add_conformal_intervals,
-    add_predict_conformal_intervals as _add_predict_conformal_intervals,
-    compute_conformity_scores as _compute_conformity_scores,
-    resolve_conformal_params as _resolve_conformal_config,
-    store_conformity_scores as _store_cs,
-)
 
 # Enable float64 precision — required by the golden-section SES optimizer.
 # Note: this affects the entire JAX session.
@@ -337,31 +315,7 @@ def _add_fitted_pi_1(
 
 
 # ============================================================
-# SECTION 4 — Conformal Interval Helpers
-# ============================================================
-
-_add_conformal_distribution_intervals = add_conformal_distribution_intervals
-_add_conformal_signed_intervals = add_conformal_signed_intervals
-_get_conformal_method = get_conformal_method
-
-
-def _conformal_method(self) -> Callable:
-    """Retrieve the conformal method from a model's conformal config.
-
-    Args:
-        self: A forecaster instance with conformal configuration.
-
-    Returns:
-        The conformal interval function.
-    """
-    conformal_cfg = _resolve_conformal_config(self)
-    if conformal_cfg is None:
-        raise ValueError("No conformal configuration is set on this model instance.")
-    return _get_conformal_method(conformal_cfg.method)
-
-
-# ============================================================
-# SECTION 5 — SES Core
+# SECTION 4 — SES Core
 # ============================================================
 
 @jax.jit
@@ -725,7 +679,7 @@ def _optimized_ses_forecast_masked(
 
 
 # ============================================================
-# SECTION 6 — Aggregation / Chunking
+# SECTION 5 — Aggregation / Chunking
 # ============================================================
 
 @_partial(jax.jit, static_argnums=(1, 2))
@@ -815,7 +769,7 @@ def _chunk_forecast(y: jnp.ndarray, aggregation_level: int) -> jnp.ndarray:
 
 
 # ============================================================
-# SECTION 7 — Intermittent Demand Helpers
+# SECTION 6 — Intermittent Demand Helpers
 # ============================================================
 
 @jax.jit
@@ -979,7 +933,7 @@ def _expand_fitted_intervals(fitted: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray
 
 
 # ============================================================
-# SECTION 8 — Seasonal & Decomposition
+# SECTION 7 — Seasonal & Decomposition
 # ============================================================
 
 def _seasonal_exponential_smoothing(
@@ -1176,7 +1130,7 @@ def _linear_extrapolate_tail(y: jnp.ndarray, tail_window: int, h: int) -> jnp.nd
 
 
 # ============================================================
-# SECTION 9 — IMAPA
+# SECTION 8 — IMAPA
 # ============================================================
 
 def _repeat_val_(val: jnp.ndarray, h: int) -> jnp.ndarray:
@@ -1321,7 +1275,7 @@ def _imapa(
 
 
 # ============================================================
-# SECTION 10 — Miscellaneous
+# SECTION 9 — Miscellaneous
 # ============================================================
 
 def is_constant(x: jnp.ndarray) -> jnp.ndarray:

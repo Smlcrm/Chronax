@@ -3,7 +3,6 @@ import jax.numpy as jnp
 from chronax import utils
 from jax import lax, vmap
 
-from chronax.utils import _get_conformal_method
 from chronax.models.base_forecaster import BaseForecaster
 
 # ---------- Test ----------
