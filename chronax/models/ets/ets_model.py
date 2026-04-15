@@ -127,6 +127,7 @@ class ETS(BaseForecaster):
         self.optax_lr: float = optax_lr
         self.optax_clip: float = optax_clip
         self.alias: str = alias
+        self.prediction_intervals: Optional[ConformalIntervals] = prediction_intervals
         self.conformal_params: Optional[ConformalIntervals] = prediction_intervals
         self.optax_steps: Optional[int] = max_iter
 

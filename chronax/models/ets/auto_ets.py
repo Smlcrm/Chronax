@@ -104,6 +104,7 @@ class AutoETS(BaseForecaster):
         self.early_stop_patience = early_stop_patience
         self.early_stop_min_delta = early_stop_min_delta
         self.alias = alias
+        self.prediction_intervals = prediction_intervals
         self.conformal_params = prediction_intervals
         self.optax_steps = self.max_iter
 

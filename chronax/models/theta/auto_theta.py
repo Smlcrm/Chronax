@@ -71,14 +71,20 @@ class AutoTheta(BaseForecaster):
         self.decomposition_type = decomposition_type
         self.model = model
         self.alias = alias
-        self.prediction_intervals = prediction_intervals
         self.n_samples = n_samples
-        if conformal_params is None:
-            self.conformal_params = ConformalIntervals()
-        else:
-            if not isinstance(conformal_params, ConformalIntervals):
-                raise TypeError("conformal_params must be a ConformalIntervals object.")
-            self.conformal_params = conformal_params
+        if conformal_params is not None and not isinstance(conformal_params, ConformalIntervals):
+            raise TypeError("conformal_params must be a ConformalIntervals object.")
+        if prediction_intervals is not None and not isinstance(prediction_intervals, ConformalIntervals):
+            raise TypeError("prediction_intervals must be a ConformalIntervals object.")
+
+        effective_cfg = conformal_params
+        if effective_cfg is None:
+            effective_cfg = prediction_intervals
+        if effective_cfg is None:
+            effective_cfg = ConformalIntervals()
+
+        self.conformal_params = effective_cfg
+        self.prediction_intervals = effective_cfg
 
     def fit(self, y: jnp.ndarray, X: jnp.ndarray | None = None) -> "AutoTheta":
         r"""Fit the AutoTheta model.

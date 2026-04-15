@@ -66,6 +66,20 @@ def test_theta():
     print("Theta test passed!")
 
 
+def test_autotheta_config_alias_consistency():
+    cfg = ConformalIntervals(n_windows=3, h=2, method="conformal_signed")
+    model = AutoTheta(prediction_intervals=cfg)
+
+    assert model.conformal_params is cfg
+    assert model.prediction_intervals is cfg
+
+    y = jnp.arange(36.0)
+    model.fit(y)
+    out = model.predict(h=2, level=[80])
+    assert "lo-80" in out and "hi-80" in out
+
+
 if __name__ == "__main__":
     test_autotheta()
     test_theta()
+    test_autotheta_config_alias_consistency()
