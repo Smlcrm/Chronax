@@ -1,5 +1,4 @@
 import jax.numpy as jnp
-import pytest
 from chronax.utils import ConformalIntervals
 from chronax.models import Theta, AutoTheta
 
@@ -66,12 +65,11 @@ def test_theta():
     print("Theta test passed!")
 
 
-def test_autotheta_config_alias_consistency():
+def test_autotheta_conformal_params():
     cfg = ConformalIntervals(n_windows=3, h=2, method="conformal_signed")
     model = AutoTheta(conformal_params=cfg)
 
     assert model.conformal_params is cfg
-    assert model.prediction_intervals is cfg
 
     y = jnp.arange(36.0)
     model.fit(y)
@@ -79,25 +77,7 @@ def test_autotheta_config_alias_consistency():
     assert "lo-80" in out and "hi-80" in out
 
 
-def test_autotheta_prediction_intervals_emits_deprecation_warning():
-    cfg = ConformalIntervals(n_windows=3, h=2, method="conformal_signed")
-    with pytest.warns(DeprecationWarning, match="prediction_intervals is deprecated"):
-        model = AutoTheta(prediction_intervals=cfg)
-    assert model.conformal_params is cfg
-    assert model.prediction_intervals is cfg
-
-
-def test_theta_prediction_intervals_emits_deprecation_warning():
-    cfg = ConformalIntervals(method="conformal_distribution")
-    with pytest.warns(DeprecationWarning, match="prediction_intervals is deprecated"):
-        model = Theta(prediction_intervals=cfg)
-    assert model.conformal_params is cfg
-    assert model.prediction_intervals is cfg
-
-
 if __name__ == "__main__":
     test_autotheta()
     test_theta()
-    test_autotheta_config_alias_consistency()
-    test_autotheta_prediction_intervals_emits_deprecation_warning()
-    test_theta_prediction_intervals_emits_deprecation_warning()
+    test_autotheta_conformal_params()

@@ -17,7 +17,7 @@ import threading  # Added for thread-safe tracking
 
 # Assumes mfles.py is in the same directory
 from .mfles import MFLES
-from chronax.models.base_forecaster import BaseForecaster, init_conformal_config
+from chronax.models.base_forecaster import BaseForecaster
 
 # =============================================================================
 # 1. JAX JIT KERNELS (Compute Heavy / GPU)
@@ -461,10 +461,9 @@ class AutoMFLES(BaseForecaster):
         step_size: Optional[int] = None,
         metric: str = "smape",
         verbose: bool = False,
-        prediction_intervals: Optional[Any] = None,
+        conformal_params: Optional[Any] = None,
         alias: str = "AutoMFLES",
         n_jobs: int = 4,
-        conformal_params: Optional[Any] = None,
     ) -> None:
         """Initializes the AutoMFLES wrapper class.
         
@@ -476,10 +475,9 @@ class AutoMFLES(BaseForecaster):
             step_size (Optional[int], optional): Steps separating CV windows. Defaults to test_size.
             metric (str, optional): Assessed target loss metric. Defaults to 'smape'.
             verbose (bool, optional): Reporting status flag. Defaults to False.
-            prediction_intervals (Optional[Any], optional): Deprecated; use ``conformal_params``.
+            conformal_params (Optional[Any], optional): Conformal prediction configuration.
             alias (str, optional): Custom system tracking ID. Defaults to "AutoMFLES".
             n_jobs (int, optional): Authorized CPU Thread limits. Defaults to 4.
-            conformal_params (Optional[Any], optional): Conformal prediction configuration (canonical).
             
         Raises:
             ValueError: If test_size or n_windows are <= 0.
@@ -495,14 +493,7 @@ class AutoMFLES(BaseForecaster):
         self.metric: str = metric
         self.verbose: bool = verbose
 
-        effective_cfg = init_conformal_config(
-            conformal_params=conformal_params,
-            prediction_intervals=prediction_intervals,
-            stacklevel=2,
-            both_must_be_identical=True,
-        )
-        self.prediction_intervals: Optional[Any] = effective_cfg
-        self.conformal_params: Optional[Any] = effective_cfg
+        self.conformal_params: Optional[Any] = conformal_params
         self.alias: str = alias
         self.n_jobs: int = n_jobs
         

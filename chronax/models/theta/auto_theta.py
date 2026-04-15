@@ -15,7 +15,7 @@ References:
     their relationship to state space models". International Journal of Forecasting.
 """
 import jax.numpy as jnp
-from chronax.models.base_forecaster import BaseForecaster, init_conformal_config
+from chronax.models.base_forecaster import BaseForecaster
 from chronax.utils import ConformalIntervals
 from chronax.models.theta.theta_model import (
     _auto_theta,
@@ -52,9 +52,7 @@ class AutoTheta(BaseForecaster):
     alias : str, default 'AutoTheta'
         Custom name of the model.
     conformal_params : ConformalIntervals or None, default None
-        Configuration for conformal prediction intervals (canonical).
-    prediction_intervals : ConformalIntervals or None, default None
-        Deprecated alias for ``conformal_params``.
+        Configuration for conformal prediction intervals.
     n_samples : int, default 200
         Number of Monte Carlo samples for prediction intervals.
     """
@@ -65,7 +63,6 @@ class AutoTheta(BaseForecaster):
         decomposition_type: str = "multiplicative",
         model: str | None = None,
         alias: str = "AutoTheta",
-        prediction_intervals: ConformalIntervals | None = None,
         conformal_params: ConformalIntervals | None = None,
         n_samples: int = 200,
     ):
@@ -76,18 +73,10 @@ class AutoTheta(BaseForecaster):
         self.n_samples = n_samples
         if conformal_params is not None and not isinstance(conformal_params, ConformalIntervals):
             raise TypeError("conformal_params must be a ConformalIntervals object.")
-        if prediction_intervals is not None and not isinstance(prediction_intervals, ConformalIntervals):
-            raise TypeError("prediction_intervals must be a ConformalIntervals object.")
 
-        resolved = init_conformal_config(
-            conformal_params=conformal_params,
-            prediction_intervals=prediction_intervals,
-            stacklevel=2,
-        )
-        effective_cfg = resolved if resolved is not None else ConformalIntervals()
+        effective_cfg = conformal_params if conformal_params is not None else ConformalIntervals()
 
         self.conformal_params = effective_cfg
-        self.prediction_intervals = effective_cfg
 
     def fit(self, y: jnp.ndarray, X: jnp.ndarray | None = None) -> "AutoTheta":
         r"""Fit the AutoTheta model.
@@ -279,9 +268,7 @@ class Theta(AutoTheta):
     alias : str, default 'Theta'
         Custom name of the model.
     conformal_params : ConformalIntervals or None, default None
-        Configuration for conformal prediction intervals (canonical).
-    prediction_intervals : ConformalIntervals or None, default None
-        Deprecated alias for ``conformal_params``.
+        Configuration for conformal prediction intervals.
     n_samples : int, default 200
         Number of Monte Carlo samples for prediction intervals.
     """
@@ -292,20 +279,13 @@ class Theta(AutoTheta):
         decomposition_type: str = "multiplicative",
         alias: str = "Theta",
         conformal_params: ConformalIntervals | None = None,
-        prediction_intervals: ConformalIntervals | None = None,
         n_samples: int = 200,
     ):
-        effective = init_conformal_config(
-            conformal_params=conformal_params,
-            prediction_intervals=prediction_intervals,
-            stacklevel=2,
-        )
         super().__init__(
             season_length=season_length,
             model="STM",
             decomposition_type=decomposition_type,
             alias=alias,
-            conformal_params=effective,
-            prediction_intervals=None,
+            conformal_params=conformal_params,
             n_samples=n_samples,
         )

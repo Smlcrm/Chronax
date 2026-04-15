@@ -12,7 +12,7 @@ from chronax.utils import (
     _add_fitted_pi,
 )
 from chronax.utils import ConformalIntervals
-from chronax.models.base_forecaster import BaseForecaster, init_conformal_config
+from chronax.models.base_forecaster import BaseForecaster
 from chronax.utils.conformal_workflow import (
     add_conformal_intervals,
     add_predict_conformal_intervals,
@@ -28,7 +28,6 @@ class SeasonalNaive(BaseForecaster):
         season_length: int,
         alias: str = "SeasonalNaive",
         conformal_params: Optional[ConformalIntervals] = None,
-        prediction_intervals: Optional[ConformalIntervals] = None,
     ) -> None:
         """Seasonal naive model.
 
@@ -41,19 +40,11 @@ class SeasonalNaive(BaseForecaster):
             season_length (int): Number of observations per unit of time. Ex: 24 Hourly data.
             alias (str): Custom name of the model.
             conformal_params (Optional[ConformalIntervals]): Conformal prediction configuration.
-            prediction_intervals (Optional[ConformalIntervals]): Deprecated alias for ``conformal_params``.
-                By default, the model will compute the native prediction
-                intervals.
+                By default, the model will compute the native prediction intervals.
         """
         self.season_length = season_length
         self.alias = alias
-        effective = init_conformal_config(
-            conformal_params=conformal_params,
-            prediction_intervals=prediction_intervals,
-            stacklevel=2,
-        )
-        self.conformal_params = effective
-        self.prediction_intervals = effective
+        self.conformal_params = conformal_params
 
     def fit(
         self,

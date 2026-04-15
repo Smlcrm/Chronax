@@ -3,8 +3,8 @@
 Instance Attributes
 -------------------
 1. ``alias`` -- model name, declared in model's ``__init__``
-2. ``conformal_params`` -- a conformal_intervals object, in statsforecast
-   previously named prediction_intervals
+2. ``conformal_params`` -- conformal interval configuration (typically a
+   ``ConformalIntervals`` instance)
 3. ``model_`` -- stores fitted model post-training
 
 Class Attributes
@@ -51,6 +51,10 @@ Methods
 
 Notes
 -----
+- Conformal interval configuration is owned by ``conformal_params`` (constructor
+  argument and instance attribute). Migrated forecasters do not accept a
+  ``prediction_intervals`` constructor keyword.
+
 - Exogenous variable support is model-specific, not framework-level.
   The boolean uses_exog must be overridden in the model's implementation.
 
@@ -61,64 +65,13 @@ Notes
 """
 from __future__ import annotations
 
-import warnings
 from abc import ABC, abstractmethod
-from typing import Any
-
 import jax
 import jax.numpy as jnp
 from jax import lax, vmap
 
 from chronax import utils
 from chronax.utils import _add_confidence_intervals
-
-
-def init_conformal_config(
-    *,
-    conformal_params: Any | None,
-    prediction_intervals: Any | None,
-    stacklevel: int = 2,
-    both_must_be_identical: bool = False,
-) -> Any | None:
-    """Resolve canonical ``conformal_params`` vs legacy ``prediction_intervals`` for ``__init__``.
-
-    ``conformal_params`` is the supported name; ``prediction_intervals`` remains
-    accepted for one compatibility phase and triggers ``DeprecationWarning`` when
-    it is the sole source of configuration.
-
-    Parameters
-    ----------
-    conformal_params, prediction_intervals
-        Conformal interval configuration objects (typically ``ConformalIntervals``),
-        or ``None``.
-    stacklevel
-        ``warnings.warn`` stack level so the warning points at caller code.
-    both_must_be_identical
-        If true, require that when both arguments are set they refer to the same
-        object (used by ``AutoMFLES``).
-
-    Returns
-    -------
-    object or None
-        ``conformal_params`` if set, otherwise ``prediction_intervals``, else ``None``.
-    """
-    if (
-        both_must_be_identical
-        and conformal_params is not None
-        and prediction_intervals is not None
-        and conformal_params is not prediction_intervals
-    ):
-        raise ValueError(
-            "Pass only one conformal config (prediction_intervals or conformal_params), "
-            "or pass the same object to both."
-        )
-    if prediction_intervals is not None and conformal_params is None:
-        warnings.warn(
-            "prediction_intervals is deprecated; use conformal_params instead.",
-            DeprecationWarning,
-            stacklevel=stacklevel,
-        )
-    return conformal_params if conformal_params is not None else prediction_intervals
 
 
 class BaseForecaster(ABC):

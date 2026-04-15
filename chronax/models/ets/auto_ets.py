@@ -12,7 +12,7 @@ from chronax.utils import (
     _add_fitted_pi,
 )
 
-from chronax.models.base_forecaster import BaseForecaster, init_conformal_config
+from chronax.models.base_forecaster import BaseForecaster
 
 from .ets_functions import ets_f, forecast_ets, forward_ets, _infer_season_length
 _PHI_LOWER = 0.8
@@ -39,8 +39,8 @@ class AutoETS(BaseForecaster):
         damped (bool, optional): A parameter that 'dampens' the trend.
         phi (float, optional): Smoothing parameter for trend damping. Only used when `damped=True`.
         alias (str, default="AutoETS"): Custom name of the model.
-        conformal_params (Optional[ConformalIntervals], optional): Conformal prediction configuration (canonical).
-        prediction_intervals (Optional[ConformalIntervals], optional): Deprecated alias for ``conformal_params``. By default, the model will compute the native prediction intervals.
+        conformal_params (Optional[ConformalIntervals], optional): Conformal prediction configuration.
+            By default, the model will compute the native prediction intervals.
 
     Notes:
         This implementation is a mirror of Hyndman's [forecast::ets](https://github.com/robjhyndman/forecast).
@@ -88,7 +88,6 @@ class AutoETS(BaseForecaster):
         early_stop_min_delta: float = 1e-5,  # Optimized: Slightly relaxed for faster convergence
         alias: str = "AutoETS",
         conformal_params: Optional[ConformalIntervals] = None,
-        prediction_intervals: Optional[ConformalIntervals] = None,
     ) -> None:
         """Initialize the AutoETS estimator configuration."""
         self.season_length = season_length
@@ -106,13 +105,7 @@ class AutoETS(BaseForecaster):
         self.early_stop_patience = early_stop_patience
         self.early_stop_min_delta = early_stop_min_delta
         self.alias = alias
-        effective = init_conformal_config(
-            conformal_params=conformal_params,
-            prediction_intervals=prediction_intervals,
-            stacklevel=2,
-        )
-        self.conformal_params = effective
-        self.prediction_intervals = effective
+        self.conformal_params = conformal_params
         self.optax_steps = self.max_iter
 
     def fit(
@@ -579,7 +572,7 @@ def test_fit_caches_conformal_then_predict_uses_cache() -> None:
     y = jnp.asarray(8.0 + 0.05 * t + 0.5 * np.sin(2 * np.pi * t / 8), dtype=jnp.float64)
 
     cfg = ConformalIntervals(n_windows=5, h=3, method="conformal_distribution")
-    ae = AutoETS(season_length=1, model="ZZZ", prediction_intervals=cfg)
+    ae = AutoETS(season_length=1, model="ZZZ", conformal_params=cfg)
 
     ae.fit(y)  # should not hit tiny-dataset in any window
     assert getattr(ae, "_cs") is not None
@@ -603,7 +596,7 @@ def test_stateless_forecast_with_conformal_intervals() -> None:
     y = jnp.asarray(5.0 + 0.1 * t + 0.3 * np.sin(2 * np.pi * t / 6), dtype=jnp.float64)
 
     cfg = ConformalIntervals(n_windows=4, h=2, method="conformal_distribution")
-    ae = AutoETS(season_length=1, model="ZZZ", prediction_intervals=cfg)
+    ae = AutoETS(season_length=1, model="ZZZ", conformal_params=cfg)
 
     out = ae.forecast(y=y, h=6, level=[90], fitted=False)
     assert "mean" in out and out["mean"].shape == (6,)

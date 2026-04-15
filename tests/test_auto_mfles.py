@@ -319,13 +319,12 @@ def test_auto_mfles() -> None:
     print("="*60)
 
 
-def test_auto_mfles_accepts_conformal_params_alias() -> None:
+def test_auto_mfles_accepts_conformal_params() -> None:
     y = generate_dummy_data(n=48)
     cfg = ConformalIntervals(n_windows=3, h=4, method="conformal_distribution")
     model = AutoMFLES(test_size=4, n_windows=2, conformal_params=cfg)
 
     assert model.conformal_params is cfg
-    assert model.prediction_intervals is cfg
 
     model.fit(y)
     res = model.predict(h=4, level=[80])
@@ -333,29 +332,13 @@ def test_auto_mfles_accepts_conformal_params_alias() -> None:
     assert "lo-80" in res and "hi-80" in res
 
 
-def test_prediction_intervals_emits_deprecation_warning() -> None:
+def test_prediction_intervals_constructor_rejected() -> None:
     cfg = ConformalIntervals(n_windows=3, h=4, method="conformal_distribution")
-    with pytest.warns(DeprecationWarning, match="prediction_intervals is deprecated"):
-        model = AutoMFLES(test_size=4, n_windows=2, prediction_intervals=cfg)
-    assert model.conformal_params is cfg
-    assert model.prediction_intervals is cfg
-
-
-def test_auto_mfles_rejects_conflicting_conformal_configs() -> None:
-    cfg_a = ConformalIntervals(n_windows=3, h=4, method="conformal_distribution")
-    cfg_b = ConformalIntervals(n_windows=3, h=4, method="conformal_signed")
-    try:
-        AutoMFLES(
-            test_size=4,
-            prediction_intervals=cfg_a,
-            conformal_params=cfg_b,
-        )
-        raise AssertionError("Expected ValueError for conflicting conformal configs")
-    except ValueError as e:
-        assert "Pass only one conformal config" in str(e)
+    with pytest.raises(TypeError):
+        AutoMFLES(test_size=4, n_windows=2, prediction_intervals=cfg)
 
 
 if __name__ == '__main__':
     test_auto_mfles()
-    test_auto_mfles_accepts_conformal_params_alias()
-    test_auto_mfles_rejects_conflicting_conformal_configs()
+    test_auto_mfles_accepts_conformal_params()
+    test_prediction_intervals_constructor_rejected()
