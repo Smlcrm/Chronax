@@ -245,7 +245,7 @@ def _fit_adida(
     y = ensure_float(y)
     model._y = y
     model.model_ = _adida_point(y=y, h=1)
-    if model.prediction_intervals is not None:
+    if model.conformal_params is not None:
         store_conformity_scores(model, y=y, X=X)
     return model
 
@@ -342,7 +342,7 @@ class ADIDA(BaseForecaster):
     def __init__(
         self,
         alias: str = "ADIDA",
-        prediction_intervals: Optional[ConformalIntervals] = None,
+        conformal_params: Optional[ConformalIntervals] = None,
     ) -> None:
         """ADIDA model.
 
@@ -360,21 +360,20 @@ class ADIDA(BaseForecaster):
 
         Args:
             alias (str, optional): Custom name of the model. Defaults to "ADIDA".
-            prediction_intervals (Optional[ConformalIntervals], optional): Information to compute conformal prediction intervals.
+            conformal_params (Optional[ConformalIntervals], optional): Information to compute conformal prediction intervals.
                 By default, the model will compute the native prediction intervals. Defaults to None.
         """
         self.alias = alias
-        self.prediction_intervals = prediction_intervals
         self.only_conformal_intervals = True
-        self.conformal_params = prediction_intervals
+        self.conformal_params = conformal_params
         self._predict_impl = (
             _predict_with_intervals
-            if prediction_intervals is not None
+            if conformal_params is not None
             else _predict_without_intervals
         )
         self._forecast_impl = (
             _forecast_with_intervals
-            if prediction_intervals is not None
+            if conformal_params is not None
             else _forecast_without_intervals
         )
 
@@ -459,7 +458,7 @@ class ADIDA(BaseForecaster):
 #     y = jnp.arange(24.0)
 
 #     ci = ConformalIntervals(method="conformal_distribution")
-#     model = ADIDA(prediction_intervals=ci)
+#     model = ADIDA(conformal_params=ci)
 
 #     fitted_model = model.fit(y)
 

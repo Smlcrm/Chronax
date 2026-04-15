@@ -10,7 +10,6 @@ from chronax.utils import (
     calculate_sigma,
     _calculate_intervals,
     _quantiles,
-    _store_cs,
     _add_fitted_pi,
 )
 from chronax.utils import ConformalIntervals

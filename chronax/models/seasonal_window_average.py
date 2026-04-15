@@ -153,7 +153,7 @@ class SeasonalWindowAverage(BaseForecaster):
         season_length: Number of observations per seasonal period
         window_size: Number of seasonal cycles to average
         alias: Model name
-        prediction_intervals: ConformalIntervals object (REQUIRED for intervals)
+        conformal_params: ConformalIntervals object (REQUIRED for intervals)
         only_conformal_intervals: Flag indicating no native intervals (always True)
         ``model_``: Dictionary storing fitted seasonal pattern
     
@@ -161,7 +161,7 @@ class SeasonalWindowAverage(BaseForecaster):
         >>> # Hourly data with daily seasonality, averaging last 7 days
         >>> from chronax.utils import ConformalIntervals
         >>> ci = ConformalIntervals(h=24, n_windows=10)
-        >>> model = SeasonalWindowAverage(season_length=24, window_size=7, prediction_intervals=ci)
+        >>> model = SeasonalWindowAverage(season_length=24, window_size=7, conformal_params=ci)
         >>> model.fit(y_train)
         >>> forecasts = model.predict(h=24, level=[80, 95])
     """
@@ -242,7 +242,7 @@ class SeasonalWindowAverage(BaseForecaster):
         Args:
             h: Forecast horizon (number of steps ahead)
             X: Ignored (no exogenous support)
-            level: Confidence levels (0-100) for prediction intervals (e.g., [80, 95]). Requires prediction_intervals to be set.
+            level: Confidence levels (0-100) for prediction intervals (e.g., [80, 95]). Requires conformal_params to be set.
             
         Returns:
             Dictionary with keys:
@@ -251,7 +251,7 @@ class SeasonalWindowAverage(BaseForecaster):
             - 'hi-XX': Upper bounds at XX% level (if level specified)
             
         Raises:
-            Exception: If level is requested but prediction_intervals is None
+            Exception: If level is requested but conformal_params is None
         """
         # Tile stored seasonal pattern to cover horizon h
         mean = utils._repeat_val_seas(self.model_["mean"], h)
@@ -316,7 +316,7 @@ class SeasonalWindowAverage(BaseForecaster):
             Dictionary with 'mean' and optional 'lo-XX'/'hi-XX' interval keys
             
         Raises:
-            Exception: If level is requested but prediction_intervals is None
+            Exception: If level is requested but conformal_params is None
             NotImplementedError: If fitted=True (not supported)
         """
         y = utils.ensure_float(y)

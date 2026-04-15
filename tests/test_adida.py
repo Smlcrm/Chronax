@@ -8,7 +8,7 @@ def test_adida():
     y = jnp.arange(24.0)
 
     ci = ConformalIntervals(method="conformal_distribution")
-    model = ADIDA(prediction_intervals=ci)
+    model = ADIDA(conformal_params=ci)
 
     fitted_model = model.fit(y)
 

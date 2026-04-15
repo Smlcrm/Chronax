@@ -21,8 +21,7 @@ Instance Attributes:
     - season_length: number of observations per seasonal cycle
     - alpha: smoothing parameter shared across all seasons (0 ≤ α ≤ 1)
     - alias: model identifier string
-    - prediction_intervals: optional ConformalIntervals for conformal prediction
-    - conformal_params: alias for prediction_intervals (BaseForecaster compatibility)
+    - conformal_params: optional ConformalIntervals for conformal prediction
     - only_conformal_intervals: always True (no native parametric intervals)
 
 Methods:
@@ -181,7 +180,7 @@ class SeasonalExponentialSmoothing(BaseForecaster):
         alpha (float): Smoothing parameter.
         season_length (int): Number of observations per unit of time. Ex: 24 Hourly data.
         alias (str): Custom name of the model.
-        prediction_intervals (Optional[ConformalIntervals]): Information to compute conformal prediction intervals. This is required for generating future prediction intervals.
+        conformal_params (Optional[ConformalIntervals]): Information to compute conformal prediction intervals. This is required for generating future prediction intervals.
     """
 
     def __init__(
@@ -189,13 +188,12 @@ class SeasonalExponentialSmoothing(BaseForecaster):
         season_length: int,
         alpha: float,
         alias: str = "SeasonalES",
-        prediction_intervals: Optional[ConformalIntervals] = None,
+        conformal_params: Optional[ConformalIntervals] = None,
     ) -> None:
         self.season_length = season_length
         self.alpha = alpha
         self.alias = alias
-        self.prediction_intervals = prediction_intervals
-        self.conformal_params = prediction_intervals
+        self.conformal_params = conformal_params
         self.only_conformal_intervals = True
 
     def fit(
@@ -206,7 +204,7 @@ class SeasonalExponentialSmoothing(BaseForecaster):
         r"""Fit the SeasonalExponentialSmoothing model.
 
         Applies per-season SES to the input series and stores the fitted
-        seasonal pattern. If `prediction_intervals` is configured, conformity
+        seasonal pattern. If `conformal_params` is configured, conformity
         scores are also computed and cached for use in `predict()`.
 
         Args:
@@ -242,23 +240,23 @@ class SeasonalExponentialSmoothing(BaseForecaster):
         Args:
             h (int): Forecast horizon (number of steps ahead).
             X (Optional[jnp.ndarray]): Exogenous variables (unused; included for API compatibility). Default is None.
-            level (Optional[List[int]]): Confidence levels (0--100) for prediction intervals, e.g. [80, 95]. Requires ``prediction_intervals`` to be set. Default is None.
+            level (Optional[List[int]]): Confidence levels (0--100) for prediction intervals, e.g. [80, 95]. Requires ``conformal_params`` to be set. Default is None.
 
         Returns:
             Dict[str, jnp.ndarray]: Dictionary containing ``"mean"`` (point forecasts of shape (h,)) and optionally ``"lo-{l}"`` / ``"hi-{l}"`` (conformal interval bounds for each level l, only present when level is not None).
 
         Raises:
-            Exception: If level is requested but ``prediction_intervals`` is None.
+            Exception: If level is requested but ``conformal_params`` is None.
         """
         mean = _repeat_val_seas(self.model_["mean"], h=h)
         res = {"mean": mean}
         if level is None:
             return res
         level = sorted(level)
-        if self.prediction_intervals is not None:
+        if self.conformal_params is not None:
             res = add_predict_conformal_intervals(self, res, level)
         else:
-            raise Exception("You must pass `prediction_intervals` to compute them.")
+            raise Exception("You must pass `conformal_params` to compute them.")
         return res
 
     def predict_in_sample(self) -> Dict[str, jnp.ndarray]:
@@ -291,14 +289,14 @@ class SeasonalExponentialSmoothing(BaseForecaster):
             h (int): Forecast horizon (number of steps ahead).
             X (Optional[jnp.ndarray]): In-sample exogenous variables (unused; included for API compatibility). Default is None.
             X_future (Optional[jnp.ndarray]): Future exogenous variables (unused; included for API compatibility). Default is None.
-            level (Optional[List[int]]): Confidence levels (0--100) for prediction intervals, e.g. [80, 95]. Requires ``prediction_intervals`` to be set. Default is None.
+            level (Optional[List[int]]): Confidence levels (0--100) for prediction intervals, e.g. [80, 95]. Requires ``conformal_params`` to be set. Default is None.
             fitted (bool): Whether to include in-sample fitted values in the output. Default is False.
 
         Returns:
             Dict[str, jnp.ndarray]: Dictionary containing ``"mean"`` (point forecasts of shape (h,)), ``"fitted"`` (in-sample fitted values of shape (t,), only if fitted=True), and optionally ``"lo-{l}"`` / ``"hi-{l}"`` (conformal interval bounds for each level l, only present when level is not None).
 
         Raises:
-            Exception: If level is requested but ``prediction_intervals`` is None.
+            Exception: If level is requested but ``conformal_params`` is None.
         """
         y = ensure_float(y)
         res = _seasonal_exponential_smoothing(
@@ -307,8 +305,8 @@ class SeasonalExponentialSmoothing(BaseForecaster):
         if level is None:
             return res
         level = sorted(level)
-        if self.prediction_intervals is not None:
+        if self.conformal_params is not None:
             res = add_conformal_intervals(self, fcst=res, y=y, X=X, level=level)
         else:
-            raise Exception("You must pass `prediction_intervals` to compute them.")
+            raise Exception("You must pass `conformal_params` to compute them.")
         return res

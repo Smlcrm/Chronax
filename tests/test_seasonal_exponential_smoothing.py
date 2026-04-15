@@ -8,7 +8,7 @@ def test_seasonal_exponential_smoothing():
     y = jnp.arange(36.0)
 
     pi = ConformalIntervals(h=12, n_windows=2)
-    model = SeasonalExponentialSmoothing(season_length=12, alpha=0.5, prediction_intervals=pi)
+    model = SeasonalExponentialSmoothing(season_length=12, alpha=0.5, conformal_params=pi)
     fitted_model = model.fit(y)
 
     result = fitted_model.predict(h=12, level=(60,75))
@@ -22,7 +22,7 @@ def test_seasonal_exponential_smoothing():
         if f"lo-{lvl}" in result:
             assert f"hi-{lvl}" in result, f"Missing upper bound for {lvl}% interval"
         else:
-            print(f"Warning: Interval {lvl}% not computed due to missing `prediction_intervals`")
+            print(f"Warning: Interval {lvl}% not computed due to missing `conformal_params`")
 
     for lvl in [80, 95]:
         assert f"lo-{lvl}" in forecast, f"Missing lower bound for {lvl}% interval"

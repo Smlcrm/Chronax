@@ -52,8 +52,7 @@ Methods
 Notes
 -----
 - Conformal interval configuration is owned by ``conformal_params`` (constructor
-  argument and instance attribute). Migrated forecasters do not accept a
-  ``prediction_intervals`` constructor keyword.
+  argument and instance attribute).
 
 - Exogenous variable support is model-specific, not framework-level.
   The boolean uses_exog must be overridden in the model's implementation.

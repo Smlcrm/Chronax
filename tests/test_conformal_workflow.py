@@ -39,7 +39,6 @@ def test_resolve_conformal_params_returns_config():
     assert cfg.n_windows == 2
     assert cfg.h == 2
     assert model.conformal_params is cfg
-    assert model.prediction_intervals is cfg
 
 
 def test_add_conformal_intervals_uses_model_scores_and_adds_lo_hi_keys():

@@ -14,31 +14,20 @@ from chronax.utils.conformal_methods import get_conformal_method
 
 
 def resolve_conformal_params(model: object) -> Optional[ConformalIntervals]:
-    """Resolve and synchronize conformal config aliases on a model instance.
+    """Return canonical conformal configuration from a model instance.
 
     Args:
-        model: A forecaster instance that may expose ``conformal_params`` and/or
-            ``prediction_intervals``.
+        model: A forecaster instance that may expose ``conformal_params``.
 
     Returns:
-        The effective conformal configuration object, or ``None`` if neither is set.
+        ``ConformalIntervals`` configuration object, or ``None`` when unset.
     """
     conformal_params = getattr(model, "conformal_params", None)
-    prediction_intervals = getattr(model, "prediction_intervals", None)
-
-    if conformal_params is None and prediction_intervals is None:
+    if conformal_params is None:
         return None
-
-    effective = conformal_params if conformal_params is not None else prediction_intervals
-    if conformal_params is not None and prediction_intervals is not None:
-        # Keep BaseForecaster parity by preferring conformal_params when both exist.
-        effective = conformal_params
-    if not isinstance(effective, ConformalIntervals):
+    if not isinstance(conformal_params, ConformalIntervals):
         raise TypeError("conformal_params must be a ConformalIntervals instance or None.")
-
-    setattr(model, "conformal_params", effective)
-    setattr(model, "prediction_intervals", effective)
-    return effective
+    return conformal_params
 
 
 def compute_conformity_scores(
