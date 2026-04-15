@@ -2,6 +2,11 @@ import pytest
 import jax.numpy as jnp
 
 from chronax.utils import ConformalIntervals
+from chronax.utils.conformal_methods import (
+    add_conformal_distribution_intervals,
+    add_conformal_signed_intervals,
+    get_conformal_method,
+)
 from chronax.models.base_forecaster import BaseForecaster
 
 
@@ -76,3 +81,26 @@ def test_invalid_method_in_add_confidence_intervals():
     cs = jnp.array([[0.5]])
     with pytest.raises(ValueError):
         BaseForecaster.add_confidence_intervals(fcst, cs, [80], "invalid")
+
+
+# =========================
+# conformal_methods module (pure helpers)
+# =========================
+
+
+def test_get_conformal_method_distribution():
+    assert get_conformal_method("conformal_distribution") is add_conformal_distribution_intervals
+
+
+def test_distribution_and_signed_return_expected_keys_and_shapes():
+    fcst_a = {"mean": jnp.array([10.0, 20.0], dtype=jnp.float32)}
+    fcst_b = {"mean": jnp.array([10.0, 20.0], dtype=jnp.float32)}
+    cs = jnp.array([[1.0, 2.0], [-1.0, -0.5]], dtype=jnp.float32)
+    out_a = add_conformal_distribution_intervals(fcst_a, cs, [80, 95])
+    out_b = add_conformal_signed_intervals(fcst_b, cs, [80, 95])
+    expected_keys = {"mean", "lo-80", "hi-80", "lo-95", "hi-95"}
+    for out in (out_a, out_b):
+        assert set(out.keys()) == expected_keys
+        for key in ("lo-80", "hi-80", "lo-95", "hi-95"):
+            assert out[key].shape == (2,)
+            assert out[key].dtype == jnp.float32
