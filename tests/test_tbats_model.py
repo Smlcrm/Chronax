@@ -1055,6 +1055,7 @@ def test_sf_parity_single_season_strict():
     t = np.arange(n)
     y = 100 + 0.05 * t \
         + 12.0 * np.sin(2 * np.pi * t / 7) \
+        + 8.0  * np.sin(2 * np.pi * t / 30) \
         + np.random.normal(0, 2.0, n)
     yjax = jnp.array(y, dtype=jnp.float32)
     h = 28

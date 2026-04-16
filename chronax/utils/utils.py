@@ -44,10 +44,8 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 import jax
 import jax.numpy as jnp
 import jax.random as jrandom
-import numpy as np
 from jax import jit, lax
 from jax.scipy.stats import norm
-from scipy.optimize import minimize_scalar
 
 # Enable float64 precision — required by the golden-section SES optimizer.
 # Note: this affects the entire JAX session.
@@ -1214,90 +1212,6 @@ def _imapa_aggregate_body(y: jnp.ndarray, max_k, upper_bound: int) -> jnp.ndarra
     return lax.fori_loop(1, max_k + 1, body, forecasts)
 
 
-def _is_jax_tracer(x: object) -> bool:
-    """Return True when ``x`` is a JAX tracer (e.g., under vmap/jit)."""
-    return isinstance(x, jax.core.Tracer)
-
-
-def _np_ses_sse(alpha: float, x: np.ndarray) -> float:
-    """NumPy SES SSE matching StatsForecast implementation."""
-    complement = 1.0 - alpha
-    forecast = float(x[0])
-    sse = 0.0
-    for i in range(1, x.size):
-        forecast = alpha * float(x[i - 1]) + complement * forecast
-        err = float(x[i]) - forecast
-        sse += err * err
-    return float(sse)
-
-
-def _np_ses_forecast(x: np.ndarray, alpha: float) -> Tuple[float, np.ndarray]:
-    """NumPy SES one-step forecast and fitted values."""
-    complement = 1.0 - alpha
-    fitted = np.empty_like(x, dtype=np.float64)
-    fitted[0] = float(x[0])
-    j = 0
-    for i in range(1, x.size):
-        fitted[i] = alpha * float(x[j]) + complement * float(fitted[j])
-        j += 1
-    forecast = alpha * float(x[j]) + complement * float(fitted[j])
-    fitted[0] = np.nan
-    return forecast, fitted
-
-
-def _np_optimized_ses_forecast(
-    x: np.ndarray, bounds: Tuple[float, float] = (0.1, 0.3)
-) -> Tuple[float, np.ndarray]:
-    """NumPy SES optimization path aligned with StatsForecast."""
-    alpha = float(
-        minimize_scalar(
-            fun=_np_ses_sse,
-            bounds=bounds,
-            args=(x,),
-        ).x
-    )
-    return _np_ses_forecast(x, alpha)
-
-
-def _imapa_numpy(y: np.ndarray, h: int, fitted: bool) -> Dict[str, np.ndarray]:
-    """Concrete IMAPA path matching StatsForecast semantics."""
-    if (y == 0).all():
-        out: Dict[str, np.ndarray] = {"mean": np.zeros(h, dtype=y.dtype)}
-        if fitted:
-            fitted_vals = np.zeros_like(y)
-            if fitted_vals.size > 0:
-                fitted_vals[0] = np.nan
-            out["fitted"] = fitted_vals
-        return out
-
-    y = np.asarray(y, dtype=np.float64 if y.dtype == np.float64 else np.float32)
-    nonzero_idxs = np.where(y != 0)[0]
-    y_intervals = np.diff(nonzero_idxs + 1, prepend=0).astype(y.dtype)
-    mean_interval = float(y_intervals.mean())
-    max_aggregation_level = max(1, int(round(mean_interval)))
-    forecasts = np.empty(max_aggregation_level, dtype=y.dtype)
-
-    for aggregation_level in range(1, max_aggregation_level + 1):
-        lost_remainder_data = y.size % aggregation_level
-        y_cut = y[lost_remainder_data:]
-        n_chunks = y_cut.size // aggregation_level
-        n_elems = n_chunks * aggregation_level
-        aggregation_sums = y_cut[:n_elems].reshape(n_chunks, aggregation_level).sum(axis=1)
-        forecast, _ = _np_optimized_ses_forecast(aggregation_sums)
-        forecasts[aggregation_level - 1] = forecast / aggregation_level
-
-    forecast = forecasts.mean()
-    out = {"mean": np.full((h,), forecast, dtype=y.dtype)}
-    if fitted:
-        warnings.warn("Computing fitted values for IMAPA is very expensive.")
-        fitted_vals = np.empty_like(y)
-        fitted_vals[0] = np.nan
-        for i in range(y.size - 1):
-            fitted_vals[i + 1] = _imapa_numpy(y[: i + 1], h=1, fitted=False)["mean"].item()
-        out["fitted"] = fitted_vals
-    return out
-
-
 def _imapa(
     y: jnp.ndarray,
     h: int,
@@ -1321,16 +1235,6 @@ def _imapa(
         Dict with 'mean' (shape (h,)) and optionally 'fitted' (shape (T,)).
     """
     y = ensure_float(y)
-
-    # For concrete execution, use a StatsForecast-equivalent NumPy path to
-    # preserve parity in reference tests. Keep the JAX path for traced calls.
-    if not _is_jax_tracer(y):
-        np_out = _imapa_numpy(np.asarray(y), h=h, fitted=fitted)
-        return {
-            k: jnp.asarray(v, dtype=y.dtype if k == "mean" else jnp.asarray(v).dtype)
-            for k, v in np_out.items()
-        }
-
     dtype = y.dtype
     all_zeros = jnp.all(y == 0)
 
