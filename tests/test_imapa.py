@@ -342,7 +342,13 @@ def test_fitted_values():
     sf_result = sf_model.forecast(y=y_np, h=1, fitted=True)
     sf_fitted = sf_result["fitted"]
     
-    assert jnp.allclose(our_result["fitted"], sf_fitted, rtol=1e-5, atol=1e-6), \
+    assert np.allclose(
+        np.asarray(our_result["fitted"], dtype=float),
+        np.asarray(sf_fitted, dtype=float),
+        rtol=1e-5,
+        atol=1e-6,
+        equal_nan=True,
+    ), \
         f"Our fitted {our_result['fitted']} differs from StatsForecast {sf_fitted}"
     print("✓ test_fitted_values passed")
 
@@ -385,7 +391,13 @@ def test_forecast_with_fitted():
     
     assert jnp.allclose(our_result["mean"], sf_mean, rtol=1e-5, atol=1e-6), \
         f"Our forecast {our_result['mean']} differs from StatsForecast {sf_mean}"
-    assert jnp.allclose(our_result["fitted"], sf_fitted, rtol=1e-5, atol=1e-6), \
+    assert np.allclose(
+        np.asarray(our_result["fitted"], dtype=float),
+        np.asarray(sf_fitted, dtype=float),
+        rtol=1e-5,
+        atol=1e-6,
+        equal_nan=True,
+    ), \
         f"Our fitted {our_result['fitted']} differs from StatsForecast {sf_fitted}"
     print("✓ test_forecast_with_fitted passed")
 

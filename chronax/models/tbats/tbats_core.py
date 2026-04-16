@@ -986,9 +986,9 @@ def tbats_selection(
 
     # ── Candidate grid ─────────────────────────────────────────────────
     if use_boxcox is None:
-        B = [False]
+        B = [False, True]
     elif use_boxcox:
-        B = [False, True]  # try simpler first; selection keeps best AIC
+        B = [True]
     else:
         B = [False]
 
@@ -1004,7 +1004,7 @@ def tbats_selection(
     combos = [(bcx, t, use_arma_errors) for bcx in B for t in T]
 
     # Pre-build seasonal blocks (shared across all candidates)
-    seasonal_blocks = _build_seasonal_blocks(seasonal_periods, k_vector, y.dtype)
+    seasonal_blocks = _build_seasonal_blocks(seasonal_periods, k_vector, jnp.float64)
 
     # ── Evaluate all candidates (no early stopping — vmap-compatible) ──
     candidates = []
@@ -1027,6 +1027,8 @@ def tbats_selection(
     # i.e., when combos is a single config)
     if len(candidates) == 1:
         best = candidates[0]
+        bcx, (trend, damped), _ = combos[0]
+        best["_config"] = {"use_boxcox": bcx, "use_trend": trend, "use_damped_trend": damped}
     else:
         # Multiple candidates: use Python-level AIC comparison.
         # This path works outside vmap (concrete values).
