@@ -14,3 +14,58 @@ def pytorch_uniform_init(hidden_size: int):
         return jax.random.uniform(key, shape, dtype, minval=-bound, maxval=bound)
 
     return init
+
+
+class GRUEncoder(nnx.Module):
+    """Stacked GRU encoder, scan over time, dropout BETWEEN layers (not after the last).
+
+    All weights init via PyTorch's Uniform(-1/sqrt(H), 1/sqrt(H)) for accuracy
+    parity. Note: Flax `nnx.GRUCell` fuses input and hidden biases into a single
+    parameter on the input projection; PyTorch `nn.GRU` keeps them separate.
+    Documented small parity gap — see `test_gru_encoder_documents_bias_parity_with_pytorch`.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        hidden_size: int,
+        n_layers: int,
+        dropout: float,
+        rngs: nnx.Rngs,
+    ):
+        init = pytorch_uniform_init(hidden_size)
+        cells = []
+        for i in range(n_layers):
+            cell_in = in_features if i == 0 else hidden_size
+            cells.append(
+                nnx.GRUCell(
+                    in_features=cell_in,
+                    hidden_features=hidden_size,
+                    kernel_init=init,
+                    recurrent_kernel_init=init,
+                    bias_init=init,
+                    rngs=rngs,
+                )
+            )
+        self.cells = cells
+        self.hidden_size = hidden_size
+        self.dropout = nnx.Dropout(rate=dropout, rngs=rngs)
+
+    def __call__(self, x: jnp.ndarray, deterministic: bool) -> jnp.ndarray:
+        """x: [B, T, F] -> out: [B, T, H]. Float32 throughout."""
+        x = x.astype(jnp.float32)
+        batch, _time, _ = x.shape
+        h = x
+        for layer_idx, cell in enumerate(self.cells):
+            carry = jnp.zeros((batch, self.hidden_size), dtype=jnp.float32)
+
+            def body(c, x_t, _cell=cell):
+                new_c, out = _cell(c, x_t)
+                return new_c, out
+
+            x_time_first = jnp.transpose(h, (1, 0, 2))
+            _, outs = jax.lax.scan(body, carry, x_time_first)
+            h = jnp.transpose(outs, (1, 0, 2))
+            if layer_idx < len(self.cells) - 1:
+                h = self.dropout(h, deterministic=deterministic)
+        return h
