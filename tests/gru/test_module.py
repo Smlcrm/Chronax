@@ -4,7 +4,12 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
-from chronax.models.gru.gru_module import GRUEncoder, pytorch_uniform_init
+from chronax.models.gru.gru_module import (
+    GRUEncoder,
+    GRUNet,
+    MLPDecoder,
+    pytorch_uniform_init,
+)
 
 
 def test_pytorch_uniform_init_bounds():
@@ -65,3 +70,40 @@ def test_gru_encoder_deterministic_with_same_seed():
     np.testing.assert_allclose(
         e1(x, deterministic=True), e2(x, deterministic=True), rtol=1e-6
     )
+
+
+def test_mlp_decoder_shape():
+    dec = MLPDecoder(in_features=200, hidden_size=128, out_features=1, rngs=nnx.Rngs(0))
+    x = jnp.ones((4, 24, 200))
+    y = dec(x, deterministic=True)
+    assert y.shape == (4, 24, 1)
+
+
+def test_grunet_forward_shape():
+    net = GRUNet(
+        in_features=1, encoder_hidden=200, encoder_layers=2,
+        decoder_hidden=128, decoder_layers=2, dropout=0.0,
+        h=24, input_size=72, rngs=nnx.Rngs(0),
+    )
+    out = net(jnp.ones((4, 72, 1)), deterministic=True)
+    assert out.shape == (4, 24, 1)
+
+
+def test_grunet_upsample_when_h_gt_input_size():
+    net = GRUNet(
+        in_features=1, encoder_hidden=32, encoder_layers=1,
+        decoder_hidden=16, decoder_layers=2, dropout=0.0,
+        h=20, input_size=10, rngs=nnx.Rngs(0),
+    )
+    out = net(jnp.ones((2, 10, 1)), deterministic=True)
+    assert out.shape == (2, 20, 1)
+
+
+def test_grunet_params_are_float32():
+    net = GRUNet(
+        in_features=1, encoder_hidden=8, encoder_layers=1,
+        decoder_hidden=4, decoder_layers=2, dropout=0.0,
+        h=6, input_size=12, rngs=nnx.Rngs(0),
+    )
+    for leaf in jax.tree_util.tree_leaves(nnx.state(net, nnx.Param)):
+        assert leaf.dtype == jnp.float32

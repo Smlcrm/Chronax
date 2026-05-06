@@ -69,3 +69,68 @@ class GRUEncoder(nnx.Module):
             if layer_idx < len(self.cells) - 1:
                 h = self.dropout(h, deterministic=deterministic)
         return h
+
+
+class MLPDecoder(nnx.Module):
+    """Linear -> ReLU -> Linear. Mirrors Nixtla `_modules.MLP(num_layers=2, dropout=0)`."""
+
+    def __init__(
+        self,
+        in_features: int,
+        hidden_size: int,
+        out_features: int,
+        rngs: nnx.Rngs,
+    ):
+        init = pytorch_uniform_init(max(in_features, hidden_size))
+        self.in_layer = nnx.Linear(
+            in_features, hidden_size, kernel_init=init, bias_init=init, rngs=rngs
+        )
+        self.out_layer = nnx.Linear(
+            hidden_size, out_features, kernel_init=init, bias_init=init, rngs=rngs
+        )
+
+    def __call__(self, x: jnp.ndarray, deterministic: bool) -> jnp.ndarray:
+        return self.out_layer(nnx.relu(self.in_layer(x)))
+
+
+class GRUNet(nnx.Module):
+    """Encoder -> last `h` hidden states (with upsample path) -> MLPDecoder."""
+
+    def __init__(
+        self,
+        *,
+        in_features: int,
+        encoder_hidden: int,
+        encoder_layers: int,
+        decoder_hidden: int,
+        decoder_layers: int,
+        dropout: float,
+        h: int,
+        input_size: int,
+        rngs: nnx.Rngs,
+    ):
+        if decoder_layers != 2:
+            raise NotImplementedError("v1 only supports decoder_layers=2.")
+        self.encoder = GRUEncoder(
+            in_features, encoder_hidden, encoder_layers, dropout, rngs=rngs
+        )
+        self.decoder = MLPDecoder(encoder_hidden, decoder_hidden, 1, rngs=rngs)
+        self.h = h
+        self.input_size = input_size
+        if h > input_size:
+            init = pytorch_uniform_init(input_size)
+            self.upsample = nnx.Linear(
+                input_size, h, kernel_init=init, bias_init=init, rngs=rngs
+            )
+        else:
+            self.upsample = None
+
+    def __call__(self, x: jnp.ndarray, deterministic: bool) -> jnp.ndarray:
+        hidden = self.encoder(x, deterministic=deterministic)
+        if self.upsample is not None:
+            hidden = jnp.transpose(hidden, (0, 2, 1))
+            hidden = self.upsample(hidden)
+            hidden = jnp.transpose(hidden, (0, 2, 1))
+        else:
+            hidden = hidden[:, -self.h :, :]
+        return self.decoder(hidden, deterministic=deterministic)
