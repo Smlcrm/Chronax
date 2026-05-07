@@ -38,7 +38,6 @@ class GRU(BaseForecaster):
         hidden_size: int = 200,
         n_layers: int = 2,
         decoder_hidden_size: int = 128,
-        decoder_layers: int = 2,
         dropout: float = 0.0,
         max_steps: int = 1000,
         learning_rate: float = 1e-3,
@@ -48,14 +47,11 @@ class GRU(BaseForecaster):
     ):
         if input_size < 1:
             input_size = 3 * h
-        if decoder_layers != 2:
-            raise NotImplementedError("v1 only supports decoder_layers=2.")
         self.h = h
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.n_layers = n_layers
         self.decoder_hidden_size = decoder_hidden_size
-        self.decoder_layers = decoder_layers
         self.dropout = dropout
         self.max_steps = max_steps
         self.learning_rate = learning_rate
@@ -64,7 +60,7 @@ class GRU(BaseForecaster):
         self.alias = alias
         self.conformal_params = None
         self.model_: GRUNet | None = None
-        self._train_y: jnp.ndarray | None = None
+        self._context: jnp.ndarray | None = None  # last `input_size` of fit-time y
         self._scaler = RobustScaler()
 
     def _build_net(self) -> GRUNet:
@@ -73,7 +69,7 @@ class GRU(BaseForecaster):
             encoder_hidden=self.hidden_size,
             encoder_layers=self.n_layers,
             decoder_hidden=self.decoder_hidden_size,
-            decoder_layers=self.decoder_layers,
+            decoder_layers=2,  # v1 only; GRUNet enforces this invariant.
             dropout=self.dropout,
             h=self.h,
             input_size=self.input_size,
@@ -100,7 +96,9 @@ class GRU(BaseForecaster):
             scaler=self._scaler,
         )
         self.model_ = net
-        self._train_y = y
+        # Only the final `input_size` window is needed for direct-decoding
+        # forecast; storing the full series would be wasteful for long inputs.
+        self._context = y[-self.input_size :]
         return self
 
     def predict(
@@ -116,10 +114,10 @@ class GRU(BaseForecaster):
             )
         if level is not None:
             raise NotImplementedError("Probabilistic intervals are not supported in v1.")
-        if self.model_ is None or self._train_y is None:
+        if self.model_ is None or self._context is None:
             raise RuntimeError("Call fit(y) before predict(h).")
         full = predict_step(
-            self.model_, self._train_y,
+            self.model_, self._context,
             h=self.h, input_size=self.input_size, scaler=self._scaler,
         )
         return {"mean": full[:h]}
