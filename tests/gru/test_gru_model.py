@@ -69,3 +69,56 @@ def test_predict_deterministic_with_same_seed():
         return m.predict(h=12)["mean"]
 
     np.testing.assert_allclose(run(), run(), rtol=1e-5)
+
+
+def test_fit_raises_on_exog():
+    m = _tiny()
+    with pytest.raises(NotImplementedError, match="Exogenous"):
+        m.fit(_make_y(), X=jnp.zeros((10, 2)))
+
+
+def test_fit_raises_on_short_series():
+    m = _tiny()  # h=12, input_size=36 -> needs 48
+    with pytest.raises(ValueError, match="too short"):
+        m.fit(jnp.arange(30, dtype=jnp.float32))
+
+
+def test_predict_before_fit_raises():
+    m = _tiny()
+    with pytest.raises(RuntimeError, match="fit"):
+        m.predict(h=12)
+
+
+def test_predict_with_level_raises():
+    m = _tiny().fit(_make_y())
+    with pytest.raises(NotImplementedError, match="intervals"):
+        m.predict(h=12, level=[80, 95])
+
+
+def test_forecast_raises_on_exog():
+    m = _tiny()
+    with pytest.raises(NotImplementedError, match="Exogenous"):
+        m.forecast(_make_y(), h=12, X=jnp.zeros((10, 2)))
+    with pytest.raises(NotImplementedError, match="Exogenous"):
+        m.forecast(_make_y(), h=12, X_future=jnp.zeros((12, 2)))
+
+
+def test_forecast_raises_on_fitted_request():
+    m = _tiny()
+    with pytest.raises(NotImplementedError, match="fitted"):
+        m.forecast(_make_y(), h=12, fitted=True)
+
+
+def test_forecast_equals_fit_then_predict_with_same_seed():
+    """`forecast` is the stateless fit-then-predict path; must agree numerically."""
+    y = _make_y()
+
+    def fresh():
+        return GRU(
+            h=12, input_size=36, hidden_size=16, n_layers=1,
+            max_steps=20, batch_size=8, random_seed=7,
+        )
+
+    a = fresh().forecast(y, h=12)["mean"]
+    b = fresh().fit(y).predict(h=12)["mean"]
+    np.testing.assert_allclose(a, b, rtol=1e-5)

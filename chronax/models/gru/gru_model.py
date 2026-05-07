@@ -84,6 +84,13 @@ class GRU(BaseForecaster):
         if X is not None:
             raise NotImplementedError("Exogenous variables are not supported in v1.")
         y = jnp.asarray(y, dtype=jnp.float32)
+        if y.ndim != 1:
+            raise ValueError(f"y must be 1-D; got shape {y.shape}.")
+        if y.shape[0] < self.input_size + self.h:
+            raise ValueError(
+                f"Series length {y.shape[0]} too short for "
+                f"input_size={self.input_size} + h={self.h}."
+            )
         net = self._build_net()
         train(
             net, y,
@@ -126,4 +133,8 @@ class GRU(BaseForecaster):
         level: list[int | float] | None = None,
         fitted: bool = False,
     ) -> dict:
+        if X is not None or X_future is not None:
+            raise NotImplementedError("Exogenous variables are not supported in v1.")
+        if fitted:
+            raise NotImplementedError("In-sample fitted values are not supported in v1.")
         return self.fit(y).predict(h=h, level=level)

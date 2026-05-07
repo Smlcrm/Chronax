@@ -81,10 +81,18 @@ def train(
 
     key = jax.random.PRNGKey(seed)
     losses = []
-    for _ in range(max_steps):
+    for step in range(max_steps):
         key, sub = jax.random.split(key)
         idx = jax.random.choice(sub, n_windows, shape=(batch_size,), replace=True)
-        losses.append(float(train_step(model, optimizer, windows[idx])))
+        loss_val = float(train_step(model, optimizer, windows[idx]))
+        if not jnp.isfinite(loss_val):
+            raise RuntimeError(
+                f"Non-finite loss ({loss_val}) at step {step}. "
+                f"Training diverged. Consider lowering `learning_rate` "
+                f"(currently used by the caller), reducing batch size, "
+                f"or checking the input series for extreme values."
+            )
+        losses.append(loss_val)
     return jnp.asarray(losses)
 
 
