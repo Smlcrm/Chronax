@@ -1,19 +1,63 @@
-"""GRU forecaster (BaseForecaster wrapper).
+"""
+File: gru_model.py
 
-Univariate, direct-decoding GRU with per-window robust scaling. Defaults mirror
-Nixtla `neuralforecast.GRU`: hidden=200, n_layers=2, decoder_hidden=128,
-decoder_layers=2, max_steps=1000, lr=1e-3.
+High-level Purpose:
+    Provides a JAX/Flax/Optax GRU forecaster wrapper with a stable class
+    interface for fitting and forecasting univariate time series.
+
+Problem Solved:
+    Encapsulates GRU training (rolling-window sampling, per-window robust
+    scaling, JIT-compiled SGD with Adam) and direct-decoding inference behind
+    a `BaseForecaster`-compatible API so downstream pipelines can treat a
+    neural model identically to ARIMA / ETS / etc.
+
+Architectural Role:
+    Sits at the model-interface layer. Delegates network definition to
+    `gru_module.GRUNet`, training loop to `gru_training.train`, scaling to
+    `gru_scaler.RobustScaler`, and stateless single-window inference to
+    `gru_training.predict_step`.
+
+Major Classes/Functions:
+    - `GRU`: Direct-decoding univariate GRU forecaster.
+
+External Dependencies:
+    - `jax`, `jax.numpy`, `flax.nnx`
+    - Internal modules: `gru_module`, `gru_training`, `gru_scaler`,
+      `base_forecaster`
+
+Expected Inputs and Outputs:
+    - Input: a 1-D `jnp.ndarray`-compatible series and a forecast horizon.
+    - Output: dictionaries containing mean forecasts (probabilistic intervals
+      planned for v1.1).
+
+Example:
+    >>> import jax.numpy as jnp
+    >>> from chronax.models import GRU
+    >>> y = jnp.asarray([1.0, 2.0, 1.5, 1.7, 2.2, 1.9, 2.1, 2.4])
+    >>> model = GRU(h=2, input_size=4, hidden_size=16, max_steps=20)
+    >>> model.fit(y)
+    >>> model.predict(h=2)["mean"].shape
+    (2,)
+
+Assumptions:
+    - The series is non-empty, 1-D, numeric, and finite.
+    - `len(y) >= input_size + h` at fit time.
+
+Side Effects:
+    - Mutates instance state (`model_`, cached context window).
+    - JIT-compiles a forward pass on first `predict` call after `fit`.
 
 Known v1 limitations
 --------------------
 - Univariate only. Multi-series / cross-learning is a v2 concern. The fit
-  signature will change in v2 to accept ``[N, T]`` instead of ``[T]``; users
+  signature will change to accept ``[N, T]`` instead of ``[T]`` then; users
   relying on v1 shape should pin the package version.
-- ``BaseForecaster.conformity_scores`` works through inheritance but is
-  impractical: it re-trains a 1000-step optimizer per cross-validation window.
-  Use a smaller ``max_steps`` if you need this on GRU, or wait for the
-  conformal-aware v1.1 path.
-- No GPU tuning. The model runs on GPU but is benchmarked on CPU only.
+- `BaseForecaster.conformity_scores` works through inheritance but is
+  impractical on GRU: it re-trains for `self.max_steps` gradient steps per
+  cross-validation window. Lower `max_steps` if you really need this on GRU,
+  or wait for the conformal-aware v1.1 path.
+- No GPU tuning. The model runs on GPU/Metal but is benchmarked on CPU only
+  in v1; speed claims are CPU-only.
 """
 from __future__ import annotations
 
@@ -27,7 +71,72 @@ from chronax.models.gru.gru_training import predict_step, train
 
 
 class GRU(BaseForecaster):
-    """JAX/Flax/Optax GRU forecaster. Univariate, direct decoding."""
+    """
+    GRU
+
+    Description:
+        Univariate gated-recurrent-unit forecaster. The encoder is a stack of
+        Flax NNX `GRUCell`s rolled over time with `jax.lax.scan`; the decoder
+        is a 2-layer MLP. Each rolling window is z-scored with a robust
+        median/MAD scaler, and the model is trained with MAE loss in scaled
+        space using Optax `adam`.
+
+    Attributes:
+        uses_exog (bool): Indicates support for exogenous regressors. False
+            in v1.
+        h (int): Forecast horizon (model is direct-decoded for exactly `h`
+            steps; `predict(h=k)` slices for any ``k <= h``).
+        input_size (int): Length of the input window. Defaults to ``3 * h``
+            when ``-1`` is passed.
+        hidden_size (int): GRU encoder hidden dimension.
+        n_layers (int): Number of stacked GRU layers.
+        decoder_hidden_size (int): MLP decoder hidden dimension.
+        dropout (float): Inter-layer dropout in the encoder.
+        max_steps (int): Number of optimizer steps during fit.
+        learning_rate (float): Adam learning rate.
+        batch_size (int): Number of windows per gradient step.
+        random_seed (int): Seed used for parameter init and batch sampling.
+        alias (str): Display name for external reporting.
+        ``model_`` (GRUNet | None): Fitted network after ``fit``.
+        conformal_params: Always None in v1 (intervals not implemented).
+
+    Args:
+        h (int): Forecast horizon.
+        input_size (int): Input-window length; -1 (default) uses ``3 * h``.
+        hidden_size (int): Encoder hidden dimension.
+        n_layers (int): Number of stacked GRU cells.
+        decoder_hidden_size (int): MLP-decoder hidden dimension.
+        dropout (float): Inter-layer dropout rate.
+        max_steps (int): Number of training steps.
+        learning_rate (float): Adam learning rate.
+        batch_size (int): Number of rolling windows sampled per step.
+        random_seed (int): Random seed for reproducibility.
+        alias (str): Friendly model name.
+
+    Methods:
+        fit(): Train the network on a 1-D series.
+        predict(): Forecast ``h`` steps from the last fitted context.
+        forecast(): Stateless fit-then-predict.
+
+    Returns:
+        Produces forecasts via dictionaries keyed by ``mean``. Probabilistic
+        intervals are planned for v1.1.
+
+    Example:
+        >>> import jax.numpy as jnp
+        >>> from chronax.models import GRU
+        >>> y = jnp.asarray([1.0, 2.0, 1.5, 1.7, 2.2, 1.9, 2.1, 2.4])
+        >>> model = GRU(h=2, input_size=4, hidden_size=16, max_steps=20)
+        >>> model.fit(y).predict(h=2)["mean"].shape
+        (2,)
+
+    Notes:
+        This class is stateful and not thread-safe for concurrent mutation.
+        Defaults (`hidden_size=200`, `n_layers=2`, `decoder_hidden_size=128`,
+        `max_steps=1000`, `learning_rate=1e-3`) mirror Nixtla
+        `neuralforecast.GRU` so single-machine benchmark comparisons are
+        apples-to-apples.
+    """
 
     uses_exog = False
 
@@ -45,6 +154,33 @@ class GRU(BaseForecaster):
         random_seed: int = 1,
         alias: str = "GRU",
     ):
+        """
+        Initialize a GRU forecaster.
+
+        Detailed Description:
+            Stores hyperparameters; the network is not built until ``fit`` is
+            called (so ``__init__`` is cheap and side-effect free).
+
+        Args:
+            h (int): Forecast horizon.
+            input_size (int): Input-window length. Use -1 for ``3 * h``.
+            hidden_size (int): Encoder hidden dimension.
+            n_layers (int): Number of stacked GRU cells.
+            decoder_hidden_size (int): MLP-decoder hidden dimension.
+            dropout (float): Inter-layer dropout rate.
+            max_steps (int): Optimizer steps for ``fit``.
+            learning_rate (float): Adam learning rate.
+            batch_size (int): Windows per training step.
+            random_seed (int): Random seed.
+            alias (str): User-facing model name.
+
+        Returns:
+            None: Constructor initializes estimator state.
+
+        Notes:
+            ``decoder_layers`` is hard-wired to 2 in v1; expose it again
+            once the decoder supports configurable depth.
+        """
         if input_size < 1:
             input_size = 3 * h
         self.h = h
@@ -77,6 +213,33 @@ class GRU(BaseForecaster):
         )
 
     def fit(self, y: jnp.ndarray, X: jnp.ndarray | None = None) -> "GRU":
+        """
+        Fit the GRU on a univariate series.
+
+        Detailed Description:
+            Builds the network with the configured hyperparameters, then runs
+            ``self.max_steps`` Adam steps over rolling windows of length
+            ``input_size + h`` sampled uniformly at random. Each window is
+            normalized with the per-window robust scaler before the forward
+            pass; loss is MAE in scaled space.
+
+        Args:
+            y (jnp.ndarray): 1-D series of length ``>= input_size + h``.
+            X: Reserved for future exogenous regressors; must be None in v1.
+
+        Returns:
+            GRU: ``self``, with ``model_`` populated.
+
+        Raises:
+            NotImplementedError: If ``X`` is provided.
+            ValueError: If ``y`` is not 1-D, or shorter than
+                ``input_size + h``.
+            RuntimeError: If a non-finite training loss is observed
+                (training diverged); message includes the offending step.
+
+        Side Effects:
+            Mutates ``self.model_`` and ``self._context``.
+        """
         if X is not None:
             raise NotImplementedError("Exogenous variables are not supported in v1.")
         y = jnp.asarray(y, dtype=jnp.float32)
@@ -107,6 +270,29 @@ class GRU(BaseForecaster):
         X: jnp.ndarray | None = None,
         level: list[int | float] | None = None,
     ) -> dict:
+        """
+        Forecast from the fitted context.
+
+        Detailed Description:
+            Runs a single deterministic forward pass on the cached context
+            window (last ``input_size`` of the fit-time series), then slices
+            to the requested ``h``. Always materializes ``self.h`` outputs
+            internally so the JIT cache is shared across calls regardless of
+            the caller's ``h``.
+
+        Args:
+            h (int): Forecast horizon. Must satisfy ``h <= self.h``.
+            X: Reserved for future exogenous regressors; ignored in v1.
+            level: Reserved for prediction intervals; must be None in v1.
+
+        Returns:
+            dict: ``{"mean": jnp.ndarray of shape (h,)}``.
+
+        Raises:
+            ValueError: If ``h > self.h``.
+            NotImplementedError: If ``level`` is provided.
+            RuntimeError: If called before ``fit``.
+        """
         if h > self.h:
             raise ValueError(
                 f"GRU was trained for h={self.h}; predict(h={h}) is not supported. "
@@ -131,6 +317,31 @@ class GRU(BaseForecaster):
         level: list[int | float] | None = None,
         fitted: bool = False,
     ) -> dict:
+        """
+        Stateless fit-then-predict.
+
+        Detailed Description:
+            Equivalent to ``self.fit(y).predict(h=h, level=level)`` and
+            numerically identical to that pattern when seeded the same way.
+            Provided for API parity with the rest of `BaseForecaster`.
+
+        Args:
+            y (jnp.ndarray): 1-D training series.
+            h (int): Forecast horizon (``<= self.h``).
+            X / X_future: Reserved; must be None in v1.
+            level: Reserved; must be None in v1.
+            fitted: Reserved; must be False in v1.
+
+        Returns:
+            dict: ``{"mean": jnp.ndarray of shape (h,)}``.
+
+        Raises:
+            NotImplementedError: For any of ``X``, ``X_future``, ``fitted``
+                that is truthy / non-None (v1 only supports the simple path).
+            ValueError: Forwarded from ``fit`` / ``predict``.
+            RuntimeError: Forwarded from ``fit`` (training divergence) or
+                ``predict``.
+        """
         if X is not None or X_future is not None:
             raise NotImplementedError("Exogenous variables are not supported in v1.")
         if fitted:

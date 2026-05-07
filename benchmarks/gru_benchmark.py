@@ -8,8 +8,9 @@ main Chronax env stays clean of torch + Lightning.
 
 Reports both total wall-clock (with JIT/Lightning warmup) and after-warmup
 wall-clock (first fit per dataset excluded). The acceptance comparison uses
-after-warmup time. See ``.claude/plans/2026-05-05-gru-v1.md`` for the
-acceptance criteria.
+after-warmup time. Reference baselines and the protocol live under
+``benchmarks/baselines/``; see that directory's README for the rule that
+``benchmarks/gru_benchmark.py`` must clear.
 
 Outputs:
     benchmarks/benchmark_results/gru_<timestamp>.csv          (raw per-run rows)
