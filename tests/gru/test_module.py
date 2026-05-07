@@ -90,13 +90,22 @@ def test_grunet_forward_shape():
 
 
 def test_grunet_upsample_when_h_gt_input_size():
+    """Upsample path is taken when h > input_size and produces non-trivial
+    output on a non-constant input (catches the case where the upsample
+    Linear is silently a no-op or transposed wrong)."""
     net = GRUNet(
         in_features=1, encoder_hidden=32, encoder_layers=1,
         decoder_hidden=16, decoder_layers=2, dropout=0.0,
         h=20, input_size=10, rngs=nnx.Rngs(0),
     )
-    out = net(jnp.ones((2, 10, 1)), deterministic=True)
+    assert net.upsample is not None, "upsample branch must be active for h > input_size"
+    rng = np.random.default_rng(0)
+    x = jnp.asarray(rng.standard_normal((2, 10, 1)), dtype=jnp.float32)
+    out = net(x, deterministic=True)
     assert out.shape == (2, 20, 1)
+    # Non-trivial output: not all timesteps collapse to the same value.
+    per_step_var = float(jnp.var(out, axis=1).mean())
+    assert per_step_var > 1e-6, "upsample produced effectively-constant output across time"
 
 
 def test_grunet_params_are_float32():

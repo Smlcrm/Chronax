@@ -122,3 +122,29 @@ def test_forecast_equals_fit_then_predict_with_same_seed():
     a = fresh().forecast(y, h=12)["mean"]
     b = fresh().fit(y).predict(h=12)["mean"]
     np.testing.assert_allclose(a, b, rtol=1e-5)
+
+
+def test_model_beats_naive_last_value_on_easy_signal():
+    """End-to-end sanity: with a clean periodic signal and a few hundred
+    training steps, the model should beat a naive 'last value' forecast.
+    Catches broken loss / optimizer / scaler-inverse wiring that would still
+    pass shape and determinism tests."""
+    n = 400
+    t = np.arange(n)
+    y = jnp.asarray(np.sin(t / 5.0), dtype=jnp.float32)
+    train_y = y[:-12]
+    test_y = np.asarray(y[-12:])
+
+    m = GRU(
+        h=12, input_size=36, hidden_size=32, n_layers=1,
+        max_steps=200, batch_size=32, random_seed=0,
+    )
+    m.fit(train_y)
+    pred = np.asarray(m.predict(h=12)["mean"])
+
+    naive_last = np.full(12, float(train_y[-1]))
+    mae_model = float(np.mean(np.abs(pred - test_y)))
+    mae_naive = float(np.mean(np.abs(naive_last - test_y)))
+    assert mae_model < mae_naive, (
+        f"model MAE {mae_model:.4f} did not beat naive-last MAE {mae_naive:.4f}"
+    )
