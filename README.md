@@ -13,7 +13,7 @@ A high-performance, JAX-accelerated time-series forecasting library. `chronax` p
 ## Features
 
 - ⚡ **JAX-accelerated** — JIT-compiled model fitting and forecasting on CPU, GPU, or TPU
-- 📈 **20+ forecasting models** including AutoARIMA, AutoETS, AutoTheta, TBATS, MFLES, GARCH, STL, GRU, and more
+- 📈 **20+ forecasting models** including AutoARIMA, AutoETS, AutoTheta, TBATS, MFLES, GARCH, STL, and more
 - 🔁 **Unified API** — every model follows the same `fit()` → `predict()` pattern
 - 📊 **Prediction intervals** — built-in conformal and native interval support
 - ✅ **NumPy compatible** — accepts and returns standard array types
@@ -217,14 +217,6 @@ Forecasters tailored to sparse series with many zeros or irregular demand arriva
 | `CrostonClassic` | ✓ | ✓ | — | Conformal |
 | `IMAPA` | ✓ | ✓ | — | Conformal |
 | `TSB` | ✓ | ✓ | — | Native + conformal |
-
-### Neural Networks
-
-Recurrent neural network forecasters built on JAX, Flax NNX, and Optax. Univariate v1; multi-series cross-learning is planned for v2.
-
-| Model | Point Forecast | Probabilistic Forecast | Exogenous Regressors | Interval Type |
-|-------|----------------|------------------------|----------------------|---------------|
-| `GRU` | ✓ | — | — | — (planned v1.1) |
 
 All models are importable from `chronax.models`.
 
