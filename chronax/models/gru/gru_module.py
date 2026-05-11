@@ -6,8 +6,8 @@ import jax.numpy as jnp
 from flax import nnx
 
 
-def pytorch_uniform_init(hidden_size: int):
-    """Match PyTorch nn.GRU / nn.Linear default: Uniform(-1/sqrt(H), 1/sqrt(H))."""
+def uniform_one_over_sqrt_h_init(hidden_size: int):
+    """Initializer that draws from Uniform(-1/sqrt(H), 1/sqrt(H))."""
     bound = float(1.0 / jnp.sqrt(jnp.asarray(hidden_size, dtype=jnp.float32)))
 
     def init(key, shape, dtype=jnp.float32):
@@ -19,10 +19,9 @@ def pytorch_uniform_init(hidden_size: int):
 class GRUEncoder(nnx.Module):
     """Stacked GRU encoder, scan over time, dropout BETWEEN layers (not after the last).
 
-    All weights init via PyTorch's Uniform(-1/sqrt(H), 1/sqrt(H)) for accuracy
-    parity. Note: Flax `nnx.GRUCell` fuses input and hidden biases into a single
-    parameter on the input projection; PyTorch `nn.GRU` keeps them separate.
-    Documented small parity gap — see `test_gru_encoder_documents_bias_parity_with_pytorch`.
+    All weights init from Uniform(-1/sqrt(H), 1/sqrt(H)). Flax `nnx.GRUCell`
+    fuses input and hidden biases into a single parameter on the input
+    projection — pinned by `test_gru_encoder_has_single_fused_bias_per_cell`.
     """
 
     def __init__(
@@ -33,7 +32,7 @@ class GRUEncoder(nnx.Module):
         dropout: float,
         rngs: nnx.Rngs,
     ):
-        init = pytorch_uniform_init(hidden_size)
+        init = uniform_one_over_sqrt_h_init(hidden_size)
         cells = []
         for i in range(n_layers):
             cell_in = in_features if i == 0 else hidden_size
@@ -72,7 +71,7 @@ class GRUEncoder(nnx.Module):
 
 
 class MLPDecoder(nnx.Module):
-    """Linear -> ReLU -> Linear. Mirrors Nixtla `_modules.MLP(num_layers=2, dropout=0)`."""
+    """Linear -> ReLU -> Linear. Standard 2-layer MLP head."""
 
     def __init__(
         self,
@@ -81,7 +80,7 @@ class MLPDecoder(nnx.Module):
         out_features: int,
         rngs: nnx.Rngs,
     ):
-        init = pytorch_uniform_init(max(in_features, hidden_size))
+        init = uniform_one_over_sqrt_h_init(max(in_features, hidden_size))
         self.in_layer = nnx.Linear(
             in_features, hidden_size, kernel_init=init, bias_init=init, rngs=rngs
         )
@@ -118,7 +117,7 @@ class GRUNet(nnx.Module):
         self.h = h
         self.input_size = input_size
         if h > input_size:
-            init = pytorch_uniform_init(input_size)
+            init = uniform_one_over_sqrt_h_init(input_size)
             self.upsample = nnx.Linear(
                 input_size, h, kernel_init=init, bias_init=init, rngs=rngs
             )

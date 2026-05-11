@@ -30,7 +30,7 @@ def scaled_forward_loss(
     input_size: int,
     scaler: Scaler,
 ) -> jnp.ndarray:
-    """MAE in scaled space, mirrors Nixtla. windows: [B, input_size+h] -> scalar."""
+    """MAE in scaled space. windows: [B, input_size+h] -> scalar."""
     insample = windows[:, :input_size]
     target = windows[:, input_size:]
     shift, scale = scaler.stats(insample, axis=1)

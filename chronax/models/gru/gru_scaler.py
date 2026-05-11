@@ -48,7 +48,8 @@ def _masked_mean(x: jnp.ndarray, mask: jnp.ndarray | None, axis: int) -> jnp.nda
 class RobustScaler:
     """Median + MAD scaler with 0.6745*std fallback when MAD=0.
 
-    Mirrors Nixtla neuralforecast `_scalers.robust_statistics`.
+    The fallback uses the Gaussian relationship `MAD ≈ 0.6745·σ` to estimate
+    MAD when the empirical MAD degenerates to zero (e.g. near-constant input).
     """
 
     def stats(

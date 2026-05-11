@@ -8,14 +8,14 @@ from chronax.models.gru.gru_module import (
     GRUEncoder,
     GRUNet,
     MLPDecoder,
-    pytorch_uniform_init,
+    uniform_one_over_sqrt_h_init,
 )
 
 
-def test_pytorch_uniform_init_bounds():
-    """PyTorch nn.GRU/nn.Linear default: Uniform(-1/sqrt(H), 1/sqrt(H))."""
+def test_uniform_one_over_sqrt_h_init_bounds():
+    """Sampled values stay inside ±1/sqrt(H) and are roughly zero-mean."""
     hidden = 200
-    init = pytorch_uniform_init(hidden)
+    init = uniform_one_over_sqrt_h_init(hidden)
     key = jax.random.PRNGKey(0)
     w = init(key, (hidden, 4 * hidden))
     bound = float(1.0 / jnp.sqrt(jnp.asarray(hidden, dtype=jnp.float32)))
@@ -46,10 +46,10 @@ def test_gru_encoder_uses_float32_by_default():
         assert leaf.dtype == jnp.float32, f"expected float32, got {leaf.dtype}"
 
 
-def test_gru_encoder_documents_bias_parity_with_pytorch():
-    """Flax `nnx.GRUCell` fuses biases into a single param on the input
-    projection; PyTorch `nn.GRU` has two (b_ih, b_hh). Document the gap so
-    accuracy-parity claims are honest about the bounded divergence.
+def test_gru_encoder_has_single_fused_bias_per_cell():
+    """Flax `nnx.GRUCell` fuses biases into a single parameter on the input
+    projection. Pinning this so any regression that changes the cell's
+    parameter layout (or our wrapping of it) is caught loudly.
     """
     encoder = GRUEncoder(
         in_features=1, hidden_size=8, n_layers=1,
@@ -58,8 +58,7 @@ def test_gru_encoder_documents_bias_parity_with_pytorch():
     flat = jax.tree_util.tree_leaves_with_path(nnx.state(encoder, nnx.Param))
     bias_count = sum(1 for path, _ in flat if "bias" in str(path).lower())
     assert bias_count == 1, (
-        f"Expected 1 bias per cell (Flax convention); got {bias_count}. "
-        "PyTorch nn.GRU would have 2 (b_ih, b_hh) — known parity divergence."
+        f"Expected 1 bias per cell (Flax convention); got {bias_count}."
     )
 
 

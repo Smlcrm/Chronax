@@ -132,10 +132,8 @@ class GRU(BaseForecaster):
 
     Notes:
         This class is stateful and not thread-safe for concurrent mutation.
-        Defaults (`hidden_size=200`, `n_layers=2`, `decoder_hidden_size=128`,
-        `max_steps=1000`, `learning_rate=1e-3`) mirror Nixtla
-        `neuralforecast.GRU` so single-machine benchmark comparisons are
-        apples-to-apples.
+        Defaults: `hidden_size=200`, `n_layers=2`, `decoder_hidden_size=128`,
+        `max_steps=1000`, `learning_rate=1e-3`.
     """
 
     uses_exog = False
