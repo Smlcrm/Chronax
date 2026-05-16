@@ -27,8 +27,7 @@ External Dependencies:
 
 Expected Inputs and Outputs:
     - Input: a 1-D `jnp.ndarray`-compatible series and a forecast horizon.
-    - Output: dictionaries containing mean forecasts (probabilistic intervals
-      planned for v1.1).
+    - Output: dictionaries containing mean forecasts.
 
 Example:
     >>> import jax.numpy as jnp
@@ -46,18 +45,6 @@ Assumptions:
 Side Effects:
     - Mutates instance state (`model_`, cached context window).
     - JIT-compiles a forward pass on first `predict` call after `fit`.
-
-Known v1 limitations
---------------------
-- Univariate only. Multi-series / cross-learning is a v2 concern. The fit
-  signature will change to accept ``[N, T]`` instead of ``[T]`` then; users
-  relying on v1 shape should pin the package version.
-- `BaseForecaster.conformity_scores` works through inheritance but is
-  impractical on GRU: it re-trains for `self.max_steps` gradient steps per
-  cross-validation window. Lower `max_steps` if you really need this on GRU,
-  or wait for the conformal-aware v1.1 path.
-- No GPU tuning. The model runs on GPU/Metal but is benchmarked on CPU only
-  in v1; speed claims are CPU-only.
 """
 from __future__ import annotations
 
@@ -119,8 +106,7 @@ class GRU(BaseForecaster):
         forecast(): Stateless fit-then-predict.
 
     Returns:
-        Produces forecasts via dictionaries keyed by ``mean``. Probabilistic
-        intervals are planned for v1.1.
+        Produces forecasts via dictionaries keyed by ``mean``.
 
     Example:
         >>> import jax.numpy as jnp
