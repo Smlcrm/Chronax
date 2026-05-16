@@ -128,10 +128,13 @@ def test_forecast_raises_on_exog():
         m.forecast(_make_y(), h=12, X_future=jnp.zeros((12, 2)))
 
 
-def test_forecast_raises_on_fitted_request():
+def test_forecast_with_fitted_returns_fitted_key():
+    """forecast(y, h, fitted=True) returns the 'fitted' key (replaces the
+    previous NotImplementedError contract). Detailed shape behavior covered
+    in test_forecast_fitted_returns_fitted_values."""
     m = _tiny()
-    with pytest.raises(NotImplementedError, match="fitted"):
-        m.forecast(_make_y(), h=12, fitted=True)
+    result = m.forecast(_make_y(), h=12, fitted=True)
+    assert "fitted" in result
 
 
 def test_forecast_equals_fit_then_predict_with_same_seed():
@@ -251,3 +254,31 @@ def test_conformity_scores_inheritance_smoke_xfail():
     model.fit(y)
     cs = model.conformity_scores(y)  # expected to raise — xfail
     assert cs.ndim == 2 and np.all(np.isfinite(np.asarray(cs)))
+
+
+def test_forecast_fitted_returns_fitted_values():
+    """forecast(y, h, fitted=True) returns {'mean', 'fitted'}. The 'fitted'
+    array has shape (len(y),) with the first input_size entries NaN and the
+    rest finite. Matches the convention used by HistoricAverage etc.
+    """
+    y = jnp.asarray(np.sin(np.arange(120) / 5.0), dtype=jnp.float32)
+    model = GRU(h=4, input_size=12, hidden_size=8, n_layers=1, max_steps=10,
+                batch_size=4, random_seed=0)
+    result = model.forecast(y, h=4, fitted=True)
+    assert isinstance(result, dict)
+    assert "mean" in result and result["mean"].shape == (4,)
+    assert "fitted" in result, f"missing 'fitted' key in {list(result.keys())}"
+    fitted = np.asarray(result["fitted"])
+    assert fitted.shape == (len(y),), f"got shape {fitted.shape}"
+    assert np.all(np.isnan(fitted[:model.input_size]))
+    assert np.all(np.isfinite(fitted[model.input_size:]))
+
+
+def test_forecast_without_fitted_returns_mean_only():
+    """forecast(y, h) without fitted=True returns only the 'mean' key."""
+    y = jnp.asarray(np.sin(np.arange(120) / 5.0), dtype=jnp.float32)
+    model = GRU(h=4, input_size=12, hidden_size=8, n_layers=1, max_steps=5,
+                batch_size=4, random_seed=0)
+    result = model.forecast(y, h=4)
+    assert "mean" in result
+    assert "fitted" not in result

@@ -204,6 +204,7 @@ class GRU(BaseForecaster):
         self.conformal_params = None
         self.model_: GRUNet | None = None
         self._context: jnp.ndarray | None = None  # last `input_size` of fit-time y
+        self._train_y: jnp.ndarray | None = None  # full fit-time series (for fitted-values)
         self._scaler = RobustScaler()
 
     def _build_net(self) -> GRUNet:
@@ -269,6 +270,7 @@ class GRU(BaseForecaster):
         # Only the final `input_size` window is needed for direct-decoding
         # forecast; storing the full series would be wasteful for long inputs.
         self._context = y[-self.input_size :]
+        self._train_y = y
         return self
 
     def predict(
@@ -330,32 +332,62 @@ class GRU(BaseForecaster):
         Stateless fit-then-predict.
 
         Detailed Description:
-            Equivalent to ``self.fit(y).predict(h=h, level=level)`` and
-            numerically identical to that pattern when seeded the same way.
-            Provided for API parity with the rest of `BaseForecaster`.
+            Equivalent to ``self.fit(y).predict(h=h, level=level)`` (plus an
+            extra ``"fitted"`` key when ``fitted=True``) and numerically
+            identical to that pattern when seeded the same way.
 
         Args:
             y (jnp.ndarray): 1-D training series.
             h (int): Forecast horizon (``<= self.h``).
             X / X_future: Reserved; must be None in v1.
             level: Not supported; non-None raises NotImplementedError.
-            fitted: Reserved; must be False in v1.
+            fitted (bool): If True, the returned dict additionally contains
+                a ``"fitted"`` key with one-step-ahead predictions over the
+                training series. The first ``input_size`` entries are NaN
+                (no input window available); the remaining entries are
+                finite. Matches the convention used by other Chronax models.
 
         Returns:
-            dict: ``{"mean": jnp.ndarray of shape (h,)}``.
+            dict: ``{"mean": ..., optional "fitted": ...}``.
 
         Raises:
-            NotImplementedError: For any of ``X``, ``X_future``, ``fitted``
-                that is truthy / non-None (v1 only supports the simple path).
+            NotImplementedError: If ``X`` or ``X_future`` is non-None, or if
+                ``level`` is non-None.
             ValueError: Forwarded from ``fit`` / ``predict``.
             RuntimeError: Forwarded from ``fit`` (training divergence) or
                 ``predict``.
         """
         if X is not None or X_future is not None:
             raise NotImplementedError("Exogenous variables are not supported in v1.")
+        self.fit(y)
+        result = self.predict(h=h, level=level)
         if fitted:
-            raise NotImplementedError("In-sample fitted values are not supported in v1.")
-        return self.fit(y).predict(h=h, level=level)
+            result["fitted"] = self._compute_fitted_values()
+        return result
+
+    def _compute_fitted_values(self) -> jnp.ndarray:
+        """One-step-ahead fitted values over rolling windows of the training
+        series. Returns shape ``(len(y),)`` where the first ``input_size``
+        entries are NaN (no input window available) and the rest are the
+        model's one-step-ahead predictions.
+        """
+        if self._train_y is None or self.model_ is None:
+            raise RuntimeError("Call fit(y) before computing fitted values.")
+        y = self._train_y
+        n_windows = y.shape[0] - self.input_size
+        if n_windows <= 0:
+            return jnp.full((y.shape[0],), jnp.nan, dtype=jnp.float32)
+
+        idx = jnp.arange(self.input_size)[None, :] + jnp.arange(n_windows)[:, None]
+        in_windows = y[idx]  # [n_windows, input_size]
+        shift, scale = self._scaler.stats(in_windows, axis=1)
+        x_z = self._scaler.transform(in_windows, shift, scale)[..., None]
+        pred_z = self.model_(x_z, deterministic=True)  # [n_windows, h, 1]
+        first_step_z = pred_z[:, 0, 0:1]  # [n_windows, 1]
+        finite_part = self._scaler.inverse(first_step_z, shift, scale)[:, 0]
+
+        nan_head = jnp.full((self.input_size,), jnp.nan, dtype=jnp.float32)
+        return jnp.concatenate([nan_head, finite_part])
 
     def __getstate__(self) -> dict:
         """Make the fitted model picklable.
