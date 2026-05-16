@@ -57,6 +57,21 @@ from chronax.models.gru.gru_scaler import RobustScaler
 from chronax.models.gru.gru_training import predict_step, train
 
 
+_LEVEL_NOT_SUPPORTED_MSG = (
+    "GRU does not produce probabilistic intervals via predict(level=...). "
+    "The inherited BaseForecaster.conformity_scores path is incompatible "
+    "with this model — it uses jax.vmap over CV windows, but GRU's training "
+    "loop does a host-side float(loss) check each step, which raises "
+    "ConcretizationTypeError under vmap.\n\n"
+    "If you need conformal intervals, compute them outside this model: \n"
+    "  - Roll your own walk-forward CV that calls model.fit / model.predict "
+    "directly (no jax.vmap).\n"
+    "  - Collect the per-window signed residuals.\n"
+    "  - Call BaseForecaster.add_confidence_intervals(fcst, cs, level, "
+    "method) with those residuals to assemble lo-XX / hi-XX keys.\n"
+)
+
+
 class GRU(BaseForecaster):
     """
     GRU
@@ -275,7 +290,9 @@ class GRU(BaseForecaster):
         Args:
             h (int): Forecast horizon. Must satisfy ``h <= self.h``.
             X: Reserved for future exogenous regressors; ignored in v1.
-            level: Reserved for prediction intervals; must be None in v1.
+            level: Probabilistic intervals are not produced by this model.
+                Any non-None value raises NotImplementedError with a pointer
+                to the manual conformity-scores workflow.
 
         Returns:
             dict: ``{"mean": jnp.ndarray of shape (h,)}``.
@@ -291,7 +308,7 @@ class GRU(BaseForecaster):
                 f"Pass h <= {self.h} or re-fit with a larger h."
             )
         if level is not None:
-            raise NotImplementedError("Probabilistic intervals are not supported in v1.")
+            raise NotImplementedError(_LEVEL_NOT_SUPPORTED_MSG)
         if self.model_ is None or self._context is None:
             raise RuntimeError("Call fit(y) before predict(h).")
         full = predict_step(
@@ -321,7 +338,7 @@ class GRU(BaseForecaster):
             y (jnp.ndarray): 1-D training series.
             h (int): Forecast horizon (``<= self.h``).
             X / X_future: Reserved; must be None in v1.
-            level: Reserved; must be None in v1.
+            level: Not supported; non-None raises NotImplementedError.
             fitted: Reserved; must be False in v1.
 
         Returns:
@@ -370,3 +387,16 @@ class GRU(BaseForecaster):
             self.model_ = net
             return
         self.__dict__.update(state)
+
+    def conformity_scores(
+        self, y: jnp.ndarray, X: jnp.ndarray | None = None
+    ) -> jnp.ndarray:
+        """Conformity scores are not supported on GRU.
+
+        The inherited `BaseForecaster.conformity_scores` uses `jax.vmap` over
+        CV windows, but GRU's training loop has a host-side `float(loss)` per
+        step (the finite-loss check), which raises `ConcretizationTypeError`
+        under vmap. Rather than letting users hit that opaque JAX error, we
+        override to raise with a clear pointer to the manual workflow.
+        """
+        raise NotImplementedError(_LEVEL_NOT_SUPPORTED_MSG)

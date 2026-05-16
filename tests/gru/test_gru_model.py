@@ -91,10 +91,33 @@ def test_predict_before_fit_raises():
         m.predict(h=12)
 
 
-def test_predict_with_level_raises():
+def test_predict_with_level_raises_with_helpful_message():
+    """`predict(h, level=...)` raises with a clear message pointing the user
+    at the manual conformity_scores + add_confidence_intervals workflow.
+
+    The inherited path is not just slow on GRU — it's broken under vmap
+    (see test_conformity_scores_inheritance_smoke_xfail). So the right UX
+    is a clear NotImplementedError that documents the manual escape.
+    """
     m = _tiny().fit(_make_y())
-    with pytest.raises(NotImplementedError, match="intervals"):
+    with pytest.raises(NotImplementedError) as exc_info:
         m.predict(h=12, level=[80, 95])
+    msg = str(exc_info.value)
+    assert "conformity_scores" in msg
+    assert "add_confidence_intervals" in msg
+
+
+def test_conformity_scores_raises_with_helpful_message():
+    """GRU.conformity_scores overrides the inherited (vmap-broken) path with
+    a clear NotImplementedError that documents the constraint and the manual
+    escape hatch.
+    """
+    m = _tiny()
+    with pytest.raises(NotImplementedError) as exc_info:
+        m.conformity_scores(_make_y())
+    msg = str(exc_info.value)
+    assert "vmap" in msg.lower() or "incompatible" in msg.lower()
+    assert "add_confidence_intervals" in msg
 
 
 def test_forecast_raises_on_exog():
@@ -201,20 +224,22 @@ def test_h_equals_one_and_tiny_input_size():
 
 @pytest.mark.xfail(
     reason=(
-        "BaseForecaster.conformity_scores uses jax.vmap over windows, but "
-        "GRU.fit -> train() does a host-side float(loss) every step (for the "
-        "finite-loss check). That breaks under vmap with a "
-        "ConcretizationTypeError. The inheritance path is therefore broken on "
-        "GRU, not just slow. The GRU class overrides conformity_scores to "
-        "raise NotImplementedError with a helpful message — see "
-        "test_conformity_scores_raises_with_helpful_message."
+        "BaseForecaster.conformity_scores uses jax.vmap over windows. GRU's "
+        "train() does a host-side float(loss) each step, which raises "
+        "ConcretizationTypeError under vmap. The GRU class therefore "
+        "overrides conformity_scores to raise NotImplementedError "
+        "immediately with a helpful pointer to the manual workflow — see "
+        "test_conformity_scores_raises_with_helpful_message. This test "
+        "pins the gap: a future refactor that makes train() vmap-safe AND "
+        "removes the override should flip this from xfail to xpass."
     ),
     strict=True,
 )
 def test_conformity_scores_inheritance_smoke_xfail():
     """Documents the known incompatibility between BaseForecaster.conformity_scores
     and GRU's vmap-unsafe training loop. If a future refactor makes train()
-    vmap-compatible, this test should flip from xfail to xpass."""
+    vmap-compatible AND removes the conformity_scores override, this test
+    should flip from xfail to xpass."""
     from chronax.utils import ConformalIntervals
 
     y = jnp.asarray(np.sin(np.arange(120) / 5.0), dtype=jnp.float32)
