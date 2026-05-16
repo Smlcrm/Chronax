@@ -68,6 +68,14 @@ class GRU(BaseForecaster):
         median/MAD scaler, and the model is trained with MAE loss in scaled
         space using Optax `adam`.
 
+    Maintenance Status:
+        Frozen v1 — this model is shipped as-is and will not receive feature
+        additions or bug-fix releases unless a downstream consumer surfaces a
+        correctness issue. Knobs intentionally kept minimal. For wider
+        configuration (custom optimizer, custom loss, exogenous variables,
+        recursive decoding, early stopping), prefer one of the stats-based
+        forecasters in ``chronax.models`` or a peer neural library.
+
     Attributes:
         uses_exog (bool): Indicates support for exogenous regressors. False
             in v1.
