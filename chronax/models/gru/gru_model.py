@@ -339,3 +339,34 @@ class GRU(BaseForecaster):
         if fitted:
             raise NotImplementedError("In-sample fitted values are not supported in v1.")
         return self.fit(y).predict(h=h, level=level)
+
+    def __getstate__(self) -> dict:
+        """Make the fitted model picklable.
+
+        The full GraphDef returned by `nnx.split` retains references to JAX
+        ufuncs (e.g. `jnp.tanh`, `jax.nn.sigmoid`) used as `activation_fn` /
+        `gate_fn` on `nnx.GRUCell`. Those ufuncs aren't pickle-stable across
+        JAX's lazy loading, so we serialize *only* the state (parameters +
+        RNG streams) and rebuild the GraphDef on unpickle by re-running
+        `_build_net()` from the same constructor args. The fitted parameter
+        values are then loaded back via `nnx.update`.
+        """
+        state = self.__dict__.copy()
+        if state.get("model_") is not None:
+            _, full_state = nnx.split(state["model_"])
+            state["model_"] = ("__params_only__", full_state)
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        m = state.get("model_")
+        if isinstance(m, tuple) and m and m[0] == "__params_only__":
+            saved_state = m[1]
+            state["model_"] = None
+            self.__dict__.update(state)
+            # Rebuild a fresh network from the same constructor args, then
+            # overwrite its state with the saved parameters.
+            net = self._build_net()
+            nnx.update(net, saved_state)
+            self.model_ = net
+            return
+        self.__dict__.update(state)

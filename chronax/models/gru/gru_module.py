@@ -6,14 +6,30 @@ import jax.numpy as jnp
 from flax import nnx
 
 
-def uniform_one_over_sqrt_h_init(hidden_size: int):
+class _UniformInit:
+    """Picklable callable that draws from Uniform(-bound, bound).
+
+    Implemented as a class (rather than a closure) so module references to
+    this initializer survive pickle.dumps — NNX `GRUCell`/`Linear` retain
+    their `kernel_init` etc. as instance attributes, and a `<locals>.init`
+    closure would otherwise raise `AttributeError` on serialization.
+    """
+
+    __slots__ = ("bound",)
+
+    def __init__(self, bound: float) -> None:
+        self.bound = bound
+
+    def __call__(self, key, shape, dtype=jnp.float32):
+        return jax.random.uniform(
+            key, shape, dtype, minval=-self.bound, maxval=self.bound
+        )
+
+
+def uniform_one_over_sqrt_h_init(hidden_size: int) -> _UniformInit:
     """Initializer that draws from Uniform(-1/sqrt(H), 1/sqrt(H))."""
     bound = float(1.0 / jnp.sqrt(jnp.asarray(hidden_size, dtype=jnp.float32)))
-
-    def init(key, shape, dtype=jnp.float32):
-        return jax.random.uniform(key, shape, dtype, minval=-bound, maxval=bound)
-
-    return init
+    return _UniformInit(bound)
 
 
 class GRUEncoder(nnx.Module):

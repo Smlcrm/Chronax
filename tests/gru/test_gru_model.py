@@ -1,4 +1,6 @@
 """Tests for chronax.models.gru.gru_model — BaseForecaster contract conformance."""
+import pickle
+
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -148,3 +150,17 @@ def test_model_beats_naive_last_value_on_easy_signal():
     assert mae_model < mae_naive, (
         f"model MAE {mae_model:.4f} did not beat naive-last MAE {mae_naive:.4f}"
     )
+
+
+def test_gru_pickle_round_trip():
+    """A fitted GRU survives pickle.dumps/loads and produces identical predictions."""
+    y = _make_y()
+    model = _tiny()
+    model.fit(y)
+    pred_before = np.asarray(model.predict(h=12)["mean"])
+
+    blob = pickle.dumps(model)
+    restored = pickle.loads(blob)
+
+    pred_after = np.asarray(restored.predict(h=12)["mean"])
+    np.testing.assert_allclose(pred_before, pred_after, rtol=1e-5)
