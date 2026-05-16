@@ -197,3 +197,32 @@ def test_h_equals_one_and_tiny_input_size():
     pred = model.predict(h=1)["mean"]
     assert pred.shape == (1,)
     assert np.isfinite(float(pred[0]))
+
+
+@pytest.mark.xfail(
+    reason=(
+        "BaseForecaster.conformity_scores uses jax.vmap over windows, but "
+        "GRU.fit -> train() does a host-side float(loss) every step (for the "
+        "finite-loss check). That breaks under vmap with a "
+        "ConcretizationTypeError. The inheritance path is therefore broken on "
+        "GRU, not just slow. The GRU class overrides conformity_scores to "
+        "raise NotImplementedError with a helpful message — see "
+        "test_conformity_scores_raises_with_helpful_message."
+    ),
+    strict=True,
+)
+def test_conformity_scores_inheritance_smoke_xfail():
+    """Documents the known incompatibility between BaseForecaster.conformity_scores
+    and GRU's vmap-unsafe training loop. If a future refactor makes train()
+    vmap-compatible, this test should flip from xfail to xpass."""
+    from chronax.utils import ConformalIntervals
+
+    y = jnp.asarray(np.sin(np.arange(120) / 5.0), dtype=jnp.float32)
+    model = GRU(h=6, input_size=18, hidden_size=8, n_layers=1,
+                max_steps=1, batch_size=2, random_seed=0)
+    model.conformal_params = ConformalIntervals(
+        n_windows=2, h=6, method="conformal_distribution"
+    )
+    model.fit(y)
+    cs = model.conformity_scores(y)  # expected to raise — xfail
+    assert cs.ndim == 2 and np.all(np.isfinite(np.asarray(cs)))
