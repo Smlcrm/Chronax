@@ -164,3 +164,36 @@ def test_gru_pickle_round_trip():
 
     pred_after = np.asarray(restored.predict(h=12)["mean"])
     np.testing.assert_allclose(pred_before, pred_after, rtol=1e-5)
+
+
+def test_fit_predict_on_constant_series_returns_finite():
+    """Constant input → MAD=0 → scaler fallback fires. Forecast must be finite."""
+    y = jnp.ones(200, dtype=jnp.float32) * 5.0
+    model = _tiny()  # h=12, input_size=36
+    model.fit(y)
+    pred = np.asarray(model.predict(h=12)["mean"])
+    assert np.all(np.isfinite(pred)), f"got non-finite forecast: {pred}"
+
+
+def test_fit_works_at_minimum_series_length():
+    """Series of exactly input_size + h trains without ValueError (n_windows == 1)."""
+    h, L = 4, 12
+    y = jnp.asarray(np.sin(np.arange(L + h) / 3.0), dtype=jnp.float32)
+    model = GRU(h=h, input_size=L, hidden_size=8, n_layers=1,
+                max_steps=5, batch_size=1, random_seed=0)
+    model.fit(y)
+    pred = model.predict(h=h)["mean"]
+    assert pred.shape == (h,)
+    assert np.all(np.isfinite(np.asarray(pred)))
+    assert model._context.shape == (L,)
+
+
+def test_h_equals_one_and_tiny_input_size():
+    """Smallest non-degenerate h=1, input_size=2 configuration."""
+    y = jnp.asarray(np.sin(np.arange(50) / 5.0), dtype=jnp.float32)
+    model = GRU(h=1, input_size=2, hidden_size=4, n_layers=1,
+                max_steps=5, batch_size=2, random_seed=0)
+    model.fit(y)
+    pred = model.predict(h=1)["mean"]
+    assert pred.shape == (1,)
+    assert np.isfinite(float(pred[0]))
