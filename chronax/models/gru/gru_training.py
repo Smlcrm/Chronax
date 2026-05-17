@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 from flax import nnx
 
@@ -58,42 +59,61 @@ def train(
     seed: int,
     scaler: Scaler | None = None,
 ) -> jnp.ndarray:
-    """Train `model` in place. Returns array of per-step training losses.
+    """Train `model` in place. Returns per-step training losses.
 
-    The train_step closure is JIT-compiled once and reused across
-    `max_steps` — no per-step retracing.
+    The training loop runs as a single `nnx.scan`, which makes the entire
+    function `jax.vmap`-traceable. Mutable Flax NNX state (model parameters,
+    optimizer momentum) flows through the scan as `nnx.Carry` — NNX handles
+    the graph-vs-state separation internally.
+
+    Per-step batches are pre-sampled outside the scan so the body is a pure
+    function of `(model, optimizer, batch) -> mutated state, loss`. The
+    non-finite-loss check is one host-side reduction over the loss array
+    after the scan returns, rather than a per-step sync.
     """
     if scaler is None:
         scaler = RobustScaler()
     windows = build_windows(y, input_size, h)
     n_windows = windows.shape[0]
+
+    # Pre-sample per-step batch indices. One choice() call → [max_steps, B];
+    # the scan then iterates over the leading axis.
+    key = jax.random.PRNGKey(seed)
+    batch_idx = jax.random.choice(
+        key, n_windows, shape=(max_steps, batch_size), replace=True
+    )
+    batches = windows[batch_idx]  # [max_steps, batch_size, L+h]
+
     optimizer = nnx.Optimizer(model, optax.adam(lr), wrt=nnx.Param)
 
-    @nnx.jit
-    def train_step(model, optimizer, batch):
+    # nnx.scan in flax 0.10.7 takes exactly one Carry slot. Pack model and
+    # optimizer into a tuple carry; NNX recognizes the stateful members
+    # inside and threads their graph state correctly.
+    @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
+    def step(carry, batch):
+        model, opt = carry
         loss, grads = nnx.value_and_grad(
             lambda m: scaled_forward_loss(
                 m, batch, h=h, input_size=input_size, scaler=scaler
             )
         )(model)
-        optimizer.update(grads)
-        return loss
+        opt.update(grads)
+        return (model, opt), loss
 
-    key = jax.random.PRNGKey(seed)
-    losses = []
-    for step in range(max_steps):
-        key, sub = jax.random.split(key)
-        idx = jax.random.choice(sub, n_windows, shape=(batch_size,), replace=True)
-        loss_val = float(train_step(model, optimizer, windows[idx]))
-        if not jnp.isfinite(loss_val):
-            raise RuntimeError(
-                f"Non-finite loss ({loss_val}) at step {step}. "
-                f"Training diverged. Consider lowering `learning_rate` "
-                f"(currently used by the caller), reducing batch size, "
-                f"or checking the input series for extreme values."
-            )
-        losses.append(loss_val)
-    return jnp.asarray(losses)
+    _, losses = step((model, optimizer), batches)  # shape: [max_steps]
+
+    # Single host sync: check finiteness once, after the scan.
+    losses_host = np.asarray(losses)
+    bad = ~np.isfinite(losses_host)
+    if bad.any():
+        first_bad = int(np.argmax(bad))
+        raise RuntimeError(
+            f"Non-finite loss ({losses_host[first_bad]}) at step {first_bad}. "
+            f"Training diverged. Consider lowering `learning_rate`, "
+            f"reducing batch size, or checking the input series for extreme values."
+        )
+
+    return jnp.asarray(losses_host)
 
 
 def predict_step(
