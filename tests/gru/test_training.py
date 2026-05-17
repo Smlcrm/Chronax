@@ -120,3 +120,56 @@ def test_predict_step_shape_and_idempotent():
     p2 = predict_step(net, y, h=6, input_size=18, scaler=sc)
     assert p1.shape == (6,)
     np.testing.assert_allclose(p1, p2, rtol=1e-5)
+
+
+def test_train_losses_match_pre_refactor_trajectory():
+    """After the nnx.scan refactor of train(), per-step losses on a fixed
+    seed must stay close to the pre-refactor trajectory (captured
+    2026-05-17 against `yash/gru`'s HEAD before the refactor).
+
+    Bit-for-bit equality is not promised: the RNG-threading order changed
+    (per-step `jax.random.split` + per-step `choice` → upfront single
+    `choice` of shape [max_steps, batch_size]). The same seed produces a
+    different sample sequence with the new layout, so per-step losses
+    drift. Mean within rtol=0.20 catches real refactor bugs (NaN, wildly
+    different magnitudes) while allowing the legitimate sampling drift.
+    With only max_steps=10 the loss-mean is particularly noise-sensitive;
+    we use a looser bound on the mean than on the final value.
+    """
+    # Reference values from the pre-refactor capture; if these need to be
+    # updated for a legitimate algorithmic change, re-run the capture on
+    # the pre-change branch and update here.
+    PRE_REFACTOR_LOSSES_MEAN = 2.8072
+    PRE_REFACTOR_LOSSES_FINAL = 1.3303
+
+    from chronax.models.gru.gru_module import GRUNet
+    from chronax.models.gru.gru_training import train
+    from flax import nnx
+
+    y = jnp.asarray(np.sin(np.arange(200) / 10.0), dtype=jnp.float32)
+    net = GRUNet(in_features=1, encoder_hidden=16, encoder_layers=1,
+                 decoder_hidden=8, decoder_layers=2, dropout=0.0,
+                 h=4, input_size=12, rngs=nnx.Rngs(42))
+    losses = np.asarray(train(net, y, h=4, input_size=12, max_steps=10,
+                              batch_size=4, lr=1e-3, seed=42))
+    # Mean: 20% slack — captures noise from a 10-step stochastic average
+    # of differently-ordered batches.
+    np.testing.assert_allclose(losses.mean(), PRE_REFACTOR_LOSSES_MEAN, rtol=0.20)
+    # Final loss: 30% slack — single-step value, even noisier.
+    np.testing.assert_allclose(losses[-1], PRE_REFACTOR_LOSSES_FINAL, rtol=0.30)
+
+
+def test_predict_matches_pre_refactor_trajectory():
+    """End-to-end fit().predict() output stays close in magnitude after
+    the refactor. Allowed slack: atol=0.5 because the prediction's
+    magnitude is O(1) and we accept trajectory drift, not bit-for-bit."""
+    PRE_REFACTOR_PRED_MEAN = 0.4585
+
+    from chronax.models.gru.gru_model import GRU
+
+    y = jnp.asarray(np.sin(np.arange(200) / 10.0), dtype=jnp.float32)
+    m = GRU(h=4, input_size=12, hidden_size=16, n_layers=1,
+            max_steps=10, batch_size=4, random_seed=42)
+    m.fit(y)
+    pred = np.asarray(m.predict(h=4)["mean"])
+    np.testing.assert_allclose(pred.mean(), PRE_REFACTOR_PRED_MEAN, atol=0.5)
