@@ -311,3 +311,26 @@ def test_build_net_works_under_vmap():
         out = net(x, deterministic=True)
         assert out.shape == (1, 2, 1)
         assert np.all(np.isfinite(np.asarray(out)))
+
+
+def test_pickle_round_trip_with_full_max_steps():
+    """Pickle round-trip after the nnx.scan refactor.
+
+    The refactor changes how optimizer state is constructed (inside the
+    nnx.scan body, with the (model, optimizer) tuple as a single Carry).
+    Verifies the full-fitted-state pickling still produces identical
+    predictions. Uses a larger max_steps to exercise the warm-trace path
+    that the small `_tiny()` config in `test_gru_pickle_round_trip`
+    doesn't fully cover.
+    """
+    y = _make_y()
+    model = GRU(h=12, input_size=36, hidden_size=16, n_layers=1,
+                max_steps=50, batch_size=8, random_seed=0)
+    model.fit(y)
+    pred_before = np.asarray(model.predict(h=12)["mean"])
+
+    blob = pickle.dumps(model)
+    restored = pickle.loads(blob)
+    pred_after = np.asarray(restored.predict(h=12)["mean"])
+
+    np.testing.assert_allclose(pred_before, pred_after, rtol=1e-5)
