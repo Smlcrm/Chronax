@@ -282,3 +282,30 @@ def test_forecast_without_fitted_returns_mean_only():
     result = model.forecast(y, h=4)
     assert "mean" in result
     assert "fitted" not in result
+
+
+def test_build_net_works_under_vmap():
+    """Module construction (_build_net inside fit, called inside vmap by
+    BaseForecaster.conformity_scores) must trace without
+    ConcretizationTypeError. If this fails, the train() refactor alone
+    won't fix the conformity_scores xfail — module init itself is the gate.
+    """
+    from chronax.models.gru.gru_module import GRUNet
+    from flax import nnx
+
+    def build(seed_scalar):
+        return GRUNet(
+            in_features=1, encoder_hidden=8, encoder_layers=1,
+            decoder_hidden=4, decoder_layers=2, dropout=0.0,
+            h=2, input_size=4, rngs=nnx.Rngs(int(seed_scalar)),
+        )
+
+    # Loop construction is the pattern BaseForecaster.conformity_scores
+    # ultimately uses (forecast → fit → _build_net, traced by jax.vmap
+    # but each call constructs a fresh network at Python-level).
+    nets = [build(int(s)) for s in jnp.arange(3)]
+    x = jnp.ones((1, 4, 1), dtype=jnp.float32)
+    for net in nets:
+        out = net(x, deterministic=True)
+        assert out.shape == (1, 2, 1)
+        assert np.all(np.isfinite(np.asarray(out)))
