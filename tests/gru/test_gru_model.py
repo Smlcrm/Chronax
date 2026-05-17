@@ -91,33 +91,48 @@ def test_predict_before_fit_raises():
         m.predict(h=12)
 
 
-def test_predict_with_level_raises_with_helpful_message():
-    """`predict(h, level=...)` raises with a clear message pointing the user
-    at the manual conformity_scores + add_confidence_intervals workflow.
+def test_predict_with_level_returns_interval_keys():
+    """predict(h, level=[80, 95]) returns mean + lo-XX/hi-XX via the
+    inherited BaseForecaster.add_confidence_intervals path. Possible
+    because the training loop is now nnx.scan-based and vmap-safe."""
+    from chronax.utils import ConformalIntervals
+    y = jnp.asarray(np.sin(np.arange(120) / 5.0), dtype=jnp.float32)
+    model = GRU(h=4, input_size=12, hidden_size=8, n_layers=1,
+                max_steps=2, batch_size=4, random_seed=0)
+    model.conformal_params = ConformalIntervals(n_windows=2, h=4)
+    model.fit(y)
+    fcst = model.predict(h=4, level=[80, 95])
+    for k in ("mean", "lo-80", "hi-80", "lo-95", "hi-95"):
+        assert k in fcst, f"missing {k!r} in {list(fcst.keys())}"
+        assert fcst[k].shape == (4,)
+        assert np.all(np.isfinite(np.asarray(fcst[k])))
+    assert float(fcst["lo-95"].mean()) <= float(fcst["mean"].mean())
+    assert float(fcst["mean"].mean()) <= float(fcst["hi-95"].mean())
 
-    The inherited path is not just slow on GRU — it's broken under vmap
-    (see test_conformity_scores_inheritance_smoke_xfail). So the right UX
-    is a clear NotImplementedError that documents the manual escape.
-    """
+
+def test_predict_with_level_raises_without_conformal_params():
+    """If level is set but conformal_params isn't, raise clearly with a
+    'minutes per call' cost warning so users don't accidentally invoke
+    a multi-minute compute path."""
     m = _tiny().fit(_make_y())
-    with pytest.raises(NotImplementedError) as exc_info:
+    with pytest.raises(ValueError) as exc_info:
         m.predict(h=12, level=[80, 95])
-    msg = str(exc_info.value)
-    assert "conformity_scores" in msg
-    assert "add_confidence_intervals" in msg
+    msg = str(exc_info.value).lower()
+    assert "conformal_params" in msg
+    assert "minutes" in msg, "error must surface the compute cost in user-readable units"
 
 
-def test_conformity_scores_raises_with_helpful_message():
-    """GRU.conformity_scores overrides the inherited (vmap-broken) path with
-    a clear NotImplementedError that documents the constraint and the manual
-    escape hatch.
-    """
-    m = _tiny()
-    with pytest.raises(NotImplementedError) as exc_info:
-        m.conformity_scores(_make_y())
-    msg = str(exc_info.value)
-    assert "vmap" in msg.lower() or "incompatible" in msg.lower()
-    assert "add_confidence_intervals" in msg
+def test_conformity_scores_returns_finite_2d_array():
+    """conformity_scores now works via the inherited (vmap-safe) path."""
+    from chronax.utils import ConformalIntervals
+    y = jnp.asarray(np.sin(np.arange(120) / 5.0), dtype=jnp.float32)
+    model = GRU(h=4, input_size=12, hidden_size=8, n_layers=1,
+                max_steps=2, batch_size=4, random_seed=0)
+    model.conformal_params = ConformalIntervals(n_windows=2, h=4)
+    model.fit(y)
+    cs = model.conformity_scores(y)
+    assert cs.ndim == 2
+    assert np.all(np.isfinite(np.asarray(cs)))
 
 
 def test_forecast_raises_on_exog():
@@ -225,24 +240,11 @@ def test_h_equals_one_and_tiny_input_size():
     assert np.isfinite(float(pred[0]))
 
 
-@pytest.mark.xfail(
-    reason=(
-        "BaseForecaster.conformity_scores uses jax.vmap over windows. GRU's "
-        "train() does a host-side float(loss) each step, which raises "
-        "ConcretizationTypeError under vmap. The GRU class therefore "
-        "overrides conformity_scores to raise NotImplementedError "
-        "immediately with a helpful pointer to the manual workflow — see "
-        "test_conformity_scores_raises_with_helpful_message. This test "
-        "pins the gap: a future refactor that makes train() vmap-safe AND "
-        "removes the override should flip this from xfail to xpass."
-    ),
-    strict=True,
-)
-def test_conformity_scores_inheritance_smoke_xfail():
-    """Documents the known incompatibility between BaseForecaster.conformity_scores
-    and GRU's vmap-unsafe training loop. If a future refactor makes train()
-    vmap-compatible AND removes the conformity_scores override, this test
-    should flip from xfail to xpass."""
+def test_conformity_scores_inheritance_smoke():
+    """Inherited BaseForecaster.conformity_scores works via the nnx.scan-based
+    train(). Originally xfailed pre-refactor because the loop did a host-side
+    float(loss) per step. Flipped to xpass after the lax.scan/nnx.scan rewrite
+    of train()."""
     from chronax.utils import ConformalIntervals
 
     y = jnp.asarray(np.sin(np.arange(120) / 5.0), dtype=jnp.float32)
