@@ -1,0 +1,7 @@
+library,dataset,mae_mean,mae_std,smape_mean,smape_std,wallclock_mean,wallclock_std,wallclock_mean_after,wallclock_std_after
+chronax,AirlinePassengers,41.1271,3.9538,8.746,0.8355,314.8528,50.5531,313.8623,58.3176
+chronax,DailyFemaleBirths,8.7905,0.8759,20.2933,2.1283,220.1481,4.4157,221.1747,4.3557
+chronax,RoomTemperature,1.1545,0.8598,5.0579,4.034,219.2934,2.1751,219.5918,2.3906
+nixtla,AirlinePassengers,48.0318,4.1377,9.9301,0.847,151.7478,6.3288,149.6583,4.9291
+nixtla,DailyFemaleBirths,8.0961,0.4506,18.5565,0.8744,144.7828,0.6511,144.7985,0.7508
+nixtla,RoomTemperature,0.8146,0.5517,3.5189,2.4641,145.403,0.2487,145.4768,0.2147

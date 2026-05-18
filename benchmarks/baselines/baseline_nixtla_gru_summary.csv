@@ -1,0 +1,4 @@
+dataset,mae_mean,mae_std,smape_mean,smape_std,wallclock_mean,wallclock_std
+AirlinePassengers,48.0318,4.1377,9.9301,0.847,179.2538,2.6149
+DailyFemaleBirths,8.0961,0.4506,18.5565,0.8744,170.8251,6.2925
+RoomTemperature,0.8146,0.5517,3.5189,2.4641,175.7643,36.9701
