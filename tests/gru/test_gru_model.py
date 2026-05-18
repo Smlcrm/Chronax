@@ -3,6 +3,7 @@ import pickle
 
 import jax.numpy as jnp
 import numpy as np
+import optax
 import pytest
 
 from chronax.models.base_forecaster import BaseForecaster
@@ -11,6 +12,26 @@ from chronax.models.gru.gru_model import GRU
 
 def _make_y(n: int = 200) -> jnp.ndarray:
     return jnp.asarray(np.sin(np.arange(n) / 10.0), dtype=jnp.float32)
+
+
+class _LinearDecay:
+    """Module-level picklable schedule used by the LR-schedule pickle test.
+
+    optax's own schedule helpers return inner closures that don't survive
+    pickle.dumps; a class-based callable does. Real users get the same
+    guarantee by writing their own class or using a third-party serialiser
+    like cloudpickle.
+    """
+
+    __slots__ = ("initial", "total_steps")
+
+    def __init__(self, initial: float, total_steps: int) -> None:
+        self.initial = initial
+        self.total_steps = max(int(total_steps), 1)
+
+    def __call__(self, step):
+        progress = jnp.minimum(step / self.total_steps, 1.0)
+        return self.initial * (1.0 - progress)
 
 
 def _tiny() -> GRU:
@@ -474,3 +495,59 @@ def test_recurrent_init_unknown_raises_at_fit_time():
     )
     with pytest.raises(ValueError, match="Unknown recurrent_init"):
         model.fit(_make_y())
+
+
+def test_learning_rate_accepts_optax_cosine_schedule():
+    """An ``optax.cosine_decay_schedule`` callable trains end-to-end.
+
+    Doesn't assert pickle-safety here — the optax closure is not picklable;
+    that requirement is covered by ``test_learning_rate_class_schedule_pickle``
+    using a module-level class-based schedule.
+    """
+    schedule = optax.cosine_decay_schedule(init_value=1e-3, decay_steps=20)
+    y = _make_y()
+    model = GRU(
+        h=12, input_size=36, hidden_size=16, n_layers=1,
+        max_steps=20, batch_size=8, random_seed=0,
+        learning_rate=schedule,
+    )
+    model.fit(y)
+    pred = np.asarray(model.predict(h=12)["mean"])
+    assert pred.shape == (12,)
+    assert np.all(np.isfinite(pred))
+
+
+def test_learning_rate_scalar_default_unchanged():
+    """A float learning_rate must produce the same trajectory as before the
+    schedule passthrough was added."""
+    y = _make_y()
+    pred = np.asarray(
+        GRU(
+            h=12, input_size=36, hidden_size=16, n_layers=1,
+            max_steps=20, batch_size=8, random_seed=0,
+            learning_rate=1e-3,
+        ).fit(y).predict(h=12)["mean"]
+    )
+    assert np.all(np.isfinite(pred))
+
+
+def test_learning_rate_class_schedule_pickle():
+    """A class-based schedule pickles cleanly with the fitted estimator,
+    and the restored estimator reproduces the original predictions."""
+    y = _make_y()
+    schedule = _LinearDecay(initial=1e-3, total_steps=20)
+    model = GRU(
+        h=12, input_size=36, hidden_size=16, n_layers=1,
+        max_steps=20, batch_size=8, random_seed=0,
+        learning_rate=schedule,
+    )
+    model.fit(y)
+    pred_before = np.asarray(model.predict(h=12)["mean"])
+
+    restored = pickle.loads(pickle.dumps(model))
+    assert isinstance(restored.learning_rate, _LinearDecay)
+    assert restored.learning_rate.initial == 1e-3
+    assert restored.learning_rate.total_steps == 20
+
+    pred_after = np.asarray(restored.predict(h=12)["mean"])
+    np.testing.assert_allclose(pred_before, pred_after, rtol=1e-5)

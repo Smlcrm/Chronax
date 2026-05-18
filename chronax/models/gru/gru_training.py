@@ -61,7 +61,7 @@ def train(
     input_size: int,
     max_steps: int,
     batch_size: int,
-    lr: float,
+    lr: optax.ScalarOrSchedule,
     seed: int,
     scaler: Scaler | None = None,
     loss_fn: LossFn = mae,

@@ -51,7 +51,7 @@ from __future__ import annotations
 import jax.numpy as jnp
 from flax import nnx
 
-from typing import Union
+from typing import Callable, Union
 
 from chronax.models.base_forecaster import BaseForecaster
 from chronax.models.gru.gru_losses import LossFn, resolve as _resolve_loss
@@ -88,7 +88,8 @@ class GRU(BaseForecaster):
         decoder_hidden_size (int): MLP decoder hidden dimension.
         dropout (float): Inter-layer dropout in the encoder.
         max_steps (int): Number of optimizer steps during fit.
-        learning_rate (float): Adam learning rate.
+        learning_rate: Adam learning rate — scalar or ``optax.ScalarOrSchedule``
+            callable. Passed through to ``optax.adam`` at fit time.
         batch_size (int): Number of windows per gradient step.
         random_seed (int): Seed used for parameter init and batch sampling.
         alias (str): Display name for external reporting.
@@ -105,7 +106,8 @@ class GRU(BaseForecaster):
         decoder_hidden_size (int): MLP-decoder hidden dimension.
         dropout (float): Inter-layer dropout rate.
         max_steps (int): Number of training steps.
-        learning_rate (float): Adam learning rate.
+        learning_rate: Adam learning rate; see Attributes for the
+            scalar-or-schedule contract.
         batch_size (int): Number of rolling windows sampled per step.
         random_seed (int): Random seed for reproducibility.
         alias (str): Friendly model name.
@@ -143,7 +145,7 @@ class GRU(BaseForecaster):
         decoder_hidden_size: int = 128,
         dropout: float = 0.0,
         max_steps: int = 1000,
-        learning_rate: float = 1e-3,
+        learning_rate: Union[float, Callable[[int], float]] = 1e-3,
         batch_size: int = 128,
         random_seed: int = 1,
         alias: str = "GRU",
@@ -165,7 +167,13 @@ class GRU(BaseForecaster):
             decoder_hidden_size (int): MLP-decoder hidden dimension.
             dropout (float): Inter-layer dropout rate.
             max_steps (int): Optimizer steps for ``fit``.
-            learning_rate (float): Adam learning rate.
+            learning_rate: Adam learning rate. Accepts either a scalar or any
+                ``optax.ScalarOrSchedule`` (a callable mapping step → LR, e.g.
+                ``optax.cosine_decay_schedule``). If you pass a callable and
+                later want to pickle the fitted estimator, ensure the
+                callable itself is picklable (a class-based callable or a
+                module-level helper — closures returned by some optax helpers
+                are not).
             batch_size (int): Windows per training step.
             random_seed (int): Random seed.
             alias (str): User-facing model name.
