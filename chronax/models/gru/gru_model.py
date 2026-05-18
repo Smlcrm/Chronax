@@ -51,7 +51,10 @@ from __future__ import annotations
 import jax.numpy as jnp
 from flax import nnx
 
+from typing import Union
+
 from chronax.models.base_forecaster import BaseForecaster
+from chronax.models.gru.gru_losses import LossFn, resolve as _resolve_loss
 from chronax.models.gru.gru_module import GRUNet
 from chronax.models.gru.gru_scaler import RobustScaler
 from chronax.models.gru.gru_training import predict_step, train
@@ -65,8 +68,8 @@ class GRU(BaseForecaster):
         Univariate gated-recurrent-unit forecaster. The encoder is a stack of
         Flax NNX `GRUCell`s rolled over time with `jax.lax.scan`; the decoder
         is a 2-layer MLP. Each rolling window is z-scored with a robust
-        median/MAD scaler, and the model is trained with MAE loss in scaled
-        space using Optax `adam`.
+        median/MAD scaler, and the model is trained in scaled space using
+        Optax `adam` with a pluggable point loss (see ``loss``).
 
     Maintenance Status:
         Active univariate forecaster. Integrates with the ``BaseForecaster``
@@ -144,6 +147,7 @@ class GRU(BaseForecaster):
         batch_size: int = 128,
         random_seed: int = 1,
         alias: str = "GRU",
+        loss: Union[str, LossFn] = "mae",
     ):
         """
         Initialize a GRU forecaster.
@@ -164,13 +168,18 @@ class GRU(BaseForecaster):
             batch_size (int): Windows per training step.
             random_seed (int): Random seed.
             alias (str): User-facing model name.
+            loss: Either a registered name (``"mae"``, ``"mse"``, ``"huber"``)
+                from :mod:`chronax.models.gru.gru_losses` or a callable with
+                signature ``(pred, target) -> scalar``. Strings are validated
+                lazily at ``fit`` time so the constructor stays cheap and the
+                resulting estimator pickles cleanly.
 
         Returns:
             None: Constructor initializes estimator state.
 
         Notes:
-            ``decoder_layers`` is hard-wired to 2 in v1; expose it again
-            once the decoder supports configurable depth.
+            ``decoder_layers`` is hard-wired to 2; expose it again once the
+            decoder supports configurable depth.
         """
         if input_size < 1:
             input_size = 3 * h
@@ -185,11 +194,17 @@ class GRU(BaseForecaster):
         self.batch_size = batch_size
         self.random_seed = random_seed
         self.alias = alias
+        self.loss = loss
         self.conformal_params = None
         self.model_: GRUNet | None = None
         self._context: jnp.ndarray | None = None  # last `input_size` of fit-time y
         self._train_y: jnp.ndarray | None = None  # full fit-time series (for fitted-values)
         self._scaler = RobustScaler()
+
+    @property
+    def _loss_fn(self) -> LossFn:
+        """Resolve ``self.loss`` to a callable. Lazy so string forms pickle."""
+        return _resolve_loss(self.loss)
 
     def _build_net(self) -> GRUNet:
         return GRUNet(
@@ -213,7 +228,7 @@ class GRU(BaseForecaster):
             ``self.max_steps`` Adam steps over rolling windows of length
             ``input_size + h`` sampled uniformly at random. Each window is
             normalized with the per-window robust scaler before the forward
-            pass; loss is MAE in scaled space.
+            pass; the configured ``loss`` is applied in scaled space.
 
         Args:
             y (jnp.ndarray): 1-D series of length ``>= input_size + h``.
@@ -249,6 +264,7 @@ class GRU(BaseForecaster):
             max_steps=self.max_steps, batch_size=self.batch_size,
             lr=self.learning_rate, seed=self.random_seed,
             scaler=self._scaler,
+            loss_fn=self._loss_fn,
         )
         self.model_ = net
         # Only the final `input_size` window is needed for direct-decoding

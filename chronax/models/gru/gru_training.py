@@ -7,6 +7,7 @@ import numpy as np
 import optax
 from flax import nnx
 
+from chronax.models.gru.gru_losses import LossFn, mae
 from chronax.models.gru.gru_module import GRUNet
 from chronax.models.gru.gru_scaler import RobustScaler, Scaler
 
@@ -30,15 +31,20 @@ def scaled_forward_loss(
     h: int,
     input_size: int,
     scaler: Scaler,
+    loss_fn: LossFn = mae,
 ) -> jnp.ndarray:
-    """MAE in scaled space. windows: [B, input_size+h] -> scalar."""
+    """Forward + point-loss in scaled space. windows: [B, input_size+h] -> scalar.
+
+    ``loss_fn`` must be a callable with signature ``(pred, target) -> scalar``;
+    see :mod:`chronax.models.gru.gru_losses` for the built-in registry.
+    """
     insample = windows[:, :input_size]
     target = windows[:, input_size:]
     shift, scale = scaler.stats(insample, axis=1)
     insample_z = scaler.transform(insample, shift, scale)
     target_z = scaler.transform(target, shift, scale)
     pred = model(insample_z[..., None], deterministic=False)
-    return jnp.mean(jnp.abs(pred[..., 0] - target_z))
+    return loss_fn(pred[..., 0], target_z)
 
 
 @nnx.jit
@@ -58,6 +64,7 @@ def train(
     lr: float,
     seed: int,
     scaler: Scaler | None = None,
+    loss_fn: LossFn = mae,
 ) -> jnp.ndarray:
     """Train `model` in place. Returns per-step training losses.
 
@@ -94,7 +101,8 @@ def train(
         model, opt = carry
         loss, grads = nnx.value_and_grad(
             lambda m: scaled_forward_loss(
-                m, batch, h=h, input_size=input_size, scaler=scaler
+                m, batch, h=h, input_size=input_size,
+                scaler=scaler, loss_fn=loss_fn,
             )
         )(model)
         opt.update(grads)

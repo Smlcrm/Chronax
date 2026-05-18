@@ -334,3 +334,80 @@ def test_pickle_round_trip_with_full_max_steps():
     pred_after = np.asarray(restored.predict(h=12)["mean"])
 
     np.testing.assert_allclose(pred_before, pred_after, rtol=1e-5)
+
+
+@pytest.mark.parametrize("loss_name", ["mae", "mse", "huber"])
+def test_loss_string_options_train_and_predict(loss_name):
+    """Each registered loss string trains a model that produces finite forecasts."""
+    y = _make_y()
+    model = GRU(
+        h=12, input_size=36, hidden_size=16, n_layers=1,
+        max_steps=20, batch_size=8, random_seed=0, loss=loss_name,
+    )
+    model.fit(y)
+    pred = np.asarray(model.predict(h=12)["mean"])
+    assert pred.shape == (12,)
+    assert np.all(np.isfinite(pred))
+
+
+def test_loss_default_matches_explicit_mae():
+    """Default loss must be MAE — the constructor signature change is meant to
+    be backwards compatible for everyone who didn't pass `loss=`."""
+    y = _make_y()
+    m_default = GRU(
+        h=12, input_size=36, hidden_size=16, n_layers=1,
+        max_steps=20, batch_size=8, random_seed=0,
+    ).fit(y)
+    m_explicit = GRU(
+        h=12, input_size=36, hidden_size=16, n_layers=1,
+        max_steps=20, batch_size=8, random_seed=0, loss="mae",
+    ).fit(y)
+    np.testing.assert_allclose(
+        np.asarray(m_default.predict(h=12)["mean"]),
+        np.asarray(m_explicit.predict(h=12)["mean"]),
+        rtol=1e-6,
+    )
+
+
+def test_loss_custom_callable_trains():
+    """A user-supplied callable should be honoured at fit time."""
+    def my_mae(pred, target):
+        return jnp.mean(jnp.abs(pred - target))
+
+    y = _make_y()
+    model = GRU(
+        h=12, input_size=36, hidden_size=16, n_layers=1,
+        max_steps=20, batch_size=8, random_seed=0, loss=my_mae,
+    )
+    model.fit(y)
+    pred = np.asarray(model.predict(h=12)["mean"])
+    assert np.all(np.isfinite(pred))
+
+
+def test_loss_string_pickle_round_trip_preserves_predictions():
+    """Pickling a GRU with loss='mse' must keep the loss setting alive
+    and produce identical predictions after restore."""
+    y = _make_y()
+    model = GRU(
+        h=12, input_size=36, hidden_size=16, n_layers=1,
+        max_steps=20, batch_size=8, random_seed=0, loss="mse",
+    )
+    model.fit(y)
+    pred_before = np.asarray(model.predict(h=12)["mean"])
+
+    restored = pickle.loads(pickle.dumps(model))
+    assert restored.loss == "mse"
+
+    pred_after = np.asarray(restored.predict(h=12)["mean"])
+    np.testing.assert_allclose(pred_before, pred_after, rtol=1e-5)
+
+
+def test_loss_unknown_string_raises_at_fit_time():
+    """An invalid loss name surfaces a clear ValueError on fit, not at init —
+    keeps the constructor cheap and side-effect free."""
+    model = GRU(
+        h=12, input_size=36, hidden_size=16, n_layers=1,
+        max_steps=5, batch_size=2, random_seed=0, loss="rmse",
+    )
+    with pytest.raises(ValueError, match="Unknown loss"):
+        model.fit(_make_y())
