@@ -148,6 +148,7 @@ class GRU(BaseForecaster):
         random_seed: int = 1,
         alias: str = "GRU",
         loss: Union[str, LossFn] = "mae",
+        recurrent_init: str = "uniform",
     ):
         """
         Initialize a GRU forecaster.
@@ -173,6 +174,12 @@ class GRU(BaseForecaster):
                 signature ``(pred, target) -> scalar``. Strings are validated
                 lazily at ``fit`` time so the constructor stays cheap and the
                 resulting estimator pickles cleanly.
+            recurrent_init: Initializer for the GRU recurrent kernels.
+                ``"uniform"`` (default) samples from Uniform(-1/sqrt(H), 1/sqrt(H));
+                ``"orthogonal"`` uses Saxe-style orthogonal initialization, which
+                stabilises gradients through time and often helps with longer
+                ``input_size``. The input kernel and biases use the uniform
+                init regardless.
 
         Returns:
             None: Constructor initializes estimator state.
@@ -195,6 +202,7 @@ class GRU(BaseForecaster):
         self.random_seed = random_seed
         self.alias = alias
         self.loss = loss
+        self.recurrent_init = recurrent_init
         self.conformal_params = None
         self.model_: GRUNet | None = None
         self._context: jnp.ndarray | None = None  # last `input_size` of fit-time y
@@ -212,11 +220,12 @@ class GRU(BaseForecaster):
             encoder_hidden=self.hidden_size,
             encoder_layers=self.n_layers,
             decoder_hidden=self.decoder_hidden_size,
-            decoder_layers=2,  # v1 only; GRUNet enforces this invariant.
+            decoder_layers=2,  # GRUNet enforces this invariant.
             dropout=self.dropout,
             h=self.h,
             input_size=self.input_size,
             rngs=nnx.Rngs(self.random_seed),
+            recurrent_init=self.recurrent_init,
         )
 
     def fit(self, y: jnp.ndarray, X: jnp.ndarray | None = None) -> "GRU":

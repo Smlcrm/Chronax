@@ -411,3 +411,66 @@ def test_loss_unknown_string_raises_at_fit_time():
     )
     with pytest.raises(ValueError, match="Unknown loss"):
         model.fit(_make_y())
+
+
+@pytest.mark.parametrize("init_name", ["uniform", "orthogonal"])
+def test_recurrent_init_options_train_and_predict(init_name):
+    """Both supported recurrent inits train + produce finite forecasts."""
+    y = _make_y()
+    model = GRU(
+        h=12, input_size=36, hidden_size=16, n_layers=1,
+        max_steps=20, batch_size=8, random_seed=0,
+        recurrent_init=init_name,
+    )
+    model.fit(y)
+    pred = np.asarray(model.predict(h=12)["mean"])
+    assert pred.shape == (12,)
+    assert np.all(np.isfinite(pred))
+
+
+def test_recurrent_init_default_is_uniform():
+    """Default behaviour must be unchanged for existing callers."""
+    y = _make_y()
+    m_default = GRU(
+        h=12, input_size=36, hidden_size=16, n_layers=1,
+        max_steps=20, batch_size=8, random_seed=0,
+    ).fit(y)
+    m_explicit = GRU(
+        h=12, input_size=36, hidden_size=16, n_layers=1,
+        max_steps=20, batch_size=8, random_seed=0,
+        recurrent_init="uniform",
+    ).fit(y)
+    np.testing.assert_allclose(
+        np.asarray(m_default.predict(h=12)["mean"]),
+        np.asarray(m_explicit.predict(h=12)["mean"]),
+        rtol=1e-6,
+    )
+
+
+def test_recurrent_init_orthogonal_pickle_round_trip():
+    """A fitted orthogonal-init GRU must survive pickle and reproduce predictions."""
+    y = _make_y()
+    model = GRU(
+        h=12, input_size=36, hidden_size=16, n_layers=1,
+        max_steps=20, batch_size=8, random_seed=0,
+        recurrent_init="orthogonal",
+    )
+    model.fit(y)
+    pred_before = np.asarray(model.predict(h=12)["mean"])
+
+    restored = pickle.loads(pickle.dumps(model))
+    assert restored.recurrent_init == "orthogonal"
+
+    pred_after = np.asarray(restored.predict(h=12)["mean"])
+    np.testing.assert_allclose(pred_before, pred_after, rtol=1e-5)
+
+
+def test_recurrent_init_unknown_raises_at_fit_time():
+    """Unknown initializer name surfaces a clear ValueError on fit."""
+    model = GRU(
+        h=12, input_size=36, hidden_size=16, n_layers=1,
+        max_steps=5, batch_size=2, random_seed=0,
+        recurrent_init="lecun_normal",
+    )
+    with pytest.raises(ValueError, match="Unknown recurrent_init"):
+        model.fit(_make_y())
