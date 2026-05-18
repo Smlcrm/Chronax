@@ -69,16 +69,13 @@ class GRU(BaseForecaster):
         space using Optax `adam`.
 
     Maintenance Status:
-        Frozen v1 — this model is shipped as-is and will not receive feature
-        additions or bug-fix releases unless a downstream consumer surfaces a
-        correctness issue. Knobs intentionally kept minimal. For wider
-        configuration (custom optimizer, custom loss, exogenous variables,
-        recursive decoding, early stopping), prefer one of the stats-based
-        forecasters in ``chronax.models`` or a peer neural library.
+        Active univariate forecaster. Integrates with the ``BaseForecaster``
+        interface, including conformal prediction intervals via
+        ``predict(level=...)``, pickle round-trip, and
+        ``forecast(fitted=True)``.
 
     Attributes:
-        uses_exog (bool): Indicates support for exogenous regressors. False
-            in v1.
+        uses_exog (bool): Indicates support for exogenous regressors.
         h (int): Forecast horizon (model is direct-decoded for exactly `h`
             steps; `predict(h=k)` slices for any ``k <= h``).
         input_size (int): Length of the input window. Defaults to ``3 * h``
@@ -93,7 +90,9 @@ class GRU(BaseForecaster):
         random_seed (int): Seed used for parameter init and batch sampling.
         alias (str): Display name for external reporting.
         ``model_`` (GRUNet | None): Fitted network after ``fit``.
-        conformal_params: Always None in v1 (intervals not implemented).
+        conformal_params: Conformal calibration set by ``BaseForecaster``
+            when ``fit`` is given ``prediction_intervals``; consumed by
+            ``predict(level=...)``.
 
     Args:
         h (int): Forecast horizon.
