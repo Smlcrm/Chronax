@@ -102,8 +102,15 @@ def train(
 
     _, losses = step((model, optimizer), batches)  # shape: [max_steps]
 
-    # Single host sync: check finiteness once, after the scan.
-    losses_host = np.asarray(losses)
+    # Finite check: only when running concretely. When train() runs under a
+    # higher-level jax trace (e.g. BaseForecaster.conformity_scores's vmap),
+    # the loss array is a tracer and np.asarray would raise. In that path
+    # we return the traced array and let the caller handle non-finite values
+    # downstream (typically they'd surface as NaN in predictions).
+    try:
+        losses_host = np.asarray(losses)
+    except jax.errors.TracerArrayConversionError:
+        return losses
     bad = ~np.isfinite(losses_host)
     if bad.any():
         first_bad = int(np.argmax(bad))
