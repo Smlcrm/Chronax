@@ -115,3 +115,47 @@ class PatchEmbedding(nnx.Module):
         z = self.proj(patches.astype(jnp.float32))
         z = z + self.pos.value[None, :, :]
         return self.dropout(z, deterministic=deterministic)
+
+
+class MultiHeadAttention(nnx.Module):
+    """Multi-head self-attention with Realformer residual-attention threading.
+
+    Faithful to NF's ``res_attention=True`` path: pre-softmax scores are added
+    across layers via ``prev`` and the scaling factor ``d_k**-0.5`` is a frozen
+    constant (NF uses ``lsa=False``). Hand-rolled (not
+    ``jax.nn.dot_product_attention``) because that fused path only matches NF's
+    ``res_attention=False`` branch.
+    """
+
+    def __init__(self, *, hidden_size, n_heads, attn_dropout, proj_dropout, rngs: nnx.Rngs):
+        if hidden_size % n_heads != 0:
+            raise ValueError(f"hidden_size ({hidden_size}) must be divisible by n_heads ({n_heads}).")
+        self.n_heads = n_heads
+        self.d_k = hidden_size // n_heads
+        self.scale = float(self.d_k ** -0.5)
+        self.w_q = nnx.Linear(hidden_size, hidden_size, rngs=rngs)
+        self.w_k = nnx.Linear(hidden_size, hidden_size, rngs=rngs)
+        self.w_v = nnx.Linear(hidden_size, hidden_size, rngs=rngs)
+        self.w_o = nnx.Linear(hidden_size, hidden_size, rngs=rngs)
+        self.attn_dropout = nnx.Dropout(rate=attn_dropout, rngs=rngs)
+        self.proj_dropout = nnx.Dropout(rate=proj_dropout, rngs=rngs)
+
+    def _split(self, x):
+        B, T, _ = x.shape
+        return x.reshape(B, T, self.n_heads, self.d_k).transpose(0, 2, 1, 3)  # [B, H, T, d_k]
+
+    def __call__(self, x, prev, deterministic: bool):
+        """x: [B, T, hidden] -> (out: [B, T, hidden], scores: [B, H, T, T])."""
+        q = self._split(self.w_q(x))
+        k = self._split(self.w_k(x))
+        v = self._split(self.w_v(x))
+        scores = jnp.einsum("bhqd,bhkd->bhqk", q, k) * self.scale
+        if prev is not None:
+            scores = scores + prev
+        weights = jax.nn.softmax(scores, axis=-1)
+        weights = self.attn_dropout(weights, deterministic=deterministic)
+        ctx = jnp.einsum("bhqk,bhkd->bhqd", weights, v)  # [B, H, T, d_k]
+        B, _, T, _ = ctx.shape
+        ctx = ctx.transpose(0, 2, 1, 3).reshape(B, T, self.n_heads * self.d_k)
+        out = self.proj_dropout(self.w_o(ctx), deterministic=deterministic)
+        return out, scores

@@ -85,3 +85,28 @@ def test_patch_embedding_shape_and_pos():
     assert out.dtype == jnp.float32
     # positional encoding is a learnable [patch_num, hidden] param
     assert emb.pos.value.shape == (pn, hidden)
+
+
+from chronax.models.patchtst.patchtst_module import MultiHeadAttention
+
+
+def test_mha_shape_and_returns_scores():
+    B, T, hidden, heads = 2, 7, 32, 4
+    mha = MultiHeadAttention(hidden_size=hidden, n_heads=heads, attn_dropout=0.0,
+                             proj_dropout=0.0, rngs=nnx.Rngs(0))
+    x = jnp.ones((B, T, hidden), dtype=jnp.float32)
+    out, scores = mha(x, prev=None, deterministic=True)
+    assert out.shape == (B, T, hidden)
+    assert scores.shape == (B, heads, T, T)
+
+
+def test_mha_prev_changes_output():
+    B, T, hidden, heads = 1, 5, 16, 2
+    mha = MultiHeadAttention(hidden_size=hidden, n_heads=heads, attn_dropout=0.0,
+                             proj_dropout=0.0, rngs=nnx.Rngs(0))
+    # Non-constant input: an all-ones input makes every position identical, so the
+    # prev-score residual cannot change the (constant) attention output.
+    x = jnp.asarray(np.random.RandomState(2).randn(B, T, hidden), dtype=jnp.float32)
+    out0, scores0 = mha(x, prev=None, deterministic=True)
+    out1, _ = mha(x, prev=scores0 + 5.0, deterministic=True)
+    assert not np.allclose(np.asarray(out0), np.asarray(out1))
