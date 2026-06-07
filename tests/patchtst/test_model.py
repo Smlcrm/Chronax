@@ -141,3 +141,74 @@ def test_loss_string_pickle_round_trip(loss_name):
 def test_patchtst_importable_from_models_namespace():
     from chronax.models import PatchTST as P
     assert P is PatchTST
+
+
+from chronax.utils import ConformalIntervals
+
+
+def test_constant_series_returns_finite():
+    m = _tiny().fit(jnp.ones(200, dtype=jnp.float32))
+    assert jnp.all(jnp.isfinite(m.predict(h=12)["mean"]))
+
+
+def test_h_equals_one():
+    m = PatchTST(h=1, input_size=12, hidden_size=8, n_heads=2, encoder_layers=1,
+                 linear_hidden_size=16, max_steps=5, windows_batch_size=16, random_seed=0)
+    m.fit(_make_y(60))
+    assert m.predict(h=1)["mean"].shape == (1,)
+
+
+def test_forecast_equals_fit_then_predict_same_seed():
+    y = _make_y()
+    a = _tiny().forecast(y, h=12)["mean"]
+    b = _tiny().fit(y).predict(h=12)["mean"]
+    np.testing.assert_allclose(np.asarray(a), np.asarray(b), rtol=1e-5, atol=1e-5)
+
+
+def test_forecast_fitted_has_nan_head_and_finite_tail():
+    res = _tiny().forecast(_make_y(), h=12, fitted=True)
+    fitted = np.asarray(res["fitted"])
+    assert fitted.shape == (200,)
+    assert np.all(np.isnan(fitted[:36]))
+    assert np.all(np.isfinite(fitted[36:]))
+
+
+def test_build_net_works_under_vmap_loop_construction():
+    # precursor to conformity_scores' vmap: constructing the net in a loop
+    nets = [_tiny()._build_net() for _ in range(3)]
+    assert len(nets) == 3
+
+
+def test_predict_with_level_returns_interval_keys():
+    m = PatchTST(h=4, input_size=12, hidden_size=8, n_heads=2, encoder_layers=1,
+                 linear_hidden_size=16, max_steps=2, windows_batch_size=16, random_seed=0)
+    m.fit(_make_y(80))
+    m.conformal_params = ConformalIntervals(h=4, n_windows=3)
+    out = m.predict(h=4, level=[80])
+    assert "lo-80" in out and "hi-80" in out
+
+
+def test_predict_with_level_raises_without_conformal_params():
+    m = _tiny().fit(_make_y())
+    with pytest.raises(ValueError, match="conformal_params"):
+        m.predict(h=12, level=[80])
+
+
+def test_conformity_scores_returns_finite_2d_array():
+    m = PatchTST(h=4, input_size=12, hidden_size=8, n_heads=2, encoder_layers=1,
+                 linear_hidden_size=16, max_steps=2, windows_batch_size=16, random_seed=0)
+    m.fit(_make_y(80))
+    m.conformal_params = ConformalIntervals(h=4, n_windows=3)
+    cs = m.conformity_scores(_make_y(80))
+    assert cs.ndim == 2 and cs.shape[1] == 4
+    assert jnp.all(jnp.isfinite(cs))
+
+
+def test_patch_len_clamp_fires_on_short_input():
+    # input_size + stride < patch_len forces the clamp; forward must still work.
+    m = PatchTST(h=2, input_size=4, patch_len=16, stride=2, hidden_size=8, n_heads=2,
+                 encoder_layers=1, linear_hidden_size=16, max_steps=3,
+                 windows_batch_size=8, random_seed=0)
+    m.fit(_make_y(40))
+    out = m.predict(h=2)["mean"]
+    assert out.shape == (2,) and jnp.all(jnp.isfinite(out))
