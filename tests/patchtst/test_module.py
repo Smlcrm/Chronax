@@ -70,3 +70,18 @@ def test_patchify_end_padding_replicates_last():
     assert patches.shape == (1, 1, patch_len)
     # padded tail must equal the last value (edge replication)
     assert float(patches[0, 0, -1]) == float(x[0, -1])
+
+
+from chronax.models.patchtst.patchtst_module import PatchEmbedding
+
+
+def test_patch_embedding_shape_and_pos():
+    B, patch_len, hidden, pn = 2, 16, 32, 7
+    emb = PatchEmbedding(patch_len=patch_len, hidden_size=hidden, patch_num=pn,
+                         dropout=0.0, rngs=nnx.Rngs(0))
+    patches = jnp.zeros((B, pn, patch_len), dtype=jnp.float32)
+    out = emb(patches, deterministic=True)
+    assert out.shape == (B, pn, hidden)
+    assert out.dtype == jnp.float32
+    # positional encoding is a learnable [patch_num, hidden] param
+    assert emb.pos.value.shape == (pn, hidden)

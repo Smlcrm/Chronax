@@ -84,3 +84,34 @@ def patchify(x: jnp.ndarray, *, patch_len: int, stride: int) -> jnp.ndarray:
     offs = jnp.arange(patch_len)
     idx = starts[:, None] + offs[None, :]               # [patch_num, patch_len]
     return x[:, idx]                                     # [B, patch_num, patch_len]
+
+
+class _UniformPos:
+    """Picklable Uniform(-0.02, 0.02) initializer for the positional encoding."""
+
+    __slots__ = ()
+
+    def __call__(self, key, shape, dtype=jnp.float32):
+        return jax.random.uniform(key, shape, dtype, minval=-0.02, maxval=0.02)
+
+
+class PatchEmbedding(nnx.Module):
+    """Linear patch projection + learnable positional encoding + residual dropout.
+
+    Mirrors NF's ``W_P`` (``Linear(patch_len -> hidden_size)``) plus
+    ``positional_encoding(pe='zeros', learn_pe=True)`` — a learnable
+    ``[patch_num, hidden_size]`` parameter initialized ``Uniform(-0.02, 0.02)``.
+    Receives pre-cut patches; patchify lives in ``PatchTSTNet``.
+    """
+
+    def __init__(self, *, patch_len, hidden_size, patch_num, dropout, rngs: nnx.Rngs):
+        self.proj = nnx.Linear(patch_len, hidden_size, rngs=rngs)
+        key = rngs.params()
+        self.pos = nnx.Param(_UniformPos()(key, (patch_num, hidden_size)))
+        self.dropout = nnx.Dropout(rate=dropout, rngs=rngs)
+
+    def __call__(self, patches: jnp.ndarray, deterministic: bool) -> jnp.ndarray:
+        """patches: [B, patch_num, patch_len] -> tokens: [B, patch_num, hidden_size]."""
+        z = self.proj(patches.astype(jnp.float32))
+        z = z + self.pos.value[None, :, :]
+        return self.dropout(z, deterministic=deterministic)
