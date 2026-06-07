@@ -136,3 +136,8 @@ def test_loss_string_pickle_round_trip(loss_name):
         np.asarray(m2.predict(h=12)["mean"]), np.asarray(m.predict(h=12)["mean"]),
         rtol=1e-5, atol=1e-5,
     )
+
+
+def test_patchtst_importable_from_models_namespace():
+    from chronax.models import PatchTST as P
+    assert P is PatchTST

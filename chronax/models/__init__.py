@@ -48,6 +48,8 @@ from .randomWalkWithDrift import RandomWalkWithDrift
 
 from .gru import GRU
 
+from .patchtst import PatchTST
+
 from .batched_forecaster import BatchedForecaster
 
 __all__ = [
@@ -81,6 +83,7 @@ __all__ = [
     "TSB",
     "RandomWalkWithDrift",
     "GRU",
+    "PatchTST",
     "BatchedForecaster",
 ]
 
