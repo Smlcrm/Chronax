@@ -98,3 +98,10 @@ def train(model, y, *, h, input_size, max_steps, windows_batch_size, lr, seed,
             f"`windows_batch_size`, or checking the input series for extreme values."
         )
     return jnp.asarray(losses_host)
+
+
+def predict_step(model, y, *, h, input_size):
+    """Forecast next h steps from the final ``input_size`` of y. Returns (h,)."""
+    x = y[-input_size:][None, :, None]                 # [1, L, 1]
+    pred = _jit_forward_deterministic(model, x)        # [1, h, 1]
+    return pred[0, :, 0]

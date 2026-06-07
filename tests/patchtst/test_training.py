@@ -6,7 +6,9 @@ import pytest
 from flax import nnx
 
 from chronax.models.patchtst.patchtst_module import PatchTSTNet
-from chronax.models.patchtst.patchtst_training import build_windows, forward_loss, train
+from chronax.models.patchtst.patchtst_training import (
+    build_windows, forward_loss, predict_step, train,
+)
 
 
 def _make_y(n=200):
@@ -54,3 +56,13 @@ def test_train_deterministic_with_same_seed():
     l2 = train(n2, y, h=12, input_size=36, max_steps=10,
                windows_batch_size=64, lr=1e-3, seed=0)
     np.testing.assert_allclose(np.asarray(l1), np.asarray(l2), rtol=1e-5)
+
+
+def test_predict_step_shape_and_idempotent():
+    net = _net()
+    y = _make_y()
+    train(net, y, h=12, input_size=36, max_steps=5, windows_batch_size=64, lr=1e-3, seed=0)
+    p1 = predict_step(net, y[-36:], h=12, input_size=36)
+    p2 = predict_step(net, y[-36:], h=12, input_size=36)
+    assert p1.shape == (12,)
+    np.testing.assert_allclose(np.asarray(p1), np.asarray(p2), rtol=1e-6)
