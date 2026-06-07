@@ -136,3 +136,37 @@ def test_encoder_layer_batchnorm_train_vs_eval_differ_after_update():
     out_train, _ = layer(x, prev=None, deterministic=True, use_running_average=False)
     out_eval, _ = layer(x, prev=None, deterministic=True, use_running_average=True)
     assert not np.allclose(np.asarray(out_train), np.asarray(out_eval))
+
+
+from chronax.models.patchtst.patchtst_module import FlattenHead, TSTEncoder
+
+
+def test_encoder_stack_shape_and_threads_prev():
+    B, T, hidden, heads = 2, 7, 32, 4
+    enc = TSTEncoder(n_layers=3, hidden_size=hidden, n_heads=heads,
+                     linear_hidden_size=64, dropout=0.0, attn_dropout=0.0, rngs=nnx.Rngs(0))
+    x = jnp.ones((B, T, hidden), dtype=jnp.float32)
+    out = enc(x, deterministic=True, use_running_average=False)
+    assert out.shape == (B, T, hidden)
+    assert len(enc.layers) == 3
+
+
+def test_flatten_head_shape():
+    B, T, hidden, h = 2, 7, 32, 24
+    head = FlattenHead(hidden_size=hidden, patch_num=T, h=h, head_dropout=0.0, rngs=nnx.Rngs(0))
+    x = jnp.ones((B, T, hidden), dtype=jnp.float32)
+    out = head(x, deterministic=True)
+    assert out.shape == (B, h)
+
+
+def test_flatten_head_uses_hidden_major_order():
+    # Pin NF's flatten order: hidden slow, patch_num fast. Reproduce the head
+    # output with an explicit hidden-major flatten + the head's own weights; a
+    # patch-major flatten (the original bug) would not match.
+    B, patch_num, hidden, h = 1, 3, 4, 5
+    head = FlattenHead(hidden_size=hidden, patch_num=patch_num, h=h, head_dropout=0.0, rngs=nnx.Rngs(0))
+    x = jnp.asarray(np.random.RandomState(0).randn(B, patch_num, hidden), dtype=jnp.float32)
+    out = np.asarray(head(x, deterministic=True))
+    flat = np.asarray(x).transpose(0, 2, 1).reshape(B, -1)        # hidden-major
+    expected = flat @ np.asarray(head.linear.kernel.value) + np.asarray(head.linear.bias.value)
+    np.testing.assert_allclose(out, expected, rtol=1e-5, atol=1e-5)

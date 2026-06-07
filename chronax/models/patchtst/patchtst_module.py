@@ -211,3 +211,46 @@ class TSTEncoderLayer(nnx.Module):
         x = x + self.dropout_ffn(ff, deterministic=deterministic)
         x = self.norm_ffn(x, use_running_average=use_running_average)
         return x, scores
+
+
+class TSTEncoder(nnx.Module):
+    """Stack of ``n_layers`` encoder layers, threading residual attention scores."""
+
+    def __init__(self, *, n_layers, hidden_size, n_heads, linear_hidden_size,
+                 dropout, attn_dropout, activation="gelu", rngs: nnx.Rngs):
+        self.layers = [
+            TSTEncoderLayer(
+                hidden_size=hidden_size, n_heads=n_heads,
+                linear_hidden_size=linear_hidden_size, dropout=dropout,
+                attn_dropout=attn_dropout, activation=activation, rngs=rngs,
+            )
+            for _ in range(n_layers)
+        ]
+
+    def __call__(self, x, deterministic: bool, use_running_average: bool):
+        scores = None
+        for layer in self.layers:
+            x, scores = layer(x, prev=scores, deterministic=deterministic,
+                              use_running_average=use_running_average)
+        return x
+
+
+class FlattenHead(nnx.Module):
+    """Flatten and project to the horizon (univariate).
+
+    NF flattens its encoder output ``[B, hidden, patch_num]`` with
+    ``nn.Flatten(start_dim=-2)`` — HIDDEN-major (hidden is the slow axis). Our
+    encoder produces ``[B, patch_num, hidden]``, so we transpose to
+    ``[B, hidden, patch_num]`` BEFORE flattening, otherwise the linear-head weight
+    columns are permuted relative to NF and the parity gate fails (measured:
+    max|Δ|=1.81 patch-major vs 7.4e-5 hidden-major).
+    """
+
+    def __init__(self, *, hidden_size, patch_num, h, head_dropout, rngs: nnx.Rngs):
+        self.linear = nnx.Linear(hidden_size * patch_num, h, rngs=rngs)
+        self.dropout = nnx.Dropout(rate=head_dropout, rngs=rngs)
+
+    def __call__(self, x: jnp.ndarray, deterministic: bool) -> jnp.ndarray:
+        B = x.shape[0]
+        flat = x.transpose(0, 2, 1).reshape(B, -1)   # [B, patch_num, hidden] -> hidden-major
+        return self.dropout(self.linear(flat), deterministic=deterministic)
