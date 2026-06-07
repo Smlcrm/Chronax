@@ -169,3 +169,29 @@ class PatchTST(BaseForecaster):
         finite_part = pred[:, 0, 0]                         # one-step-ahead
         nan_head = jnp.full((self.input_size,), jnp.nan, dtype=jnp.float32)
         return jnp.concatenate([nan_head, finite_part])
+
+    def __getstate__(self) -> dict:
+        """Serialize only NNX state (params + BatchNorm running stats + RNG).
+
+        ``nnx.split`` captures every Variable type, including ``BatchStat``
+        running mean/var. The GraphDef holds references to JAX ufuncs that are
+        not pickle-stable, so we drop it and rebuild via ``_build_net()`` on
+        unpickle, then reload the saved state with ``nnx.update``.
+        """
+        state = self.__dict__.copy()
+        if state.get("model_") is not None:
+            _, full_state = nnx.split(state["model_"])
+            state["model_"] = ("__params_only__", full_state)
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        m = state.get("model_")
+        if isinstance(m, tuple) and m and m[0] == "__params_only__":
+            saved_state = m[1]
+            state["model_"] = None
+            self.__dict__.update(state)
+            net = self._build_net()
+            nnx.update(net, saved_state)
+            self.model_ = net
+            return
+        self.__dict__.update(state)

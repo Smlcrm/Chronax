@@ -5,6 +5,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from flax import nnx
 
 from chronax.models.base_forecaster import BaseForecaster
 from chronax.models.patchtst.patchtst_model import PatchTST
@@ -91,3 +92,47 @@ def test_hidden_not_divisible_by_heads_raises_at_fit():
                  max_steps=2, windows_batch_size=8, random_seed=0)
     with pytest.raises(ValueError, match="divisible"):
         m.fit(_make_y())
+
+
+def test_pickle_round_trip_preserves_predictions():
+    m = _tiny().fit(_make_y())
+    before = np.asarray(m.predict(h=12)["mean"])
+    m2 = pickle.loads(pickle.dumps(m))
+    after = np.asarray(m2.predict(h=12)["mean"])
+    np.testing.assert_allclose(after, before, rtol=1e-5, atol=1e-5)
+
+
+def test_pickle_round_trip_preserves_batchnorm_running_stats():
+    m = _tiny().fit(_make_y())
+    _, state_before = nnx.split(m.model_)
+    m2 = pickle.loads(pickle.dumps(m))
+    _, state_after = nnx.split(m2.model_)
+    flat_b = nnx.to_flat_state(state_before)
+    flat_a = nnx.to_flat_state(state_after)
+
+    def _arrays(flat):
+        # Skip Rngs PRNGKey variables — np.asarray on a key<fry> dtype raises.
+        out = {}
+        for p, v in flat:
+            val = getattr(v, "value", None)
+            if val is None or str(getattr(val, "dtype", "")).startswith("key"):
+                continue
+            out[tuple(p)] = val
+        return out
+
+    bn_before, bn_after = _arrays(flat_b), _arrays(flat_a)
+    assert bn_before.keys() == bn_after.keys()
+    for k in bn_before:
+        np.testing.assert_array_equal(np.asarray(bn_before[k]), np.asarray(bn_after[k]))
+
+
+@pytest.mark.parametrize("loss_name", ["mae", "mse", "huber"])
+def test_loss_string_pickle_round_trip(loss_name):
+    m = PatchTST(h=12, input_size=36, hidden_size=16, n_heads=2, encoder_layers=1,
+                 linear_hidden_size=32, max_steps=10, windows_batch_size=64,
+                 random_seed=0, loss=loss_name).fit(_make_y())
+    m2 = pickle.loads(pickle.dumps(m))
+    np.testing.assert_allclose(
+        np.asarray(m2.predict(h=12)["mean"]), np.asarray(m.predict(h=12)["mean"]),
+        rtol=1e-5, atol=1e-5,
+    )
