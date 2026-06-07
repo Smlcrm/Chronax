@@ -6,7 +6,7 @@ import pytest
 from flax import nnx
 
 from chronax.models.patchtst.patchtst_module import PatchTSTNet
-from chronax.models.patchtst.patchtst_training import build_windows, forward_loss
+from chronax.models.patchtst.patchtst_training import build_windows, forward_loss, train
 
 
 def _make_y(n=200):
@@ -34,3 +34,23 @@ def test_forward_loss_returns_scalar():
     loss = forward_loss(net, w[:8], h=12, input_size=36)
     assert loss.shape == ()
     assert jnp.isfinite(loss)
+
+
+def test_train_gradient_step_decreases_loss():
+    net = _net()
+    y = _make_y()
+    losses = train(net, y, h=12, input_size=36, max_steps=30,
+                   windows_batch_size=64, lr=1e-3, seed=0)
+    assert losses.shape == (30,)
+    assert float(losses[-1]) < float(losses[0])
+
+
+def test_train_deterministic_with_same_seed():
+    y = _make_y()
+    n1 = _net()
+    l1 = train(n1, y, h=12, input_size=36, max_steps=10,
+               windows_batch_size=64, lr=1e-3, seed=0)
+    n2 = _net()
+    l2 = train(n2, y, h=12, input_size=36, max_steps=10,
+               windows_batch_size=64, lr=1e-3, seed=0)
+    np.testing.assert_allclose(np.asarray(l1), np.asarray(l2), rtol=1e-5)
