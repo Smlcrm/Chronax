@@ -159,3 +159,55 @@ class MultiHeadAttention(nnx.Module):
         ctx = ctx.transpose(0, 2, 1, 3).reshape(B, T, self.n_heads * self.d_k)
         out = self.proj_dropout(self.w_o(ctx), deterministic=deterministic)
         return out, scores
+
+
+def _resolve_activation(name: str):
+    """Map an activation name to a callable. NF uses EXACT (erf) GELU by default —
+    ``jax.nn.gelu`` defaults to the tanh approximation, which diverges ~1e-3 per
+    call and would fail the weight-parity gate, so pass ``approximate=False``.
+    """
+    if name == "gelu":
+        return lambda z: jax.nn.gelu(z, approximate=False)  # == torch nn.GELU()
+    if name == "relu":
+        return jax.nn.relu
+    raise ValueError(f"Unknown activation {name!r}. Available: 'gelu', 'relu'.")
+
+
+class TSTEncoderLayer(nnx.Module):
+    """One transformer encoder layer: residual MHA + BatchNorm, then FFN + BatchNorm.
+
+    Post-norm (NF default ``pre_norm=False``). BatchNorm with ``axis=-1`` over
+    ``[B, patch_num, hidden]`` matches NF's transpose/BatchNorm1d sandwich;
+    ``momentum=0.9`` matches torch BatchNorm1d's ``momentum=0.1`` running-stat
+    decay. (flax updates running-var with the biased/ddof=0 batch variance vs
+    torch's unbiased/ddof=1 — negligible at the benchmark's effective batch size
+    of thousands, and irrelevant to the parity gate, which loads NF's stats and
+    only runs eval.)
+    """
+
+    def __init__(self, *, hidden_size, n_heads, linear_hidden_size, dropout,
+                 attn_dropout, activation="gelu", rngs: nnx.Rngs):
+        self.activation = activation
+        self.attn = MultiHeadAttention(
+            hidden_size=hidden_size, n_heads=n_heads, attn_dropout=attn_dropout,
+            proj_dropout=dropout, rngs=rngs,
+        )
+        self.dropout_attn = nnx.Dropout(rate=dropout, rngs=rngs)
+        self.norm_attn = nnx.BatchNorm(hidden_size, axis=-1, momentum=0.9,
+                                       epsilon=1e-5, rngs=rngs)
+        self.ff1 = nnx.Linear(hidden_size, linear_hidden_size, rngs=rngs)
+        self.ff2 = nnx.Linear(linear_hidden_size, hidden_size, rngs=rngs)
+        self.dropout_ff = nnx.Dropout(rate=dropout, rngs=rngs)
+        self.dropout_ffn = nnx.Dropout(rate=dropout, rngs=rngs)
+        self.norm_ffn = nnx.BatchNorm(hidden_size, axis=-1, momentum=0.9,
+                                      epsilon=1e-5, rngs=rngs)
+
+    def __call__(self, x, prev, deterministic: bool, use_running_average: bool):
+        act = _resolve_activation(self.activation)
+        attn_out, scores = self.attn(x, prev=prev, deterministic=deterministic)
+        x = x + self.dropout_attn(attn_out, deterministic=deterministic)
+        x = self.norm_attn(x, use_running_average=use_running_average)
+        ff = self.ff2(self.dropout_ff(act(self.ff1(x)), deterministic=deterministic))
+        x = x + self.dropout_ffn(ff, deterministic=deterministic)
+        x = self.norm_ffn(x, use_running_average=use_running_average)
+        return x, scores

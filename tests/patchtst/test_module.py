@@ -110,3 +110,29 @@ def test_mha_prev_changes_output():
     out0, scores0 = mha(x, prev=None, deterministic=True)
     out1, _ = mha(x, prev=scores0 + 5.0, deterministic=True)
     assert not np.allclose(np.asarray(out0), np.asarray(out1))
+
+
+from chronax.models.patchtst.patchtst_module import TSTEncoderLayer
+
+
+def test_encoder_layer_shape_and_residual_scores():
+    B, T, hidden, heads = 2, 7, 32, 4
+    layer = TSTEncoderLayer(hidden_size=hidden, n_heads=heads, linear_hidden_size=64,
+                            dropout=0.0, attn_dropout=0.0, rngs=nnx.Rngs(0))
+    x = jnp.ones((B, T, hidden), dtype=jnp.float32)
+    out, scores = layer(x, prev=None, deterministic=True, use_running_average=False)
+    assert out.shape == (B, T, hidden)
+    assert scores.shape == (B, heads, T, T)
+
+
+def test_encoder_layer_batchnorm_train_vs_eval_differ_after_update():
+    B, T, hidden, heads = 8, 7, 16, 2
+    layer = TSTEncoderLayer(hidden_size=hidden, n_heads=heads, linear_hidden_size=32,
+                            dropout=0.0, attn_dropout=0.0, rngs=nnx.Rngs(0))
+    rng = np.random.RandomState(0)
+    x = jnp.asarray(rng.randn(B, T, hidden), dtype=jnp.float32)
+    # training pass updates running stats
+    layer(x, prev=None, deterministic=True, use_running_average=False)
+    out_train, _ = layer(x, prev=None, deterministic=True, use_running_average=False)
+    out_eval, _ = layer(x, prev=None, deterministic=True, use_running_average=True)
+    assert not np.allclose(np.asarray(out_train), np.asarray(out_eval))
