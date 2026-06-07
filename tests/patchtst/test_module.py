@@ -39,3 +39,34 @@ def test_revin_outputs_float32():
     revin = RevIN(num_features=1, subtract_last=True, affine=False, rngs=nnx.Rngs(0))
     z, loc, scale = revin.norm(_x())
     assert z.dtype == jnp.float32
+
+
+from chronax.models.patchtst.patchtst_module import compute_patch_num, patchify
+
+
+def test_compute_patch_num_standard():
+    # input_size=512, patch_len=16, stride=8 -> 63 + 1 = 64
+    assert compute_patch_num(512, 16, 8) == 64
+
+
+def test_compute_patch_num_degenerate_input_shorter_than_patch():
+    # input_size=12, patch_len=16, stride=8 -> int(-0.5)= 0; +1 = 1
+    assert compute_patch_num(12, 16, 8) == 1
+
+
+def test_patchify_shape_and_values():
+    B, L, patch_len, stride = 2, 512, 16, 8
+    x = jnp.arange(B * L, dtype=jnp.float32).reshape(B, L)
+    patches = patchify(x, patch_len=patch_len, stride=stride)
+    assert patches.shape == (B, compute_patch_num(L, patch_len, stride), patch_len)
+    # first patch is the first patch_len samples of the (padded) series
+    np.testing.assert_allclose(np.asarray(patches[0, 0]), np.asarray(x[0, :patch_len]))
+
+
+def test_patchify_end_padding_replicates_last():
+    B, L, patch_len, stride = 1, 12, 16, 8
+    x = jnp.arange(L, dtype=jnp.float32).reshape(1, L)
+    patches = patchify(x, patch_len=patch_len, stride=stride)
+    assert patches.shape == (1, 1, patch_len)
+    # padded tail must equal the last value (edge replication)
+    assert float(patches[0, 0, -1]) == float(x[0, -1])

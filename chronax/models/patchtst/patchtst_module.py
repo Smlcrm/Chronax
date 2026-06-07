@@ -57,3 +57,30 @@ class RevIN(nnx.Module):
         if self.affine:
             z = (z - self.beta.value[None, None, :]) / (self.gamma.value[None, None, :] + self.eps * self.eps)
         return z * scale + loc
+
+
+def compute_patch_num(input_size: int, patch_len: int, stride: int) -> int:
+    """Number of patches after end-padding by ``stride`` (NF padding_patch='end').
+
+    Mirrors NF's ``int((input_size - patch_len) / stride + 1) + 1`` exactly
+    (truncation toward zero, not Python floor) so it stays correct even if called
+    with an unclamped ``patch_len``; callers normally pass the clamped
+    ``patch_len = min(input_size + stride, patch_len)``.
+    """
+    return int((input_size - patch_len) / stride + 1) + 1
+
+
+def patchify(x: jnp.ndarray, *, patch_len: int, stride: int) -> jnp.ndarray:
+    """x: [B, L] -> patches: [B, patch_num, patch_len].
+
+    Replicates torch ``ReplicationPad1d((0, stride))`` then
+    ``unfold(dim=-1, size=patch_len, step=stride)``.
+    """
+    x = x.astype(jnp.float32)
+    orig_L = x.shape[1]                                 # input_size, before padding
+    x = jnp.pad(x, ((0, 0), (0, stride)), mode="edge")  # end padding
+    n = compute_patch_num(orig_L, patch_len, stride)
+    starts = jnp.arange(n) * stride
+    offs = jnp.arange(patch_len)
+    idx = starts[:, None] + offs[None, :]               # [patch_num, patch_len]
+    return x[:, idx]                                     # [B, patch_num, patch_len]
