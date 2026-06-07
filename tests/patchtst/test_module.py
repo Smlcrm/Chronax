@@ -170,3 +170,36 @@ def test_flatten_head_uses_hidden_major_order():
     flat = np.asarray(x).transpose(0, 2, 1).reshape(B, -1)        # hidden-major
     expected = flat @ np.asarray(head.linear.kernel.value) + np.asarray(head.linear.bias.value)
     np.testing.assert_allclose(out, expected, rtol=1e-5, atol=1e-5)
+
+
+import pytest
+
+from chronax.models.patchtst.patchtst_module import PatchTSTNet
+
+
+def _net(h=24, input_size=72, hidden=32, heads=4, layers=2):
+    return PatchTSTNet(
+        h=h, input_size=input_size, patch_len=16, stride=8,
+        hidden_size=hidden, n_heads=heads, encoder_layers=layers,
+        linear_hidden_size=64, dropout=0.0, fc_dropout=0.0, head_dropout=0.0,
+        attn_dropout=0.0, revin=True, revin_affine=False, revin_subtract_last=True,
+        rngs=nnx.Rngs(0),
+    )
+
+
+def test_net_forward_shape():
+    net = _net()
+    x = jnp.ones((4, 72, 1), dtype=jnp.float32)
+    out = net(x, deterministic=True, use_running_average=True)
+    assert out.shape == (4, 24, 1)
+    assert out.dtype == jnp.float32
+
+
+def test_net_hidden_not_divisible_raises():
+    with pytest.raises(ValueError, match="divisible"):
+        PatchTSTNet(
+            h=4, input_size=12, patch_len=16, stride=8, hidden_size=30, n_heads=4,
+            encoder_layers=1, linear_hidden_size=16, dropout=0.0, fc_dropout=0.0,
+            head_dropout=0.0, attn_dropout=0.0, revin=True, revin_affine=False,
+            revin_subtract_last=True, rngs=nnx.Rngs(0),
+        )

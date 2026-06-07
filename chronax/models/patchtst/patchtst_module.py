@@ -254,3 +254,54 @@ class FlattenHead(nnx.Module):
         B = x.shape[0]
         flat = x.transpose(0, 2, 1).reshape(B, -1)   # [B, patch_num, hidden] -> hidden-major
         return self.dropout(self.linear(flat), deterministic=deterministic)
+
+
+class PatchTSTNet(nnx.Module):
+    """Full PatchTST backbone: RevIN -> patchify -> embed -> encoder -> head -> denorm.
+
+    I/O mirrors the GRU network: ``__call__(x: [B, L, 1]) -> [B, h, 1]``.
+    """
+
+    def __init__(self, *, h, input_size, patch_len, stride, hidden_size, n_heads,
+                 encoder_layers, linear_hidden_size, dropout, fc_dropout,
+                 head_dropout, attn_dropout, revin, revin_affine,
+                 revin_subtract_last, activation="gelu", rngs: nnx.Rngs):
+        # fc_dropout is accepted for NF-signature parity but inert: NF uses it only
+        # in the disabled pretrain head; the active residual dropout is `dropout`.
+        self.h = h
+        self.input_size = input_size
+        self.patch_len = min(input_size + stride, patch_len)  # NF clamp
+        self.stride = stride
+        self.revin_enabled = revin
+        patch_num = compute_patch_num(input_size, self.patch_len, stride)
+        if revin:
+            self.revin = RevIN(num_features=1, subtract_last=revin_subtract_last,
+                               affine=revin_affine, rngs=rngs)
+        self.embedding = PatchEmbedding(
+            patch_len=self.patch_len, hidden_size=hidden_size, patch_num=patch_num,
+            dropout=dropout, rngs=rngs,   # NF residual/positional dropout uses the main `dropout`
+        )
+        self.encoder = TSTEncoder(
+            n_layers=encoder_layers, hidden_size=hidden_size, n_heads=n_heads,
+            linear_hidden_size=linear_hidden_size, dropout=dropout,
+            attn_dropout=attn_dropout, activation=activation, rngs=rngs,
+        )
+        self.head = FlattenHead(hidden_size=hidden_size, patch_num=patch_num, h=h,
+                                head_dropout=head_dropout, rngs=rngs)
+
+    def __call__(self, x: jnp.ndarray, deterministic: bool, use_running_average: bool) -> jnp.ndarray:
+        x = x.astype(jnp.float32)                     # [B, L, 1]
+        if self.revin_enabled:
+            z, loc, scale = self.revin.norm(x)        # z: [B, L, 1]
+        else:
+            z, loc, scale = x, None, None
+        series = z[:, :, 0]                           # [B, L]
+        patches = patchify(series, patch_len=self.patch_len, stride=self.stride)
+        tokens = self.embedding(patches, deterministic=deterministic)
+        enc = self.encoder(tokens, deterministic=deterministic,
+                           use_running_average=use_running_average)
+        out = self.head(enc, deterministic=deterministic)   # [B, h]
+        out = out[:, :, None]                               # [B, h, 1]
+        if self.revin_enabled:
+            out = self.revin.denorm(out, loc, scale)
+        return out
