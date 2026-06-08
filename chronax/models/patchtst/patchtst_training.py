@@ -23,7 +23,8 @@ def build_windows(y: jnp.ndarray, input_size: int, h: int) -> jnp.ndarray:
     return y[idx]
 
 
-def forward_loss(model, windows, *, h, input_size, loss_fn: LossFn = mae):
+def forward_loss(model: PatchTSTNet, windows: jnp.ndarray, *, h: int,
+                 input_size: int, loss_fn: LossFn = mae) -> jnp.ndarray:
     """Forward + point loss in ORIGINAL scale (RevIN denorms inside the net).
 
     windows: [B, input_size+h] -> scalar.
@@ -40,8 +41,9 @@ def _jit_forward_deterministic(model: PatchTSTNet, x: jnp.ndarray) -> jnp.ndarra
     return model(x, deterministic=True, use_running_average=True)
 
 
-def train(model, y, *, h, input_size, max_steps, windows_batch_size, lr, seed,
-          loss_fn: LossFn = mae):
+def train(model: PatchTSTNet, y: jnp.ndarray, *, h: int, input_size: int,
+          max_steps: int, windows_batch_size: int, lr: optax.ScalarOrSchedule,
+          seed: int, loss_fn: LossFn = mae) -> jnp.ndarray:
     """Train ``model`` in place via a single ``nnx.scan``. Returns per-step losses.
 
     The whole loop is one ``nnx.scan`` (carry = (model, optimizer)), which keeps
@@ -49,10 +51,16 @@ def train(model, y, *, h, input_size, max_steps, windows_batch_size, lr, seed,
     Window sampling replicates neuralforecast's REGIME-DEPENDENT scheme
     (``_base_model.py`` training_step): when ``n_windows < windows_batch_size`` NF
     draws ``windows_batch_size`` indices WITH replacement (oversampling with
-    duplicates — the regime every small benchmark series hits, e.g. 25/246
-    windows vs 1024); otherwise it takes a without-replacement permutation of
-    ``windows_batch_size`` windows. Getting this branch right is load-bearing for
-    accuracy parity, so we do NOT collapse it to full-batch.
+    duplicates — the regime every small benchmark series hits, e.g. ~24 windows
+    for AirlinePassengers or ~245 for DailyFemaleBirths, both << 1024); otherwise
+    it takes a without-replacement permutation of ``windows_batch_size`` windows.
+    Getting this branch right is load-bearing for accuracy parity, so we do NOT
+    collapse it to full-batch.
+
+    Note: ``batches`` materializes a ``[max_steps, windows_batch_size, input_size+h]``
+    tensor up front (mirrors the GRU sibling's pre-sampling). At the benchmark
+    defaults that is ~1.9 GB resident — acceptable for an offline benchmark, but
+    reduce ``windows_batch_size`` or ``max_steps`` if memory-constrained.
     """
     windows = build_windows(y, input_size, h)
     n_windows = windows.shape[0]
@@ -85,6 +93,10 @@ def train(model, y, *, h, input_size, max_steps, windows_batch_size, lr, seed,
 
     _, losses = step((model, optimizer), batches)
 
+    # Finite check runs only when concrete. Under a higher-level trace (e.g.
+    # BaseForecaster.conformity_scores's vmap) the loss array is a tracer and
+    # np.asarray raises; in that path we return the traced array and let any
+    # non-finite values surface downstream as NaN predictions.
     try:
         losses_host = np.asarray(losses)
     except jax.errors.TracerArrayConversionError:
@@ -100,7 +112,7 @@ def train(model, y, *, h, input_size, max_steps, windows_batch_size, lr, seed,
     return jnp.asarray(losses_host)
 
 
-def predict_step(model, y, *, h, input_size):
+def predict_step(model: PatchTSTNet, y: jnp.ndarray, *, h: int, input_size: int) -> jnp.ndarray:
     """Forecast next h steps from the final ``input_size`` of y. Returns (h,)."""
     x = y[-input_size:][None, :, None]                 # [1, L, 1]
     pred = _jit_forward_deterministic(model, x)        # [1, h, 1]

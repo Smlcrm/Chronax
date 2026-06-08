@@ -53,6 +53,17 @@ class PatchTST(BaseForecaster):
         alias: str = "PatchTST",
         loss: Union[str, LossFn] = "mae",
     ):
+        """Initialize a PatchTST forecaster.
+
+        Stores hyperparameters; the network is built lazily at ``fit`` time so
+        construction is cheap and side-effect free. Defaults match
+        neuralforecast.PatchTST. ``input_size=-1`` resolves to ``3 * h``. ``loss``
+        is a registry name (``"mae"``/``"mse"``/``"huber"``) or a callable;
+        ``learning_rate`` is a scalar or an ``optax.ScalarOrSchedule``;
+        ``activation`` is ``"gelu"`` or ``"relu"``. If the fitted estimator will
+        be pickled, any callable passed for ``loss``/``learning_rate`` must itself
+        be picklable (a class-based callable or module-level function).
+        """
         if input_size < 1:
             input_size = 3 * h
         self.h = h
@@ -100,6 +111,23 @@ class PatchTST(BaseForecaster):
         )
 
     def fit(self, y: jnp.ndarray, X: jnp.ndarray | None = None) -> "PatchTST":
+        """Fit the network on a 1-D series.
+
+        Builds the network and runs ``max_steps`` Adam steps over rolling windows
+        of length ``input_size + h``, sampled per step the way neuralforecast does.
+
+        Args:
+            y: 1-D series of length ``>= input_size + h``.
+            X: Reserved for exogenous regressors; must be None.
+
+        Returns:
+            PatchTST: ``self``, with ``model_`` populated.
+
+        Raises:
+            NotImplementedError: If ``X`` is provided.
+            ValueError: If ``y`` is not 1-D or is shorter than ``input_size + h``.
+            RuntimeError: If a non-finite training loss is observed (divergence).
+        """
         if X is not None:
             raise NotImplementedError("Exogenous variables are not supported.")
         y = jnp.asarray(y, dtype=jnp.float32)
@@ -121,9 +149,37 @@ class PatchTST(BaseForecaster):
         self._train_y = y
         return self
 
-    def predict(self, h, X=None, level=None) -> dict:
+    def predict(
+        self,
+        h: int,
+        X: jnp.ndarray | None = None,
+        level: list[int | float] | None = None,
+    ) -> dict:
+        """Forecast ``h`` steps from the fitted context.
+
+        Args:
+            h: Forecast horizon; must satisfy ``1 <= h <= self.h`` (the model is
+                direct-decoded for ``self.h`` steps and sliced).
+            X: Reserved for exogenous regressors; ignored.
+            level: Optional confidence levels (e.g. ``[80, 95]``). When set,
+                returns conformal ``lo-XX``/``hi-XX`` keys via the inherited
+                ``BaseForecaster`` path and requires ``self.conformal_params``.
+                Each call re-fits the model per CV window under ``vmap`` — on a
+                full PatchTST this costs minutes.
+
+        Returns:
+            dict: ``{"mean": jnp.ndarray of shape (h,)}`` plus interval keys when
+            ``level`` is provided.
+
+        Raises:
+            RuntimeError: If called before ``fit``.
+            ValueError: If ``h < 1`` or ``h > self.h``, or if ``level`` is given
+                without ``self.conformal_params`` set.
+        """
         if self.model_ is None or self._context is None:
             raise RuntimeError("Call fit(y) before predict(h).")
+        if h < 1:
+            raise ValueError(f"h must be a positive integer; got h={h}.")
         if h > self.h:
             raise ValueError(
                 f"PatchTST was trained for h={self.h}; predict(h={h}) is not supported. "
@@ -146,7 +202,35 @@ class PatchTST(BaseForecaster):
             fcst = BaseForecaster.add_confidence_intervals(fcst, cs, level, method)
         return fcst
 
-    def forecast(self, y, h, X=None, X_future=None, level=None, fitted=False) -> dict:
+    def forecast(
+        self,
+        y: jnp.ndarray,
+        h: int,
+        X: jnp.ndarray | None = None,
+        X_future: jnp.ndarray | None = None,
+        level: list[int | float] | None = None,
+        fitted: bool = False,
+    ) -> dict:
+        """Stateless fit-then-predict on ``y``.
+
+        Equivalent to ``self.fit(y).predict(h=h, level=level)``, optionally adding
+        a ``"fitted"`` key with one-step-ahead in-sample predictions.
+
+        Args:
+            y: 1-D training series.
+            h: Forecast horizon (``<= self.h``).
+            X / X_future: Reserved for exogenous regressors; must be None.
+            level: Optional confidence levels; see ``predict``.
+            fitted: If True, include ``"fitted"`` — one-step-ahead values over the
+                training series, NaN for the first ``input_size`` entries.
+
+        Returns:
+            dict: ``{"mean": ..., optional "fitted": ...}``.
+
+        Raises:
+            NotImplementedError: If ``X`` or ``X_future`` is provided.
+            ValueError / RuntimeError: Forwarded from ``fit`` / ``predict``.
+        """
         if X is not None or X_future is not None:
             raise NotImplementedError("Exogenous variables are not supported.")
         self.fit(y)
@@ -156,7 +240,8 @@ class PatchTST(BaseForecaster):
         return result
 
     def _compute_fitted_values(self) -> jnp.ndarray:
-        """One-step-ahead fitted values; first ``input_size`` entries are NaN."""
+        """One-step-ahead fitted values; first ``input_size`` entries are NaN
+        (all-NaN if the series is too short to form any rolling window)."""
         if self._train_y is None or self.model_ is None:
             raise RuntimeError("Call fit(y) before computing fitted values.")
         y = self._train_y

@@ -61,7 +61,7 @@ class RevIN(nnx.Module):
             self.gamma = nnx.Param(jnp.ones((num_features,), dtype=jnp.float32))
             self.beta = nnx.Param(jnp.zeros((num_features,), dtype=jnp.float32))
 
-    def norm(self, x: jnp.ndarray):
+    def norm(self, x: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """x: [B, L, C] -> (z: [B, L, C], loc: [B, 1, C], scale: [B, 1, C])."""
         x = x.astype(jnp.float32)
         if self.subtract_last:
@@ -272,7 +272,7 @@ class FlattenHead(nnx.Module):
     encoder produces ``[B, patch_num, hidden]``, so we transpose to
     ``[B, hidden, patch_num]`` BEFORE flattening, otherwise the linear-head weight
     columns are permuted relative to NF and the parity gate fails (measured:
-    max|Δ|=1.81 patch-major vs 7.4e-5 hidden-major).
+    ~1.8 patch-major vs <1e-4 hidden-major — the gate passes only hidden-major).
     """
 
     def __init__(self, *, hidden_size, patch_num, h, head_dropout, rngs: nnx.Rngs):
