@@ -1,26 +1,28 @@
 """PatchTST comparison benchmark: Chronax vs Nixtla neuralforecast.
 
-Run with:
-    .venv/bin/python benchmarks/patchtst_benchmark.py
+Run with (long job; rows are written incrementally so it is crash-safe):
+    .venv/bin/python benchmarks/patchtst_benchmark.py --resume
 
 The Nixtla side runs in ``benchmarks/.venv-nf`` (subprocess) at PatchTST's native
 defaults — RevIN + ``scaler_type='identity'``, ``max_steps=5000``,
 ``windows_batch_size=1024`` — so the comparison is faithful, not confounded by a
 weakened reference. Reports total wall-clock (with JIT/Lightning warmup) and
-after-warmup wall-clock (first fit per dataset excluded); acceptance uses
-after-warmup time.
+after-warmup wall-clock (first seed per dataset excluded); acceptance uses
+after-warmup time. Each (library, dataset, seed) row is appended to the output
+CSV as it finishes; ``--resume`` skips rows already present so an interrupted run
+continues where it left off.
 
-Outputs:
-    benchmarks/benchmark_results/patchtst_<timestamp>.csv          (raw per-run rows)
-    benchmarks/benchmark_results/patchtst_<timestamp>_summary.csv  (mean/std summary)
+Outputs (stable names so ``--resume`` works):
+    benchmarks/benchmark_results/patchtst_results.csv          (raw per-run rows)
+    benchmarks/benchmark_results/patchtst_results_summary.csv  (mean/std summary)
 """
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import subprocess
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 
 import jax.numpy as jnp
@@ -103,26 +105,52 @@ print(json.dumps({{'mae': mae, 'smape': smape, 'wallclock': t}}))
     return d["mae"], d["smape"], d["wallclock"]
 
 
+_FIELDS = ["library", "dataset", "seed", "iter_idx", "is_warmup", "mae", "smape", "wallclock_s"]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--libs", nargs="+", default=["chronax", "nixtla"], choices=["chronax", "nixtla"])
     ap.add_argument("--datasets", nargs="+", default=None)
+    ap.add_argument("--out", default=str(RESULTS_DIR / "patchtst_results.csv"),
+                    help="Stable CSV path; each (lib,dataset,seed) row is appended as it finishes.")
+    ap.add_argument("--resume", action="store_true",
+                    help="Skip (library,dataset,seed) rows already present in --out.")
     args = ap.parse_args()
+    out_path = Path(args.out)
     datasets = DATASETS if args.datasets is None else [d for d in DATASETS if d["name"] in args.datasets]
 
-    rows = []
-    for spec in datasets:
-        print(f"\n=== {spec['name']} ===")
-        for lib in args.libs:
-            for i, seed in enumerate(SEEDS):
-                fn = run_chronax if lib == "chronax" else run_nixtla
-                m, s, t = fn(spec, seed)
-                rows.append({"library": lib, "dataset": spec["name"], "seed": seed,
-                             "iter_idx": i, "is_warmup": i == 0,
-                             "mae": m, "smape": s, "wallclock_s": t})
-                print(f"  {lib:8s} seed={seed} mae={m:.4f} smape={s:.4f} t={t:.1f}s")
+    done = set()
+    if args.resume and out_path.exists():
+        prev = pd.read_csv(out_path)
+        done = {(r.library, r.dataset, int(r.seed)) for r in prev.itertuples()}
+        print(f"resume: {len(done)} rows already done in {out_path.name}", flush=True)
 
-    df = pd.DataFrame(rows)
+    write_header = not out_path.exists()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=_FIELDS)
+        if write_header:
+            writer.writeheader()
+            f.flush()
+        for spec in datasets:
+            print(f"\n=== {spec['name']} ===", flush=True)
+            for lib in args.libs:
+                for i, seed in enumerate(SEEDS):
+                    if (lib, spec["name"], seed) in done:
+                        print(f"  {lib:8s} seed={seed} (skip, already done)", flush=True)
+                        continue
+                    fn = run_chronax if lib == "chronax" else run_nixtla
+                    m, s, t = fn(spec, seed)
+                    writer.writerow({"library": lib, "dataset": spec["name"], "seed": seed,
+                                     "iter_idx": i, "is_warmup": i == 0,
+                                     "mae": m, "smape": s, "wallclock_s": t})
+                    f.flush()  # crash-safe: row is on disk before the next (long) fit
+                    print(f"  {lib:8s} seed={seed} mae={m:.4f} smape={s:.4f} t={t:.1f}s", flush=True)
+
+    if not out_path.exists():
+        return
+    df = pd.read_csv(out_path)
     summary_total = df.groupby(["library", "dataset"]).agg(
         mae_mean=("mae", "mean"), mae_std=("mae", "std"),
         smape_mean=("smape", "mean"), smape_std=("smape", "std"),
@@ -131,13 +159,11 @@ def main():
     after = df[~df["is_warmup"]].groupby(["library", "dataset"]).agg(
         wallclock_mean_after=("wallclock_s", "mean"), wallclock_std_after=("wallclock_s", "std"),
     ).round(4)
-    print("\n=== Total wall-clock (5 seeds) ===\n", summary_total.to_string())
-    print("\n=== After-warmup wall-clock (4 seeds, used for acceptance) ===\n", after.to_string())
-
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    df.to_csv(RESULTS_DIR / f"patchtst_{ts}.csv", index=False)
-    summary_total.join(after).to_csv(RESULTS_DIR / f"patchtst_{ts}_summary.csv")
-    print(f"\nWrote: patchtst_{ts}.csv  patchtst_{ts}_summary.csv")
+    print("\n=== Total wall-clock ===\n", summary_total.to_string())
+    print("\n=== After-warmup wall-clock (used for acceptance) ===\n", after.to_string())
+    summary_path = out_path.with_name(out_path.stem + "_summary.csv")
+    summary_total.join(after).to_csv(summary_path)
+    print(f"\nWrote rows -> {out_path.name}, summary -> {summary_path.name}", flush=True)
 
 
 if __name__ == "__main__":
