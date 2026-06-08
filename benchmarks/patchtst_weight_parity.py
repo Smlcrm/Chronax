@@ -93,9 +93,10 @@ def _load_into(net, W):
 
 def main() -> None:
     DUMP.parent.mkdir(parents=True, exist_ok=True)
+    DUMP.unlink(missing_ok=True)   # never read a stale dump if the torch side crashes
     out = subprocess.run([str(NF_VENV_PY), "-c", _TORCH_SIDE], capture_output=True, text=True)
-    if "DUMP_OK" not in out.stdout:
-        sys.exit(f"torch side failed:\nSTDOUT {out.stdout}\nSTDERR {out.stderr}")
+    if out.returncode != 0 or "DUMP_OK" not in out.stdout:
+        sys.exit(f"torch side failed (rc={out.returncode}):\nSTDOUT {out.stdout}\nSTDERR {out.stderr}")
     print(out.stdout.strip())
 
     data = np.load(DUMP)
