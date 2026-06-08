@@ -6,9 +6,32 @@ transformer encoder operates on ``[B, patch_num, hidden_size]``.
 """
 from __future__ import annotations
 
+import math
+
 import jax
 import jax.numpy as jnp
 from flax import nnx
+
+
+class _TorchLinearInit:
+    """Picklable initializer matching torch ``nn.Linear``'s default.
+
+    torch draws both weight and bias from ``U(-1/sqrt(fan_in), 1/sqrt(fan_in))``
+    (Kaiming-uniform with ``a=sqrt(5)`` reduces to this bound). Flax's
+    ``nnx.Linear`` defaults to ``lecun_normal`` instead, so matching torch here
+    is what makes training trajectories — and thus accuracy — comparable to
+    neuralforecast. ``fan_in`` is the Linear's ``in_features`` (passed explicitly
+    because the bias shares the weight's fan_in).
+    """
+
+    __slots__ = ("fan_in",)
+
+    def __init__(self, fan_in: int) -> None:
+        self.fan_in = fan_in
+
+    def __call__(self, key, shape, dtype=jnp.float32):
+        bound = 1.0 / math.sqrt(self.fan_in)
+        return jax.random.uniform(key, shape, dtype, minval=-bound, maxval=bound)
 
 
 class RevIN(nnx.Module):
@@ -105,7 +128,8 @@ class PatchEmbedding(nnx.Module):
     """
 
     def __init__(self, *, patch_len, hidden_size, patch_num, dropout, rngs: nnx.Rngs):
-        self.proj = nnx.Linear(patch_len, hidden_size, rngs=rngs)
+        init = _TorchLinearInit(patch_len)
+        self.proj = nnx.Linear(patch_len, hidden_size, kernel_init=init, bias_init=init, rngs=rngs)
         key = rngs.params()
         self.pos = nnx.Param(_UniformPos()(key, (patch_num, hidden_size)))
         self.dropout = nnx.Dropout(rate=dropout, rngs=rngs)
@@ -133,10 +157,11 @@ class MultiHeadAttention(nnx.Module):
         self.n_heads = n_heads
         self.d_k = hidden_size // n_heads
         self.scale = float(self.d_k ** -0.5)
-        self.w_q = nnx.Linear(hidden_size, hidden_size, rngs=rngs)
-        self.w_k = nnx.Linear(hidden_size, hidden_size, rngs=rngs)
-        self.w_v = nnx.Linear(hidden_size, hidden_size, rngs=rngs)
-        self.w_o = nnx.Linear(hidden_size, hidden_size, rngs=rngs)
+        init = _TorchLinearInit(hidden_size)
+        self.w_q = nnx.Linear(hidden_size, hidden_size, kernel_init=init, bias_init=init, rngs=rngs)
+        self.w_k = nnx.Linear(hidden_size, hidden_size, kernel_init=init, bias_init=init, rngs=rngs)
+        self.w_v = nnx.Linear(hidden_size, hidden_size, kernel_init=init, bias_init=init, rngs=rngs)
+        self.w_o = nnx.Linear(hidden_size, hidden_size, kernel_init=init, bias_init=init, rngs=rngs)
         self.attn_dropout = nnx.Dropout(rate=attn_dropout, rngs=rngs)
         self.proj_dropout = nnx.Dropout(rate=proj_dropout, rngs=rngs)
 
@@ -195,8 +220,12 @@ class TSTEncoderLayer(nnx.Module):
         self.dropout_attn = nnx.Dropout(rate=dropout, rngs=rngs)
         self.norm_attn = nnx.BatchNorm(hidden_size, axis=-1, momentum=0.9,
                                        epsilon=1e-5, rngs=rngs)
-        self.ff1 = nnx.Linear(hidden_size, linear_hidden_size, rngs=rngs)
-        self.ff2 = nnx.Linear(linear_hidden_size, hidden_size, rngs=rngs)
+        self.ff1 = nnx.Linear(hidden_size, linear_hidden_size,
+                              kernel_init=_TorchLinearInit(hidden_size),
+                              bias_init=_TorchLinearInit(hidden_size), rngs=rngs)
+        self.ff2 = nnx.Linear(linear_hidden_size, hidden_size,
+                              kernel_init=_TorchLinearInit(linear_hidden_size),
+                              bias_init=_TorchLinearInit(linear_hidden_size), rngs=rngs)
         self.dropout_ff = nnx.Dropout(rate=dropout, rngs=rngs)
         self.dropout_ffn = nnx.Dropout(rate=dropout, rngs=rngs)
         self.norm_ffn = nnx.BatchNorm(hidden_size, axis=-1, momentum=0.9,
@@ -247,7 +276,8 @@ class FlattenHead(nnx.Module):
     """
 
     def __init__(self, *, hidden_size, patch_num, h, head_dropout, rngs: nnx.Rngs):
-        self.linear = nnx.Linear(hidden_size * patch_num, h, rngs=rngs)
+        init = _TorchLinearInit(hidden_size * patch_num)
+        self.linear = nnx.Linear(hidden_size * patch_num, h, kernel_init=init, bias_init=init, rngs=rngs)
         self.dropout = nnx.Dropout(rate=head_dropout, rngs=rngs)
 
     def __call__(self, x: jnp.ndarray, deterministic: bool) -> jnp.ndarray:

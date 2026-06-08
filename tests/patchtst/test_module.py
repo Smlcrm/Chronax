@@ -203,3 +203,19 @@ def test_net_hidden_not_divisible_raises():
             head_dropout=0.0, attn_dropout=0.0, revin=True, revin_affine=False,
             revin_subtract_last=True, rngs=nnx.Rngs(0),
         )
+
+
+def test_linear_init_matches_torch_bound():
+    # torch nn.Linear default: weight+bias ~ U(-1/sqrt(fan_in), 1/sqrt(fan_in)),
+    # not flax's unbounded lecun_normal. fan_in for proj = patch_len.
+    import math
+    patch_len, hidden = 16, 32
+    emb = PatchEmbedding(patch_len=patch_len, hidden_size=hidden, patch_num=4,
+                         dropout=0.0, rngs=nnx.Rngs(0))
+    bound = 1.0 / math.sqrt(patch_len)
+    k = np.asarray(emb.proj.kernel.value)
+    b = np.asarray(emb.proj.bias.value)
+    assert k.max() <= bound + 1e-6 and k.min() >= -bound - 1e-6
+    assert b.max() <= bound + 1e-6 and b.min() >= -bound - 1e-6
+    # actually uses most of the range (a normal init would not be bounded like this)
+    assert k.max() > 0.5 * bound and k.min() < -0.5 * bound
