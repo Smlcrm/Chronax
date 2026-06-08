@@ -50,6 +50,8 @@ from .gru import GRU
 
 from .batched_forecaster import BatchedForecaster
 
+from .xlstm import XLSTM
+
 __all__ = [
     "ARIMA",
     "AutoARIMA",
@@ -82,5 +84,6 @@ __all__ = [
     "RandomWalkWithDrift",
     "GRU",
     "BatchedForecaster",
+    "XLSTM",
 ]
 
