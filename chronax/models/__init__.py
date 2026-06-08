@@ -46,7 +46,10 @@ from .ces import AutoCES
 from .tsb import TSB
 from .randomWalkWithDrift import RandomWalkWithDrift
 
-from .gru import GRU
+try:
+    from .gru import GRU
+except ImportError:
+    GRU = None
 
 from .batched_forecaster import BatchedForecaster
 
