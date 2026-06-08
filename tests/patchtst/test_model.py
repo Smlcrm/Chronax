@@ -3,7 +3,6 @@ import pickle
 
 import jax.numpy as jnp
 import numpy as np
-import optax
 import pytest
 from flax import nnx
 
@@ -70,6 +69,30 @@ def test_predict_larger_h_raises():
     m = _tiny().fit(_make_y())
     with pytest.raises(ValueError, match="not supported"):
         m.predict(h=13)
+
+
+def test_predict_h_below_one_raises():
+    m = _tiny().fit(_make_y())
+    with pytest.raises(ValueError, match="positive"):
+        m.predict(h=0)
+
+
+def test_loss_custom_callable_trains():
+    def my_loss(pred, target):
+        return jnp.mean(jnp.abs(pred - target))
+    m = PatchTST(h=12, input_size=36, hidden_size=16, n_heads=2, encoder_layers=1,
+                 linear_hidden_size=32, max_steps=10, windows_batch_size=64,
+                 random_seed=0, loss=my_loss)
+    m.fit(_make_y())
+    assert jnp.all(jnp.isfinite(m.predict(h=12)["mean"]))
+
+
+def test_loss_unknown_string_raises_at_fit():
+    m = PatchTST(h=12, input_size=36, hidden_size=16, n_heads=2, encoder_layers=1,
+                 linear_hidden_size=32, max_steps=2, windows_batch_size=64,
+                 random_seed=0, loss="rmse")
+    with pytest.raises(ValueError, match="Unknown loss"):
+        m.fit(_make_y())
 
 
 def test_fit_raises_on_exog():

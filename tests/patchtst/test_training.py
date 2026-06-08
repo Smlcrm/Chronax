@@ -1,7 +1,6 @@
 """Tests for chronax.models.patchtst.patchtst_training."""
 import jax.numpy as jnp
 import numpy as np
-import optax
 import pytest
 from flax import nnx
 
@@ -66,3 +65,20 @@ def test_predict_step_shape_and_idempotent():
     p2 = predict_step(net, y[-36:], h=12, input_size=36)
     assert p1.shape == (12,)
     np.testing.assert_allclose(np.asarray(p1), np.asarray(p2), rtol=1e-6)
+
+
+def test_train_oversample_with_replacement_small_n_regime():
+    # n_windows < windows_batch_size -> NF with-replacement branch (the regime
+    # every benchmark series hits). y(60), input_size=36, h=12 -> n_windows=13.
+    net = _net()
+    losses = train(net, _make_y(60), h=12, input_size=36, max_steps=8,
+                   windows_batch_size=64, lr=1e-3, seed=0)
+    assert losses.shape == (8,)
+    assert jnp.all(jnp.isfinite(losses))
+
+
+def test_train_raises_on_divergence():
+    net = _net()
+    with pytest.raises(RuntimeError, match="diverged"):
+        train(net, _make_y(), h=12, input_size=36, max_steps=10,
+              windows_batch_size=64, lr=1e9, seed=0)

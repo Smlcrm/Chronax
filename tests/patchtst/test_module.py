@@ -54,6 +54,13 @@ def test_compute_patch_num_degenerate_input_shorter_than_patch():
     assert compute_patch_num(12, 16, 8) == 1
 
 
+def test_compute_patch_num_truncation_and_nonexact():
+    # truncation toward zero (not Python floor) on a negative non-integer,
+    # and a non-exact positive case cross-checked against the NF formula.
+    assert compute_patch_num(4, 16, 8) == 1                       # int(-0.5)=0 -> +1
+    assert compute_patch_num(100, 16, 8) == int((100 - 16) / 8 + 1) + 1
+
+
 def test_patchify_shape_and_values():
     B, L, patch_len, stride = 2, 512, 16, 8
     x = jnp.arange(B * L, dtype=jnp.float32).reshape(B, L)
