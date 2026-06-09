@@ -57,10 +57,11 @@ def train(model: PatchTSTNet, y: jnp.ndarray, *, h: int, input_size: int,
     Getting this branch right is load-bearing for accuracy parity, so we do NOT
     collapse it to full-batch.
 
-    Note: ``batches`` materializes a ``[max_steps, windows_batch_size, input_size+h]``
-    tensor up front (mirrors the GRU sibling's pre-sampling). At the benchmark
-    defaults that is ~1.9 GB resident — acceptable for an offline benchmark, but
-    reduce ``windows_batch_size`` or ``max_steps`` if memory-constrained.
+    Memory: only the int32 index tensor ``[max_steps, windows_batch_size]`` is
+    pre-sampled (~40 MB at benchmark defaults); the windows themselves are
+    gathered inside the scan step from the small ``windows`` array, avoiding a
+    ~1.9 GB float32 materialization — a large peak-memory win on GPU/TPU HBM,
+    neutral on CPU wall-clock.
     """
     windows = build_windows(y, input_size, h)
     n_windows = windows.shape[0]
@@ -77,21 +78,25 @@ def train(model: PatchTSTNet, y: jnp.ndarray, *, h: int, input_size: int,
         def sample_one(k):
             return jax.random.permutation(k, n_windows)[:windows_batch_size]
 
-    batch_idx = jax.vmap(sample_one)(step_keys)   # [max_steps, windows_batch_size]
-    batches = windows[batch_idx]                  # [max_steps, windows_batch_size, L+h]
+    batch_idx = jax.vmap(sample_one)(step_keys)   # [max_steps, windows_batch_size] int32
 
     optimizer = nnx.Optimizer(model, optax.adam(lr), wrt=nnx.Param)
 
+    # Scan over the int32 index tensor and gather the windows INSIDE the step
+    # (windows is a small closure constant), rather than pre-materializing a
+    # ~1.9 GB [max_steps, windows_batch_size, input_size+h] float32 tensor.
+    # Bit-identical; a large peak-memory win on GPU/TPU HBM, neutral on CPU.
     @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
-    def step(carry, batch_windows):
+    def step(carry, idx):
         model, opt = carry
+        batch_windows = windows[idx]
         loss, grads = nnx.value_and_grad(
             lambda m: forward_loss(m, batch_windows, h=h, input_size=input_size, loss_fn=loss_fn)
         )(model)
         opt.update(grads)
         return (model, opt), loss
 
-    _, losses = step((model, optimizer), batches)
+    _, losses = step((model, optimizer), batch_idx)
 
     # Finite check runs only when concrete. Under a higher-level trace (e.g.
     # BaseForecaster.conformity_scores's vmap) the loss array is a tracer and
