@@ -53,6 +53,8 @@ except ImportError:
 
 from .patchtst import PatchTST
 
+from .itransformer import iTransformer
+
 from .batched_forecaster import BatchedForecaster
 
 __all__ = [
@@ -87,6 +89,7 @@ __all__ = [
     "RandomWalkWithDrift",
     "GRU",
     "PatchTST",
+    "iTransformer",
     "BatchedForecaster",
 ]
 
