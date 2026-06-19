@@ -157,3 +157,10 @@ Intermittent Demand
 .. autoclass:: chronax.models.IMAPA
    :members:
    :undoc-members:
+
+Deep Learning
+-------------
+
+.. autoclass:: chronax.models.iTransformer
+   :members:
+   :undoc-members:
