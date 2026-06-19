@@ -56,6 +56,10 @@ USE_NORM = True
 MAX_STEPS = 1000
 LEARNING_RATE = 1e-3
 WINDOWS_BATCH_SIZE = 32
+# Chronax-only enhancement (no neuralforecast equivalent): Box-Cox variance
+# stabilization for multiplicative / trending series, mirroring TBATS's
+# use_boxcox. Off by default so the comparison stays a faithful port.
+USE_BOXCOX = False
 
 DATASETS = [
     {"name": "AirlinePassengers", "path": str(DATASETS_DIR / "airline-passengers.csv"),
@@ -100,7 +104,7 @@ def run_chronax(spec, seed):
     model = iTransformer(
         h=H, input_size=INPUT_SIZE, hidden_size=HIDDEN_SIZE, n_heads=N_HEADS,
         e_layers=E_LAYERS, d_ff=D_FF, dropout=DROPOUT, use_norm=USE_NORM,
-        max_steps=MAX_STEPS, learning_rate=LEARNING_RATE,
+        use_boxcox=USE_BOXCOX, max_steps=MAX_STEPS, learning_rate=LEARNING_RATE,
         windows_batch_size=WINDOWS_BATCH_SIZE, random_seed=seed,
     )
     t0 = time.perf_counter()
@@ -147,7 +151,7 @@ print(json.dumps({{'mae': mae, 'rmse': rmse, 'mape': mape, 'smape': smape, 'wall
 
 
 def main():
-    global INPUT_SIZE, MAX_STEPS, HIDDEN_SIZE, D_FF, LEARNING_RATE, SEEDS
+    global INPUT_SIZE, MAX_STEPS, HIDDEN_SIZE, D_FF, LEARNING_RATE, SEEDS, USE_BOXCOX
     ap = argparse.ArgumentParser()
     ap.add_argument("--libs", nargs="+", default=["chronax", "nixtla"], choices=["chronax", "nixtla"])
     ap.add_argument("--datasets", nargs="+", default=None)
@@ -157,13 +161,16 @@ def main():
     ap.add_argument("--d-ff", type=int, default=D_FF)
     ap.add_argument("--learning-rate", type=float, default=LEARNING_RATE)
     ap.add_argument("--seeds", nargs="+", type=int, default=SEEDS)
+    ap.add_argument("--use-boxcox", action="store_true",
+                    help="Chronax-only: Box-Cox transform (no NF equivalent).")
     args = ap.parse_args()
     # Both sides read these module globals, so overriding here keeps the comparison matched.
     INPUT_SIZE, MAX_STEPS, HIDDEN_SIZE = args.input_size, args.max_steps, args.hidden_size
     D_FF, LEARNING_RATE, SEEDS = args.d_ff, args.learning_rate, args.seeds
+    USE_BOXCOX = args.use_boxcox
     datasets = DATASETS if args.datasets is None else [d for d in DATASETS if d["name"] in args.datasets]
     print(f"config: input_size={INPUT_SIZE} max_steps={MAX_STEPS} hidden_size={HIDDEN_SIZE} "
-          f"d_ff={D_FF} lr={LEARNING_RATE} seeds={SEEDS}")
+          f"d_ff={D_FF} lr={LEARNING_RATE} use_boxcox={USE_BOXCOX} seeds={SEEDS}")
 
     if "nixtla" in args.libs and not NF_VENV_PY.exists():
         raise SystemExit(
@@ -178,9 +185,11 @@ def main():
             for i, seed in enumerate(SEEDS):
                 fn = run_chronax if lib == "chronax" else run_nixtla
                 r = fn(spec, seed)
+                # use_boxcox is a Chronax-only enhancement; it does not apply to NF.
                 rows.append({"library": lib, "dataset": spec["name"], "seed": seed,
                              "iter_idx": i, "is_warmup": i == 0,
-                             "input_size": INPUT_SIZE, "max_steps": MAX_STEPS, **r,
+                             "input_size": INPUT_SIZE, "max_steps": MAX_STEPS,
+                             "use_boxcox": USE_BOXCOX and lib == "chronax", **r,
                              "wallclock_s": r["wallclock"]})
                 print(f"  {lib:8s} seed={seed} mae={r['mae']:.4f} rmse={r['rmse']:.4f} "
                       f"mape={r['mape']:.3f} t={r['wallclock']:.1f}s")

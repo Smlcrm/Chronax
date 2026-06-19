@@ -26,7 +26,9 @@ from chronax.models.itransformer.itransformer_module import (
     TransEncoderLayer,
     _resolve_activation,
 )
-from chronax.models.itransformer.itransformer_model import iTransformer
+from chronax.models.itransformer.itransformer_model import (
+    iTransformer, _boxcox, _inv_boxcox, _select_boxcox_lambda,
+)
 from chronax.models.itransformer.itransformer_training import (
     build_windows, forward_loss, predict_step, train,
 )
@@ -568,3 +570,83 @@ def test_conformity_scores_returns_finite_2d_array():
 def test_input_size_default_resolves_to_three_h():
     m = iTransformer(h=10)
     assert m.input_size == 30
+
+
+# =============================================================================
+# Box-Cox transform (use_boxcox)
+# =============================================================================
+
+@pytest.mark.parametrize("lam", [0.0, 0.5, 1.0, -0.3])
+def test_boxcox_inverse_round_trip(lam):
+    y = jnp.asarray([1.0, 2.0, 5.0, 10.0, 100.0], dtype=jnp.float32)
+    rt = _inv_boxcox(_boxcox(y, lam), lam)
+    np.testing.assert_allclose(np.asarray(rt), np.asarray(y), rtol=1e-4, atol=1e-4)
+
+
+def test_boxcox_lambda_zero_is_log():
+    y = jnp.asarray([1.0, 2.0, 10.0], dtype=jnp.float32)
+    np.testing.assert_allclose(np.asarray(_boxcox(y, 0.0)), np.log(np.asarray(y)), rtol=1e-5)
+
+
+def test_select_lambda_in_grid_and_near_zero_for_exponential():
+    # Exponential-growth series -> Box-Cox MLE lambda near 0 (the log regime).
+    y = jnp.asarray(np.exp(np.linspace(0, 5, 100)), dtype=jnp.float32)
+    lam = _select_boxcox_lambda(y)
+    assert -1.0 <= lam <= 2.0
+    assert abs(lam) <= 0.3
+
+
+def test_use_boxcox_off_keeps_lambda_none_and_matches_plain():
+    y = _make_y(200) + 2.0  # strictly positive
+    m_off = iTransformer(h=12, input_size=36, hidden_size=16, n_heads=2, e_layers=1,
+                         d_ff=32, max_steps=20, windows_batch_size=64, random_seed=0).fit(y)
+    assert m_off._bc_lambda is None
+    plain = iTransformer(h=12, input_size=36, hidden_size=16, n_heads=2, e_layers=1,
+                         d_ff=32, max_steps=20, windows_batch_size=64, random_seed=0,
+                         use_boxcox=False).fit(y)
+    np.testing.assert_allclose(np.asarray(m_off.predict(h=12)["mean"]),
+                               np.asarray(plain.predict(h=12)["mean"]), rtol=1e-5, atol=1e-5)
+
+
+def test_use_boxcox_fit_predict_finite_and_sets_lambda():
+    y = jnp.asarray(np.exp(np.linspace(0, 3, 200)) + 1.0, dtype=jnp.float32)
+    m = iTransformer(h=12, input_size=36, hidden_size=16, n_heads=2, e_layers=1,
+                     d_ff=32, max_steps=30, windows_batch_size=64, random_seed=0,
+                     use_boxcox=True).fit(y)
+    assert m._bc_lambda is not None
+    out = m.predict(h=12)["mean"]
+    assert out.shape == (12,) and jnp.all(jnp.isfinite(out))
+
+
+def test_use_boxcox_requires_positive_values():
+    y = _make_y(200)  # sine -> contains non-positive values
+    m = iTransformer(h=12, input_size=36, hidden_size=16, n_heads=2, e_layers=1,
+                     d_ff=32, max_steps=5, windows_batch_size=64, random_seed=0,
+                     use_boxcox=True)
+    with pytest.raises(ValueError, match="positive"):
+        m.fit(y)
+
+
+def test_use_boxcox_pickle_round_trip_preserves_predictions_and_lambda():
+    y = jnp.asarray(np.exp(np.linspace(0, 3, 200)) + 1.0, dtype=jnp.float32)
+    m = iTransformer(h=12, input_size=36, hidden_size=16, n_heads=2, e_layers=1,
+                     d_ff=32, max_steps=20, windows_batch_size=64, random_seed=0,
+                     use_boxcox=True).fit(y)
+    before = np.asarray(m.predict(h=12)["mean"])
+    m2 = pickle.loads(pickle.dumps(m))
+    assert m2._bc_lambda == m._bc_lambda
+    np.testing.assert_allclose(np.asarray(m2.predict(h=12)["mean"]), before, rtol=1e-5, atol=1e-5)
+
+
+def test_use_boxcox_forecast_fitted_inverts_to_original_scale():
+    y = jnp.asarray(np.exp(np.linspace(0, 3, 200)) + 1.0, dtype=jnp.float32)
+    res = iTransformer(h=12, input_size=36, hidden_size=16, n_heads=2, e_layers=1,
+                       d_ff=32, max_steps=20, windows_batch_size=64, random_seed=0,
+                       use_boxcox=True).forecast(y, h=12, fitted=True)
+    fitted = np.asarray(res["fitted"])
+    assert fitted.shape == (200,)
+    assert np.all(np.isnan(fitted[:36]))
+    tail = fitted[36:]
+    assert np.all(np.isfinite(tail))
+    # fitted values are back in the original (positive, ~exponential) scale
+    assert tail.min() > 0

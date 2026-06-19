@@ -12,6 +12,53 @@ from chronax.models.itransformer.itransformer_module import ITransformerNet
 from chronax.models.itransformer.itransformer_training import predict_step, train
 from chronax.utils import ConformalIntervals
 
+# --- Box-Cox variance-stabilizing transform (self-contained) ---------------
+# Mirrors the ``use_boxcox`` convention of chronax.models.TBATS: stabilize the
+# variance of multiplicative / strongly-trending series before modelling, then
+# invert on the output. ``lambda = 0`` is the log transform. The lambda is
+# selected once at fit time by maximizing the Box-Cox profile log-likelihood
+# (the standard MLE), kept self-contained so this module does not depend on
+# another model's internals.
+
+_BOXCOX_LAMBDA_GRID = jnp.linspace(-1.0, 2.0, 31)  # step 0.1, includes 0.0 (log)
+
+
+def _boxcox(y: jnp.ndarray, lam: float) -> jnp.ndarray:
+    """Box-Cox transform of strictly-positive ``y``. ``lam=0`` -> ``log(y)``."""
+    y = jnp.asarray(y, dtype=jnp.float32)
+    if abs(lam) < 1e-8:
+        return jnp.log(y)
+    return (jnp.power(y, lam) - 1.0) / lam
+
+
+def _inv_boxcox(z: jnp.ndarray, lam: float) -> jnp.ndarray:
+    """Inverse Box-Cox. Clamps the domain so ``lam != 0`` never yields NaN."""
+    z = jnp.asarray(z, dtype=jnp.float32)
+    if abs(lam) < 1e-8:
+        return jnp.exp(z)
+    base = jnp.maximum(lam * z + 1.0, 1e-8)
+    return jnp.power(base, 1.0 / lam)
+
+
+def _select_boxcox_lambda(y: jnp.ndarray) -> float:
+    """Pick lambda by maximizing the Box-Cox profile log-likelihood (MLE).
+
+    ``LL(lam) = -n/2 * log(var(boxcox(y, lam))) + (lam - 1) * sum(log(y))``,
+    evaluated over a fixed grid. Runs eagerly (concrete ``y``), returning a
+    plain ``float`` so it pickles trivially with the fitted estimator.
+    """
+    y = jnp.asarray(y, dtype=jnp.float32)
+    n = y.size
+    log_sum = jnp.sum(jnp.log(y))
+
+    def ll(lam: float) -> jnp.ndarray:
+        z = _boxcox(y, lam)
+        var = jnp.maximum(jnp.var(z), 1e-12)
+        return -0.5 * n * jnp.log(var) + (lam - 1.0) * log_sum
+
+    lls = jnp.array([ll(float(lam)) for lam in _BOXCOX_LAMBDA_GRID])
+    return float(_BOXCOX_LAMBDA_GRID[int(jnp.argmax(lls))])
+
 
 class iTransformer(BaseForecaster):
     """Univariate iTransformer forecaster (JAX/Flax-NNX port of neuralforecast.iTransformer).
@@ -44,6 +91,7 @@ class iTransformer(BaseForecaster):
         d_ff: int = 2048,
         dropout: float = 0.1,
         use_norm: bool = True,
+        use_boxcox: bool = False,
         activation: str = "gelu",
         max_steps: int = 1000,
         learning_rate: Union[float, Callable[[int], float]] = 1e-3,
@@ -65,6 +113,14 @@ class iTransformer(BaseForecaster):
         If the fitted estimator will be pickled, any callable passed for
         ``loss``/``learning_rate`` must itself be picklable (a class-based callable or
         module-level function).
+
+        ``use_boxcox`` (default ``False``) applies a variance-stabilizing Box-Cox
+        transform to the series before modelling and inverts it on the forecast,
+        mirroring the ``use_boxcox`` option of :class:`chronax.models.TBATS`. The
+        lambda is selected once at fit time by maximizing the Box-Cox profile
+        log-likelihood. It helps multiplicative / strongly-trending series (e.g.
+        airline passengers) and **requires strictly positive values**. Left off,
+        the model is a faithful port of neuralforecast.iTransformer.
         """
         if input_size < 1:
             input_size = 3 * h
@@ -76,6 +132,7 @@ class iTransformer(BaseForecaster):
         self.d_ff = d_ff
         self.dropout = dropout
         self.use_norm = use_norm
+        self.use_boxcox = use_boxcox
         self.activation = activation
         self.max_steps = max_steps
         self.learning_rate = learning_rate
@@ -87,6 +144,7 @@ class iTransformer(BaseForecaster):
         self.model_: ITransformerNet | None = None
         self._context: jnp.ndarray | None = None
         self._train_y: jnp.ndarray | None = None
+        self._bc_lambda: float | None = None
 
     @property
     def _loss_fn(self) -> LossFn:
@@ -129,6 +187,20 @@ class iTransformer(BaseForecaster):
                 f"Series length {y.shape[0]} too short for "
                 f"input_size={self.input_size} + h={self.h}."
             )
+        # Box-Cox stabilizes the variance before modelling; the network and its
+        # RevIN then operate entirely in the transformed space, and predict()
+        # inverts on the way out. ``_train_y`` is kept RAW so conformity_scores
+        # re-forecasts through the public API (which re-applies the transform).
+        y_raw = y
+        if self.use_boxcox:
+            if bool(jnp.any(y_raw <= 0)):
+                raise ValueError(
+                    "use_boxcox=True requires strictly positive series values."
+                )
+            self._bc_lambda = _select_boxcox_lambda(y_raw)
+            y = _boxcox(y_raw, self._bc_lambda)
+        else:
+            self._bc_lambda = None
         net = self._build_net()
         train(
             net, y, h=self.h, input_size=self.input_size, max_steps=self.max_steps,
@@ -137,7 +209,7 @@ class iTransformer(BaseForecaster):
         )
         self.model_ = net
         self._context = y[-self.input_size:]
-        self._train_y = y
+        self._train_y = y_raw
         return self
 
     def predict(
@@ -176,6 +248,8 @@ class iTransformer(BaseForecaster):
                 f"Pass h <= {self.h} or re-fit with a larger h."
             )
         full = predict_step(self.model_, self._context, h=self.h, input_size=self.input_size)
+        if self.use_boxcox and self._bc_lambda is not None:
+            full = _inv_boxcox(full, self._bc_lambda)
         fcst = {"mean": full[:h]}
         if level is not None:
             if self.conformal_params is None:
@@ -235,13 +309,22 @@ class iTransformer(BaseForecaster):
         if self._train_y is None or self.model_ is None:
             raise RuntimeError("Call fit(y) before computing fitted values.")
         y = self._train_y
+        # The network lives in the (Box-Cox) transformed space; window the
+        # transformed series, then invert the one-step-ahead outputs back to
+        # the original scale.
+        if self.use_boxcox and self._bc_lambda is not None:
+            y_model = _boxcox(y, self._bc_lambda)
+        else:
+            y_model = y
         n_windows = y.shape[0] - self.input_size
         if n_windows <= 0:
             return jnp.full((y.shape[0],), jnp.nan, dtype=jnp.float32)
         idx = jnp.arange(self.input_size)[None, :] + jnp.arange(n_windows)[:, None]
-        in_windows = y[idx][..., None]                      # [n_windows, L, 1]
+        in_windows = y_model[idx][..., None]                # [n_windows, L, 1]
         pred = self.model_(in_windows, deterministic=True)
         finite_part = pred[:, 0, 0]                         # one-step-ahead
+        if self.use_boxcox and self._bc_lambda is not None:
+            finite_part = _inv_boxcox(finite_part, self._bc_lambda)
         nan_head = jnp.full((self.input_size,), jnp.nan, dtype=jnp.float32)
         return jnp.concatenate([nan_head, finite_part])
 
