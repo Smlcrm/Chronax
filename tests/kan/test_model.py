@@ -130,3 +130,8 @@ def test_loss_string_pickle_round_trip(loss_name):
     m2 = pickle.loads(pickle.dumps(m))
     np.testing.assert_allclose(np.asarray(m2.predict(h=12)["mean"]),
                                np.asarray(m.predict(h=12)["mean"]), rtol=1e-5, atol=1e-5)
+
+
+def test_kan_importable_from_models_namespace():
+    from chronax.models import KAN as K
+    assert K is KAN
