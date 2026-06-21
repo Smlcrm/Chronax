@@ -94,3 +94,39 @@ def test_model_beats_naive_on_easy_signal():
     y_true = np.asarray(y[-12:])
     naive = np.full(12, float(y[-13]))
     assert np.mean(np.abs(pred - y_true)) < np.mean(np.abs(naive - y_true))
+
+
+def test_pickle_round_trip_preserves_predictions():
+    m = _tiny().fit(_make_y())
+    before = np.asarray(m.predict(h=12)["mean"])
+    m2 = pickle.loads(pickle.dumps(m))
+    np.testing.assert_allclose(np.asarray(m2.predict(h=12)["mean"]), before, rtol=1e-5, atol=1e-5)
+
+
+def test_pickle_preserves_grid_and_spline_state():
+    m = _tiny().fit(_make_y())
+    _, sb = nnx.split(m.model_)
+    m2 = pickle.loads(pickle.dumps(m))
+    _, sa = nnx.split(m2.model_)
+
+    def arrs(state):
+        out = {}
+        for p, v in nnx.to_flat_state(state):
+            val = getattr(v, "value", None)
+            if val is None or str(getattr(val, "dtype", "")).startswith("key"):
+                continue
+            out[tuple(p)] = val
+        return out
+
+    a, b = arrs(sb), arrs(sa)
+    assert a.keys() == b.keys()
+    for k in a:
+        np.testing.assert_array_equal(np.asarray(a[k]), np.asarray(b[k]))
+
+
+@pytest.mark.parametrize("loss_name", ["mae", "mse", "huber"])
+def test_loss_string_pickle_round_trip(loss_name):
+    m = _tiny(loss=loss_name).fit(_make_y())
+    m2 = pickle.loads(pickle.dumps(m))
+    np.testing.assert_allclose(np.asarray(m2.predict(h=12)["mean"]),
+                               np.asarray(m.predict(h=12)["mean"]), rtol=1e-5, atol=1e-5)

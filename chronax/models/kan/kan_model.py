@@ -152,3 +152,24 @@ class KAN(BaseForecaster):
         first = scaler.inverse(pred_z[:, 0, 0:1], shift, scale)[:, 0]
         nan_head = jnp.full((self.input_size,), jnp.nan, dtype=jnp.float32)
         return jnp.concatenate([nan_head, first])
+
+    def __getstate__(self) -> dict:
+        """Serialize NNX state only (Params + the non-Param grid Variable). The
+        GraphDef holds unpicklable JAX ufuncs, so it is rebuilt via _build_net()."""
+        state = self.__dict__.copy()
+        if state.get("model_") is not None:
+            _, full_state = nnx.split(state["model_"])
+            state["model_"] = ("__params_only__", full_state)
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        m = state.get("model_")
+        if isinstance(m, tuple) and m and m[0] == "__params_only__":
+            saved_state = m[1]
+            state["model_"] = None
+            self.__dict__.update(state)
+            net = self._build_net()
+            nnx.update(net, saved_state)
+            self.model_ = net
+            return
+        self.__dict__.update(state)
