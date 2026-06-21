@@ -95,3 +95,26 @@ class KANLinear(nnx.Module):
         scaled = self._scaled_spline_weight()                            # [out, in, coeff]
         spline_out = bs.reshape(bs.shape[0], -1) @ scaled.reshape(self.out_features, -1).T
         return base_out + spline_out
+
+
+class KANNet(nnx.Module):
+    """Stack of KANLinear layers: [input_size -> hidden_size (xN) -> h]. I/O [B, L, 1] -> [B, h, 1]."""
+
+    def __init__(self, *, h, input_size, n_hidden_layers, hidden_size, grid_size, spline_order,
+                 scale_noise, scale_base, scale_spline, enable_standalone_scale_spline, grid_range,
+                 rngs: nnx.Rngs):
+        self.h = h
+        dims = [input_size] + n_hidden_layers * [hidden_size] + [h]
+        self.layers = [
+            KANLinear(d_in, d_out, grid_size=grid_size, spline_order=spline_order,
+                      scale_noise=scale_noise, scale_base=scale_base, scale_spline=scale_spline,
+                      enable_standalone_scale_spline=enable_standalone_scale_spline,
+                      grid_range=grid_range, rngs=rngs)
+            for d_in, d_out in zip(dims, dims[1:])
+        ]
+
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        z = x.astype(jnp.float32)[:, :, 0]      # [B, L]
+        for layer in self.layers:
+            z = layer(z)
+        return z[:, :, None]                    # [B, h, 1]

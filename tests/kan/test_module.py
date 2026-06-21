@@ -46,3 +46,16 @@ def test_kanlinear_grid_not_trainable():
                       scale_spline=1.0, enable_standalone_scale_spline=True, grid_range=(-1.0, 1.0), rngs=nnx.Rngs(0))
     _, state = nnx.split(layer)
     assert not isinstance(layer.grid, nnx.Param)
+
+
+from chronax.models.kan.kan_module import KANNet
+
+
+def test_kannet_forward_shape():
+    net = KANNet(h=12, input_size=36, n_hidden_layers=1, hidden_size=16, grid_size=5,
+                 spline_order=3, scale_noise=0.1, scale_base=1.0, scale_spline=1.0,
+                 enable_standalone_scale_spline=True, grid_range=(-1.0, 1.0), rngs=nnx.Rngs(0))
+    x = jnp.ones((4, 36, 1), dtype=jnp.float32)
+    out = net(x)
+    assert out.shape == (4, 12, 1) and out.dtype == jnp.float32
+    assert len(net.layers) == 2          # [36->16, 16->12]
