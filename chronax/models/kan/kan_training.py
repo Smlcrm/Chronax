@@ -93,3 +93,12 @@ def train(model: KANNet, y: jnp.ndarray, *, h: int, input_size: int, max_steps: 
             f"Consider lowering `learning_rate`, reducing `windows_batch_size`, or using scaler='robust'."
         )
     return jnp.asarray(losses_host)
+
+
+def predict_step(model: KANNet, y: jnp.ndarray, *, h: int, input_size: int, scaler: Scaler) -> jnp.ndarray:
+    """Forecast next h steps from the final input_size of y, inverse-scaled. Returns (h,)."""
+    insample = y[-input_size:][None, :]                  # [1, L]
+    shift, scale = scaler.stats(insample, axis=1)
+    x_z = scaler.transform(insample, shift, scale)[..., None]
+    pred_z = _jit_forward(model, x_z)                    # [1, h, 1]
+    return scaler.inverse(pred_z[..., 0], shift, scale)[0]

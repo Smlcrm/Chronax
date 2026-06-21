@@ -6,7 +6,7 @@ from flax import nnx
 
 from chronax.models.kan.kan_module import KANNet
 from chronax.models.kan.kan_scaler import IdentityScaler
-from chronax.models.kan.kan_training import build_windows, scaled_forward_loss, train
+from chronax.models.kan.kan_training import build_windows, predict_step, scaled_forward_loss, train
 
 
 def _make_y(n=200):
@@ -55,3 +55,13 @@ def test_train_raises_on_divergence():
     with pytest.raises(RuntimeError, match="diverged"):
         train(_net(), _make_y(), h=12, input_size=36, max_steps=10, windows_batch_size=64,
               lr=1e9, seed=0, scaler=IdentityScaler())
+
+
+def test_predict_step_shape_and_idempotent():
+    net = _net()
+    y = _make_y()
+    train(net, y, h=12, input_size=36, max_steps=5, windows_batch_size=64, lr=1e-3, seed=0, scaler=IdentityScaler())
+    p1 = predict_step(net, y[-36:], h=12, input_size=36, scaler=IdentityScaler())
+    p2 = predict_step(net, y[-36:], h=12, input_size=36, scaler=IdentityScaler())
+    assert p1.shape == (12,)
+    np.testing.assert_allclose(np.asarray(p1), np.asarray(p2), rtol=1e-6)
