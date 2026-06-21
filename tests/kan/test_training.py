@@ -6,7 +6,7 @@ from flax import nnx
 
 from chronax.models.kan.kan_module import KANNet
 from chronax.models.kan.kan_scaler import IdentityScaler
-from chronax.models.kan.kan_training import build_windows, scaled_forward_loss
+from chronax.models.kan.kan_training import build_windows, scaled_forward_loss, train
 
 
 def _make_y(n=200):
@@ -28,3 +28,30 @@ def test_scaled_forward_loss_returns_scalar():
     w = build_windows(_make_y(), input_size=36, h=12)
     loss = scaled_forward_loss(net, w[:8], h=12, input_size=36, scaler=IdentityScaler())
     assert loss.shape == () and jnp.isfinite(loss)
+
+
+def test_train_gradient_step_decreases_loss():
+    net = _net()
+    losses = train(net, _make_y(), h=12, input_size=36, max_steps=30, windows_batch_size=64,
+                   lr=1e-3, seed=0, scaler=IdentityScaler())
+    assert losses.shape == (30,) and float(losses[-1]) < float(losses[0])
+
+
+def test_train_deterministic_with_same_seed():
+    y = _make_y()
+    l1 = train(_net(), y, h=12, input_size=36, max_steps=10, windows_batch_size=64, lr=1e-3, seed=0, scaler=IdentityScaler())
+    l2 = train(_net(), y, h=12, input_size=36, max_steps=10, windows_batch_size=64, lr=1e-3, seed=0, scaler=IdentityScaler())
+    np.testing.assert_allclose(np.asarray(l1), np.asarray(l2), rtol=1e-5)
+
+
+def test_train_oversample_with_replacement_small_n():
+    # y(60), input_size=36, h=12 -> n_windows=13 < windows_batch_size=64
+    losses = train(_net(), _make_y(60), h=12, input_size=36, max_steps=8, windows_batch_size=64,
+                   lr=1e-3, seed=0, scaler=IdentityScaler())
+    assert losses.shape == (8,) and jnp.all(jnp.isfinite(losses))
+
+
+def test_train_raises_on_divergence():
+    with pytest.raises(RuntimeError, match="diverged"):
+        train(_net(), _make_y(), h=12, input_size=36, max_steps=10, windows_batch_size=64,
+              lr=1e9, seed=0, scaler=IdentityScaler())
