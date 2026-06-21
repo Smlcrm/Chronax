@@ -135,3 +135,45 @@ def test_loss_string_pickle_round_trip(loss_name):
 def test_kan_importable_from_models_namespace():
     from chronax.models import KAN as K
     assert K is KAN
+
+
+from chronax.utils import ConformalIntervals
+
+
+def test_constant_series_returns_finite():
+    m = _tiny(scaler="robust").fit(jnp.ones(200, dtype=jnp.float32))
+    assert jnp.all(jnp.isfinite(m.predict(h=12)["mean"]))
+
+
+def test_h_equals_one():
+    m = KAN(h=1, input_size=12, hidden_size=8, grid_size=3, max_steps=5, windows_batch_size=16, random_seed=0)
+    m.fit(_make_y(60))
+    assert m.predict(h=1)["mean"].shape == (1,)
+
+
+def test_forecast_equals_fit_then_predict():
+    y = _make_y()
+    np.testing.assert_allclose(np.asarray(_tiny().forecast(y, h=12)["mean"]),
+                               np.asarray(_tiny().fit(y).predict(h=12)["mean"]), rtol=1e-5, atol=1e-5)
+
+
+def test_forecast_fitted_nan_head_finite_tail():
+    res = _tiny().forecast(_make_y(), h=12, fitted=True)
+    fitted = np.asarray(res["fitted"])
+    assert fitted.shape == (200,) and np.all(np.isnan(fitted[:36])) and np.all(np.isfinite(fitted[36:]))
+
+
+def test_predict_with_level_returns_interval_keys():
+    m = KAN(h=4, input_size=12, hidden_size=8, grid_size=3, max_steps=2, windows_batch_size=16, random_seed=0)
+    m.fit(_make_y(80))
+    m.conformal_params = ConformalIntervals(h=4, n_windows=3)
+    out = m.predict(h=4, level=[80])
+    assert "lo-80" in out and "hi-80" in out
+
+
+def test_conformity_scores_finite_2d():
+    m = KAN(h=4, input_size=12, hidden_size=8, grid_size=3, max_steps=2, windows_batch_size=16, random_seed=0)
+    m.fit(_make_y(80))
+    m.conformal_params = ConformalIntervals(h=4, n_windows=3)
+    cs = m.conformity_scores(_make_y(80))
+    assert cs.ndim == 2 and cs.shape[1] == 4 and jnp.all(jnp.isfinite(cs))
