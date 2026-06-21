@@ -1,0 +1,96 @@
+"""Tests for chronax.models.kan.kan_model — BaseForecaster conformance."""
+import pickle
+
+import jax.numpy as jnp
+import numpy as np
+import pytest
+from flax import nnx
+
+from chronax.models.base_forecaster import BaseForecaster
+from chronax.models.kan.kan_model import KAN
+
+
+def _make_y(n=200):
+    return jnp.asarray(np.sin(np.arange(n) / 10.0), dtype=jnp.float32)
+
+
+def _tiny(**kw):
+    return KAN(h=12, input_size=36, hidden_size=16, n_hidden_layers=1, grid_size=5,
+               max_steps=20, windows_batch_size=64, random_seed=0, **kw)
+
+
+def test_kan_inherits_baseforecaster():
+    assert issubclass(KAN, BaseForecaster)
+
+
+def test_init_conformal_params_none():
+    assert _tiny().conformal_params is None
+
+
+def test_fit_returns_self_and_sets_model():
+    m = _tiny()
+    out = m.fit(_make_y())
+    assert out is m and m.model_ is not None
+
+
+def test_predict_default_returns_h():
+    assert _tiny().fit(_make_y()).predict(h=12)["mean"].shape == (12,)
+
+
+def test_predict_smaller_h_slices():
+    assert _tiny().fit(_make_y()).predict(h=5)["mean"].shape == (5,)
+
+
+def test_predict_larger_h_raises():
+    m = _tiny().fit(_make_y())
+    with pytest.raises(ValueError, match="not supported"):
+        m.predict(h=13)
+
+
+def test_predict_h_below_one_raises():
+    m = _tiny().fit(_make_y())
+    with pytest.raises(ValueError, match="positive"):
+        m.predict(h=0)
+
+
+def test_fit_raises_on_exog():
+    with pytest.raises(NotImplementedError):
+        _tiny().fit(_make_y(), X=jnp.ones((200, 1)))
+
+
+def test_fit_raises_on_short_series():
+    with pytest.raises(ValueError, match="too short"):
+        _tiny().fit(_make_y(40))
+
+
+def test_predict_before_fit_raises():
+    with pytest.raises(RuntimeError, match="fit"):
+        _tiny().predict(h=12)
+
+
+def test_unknown_scaler_raises_at_fit():
+    with pytest.raises(ValueError, match="Unknown scaler"):
+        KAN(h=12, input_size=36, hidden_size=16, max_steps=2, windows_batch_size=8, random_seed=0, scaler="nope").fit(_make_y())
+
+
+def test_predict_deterministic_same_seed():
+    y = _make_y()
+    np.testing.assert_allclose(np.asarray(_tiny().fit(y).predict(h=12)["mean"]),
+                               np.asarray(_tiny().fit(y).predict(h=12)["mean"]), rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("scaler", ["identity", "robust"])
+def test_scaler_knob_trains_and_predicts(scaler):
+    m = _tiny(scaler=scaler).fit(_make_y())
+    assert jnp.all(jnp.isfinite(m.predict(h=12)["mean"]))
+
+
+def test_model_beats_naive_on_easy_signal():
+    n = 200
+    y = jnp.asarray(np.sin(np.arange(n) / 5.0), dtype=jnp.float32)
+    m = KAN(h=12, input_size=36, hidden_size=64, n_hidden_layers=1, grid_size=5, max_steps=200,
+            windows_batch_size=64, random_seed=0, scaler="robust").fit(y[:-12])
+    pred = np.asarray(m.predict(h=12)["mean"])
+    y_true = np.asarray(y[-12:])
+    naive = np.full(12, float(y[-13]))
+    assert np.mean(np.abs(pred - y_true)) < np.mean(np.abs(naive - y_true))
