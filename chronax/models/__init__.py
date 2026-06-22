@@ -53,6 +53,11 @@ except ImportError:
 
 from .patchtst import PatchTST
 
+try:
+    from .kan import KAN
+except ImportError:
+    KAN = None
+
 from .batched_forecaster import BatchedForecaster
 
 __all__ = [
@@ -87,6 +92,7 @@ __all__ = [
     "RandomWalkWithDrift",
     "GRU",
     "PatchTST",
+    "KAN",
     "BatchedForecaster",
 ]
 
