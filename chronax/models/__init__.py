@@ -46,7 +46,9 @@ from .ces import AutoCES
 from .tsb import TSB
 from .randomWalkWithDrift import RandomWalkWithDrift
 
-from .gru import GRU
+# from .gru import GRU  # pinned to flax==0.10.x; disabled for newer flax envs
+
+from .autoformer import Autoformer
 
 from .batched_forecaster import BatchedForecaster
 
@@ -80,7 +82,8 @@ __all__ = [
     "AutoCES",
     "TSB",
     "RandomWalkWithDrift",
-    "GRU",
+    # "GRU",
+    "Autoformer",
     "BatchedForecaster",
 ]
 
