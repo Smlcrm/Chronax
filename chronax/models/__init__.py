@@ -55,6 +55,8 @@ try:
 except ImportError:
     KAN = None
 
+from .itransformer import iTransformer
+
 from .batched_forecaster import BatchedForecaster
 
 __all__ = [
@@ -91,6 +93,7 @@ __all__ = [
     "Autoformer",
     "GRU",
     "PatchTST",
+    "iTransformer",
     "KAN",
     "BatchedForecaster",
 ]
