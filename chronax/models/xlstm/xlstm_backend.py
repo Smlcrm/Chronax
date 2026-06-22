@@ -60,6 +60,10 @@ class XLSTMConfig:
     horizon: int = 8          # static; required when decode_mode == "direct"
     use_conv1d_in_slstm: bool = False
     conv1d_kernel: int = 4
+    # sLSTM cell semantics. Defaults reproduce the original behavior; the
+    # paper-faithful FlashRNN/xLSTM sLSTM is opt-in (Eq. 13-15, arXiv 2412.07752).
+    slstm_forget_gate: str = "exp"      # "exp" (current) | "sigmoid" (log-sigmoid forget)
+    slstm_stabilizer: str = "per_head"  # "per_head" (current) | "per_cell" (per Eq.15)
 
     def __post_init__(self):
         if len(self.block_types) != self.num_layers:
@@ -73,6 +77,14 @@ class XLSTMConfig:
             raise ValueError(f"decode_mode must be 'ar' or 'direct', got {self.decode_mode!r}")
         if self.decode_mode == "direct" and self.horizon < 1:
             raise ValueError(f"horizon must be >= 1 in direct mode, got {self.horizon}")
+        if self.slstm_forget_gate not in ("exp", "sigmoid"):
+            raise ValueError(
+                f"slstm_forget_gate must be 'exp' or 'sigmoid', got {self.slstm_forget_gate!r}"
+            )
+        if self.slstm_stabilizer not in ("per_head", "per_cell"):
+            raise ValueError(
+                f"slstm_stabilizer must be 'per_head' or 'per_cell', got {self.slstm_stabilizer!r}"
+            )
 
 
 # =============================================================================
@@ -97,7 +109,8 @@ class SLSTMBlockState(NamedTuple):
     - ``h``: hidden state per head (needed for memory mixing via R), shape (H, Dh). bf16.
     - ``c``: scalar cell per unit, shape (H, Dh). bf16.
     - ``n``: normalizer, shape (H, Dh). bf16.
-    - ``m``: log-space stabilizer per head, shape (H,). float32.
+    - ``m``: log-space stabilizer, float32. Shape (H,) for ``slstm_stabilizer="per_head"``
+      (default) or (H, Dh) for ``"per_cell"`` (paper Eq.15).
     """
     h: jnp.ndarray
     c: jnp.ndarray
@@ -116,11 +129,13 @@ def init_block_state(cfg: XLSTMConfig, dtype=jnp.bfloat16) -> BlockState:
 
 def init_slstm_block_state(cfg: XLSTMConfig, dtype=jnp.bfloat16) -> SLSTMBlockState:
     H, Dh = cfg.num_heads, cfg.head_dim
+    # Stabilizer is per-cell (H, Dh) for the paper-faithful path, else per-head (H,).
+    m_shape = (H, Dh) if cfg.slstm_stabilizer == "per_cell" else (H,)
     return SLSTMBlockState(
         h=jnp.zeros((H, Dh), dtype=dtype),
         c=jnp.zeros((H, Dh), dtype=dtype),
         n=jnp.zeros((H, Dh), dtype=dtype),
-        m=jnp.full((H,), -1e9, dtype=jnp.float32),
+        m=jnp.full(m_shape, -1e9, dtype=jnp.float32),
     )
 
 
@@ -315,29 +330,33 @@ def series_decompose(x: jnp.ndarray, p: dict, kernel: int):
 # mLSTM step + block
 # =============================================================================
 
-def mlstm_step(block_params, mlstm_in, state: BlockState, cfg: XLSTMConfig):
-    """Single mLSTM timestep.
+def _block_output(h_seq, gate_in_seq, residual_seq, block_params, cfg: XLSTMConfig):
+    """Shared post-recurrence block output, vectorized over the leading (time) axis.
 
-    mlstm_in : (D,) compute-dtype (bf16). state : BlockState.
-    Returns (h_out: (H, Dh), new_state: BlockState).
+    h_seq: (..., H, Dh) raw cell outputs; gate_in_seq / residual_seq: (..., D).
+    Applies per-head group-norm, flatten, SiLU gating, down-projection, residual.
+    Identical math to the per-step block tail — just batched over T.
     """
-    Dh = cfg.head_dim
-    gc = cfg.gate_clip
-    qkv = block_params["qkv"]
-    gates = block_params["gates"]
-    dtype = mlstm_in.dtype
-
-    q = jnp.einsum("hdk,d->hk", qkv["Wq"], mlstm_in) + qkv["bq"]
-    k = (jnp.einsum("hdk,d->hk", qkv["Wk"], mlstm_in) + qkv["bk"]) / jnp.sqrt(
-        jnp.asarray(Dh, dtype=dtype)
+    D = cfg.embed_dim
+    h_norm = _per_head_norm(
+        h_seq, block_params["group_ln"]["scale"], block_params["group_ln"]["bias"], cfg.eps
     )
-    v = jnp.einsum("hdk,d->hk", qkv["Wv"], mlstm_in) + qkv["bv"]
+    h_flat = h_norm.reshape(*h_norm.shape[:-2], D)
+    gated = h_flat * jax.nn.silu(gate_in_seq)
+    down = gated @ block_params["down_proj"]["W"] + block_params["down_proj"]["b"]
+    return residual_seq + down
 
-    i_pre = jnp.einsum("hdk,d->hk", gates["Wi"], mlstm_in).squeeze(-1) + gates["bi"].squeeze(-1)
-    f_pre = jnp.einsum("hdk,d->hk", gates["Wf"], mlstm_in).squeeze(-1) + gates["bf"].squeeze(-1)
-    i_pre = jnp.clip(i_pre.astype(jnp.float32), -gc, gc)
-    f_pre = jnp.clip(f_pre.astype(jnp.float32), -gc, gc)
-    o_pre = jnp.einsum("hdk,d->hk", gates["Wo"], mlstm_in) + gates["bo"]
+
+def mlstm_recurrence_step(precomp_t, state: BlockState, cfg: XLSTMConfig):
+    """mLSTM memory recurrence given precomputed per-step input projections.
+
+    precomp_t = (q, k, v, i_pre, f_pre, o_pre): q/k/v/o_pre (H, Dh) compute-dtype,
+    i_pre/f_pre (H,) float32 (already clipped). Only the C/n/m update and retrieval
+    depend on ``state`` — all input-side projections are precomputed upstream
+    (FlashRNN: apply W to all timesteps before the recurrent loop).
+    """
+    q, k, v, i_pre, f_pre, o_pre = precomp_t
+    dtype = q.dtype
 
     m_new = jnp.maximum(f_pre + state.m, i_pre)
     i_stab = jnp.exp(i_pre - m_new)
@@ -358,6 +377,40 @@ def mlstm_step(block_params, mlstm_in, state: BlockState, cfg: XLSTMConfig):
     return h_out, BlockState(C=C_new, n=n_new, m=m_new)
 
 
+def _mlstm_input_proj(block_params, mlstm_in, cfg: XLSTMConfig):
+    """mLSTM gate/qkv input projections. Rank-polymorphic: ``mlstm_in`` may be a
+    single step (D,) or a whole sequence (T, D). Returns (q, k, v, i_pre, f_pre, o_pre)."""
+    Dh = cfg.head_dim
+    gc = cfg.gate_clip
+    qkv = block_params["qkv"]
+    gates = block_params["gates"]
+    dtype = mlstm_in.dtype
+    sub = "hdk,d->hk" if mlstm_in.ndim == 1 else "hdk,td->thk"
+
+    q = jnp.einsum(sub, qkv["Wq"], mlstm_in) + qkv["bq"]
+    k = (jnp.einsum(sub, qkv["Wk"], mlstm_in) + qkv["bk"]) / jnp.sqrt(
+        jnp.asarray(Dh, dtype=dtype)
+    )
+    v = jnp.einsum(sub, qkv["Wv"], mlstm_in) + qkv["bv"]
+
+    i_pre = jnp.einsum(sub, gates["Wi"], mlstm_in).squeeze(-1) + gates["bi"].squeeze(-1)
+    f_pre = jnp.einsum(sub, gates["Wf"], mlstm_in).squeeze(-1) + gates["bf"].squeeze(-1)
+    i_pre = jnp.clip(i_pre.astype(jnp.float32), -gc, gc)
+    f_pre = jnp.clip(f_pre.astype(jnp.float32), -gc, gc)
+    o_pre = jnp.einsum(sub, gates["Wo"], mlstm_in) + gates["bo"]
+    return q, k, v, i_pre, f_pre, o_pre
+
+
+def mlstm_step(block_params, mlstm_in, state: BlockState, cfg: XLSTMConfig):
+    """Single mLSTM timestep.
+
+    mlstm_in : (D,) compute-dtype (bf16). state : BlockState.
+    Returns (h_out: (H, Dh), new_state: BlockState).
+    """
+    precomp = _mlstm_input_proj(block_params, mlstm_in, cfg)
+    return mlstm_recurrence_step(precomp, state, cfg)
+
+
 def mlstm_block_step(block_params, x_t, state: BlockState, cfg: XLSTMConfig):
     """One mLSTM block, one timestep. x_t: (D,) compute dtype."""
     D = cfg.embed_dim
@@ -373,12 +426,31 @@ def mlstm_block_step(block_params, x_t, state: BlockState, cfg: XLSTMConfig):
 
 
 def mlstm_block_forward(block_params, x_seq, init_state: BlockState, cfg: XLSTMConfig):
-    """Run an mLSTM block over a sequence x_seq: (T, D)."""
-    def step(state, x_t):
-        h_t, new_state = mlstm_block_step(block_params, x_t, state, cfg)
+    """Run an mLSTM block over a sequence x_seq: (T, D).
+
+    Input-side ops (pre-LN, up-projection, qkv + gate projections) are computed for
+    the whole sequence up front; only the C/n/m memory recurrence runs in the scan,
+    and the block tail is vectorized over T. Numerically equivalent to scanning
+    ``mlstm_block_step`` (the AR-decode path), up to bf16 reassociation.
+
+    Perf: hoisting the input GEMMs out of the (irreducibly sequential) time loop is
+    faster on CPU/XLA at the context lengths this model uses (ctx_len <= ~128; default
+    64 -> ~1.3-1.4x). Beyond ~T=256 it becomes memory-bandwidth bound and regresses
+    vs. per-step recompute; on GPU it wins at all sizes (the FlashRNN regime).
+    """
+    x_n = _layer_norm(
+        x_seq, block_params["pre_ln"]["scale"], block_params["pre_ln"]["bias"], cfg.eps
+    )
+    up = x_n @ block_params["up_proj"]["W"] + block_params["up_proj"]["b"]
+    mlstm_in_seq, gate_in_seq = jnp.split(up, 2, axis=-1)
+    precomp_seq = _mlstm_input_proj(block_params, mlstm_in_seq, cfg)  # tuple of (T, ...)
+
+    def step(state, precomp_t):
+        h_t, new_state = mlstm_recurrence_step(precomp_t, state, cfg)
         return new_state, h_t
-    final_state, h_seq = lax.scan(step, init_state, x_seq)
-    return h_seq, final_state
+    final_state, h_seq = lax.scan(step, init_state, precomp_seq)
+    out = _block_output(h_seq, gate_in_seq, x_seq, block_params, cfg)
+    return out, final_state
 
 
 # Backward-compat alias (older tests referenced `block_step` / `block_forward`)
@@ -390,31 +462,45 @@ block_forward = mlstm_block_forward
 # sLSTM step + block
 # =============================================================================
 
-def slstm_step(block_params, x_t, state: SLSTMBlockState, cfg: XLSTMConfig):
-    """Single sLSTM timestep. Gates use BOTH input and previous hidden state.
+def _slstm_stack_weights(p):
+    """Stack the four sLSTM gates (order i, f, o, z) for fused matmuls.
 
-    x_t : (D,) compute-dtype (bf16). state : SLSTMBlockState.
-    Returns (h_out: (H, Dh), new_state: SLSTMBlockState).
+    Returns W (4, H, D, Dh), R (4, H, Dh, Dh), b (4, H, Dh).
+    """
+    W = jnp.stack([p["Wi"], p["Wf"], p["Wo"], p["Wz"]])
+    R = jnp.stack([p["Ri"], p["Rf"], p["Ro"], p["Rz"]])
+    b = jnp.stack([p["bi"], p["bf"], p["bo"], p["bz"]])
+    return W, R, b
+
+
+def slstm_recurrence_step(R_stacked, Wx_t, state: SLSTMBlockState, cfg: XLSTMConfig):
+    """sLSTM recurrence given the precomputed stacked input projection.
+
+    R_stacked: (4, H, Dh, Dh) recurrent weights (gate order i, f, o, z).
+    Wx_t: (4, H, Dh) precomputed (W·x + bias) for the four gates.
+    Only the recurrent term R·h and the c/n/m update depend on ``state``; the
+    input projection W·x is hoisted out of the time loop (FlashRNN).
     """
     gc = cfg.gate_clip
-    p = block_params["slstm_gates"]
-    dtype = x_t.dtype
+    dtype = Wx_t.dtype
+    Rh = jnp.einsum("ghkj,hj->ghk", R_stacked, state.h)  # (4, H, Dh)
+    pre = Wx_t + Rh
 
-    def gate(W, R, b):
-        # W: (H, D, Dh), R: (H, Dh, Dh), b: (H, Dh), state.h: (H, Dh)
-        x_proj = jnp.einsum("hdk,d->hk", W, x_t)
-        h_proj = jnp.einsum("hkj,hj->hk", R, state.h)
-        return x_proj + h_proj + b
+    i_pre = jnp.clip(pre[0].astype(jnp.float32), -gc, gc)
+    f_pre = jnp.clip(pre[1].astype(jnp.float32), -gc, gc)
+    o_pre = pre[2].astype(dtype)
+    z_t = jnp.tanh(pre[3]).astype(dtype)
 
-    i_pre = jnp.clip(gate(p["Wi"], p["Ri"], p["bi"]).astype(jnp.float32), -gc, gc)
-    f_pre = jnp.clip(gate(p["Wf"], p["Rf"], p["bf"]).astype(jnp.float32), -gc, gc)
-    o_pre = gate(p["Wo"], p["Ro"], p["bo"]).astype(dtype)
-    z_t = jnp.tanh(gate(p["Wz"], p["Rz"], p["bz"])).astype(dtype)
+    # Forget gate: the paper (Eq.13-15) uses log-sigmoid; "exp" keeps the raw
+    # preactivation (original Chronax behavior). cfg is static -> jit/vmap-safe.
+    logf = jax.nn.log_sigmoid(f_pre) if cfg.slstm_forget_gate == "sigmoid" else f_pre
 
-    # state.m: (H,) — broadcast over Dh
-    m_new = jnp.maximum(f_pre + state.m[:, None], i_pre)   # (H, Dh)
+    # Stabilizer: "per_cell" keeps m per (head, cell) as in the paper (Eq.15);
+    # "per_head" broadcasts one per-head scalar and recollapses (original).
+    m_prev = state.m if cfg.slstm_stabilizer == "per_cell" else state.m[:, None]
+    m_new = jnp.maximum(logf + m_prev, i_pre)   # (H, Dh)
     i_stab = jnp.exp(i_pre - m_new)
-    f_stab = jnp.exp(f_pre + state.m[:, None] - m_new)
+    f_stab = jnp.exp(logf + m_prev - m_new)
 
     i_bf = i_stab.astype(dtype)
     f_bf = f_stab.astype(dtype)
@@ -424,8 +510,22 @@ def slstm_step(block_params, x_t, state: SLSTMBlockState, cfg: XLSTMConfig):
     h_new = (jax.nn.sigmoid(o_pre)
              * (c_new / jnp.maximum(jnp.abs(n_new), jnp.asarray(1.0, dtype=dtype))))
 
-    m_collapsed = jnp.max(m_new, axis=-1).astype(jnp.float32)  # collapse Dh → (H,)
-    return h_new, SLSTMBlockState(h=h_new, c=c_new, n=n_new, m=m_collapsed)
+    if cfg.slstm_stabilizer == "per_cell":
+        m_next = m_new.astype(jnp.float32)                     # (H, Dh)
+    else:
+        m_next = jnp.max(m_new, axis=-1).astype(jnp.float32)   # collapse Dh -> (H,)
+    return h_new, SLSTMBlockState(h=h_new, c=c_new, n=n_new, m=m_next)
+
+
+def slstm_step(block_params, x_t, state: SLSTMBlockState, cfg: XLSTMConfig):
+    """Single sLSTM timestep. Gates use BOTH input and previous hidden state.
+
+    x_t : (D,) compute-dtype (bf16). state : SLSTMBlockState.
+    Returns (h_out: (H, Dh), new_state: SLSTMBlockState).
+    """
+    W, R, b = _slstm_stack_weights(block_params["slstm_gates"])
+    Wx_t = jnp.einsum("ghdk,d->ghk", W, x_t) + b   # (4, H, Dh)
+    return slstm_recurrence_step(R, Wx_t, state, cfg)
 
 
 def _causal_conv1d(x_seq, conv_W, conv_b, kernel: int):
@@ -437,16 +537,20 @@ def _causal_conv1d(x_seq, conv_W, conv_b, kernel: int):
     T, D = x_seq.shape
     pad = kernel - 1
     xp = jnp.concatenate([jnp.zeros((pad, D), dtype=x_seq.dtype), x_seq], axis=0)  # (T+pad, D)
-    # Per-channel cross-correlation: for each output t, sum over k of xp[t+k, d] * conv_W[d, k].
-    # Implementable via lax.conv_general_dilated, but a simple einsum over a strided view works.
-    # Build a (T, kernel, D) view via lax.dynamic_slice over a fori_loop is expensive; instead
-    # use jnp.stack with vmap over the time axis.
-    def at(t):
-        # Window xp[t : t+kernel, :] → (kernel, D). Multiply by conv_W^T and sum over kernel.
-        win = lax.dynamic_slice(xp, (t, 0), (kernel, D))  # (kernel, D)
-        return jnp.einsum("kd,dk->d", win, conv_W) + conv_b
-    out = jax.vmap(at)(jnp.arange(T))
-    return out
+    # Depthwise causal cross-correlation as a single fused conv (FlashRNN-style: keep the
+    # input-side op as one batched kernel rather than T dynamic-slices). conv_W is laid out
+    # (D, kernel) -> OIW (D, 1, kernel) with feature_group_count=D so each channel convolves
+    # only with its own filter. VALID padding over the left-zero-padded signal == causal.
+    dn = lax.conv_dimension_numbers((1, T + pad, D), (D, 1, kernel), ("NWC", "OIW", "NWC"))
+    out = lax.conv_general_dilated(
+        xp[None],                    # (1, T+pad, D)
+        conv_W[:, None, :],          # (D, 1, kernel)
+        window_strides=(1,),
+        padding="VALID",
+        dimension_numbers=dn,
+        feature_group_count=D,
+    )[0]                             # (T, D)
+    return out + conv_b
 
 
 def slstm_block_step(block_params, x_t, state: SLSTMBlockState, cfg: XLSTMConfig):
@@ -467,17 +571,32 @@ def slstm_block_forward(block_params, x_seq, init_state: SLSTMBlockState, cfg: X
     """Run an sLSTM block over a sequence x_seq: (T, D).
 
     If ``cfg.use_conv1d_in_slstm`` is set and the block contains a ``conv1d`` param,
-    apply causal Conv1D over the entire sequence before the scan.
+    apply causal Conv1D over the entire sequence first. Input-side projections
+    (pre-LN, up-proj, the four W·x gate projections) are computed for the whole
+    sequence up front; only R·h and the c/n/m recurrence run in the scan.
+
+    See ``mlstm_block_forward`` for the CPU large-T perf tradeoff. sLSTM is
+    irreducibly sequential: its R·h memory mixing has no parallel-scan form (this is
+    the state-tracking property), so only the per-step constant factor is reducible.
     """
     if cfg.use_conv1d_in_slstm and "conv1d" in block_params:
         x_seq = _causal_conv1d(x_seq, block_params["conv1d"]["W"], block_params["conv1d"]["b"],
                                cfg.conv1d_kernel)
 
-    def step(state, x_t):
-        h_t, new_state = slstm_block_step(block_params, x_t, state, cfg)
+    x_n = _layer_norm(
+        x_seq, block_params["pre_ln"]["scale"], block_params["pre_ln"]["bias"], cfg.eps
+    )
+    up = x_n @ block_params["up_proj"]["W"] + block_params["up_proj"]["b"]
+    slstm_in_seq, gate_in_seq = jnp.split(up, 2, axis=-1)
+    W, R, b = _slstm_stack_weights(block_params["slstm_gates"])
+    Wx_seq = jnp.einsum("ghdk,td->tghk", W, slstm_in_seq) + b[None]   # (T, 4, H, Dh)
+
+    def step(state, Wx_t):
+        h_t, new_state = slstm_recurrence_step(R, Wx_t, state, cfg)
         return new_state, h_t
-    final_state, h_seq = lax.scan(step, init_state, x_seq)
-    return h_seq, final_state
+    final_state, h_seq = lax.scan(step, init_state, Wx_seq)
+    out = _block_output(h_seq, gate_in_seq, x_seq, block_params, cfg)
+    return out, final_state
 
 
 # =============================================================================

@@ -46,7 +46,8 @@ from .ces import AutoCES
 from .tsb import TSB
 from .randomWalkWithDrift import RandomWalkWithDrift
 
-from .gru import GRU
+# NOTE: GRU is imported lazily (see __getattr__ below) — it hard-pins flax 0.10.x,
+# so `import chronax.models` must not force a flax import on callers using other models.
 
 from .batched_forecaster import BatchedForecaster
 
@@ -86,4 +87,19 @@ __all__ = [
     "BatchedForecaster",
     "XLSTM",
 ]
+
+
+def __getattr__(name):
+    """Lazily import GRU on first access (PEP 562).
+
+    GRU hard-pins flax 0.10.x (see ``chronax/models/gru/__init__.py``); importing it
+    eagerly would make the whole ``chronax.models`` namespace fail to import wherever
+    flax is unavailable or version-incompatible. Accessing ``chronax.models.GRU`` (or
+    ``from chronax.models import GRU``) triggers the import — and its flax check — only
+    when GRU is actually used.
+    """
+    if name == "GRU":
+        from .gru import GRU as _GRU
+        return _GRU
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 

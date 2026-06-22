@@ -84,6 +84,13 @@ class XLSTM(BaseForecaster):
         Apply causal Conv1D before sLSTM recurrence.
     conv1d_kernel : int
         Causal-Conv1D kernel size.
+    slstm_forget_gate : {"exp", "sigmoid"}
+        sLSTM forget-gate form. ``"exp"`` (default) preserves the original
+        behavior; ``"sigmoid"`` uses the log-sigmoid forget gate of the xLSTM
+        paper (Eq. 13-15, arXiv 2412.07752). sLSTM blocks only.
+    slstm_stabilizer : {"per_head", "per_cell"}
+        sLSTM log-space stabilizer granularity. ``"per_head"`` (default) keeps the
+        original collapsed stabilizer; ``"per_cell"`` matches the paper (Eq. 15).
     """
 
     uses_exog = False
@@ -113,6 +120,8 @@ class XLSTM(BaseForecaster):
         horizon: Optional[int] = None,
         use_conv1d_in_slstm: bool = False,
         conv1d_kernel: int = 4,
+        slstm_forget_gate: str = "exp",
+        slstm_stabilizer: str = "per_head",
     ) -> None:
         if ctx_len < 4:
             raise ValueError(f"ctx_len must be >= 4, got {ctx_len}")
@@ -146,6 +155,14 @@ class XLSTM(BaseForecaster):
             raise ValueError(f"decode_mode must be 'ar' or 'direct', got {decode_mode!r}")
         if decode_mode == "direct" and horizon is None:
             raise ValueError("decode_mode='direct' requires `horizon` to be set.")
+        if slstm_forget_gate not in ("exp", "sigmoid"):
+            raise ValueError(
+                f"slstm_forget_gate must be 'exp' or 'sigmoid', got {slstm_forget_gate!r}"
+            )
+        if slstm_stabilizer not in ("per_head", "per_cell"):
+            raise ValueError(
+                f"slstm_stabilizer must be 'per_head' or 'per_cell', got {slstm_stabilizer!r}"
+            )
 
         self.ctx_len = int(ctx_len)
         self.horizon_train = int(horizon_train)
@@ -170,6 +187,8 @@ class XLSTM(BaseForecaster):
         self.horizon = None if horizon is None else int(horizon)
         self.use_conv1d_in_slstm = bool(use_conv1d_in_slstm)
         self.conv1d_kernel = int(conv1d_kernel)
+        self.slstm_forget_gate = slstm_forget_gate
+        self.slstm_stabilizer = slstm_stabilizer
 
         self.model_ = {}
 
@@ -209,6 +228,8 @@ class XLSTM(BaseForecaster):
             horizon=int(self.horizon) if self.horizon is not None else self.horizon_train,
             use_conv1d_in_slstm=self.use_conv1d_in_slstm,
             conv1d_kernel=self.conv1d_kernel,
+            slstm_forget_gate=self.slstm_forget_gate,
+            slstm_stabilizer=self.slstm_stabilizer,
         )
 
     def fit(self, y: jnp.ndarray, X: jnp.ndarray | None = None) -> "XLSTM":
