@@ -49,6 +49,24 @@ from .randomWalkWithDrift import RandomWalkWithDrift
 # NOTE: GRU is imported lazily (see __getattr__ below) — it hard-pins flax 0.10.x,
 # so `import chronax.models` must not force a flax import on callers using other models.
 
+# The autoformer package exports the forecaster as ``AutoformerForecaster``; expose it
+# under the public registry name ``Autoformer`` that ``__all__`` advertises.
+from .autoformer import AutoformerForecaster as Autoformer
+
+try:
+    from .kan import KAN
+except ImportError:
+    KAN = None
+
+from .itransformer import iTransformer
+
+# PatchTST hard-pins flax 0.10.x (raises ImportError otherwise); guard like KAN so a
+# version/availability mismatch degrades to PatchTST=None instead of breaking the namespace.
+try:
+    from .patchtst import PatchTST
+except ImportError:
+    PatchTST = None
+
 from .batched_forecaster import BatchedForecaster
 
 from .xlstm import XLSTM
@@ -84,6 +102,10 @@ __all__ = [
     "TSB",
     "RandomWalkWithDrift",
     "GRU",
+    "Autoformer",
+    "iTransformer",
+    "KAN",
+    "PatchTST",
     "BatchedForecaster",
     "XLSTM",
 ]
