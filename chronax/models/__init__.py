@@ -84,6 +84,8 @@ __all__ = [
     "RandomWalkWithDrift",
     # "GRU",
     "Autoformer",
+    "GRU",
+    "PatchTST",
     "BatchedForecaster",
 ]
 
