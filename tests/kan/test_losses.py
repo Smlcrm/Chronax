@@ -48,3 +48,13 @@ def test_resolve_unknown_raises():
 
 def test_registry_keys_are_stable():
     assert set(LOSSES.keys()) == {"mae", "mse", "huber"}
+
+
+@pytest.mark.parametrize("fn", [mae, mse, huber])
+def test_masked_loss_ignores_zero_weighted(fn):
+    pred = jnp.array([[1.0, 2.0, 3.0]])
+    target = jnp.array([[1.0, 2.0, 99.0]])     # 3rd element is a "padded" position
+    mask = jnp.array([[1.0, 1.0, 0.0]])
+    # first two have zero error -> masked mean = 0; an unmasked mean would be large
+    assert float(fn(pred, target, mask)) == 0.0
+    assert float(fn(pred, target)) > 1.0

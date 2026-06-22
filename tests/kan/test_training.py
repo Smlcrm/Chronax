@@ -19,14 +19,18 @@ def _net(h=12, input_size=36, hidden=16):
                   enable_standalone_scale_spline=True, grid_range=(-1.0, 1.0), rngs=nnx.Rngs(0))
 
 
-def test_build_windows_shape():
-    assert build_windows(_make_y(60), input_size=36, h=12).shape == (60 - 48 + 1, 48)
+def test_build_windows_shape_and_padding():
+    # NF-style right-pad: n_windows = len(y) - input_size (incl. partial-horizon windows)
+    w, m = build_windows(_make_y(60), input_size=36, h=12)
+    assert w.shape == (60 - 36, 48) and m.shape == (60 - 36, 48)
+    assert float(m[:, :36].min()) == 1.0          # insample always real
+    assert float(m[-1, 36:].min()) == 0.0         # last window's horizon tail is padded
 
 
 def test_scaled_forward_loss_returns_scalar():
     net = _net()
-    w = build_windows(_make_y(), input_size=36, h=12)
-    loss = scaled_forward_loss(net, w[:8], h=12, input_size=36, scaler=IdentityScaler())
+    w, m = build_windows(_make_y(), input_size=36, h=12)
+    loss = scaled_forward_loss(net, w[:8], m[:8], h=12, input_size=36, scaler=IdentityScaler())
     assert loss.shape == () and jnp.isfinite(loss)
 
 

@@ -12,26 +12,43 @@ from chronax.models.kan.kan_module import KANNet
 from chronax.models.kan.kan_scaler import Scaler
 
 
-def build_windows(y: jnp.ndarray, input_size: int, h: int) -> jnp.ndarray:
-    """Return [n_windows, input_size+h] rolling windows; step=1."""
+def build_windows(y: jnp.ndarray, input_size: int, h: int) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Rolling training windows with neuralforecast-style right-padding.
+
+    Right-pads ``y`` with ``h`` zeros before unfolding (NF ``padder_train =
+    ConstantPad1d((0, h))``), yielding ``len(y) - input_size`` windows of length
+    ``input_size + h`` — including ~``h`` partial-horizon windows whose context
+    reaches the end of the series. Returns ``(windows, mask)`` where ``mask`` is
+    1 on real points and 0 on the padded tail, so the loss can drop padded
+    horizon steps. The insample (first ``input_size``) of every window is fully
+    real. Returns shape ``[n_windows, input_size+h]`` each.
+    """
     window_size = input_size + h
-    n = y.shape[0] - window_size + 1
-    if n <= 0:
-        raise ValueError(f"Series length {y.shape[0]} too short for input_size={input_size}, h={h}")
+    n_real = y.shape[0]
+    n = n_real - input_size                              # NF keeps windows with >=1 valid outsample
+    if n < 1:
+        raise ValueError(f"Series length {n_real} too short for input_size={input_size}, h={h}")
+    y_pad = jnp.concatenate([y, jnp.zeros((h,), y.dtype)])
+    avail = jnp.concatenate([jnp.ones((n_real,), y.dtype), jnp.zeros((h,), y.dtype)])
     idx = jnp.arange(window_size)[None, :] + jnp.arange(n)[:, None]
-    return y[idx]
+    return y_pad[idx], avail[idx]
 
 
-def scaled_forward_loss(model: KANNet, windows: jnp.ndarray, *, h: int, input_size: int,
-                        scaler: Scaler, loss_fn: LossFn = mae) -> jnp.ndarray:
-    """Forward + point loss in SCALED space. windows: [B, input_size+h] -> scalar."""
+def scaled_forward_loss(model: KANNet, windows: jnp.ndarray, mask: jnp.ndarray, *, h: int,
+                        input_size: int, scaler: Scaler, loss_fn: LossFn = mae) -> jnp.ndarray:
+    """Forward + masked point loss in SCALED space. windows/mask: [B, input_size+h] -> scalar.
+
+    The insample is always real (padding is target-side only), so the scaler sees
+    real values. Padded horizon steps are excluded via the outsample mask.
+    """
     insample = windows[:, :input_size]
     target = windows[:, input_size:]
+    out_mask = mask[:, input_size:]
     shift, scale = scaler.stats(insample, axis=1)
     insample_z = scaler.transform(insample, shift, scale)
     target_z = scaler.transform(target, shift, scale)
     pred = model(insample_z[..., None])
-    return loss_fn(pred[..., 0], target_z)
+    return loss_fn(pred[..., 0], target_z, out_mask)
 
 
 @nnx.jit
@@ -50,7 +67,7 @@ def train(model: KANNet, y: jnp.ndarray, *, h: int, input_size: int, max_steps: 
     else a permutation). The scan iterates an int32 index tensor and gathers
     windows in-step (avoids materializing a large float32 batch tensor).
     """
-    windows = build_windows(y, input_size, h)
+    windows, mask = build_windows(y, input_size, h)
     n_windows = windows.shape[0]
     key = jax.random.PRNGKey(seed)
     step_keys = jax.random.split(key, max_steps)
@@ -69,8 +86,9 @@ def train(model: KANNet, y: jnp.ndarray, *, h: int, input_size: int, max_steps: 
     def step(carry, idx):
         model, opt = carry
         batch_windows = windows[idx]
+        batch_mask = mask[idx]
         loss, grads = nnx.value_and_grad(
-            lambda m: scaled_forward_loss(m, batch_windows, h=h, input_size=input_size,
+            lambda m: scaled_forward_loss(m, batch_windows, batch_mask, h=h, input_size=input_size,
                                           scaler=scaler, loss_fn=loss_fn)
         )(model)
         opt.update(grads)

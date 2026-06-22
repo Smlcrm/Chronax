@@ -85,6 +85,14 @@ def test_scaler_knob_trains_and_predicts(scaler):
     assert jnp.all(jnp.isfinite(m.predict(h=12)["mean"]))
 
 
+def test_custom_callable_loss_trains():
+    def my_loss(pred, target, mask=None):
+        e = jnp.abs(pred - target)
+        return jnp.mean(e) if mask is None else (e * mask).sum() / jnp.clip(mask.sum(), 1.0)
+    m = _tiny(loss=my_loss).fit(_make_y())
+    assert jnp.all(jnp.isfinite(m.predict(h=12)["mean"]))
+
+
 def test_model_beats_naive_on_easy_signal():
     n = 200
     y = jnp.asarray(np.sin(np.arange(n) / 5.0), dtype=jnp.float32)
