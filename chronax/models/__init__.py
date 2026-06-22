@@ -46,12 +46,14 @@ from .ces import AutoCES
 from .tsb import TSB
 from .randomWalkWithDrift import RandomWalkWithDrift
 
-try:
-    from .gru import GRU
-except ImportError:
-    GRU = None
+# from .gru import GRU  # pinned to flax==0.10.x; disabled for newer flax envs
 
-from .patchtst import PatchTST
+from .autoformer import Autoformer
+
+try:
+    from .kan import KAN
+except ImportError:
+    KAN = None
 
 from .itransformer import iTransformer
 
@@ -87,9 +89,12 @@ __all__ = [
     "AutoCES",
     "TSB",
     "RandomWalkWithDrift",
+    # "GRU",
+    "Autoformer",
     "GRU",
     "PatchTST",
     "iTransformer",
+    "KAN",
     "BatchedForecaster",
 ]
 
