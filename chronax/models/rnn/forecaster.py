@@ -59,6 +59,52 @@ def _as_series_list(y: SeriesLike) -> List[np.ndarray]:
     return out
 
 
+def _build_window_cache(
+    y_list: List[np.ndarray],
+    input_size: int,
+    h: int,
+) -> tuple:
+    """Pre-extract every valid sliding window from all series.
+
+    Avoids 128 Python ``_sample_window`` calls + ``create_batch`` overhead
+    per training step.  After calling once at the start of ``fit``, each
+    step is a cheap numpy fancy-index + single ``jnp.array`` transfer.
+
+    Returns:
+        insample   [N, input_size] float32  — history windows
+        outsample  [N, h]          float32  — horizon targets
+        avail_mask [N, input_size] float32  — 1 = real data, 0 = padded
+    """
+    total = input_size + h
+    all_ins: List[np.ndarray] = []
+    all_out: List[np.ndarray] = []
+    all_msk: List[np.ndarray] = []
+    for y in y_list:
+        n = len(y)
+        if n < total:
+            ins = np.zeros(input_size, dtype=np.float32)
+            ins[input_size - min(n, input_size):] = y[:input_size]
+            out = np.zeros(h, dtype=np.float32)
+            avail = min(n - input_size, h)
+            if avail > 0:
+                out[h - avail:] = y[input_size : input_size + avail]
+            msk = np.zeros(input_size, dtype=np.float32)
+            msk[input_size - min(n, input_size):] = 1.0
+            all_ins.append(ins)
+            all_out.append(out)
+            all_msk.append(msk)
+        else:
+            for start in range(n - total + 1):
+                all_ins.append(y[start : start + input_size].astype(np.float32))
+                all_out.append(y[start + input_size : start + total].astype(np.float32))
+                all_msk.append(np.ones(input_size, dtype=np.float32))
+    return (
+        np.stack(all_ins),
+        np.stack(all_out),
+        np.stack(all_msk),
+    )
+
+
 def _scaler_fit(y_list: List[np.ndarray]) -> List[tuple]:
     """Per-series ``(mean, std)`` standardisation parameters.
 
@@ -93,21 +139,47 @@ def _invert_scale(yhat: np.ndarray, stats: List[tuple]) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 
+def _sample_window(
+    y: np.ndarray,
+    input_size: int,
+    h: int,
+    rng: np.random.RandomState,
+) -> np.ndarray:
+    """Return a random window of length ``input_size + h`` from ``y``.
+
+    If the series is shorter than ``input_size + h``, the full series is
+    returned and ``create_batch`` handles left-padding.
+    """
+    total = input_size + h
+    if len(y) <= total:
+        return y
+    start = rng.randint(0, len(y) - total + 1)
+    return y[start : start + total]
+
+
 class RNNForecaster:
     """High-level fit/forecast wrapper around :class:`chronax.models.rnn.RNN`.
 
     Args:
         config: model architecture config. Must include ``h`` and
-            ``input_size``. By default uses ``recurrent=True`` for an
-            autoregressive head.
+            ``input_size``.
         max_steps: number of optimiser steps performed by :meth:`fit`.
         learning_rate: Adam learning rate.
-        batch_size: number of windows per training step. When the dataset
-            has fewer series than ``batch_size`` we cycle indices.
+        batch_size: number of windows per training step.
         seed: PRNG seed for parameter init and training shuffling.
         scale: if True, standardise each series before training and undo the
             scaling on the forecast. Strongly recommended for raw real-world
             data (e.g. airline passengers, hourly temperature).
+        grad_clip: global gradient-norm clip threshold (0 = disabled).
+        window_sampling: if True, each training step samples a random
+            ``input_size + h`` window. When no exogenous variables are
+            present, all valid windows are pre-extracted into a numpy cache
+            at the start of ``fit``; each step then becomes a cheap fancy-
+            index instead of 128 Python ``_sample_window`` calls.
+        use_lr_schedule: if True, wrap Adam with a warmup + cosine-decay
+            schedule decaying to 1 % of ``learning_rate``. Set False to use
+            a constant learning rate (matches NeuralForecast's default
+            optimizer behaviour).
 
     Notes:
         ``forecast(h)`` ignores the ``h`` argument when set; the model's
@@ -124,6 +196,10 @@ class RNNForecaster:
         batch_size: int = 32,
         seed: int = 0,
         scale: bool = True,
+        grad_clip: float = 1.0,
+        window_sampling: bool = True,
+        use_lr_schedule: bool = True,
+        weight_decay: float = 0.0,
     ):
         self.config = config
         self.max_steps = max_steps
@@ -131,6 +207,10 @@ class RNNForecaster:
         self.batch_size = batch_size
         self.seed = seed
         self.scale = scale
+        self.grad_clip = grad_clip
+        self.window_sampling = window_sampling
+        self.use_lr_schedule = use_lr_schedule
+        self.weight_decay = weight_decay
 
         self._state: Optional[TrainState] = None
         self._scaler: Optional[List[tuple]] = None
@@ -181,28 +261,72 @@ class RNNForecaster:
 
         rng = jax.random.PRNGKey(self.seed)
         init_rng, rng = jax.random.split(rng)
+        warmup = max(1, self.max_steps // 10)
         self._state = create_train_state(
             init_rng,
             self.config,
             learning_rate=self.learning_rate,
+            weight_decay=self.weight_decay,
+            grad_clip=self.grad_clip,
+            cosine_decay_steps=self.max_steps if self.use_lr_schedule else 0,
+            warmup_steps=warmup if self.use_lr_schedule else 0,
         )
 
         np_rng = np.random.RandomState(self.seed)
         n = len(y_scaled)
         log_every = max(1, self.max_steps // 10)
 
-        for step in range(self.max_steps):
-            idx = np_rng.choice(n, size=min(self.batch_size, n), replace=(n < self.batch_size))
-            y_batch = [y_scaled[i] for i in idx]
-            sub = lambda lst: ([lst[i] for i in idx] if lst is not None else None)
-            batch = create_batch(
-                y_series=y_batch,
-                input_size=self.config.input_size,
-                h=self.config.h,
-                hist_exog_list=sub(hist_exog),
-                futr_exog_list=sub(futr_exog),
-                stat_exog_list=sub(stat_exog),
+        # ---- window cache (fast path) ----------------------------------------
+        # Pre-extract all valid windows once and move the whole cache to the
+        # JAX device.  Each training step then does only a numpy random-index
+        # selection followed by a device-side JAX gather — eliminating the
+        # per-step host-to-device transfer that dominated step time when using
+        # jnp.array(...) inside the loop.
+        _has_exog = hist_exog is not None or futr_exog is not None or stat_exog is not None
+        if self.window_sampling and not _has_exog:
+            _ins_np, _out_np, _msk_np = _build_window_cache(
+                y_scaled, self.config.input_size, self.config.h
             )
+            # One-time host→device transfer for the entire cache.
+            _ins_dev = jax.device_put(jnp.array(_ins_np))   # [N, L]
+            _out_dev = jax.device_put(jnp.array(_out_np))   # [N, h]
+            _n_wins = _ins_np.shape[0]
+            _use_cache = True
+        else:
+            _use_cache = False
+
+        _ones_mask = jnp.ones((self.batch_size, self.config.h, 1), dtype=jnp.float32)
+
+        for step in range(self.max_steps):
+            if _use_cache:
+                # numpy RNG only; index into device arrays (no host→device per step)
+                win_idx = np_rng.choice(_n_wins, size=self.batch_size, replace=True)
+                batch = {
+                    "insample_y": _ins_dev[win_idx, :, None],
+                    "outsample_y": _out_dev[win_idx, :, None],
+                    "sample_mask": _ones_mask,
+                }
+            else:
+                idx = np_rng.choice(n, size=self.batch_size, replace=True)
+                sub = lambda lst: ([lst[i] for i in idx] if lst is not None else None)
+                if self.window_sampling:
+                    y_batch = [
+                        _sample_window(
+                            y_scaled[i], self.config.input_size, self.config.h, np_rng
+                        )
+                        for i in idx
+                    ]
+                else:
+                    y_batch = [y_scaled[i] for i in idx]
+                batch = create_batch(
+                    y_series=y_batch,
+                    input_size=self.config.input_size,
+                    h=self.config.h,
+                    hist_exog_list=sub(hist_exog),
+                    futr_exog_list=sub(futr_exog),
+                    stat_exog_list=sub(stat_exog),
+                )
+
             rng, step_rng = jax.random.split(rng)
             self._state, loss, _ = train_step(self._state, batch, step_rng)
 
@@ -332,11 +456,16 @@ class RNNForecaster:
             batch_size=self.batch_size,
             seed=self.seed,
             scale=self.scale,
+            grad_clip=self.grad_clip,
+            window_sampling=self.window_sampling,
+            use_lr_schedule=self.use_lr_schedule,
+            weight_decay=self.weight_decay,
         )
 
     def __repr__(self) -> str:
         return (
             f"RNNForecaster(config={asdict(self.config)}, max_steps={self.max_steps}, "
             f"learning_rate={self.learning_rate}, batch_size={self.batch_size}, "
+            f"grad_clip={self.grad_clip}, window_sampling={self.window_sampling}, "
             f"fitted={self.fitted})"
         )
