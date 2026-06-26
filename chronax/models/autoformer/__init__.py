@@ -45,7 +45,13 @@ from chronax.models.autoformer.train import (
     train_window_step,
 )
 
+# Public alias expected by the chronax.models registry
+# (`from .autoformer import Autoformer`), matching the iTransformer naming
+# convention where the user-facing class is the bare model name.
+Autoformer = AutoformerForecaster
+
 __all__ = [
+    "Autoformer",
     # Config + model
     "AutoformerConfig",
     "AutoformerModel",
