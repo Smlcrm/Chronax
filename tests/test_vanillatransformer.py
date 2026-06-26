@@ -197,3 +197,66 @@ def test_net_deterministic_is_repeatable():
     a = net(x, deterministic=True)
     b = net(x, deterministic=True)
     assert jnp.allclose(a, b)
+
+
+from chronax.models.vanillatransformer.vanillatransformer_training import (
+    build_windows, forward_loss, predict_step, train,
+)
+
+
+# ============================================================================
+# Training
+# ============================================================================
+
+def test_build_windows_shape_and_content():
+    y = jnp.arange(10.0)
+    w = build_windows(y, input_size=4, h=2)
+    assert w.shape == (5, 6)          # n = 10 - 6 + 1 = 5
+    assert jnp.allclose(w[0], jnp.arange(6.0))
+    assert jnp.allclose(w[-1], jnp.arange(4.0, 10.0))
+
+
+def test_build_windows_too_short_raises():
+    with pytest.raises(ValueError):
+        build_windows(jnp.arange(3.0), input_size=4, h=2)
+
+
+def _tiny_net(h=4, input_size=12):
+    return VanillaTransformerNet(
+        h=h, input_size=input_size, hidden_size=16, n_heads=4, conv_hidden_size=8,
+        encoder_layers=1, decoder_layers=1, dropout=0.0, activation="gelu",
+        decoder_input_size_multiplier=0.5, rngs=nnx.Rngs(0),
+    )
+
+
+def test_forward_loss_scalar_finite():
+    net = _tiny_net()
+    w = build_windows(_make_y(60), input_size=12, h=4)
+    loss = forward_loss(net, w[:8], h=4, input_size=12)
+    assert loss.shape == ()
+    assert jnp.isfinite(loss)
+
+
+def test_train_returns_losses_and_reduces():
+    net = _tiny_net()
+    losses = train(net, _make_y(120), h=4, input_size=12, max_steps=30,
+                   windows_batch_size=16, lr=1e-3, seed=0)
+    assert losses.shape == (30,)
+    assert jnp.all(jnp.isfinite(losses))
+    assert float(jnp.mean(losses[-5:])) < float(jnp.mean(losses[:5]))
+
+
+def test_train_with_replacement_regime_runs():
+    # n_windows (= 120 - 96 + 1 = 25) < windows_batch_size (= 64) -> WITH replacement.
+    net = _tiny_net(h=24, input_size=72)
+    losses = train(net, _make_y(120), h=24, input_size=72, max_steps=10,
+                   windows_batch_size=64, lr=1e-3, seed=1)
+    assert losses.shape == (10,)
+    assert jnp.all(jnp.isfinite(losses))
+
+
+def test_predict_step_shape():
+    net = _tiny_net()
+    out = predict_step(net, _make_y(60), h=4, input_size=12)
+    assert out.shape == (4,)
+    assert jnp.all(jnp.isfinite(out))
