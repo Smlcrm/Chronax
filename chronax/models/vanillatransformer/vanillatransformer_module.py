@@ -175,3 +175,163 @@ class AttentionLayer(nnx.Module):
         B, _, Lq, _ = ctx.shape
         ctx = ctx.transpose(0, 2, 1, 3).reshape(B, Lq, self.n_heads * self.d_k)
         return self.w_o(ctx)
+
+
+class TransEncoderLayer(nnx.Module):
+    """One encoder layer (post-norm), matching NF ``TransEncoderLayer``.
+
+    ``new_x = attn(x, x); x = x + drop(new_x); y = x = norm1(x);
+    y = drop(act(conv1(y))); y = drop(conv2(y)); return norm2(x + y)``.
+    The two ``Conv1d(kernel_size=1)`` are pointwise linears with bias.
+    """
+
+    def __init__(self, *, hidden_size, n_heads, conv_hidden_size, dropout,
+                 activation="gelu", rngs: nnx.Rngs):
+        self.activation = activation
+        self.attn = AttentionLayer(
+            hidden_size=hidden_size, n_heads=n_heads, attn_dropout=dropout, rngs=rngs,
+        )
+        self.conv1 = nnx.Linear(hidden_size, conv_hidden_size,
+                                kernel_init=_TorchLinearInit(hidden_size),
+                                bias_init=_TorchLinearInit(hidden_size), rngs=rngs)
+        self.conv2 = nnx.Linear(conv_hidden_size, hidden_size,
+                                kernel_init=_TorchLinearInit(conv_hidden_size),
+                                bias_init=_TorchLinearInit(conv_hidden_size), rngs=rngs)
+        self.norm1 = nnx.LayerNorm(hidden_size, epsilon=1e-5, rngs=rngs)
+        self.norm2 = nnx.LayerNorm(hidden_size, epsilon=1e-5, rngs=rngs)
+        self.dropout = nnx.Dropout(rate=dropout, rngs=rngs)
+
+    def __call__(self, x, deterministic: bool):
+        act = _resolve_activation(self.activation)
+        new_x = self.attn(x, x, deterministic=deterministic)
+        x = x + self.dropout(new_x, deterministic=deterministic)
+        y = x = self.norm1(x)
+        y = self.dropout(act(self.conv1(y)), deterministic=deterministic)
+        y = self.dropout(self.conv2(y), deterministic=deterministic)
+        return self.norm2(x + y)
+
+
+class TransEncoder(nnx.Module):
+    """Stack of ``encoder_layers`` encoder layers + final LayerNorm."""
+
+    def __init__(self, *, encoder_layers, hidden_size, n_heads, conv_hidden_size,
+                 dropout, activation="gelu", rngs: nnx.Rngs):
+        self.layers = [
+            TransEncoderLayer(
+                hidden_size=hidden_size, n_heads=n_heads,
+                conv_hidden_size=conv_hidden_size, dropout=dropout,
+                activation=activation, rngs=rngs,
+            )
+            for _ in range(encoder_layers)
+        ]
+        self.norm = nnx.LayerNorm(hidden_size, epsilon=1e-5, rngs=rngs)
+
+    def __call__(self, x, deterministic: bool):
+        for layer in self.layers:
+            x = layer(x, deterministic=deterministic)
+        return self.norm(x)
+
+
+class TransDecoderLayer(nnx.Module):
+    """One decoder layer, matching NF ``TransDecoderLayer`` (no causal mask).
+
+    ``x = x + drop(self_attn(x, x)); x = norm1(x);
+    x = x + drop(cross_attn(x, cross)); y = x = norm2(x);
+    y = drop(act(conv1(y))); y = drop(conv2(y)); return norm3(x + y)``.
+    """
+
+    def __init__(self, *, hidden_size, n_heads, conv_hidden_size, dropout,
+                 activation="gelu", rngs: nnx.Rngs):
+        self.activation = activation
+        self.self_attn = AttentionLayer(
+            hidden_size=hidden_size, n_heads=n_heads, attn_dropout=dropout, rngs=rngs,
+        )
+        self.cross_attn = AttentionLayer(
+            hidden_size=hidden_size, n_heads=n_heads, attn_dropout=dropout, rngs=rngs,
+        )
+        self.conv1 = nnx.Linear(hidden_size, conv_hidden_size,
+                                kernel_init=_TorchLinearInit(hidden_size),
+                                bias_init=_TorchLinearInit(hidden_size), rngs=rngs)
+        self.conv2 = nnx.Linear(conv_hidden_size, hidden_size,
+                                kernel_init=_TorchLinearInit(conv_hidden_size),
+                                bias_init=_TorchLinearInit(conv_hidden_size), rngs=rngs)
+        self.norm1 = nnx.LayerNorm(hidden_size, epsilon=1e-5, rngs=rngs)
+        self.norm2 = nnx.LayerNorm(hidden_size, epsilon=1e-5, rngs=rngs)
+        self.norm3 = nnx.LayerNorm(hidden_size, epsilon=1e-5, rngs=rngs)
+        self.dropout = nnx.Dropout(rate=dropout, rngs=rngs)
+
+    def __call__(self, x, cross, deterministic: bool):
+        act = _resolve_activation(self.activation)
+        x = x + self.dropout(self.self_attn(x, x, deterministic=deterministic),
+                             deterministic=deterministic)
+        x = self.norm1(x)
+        x = x + self.dropout(self.cross_attn(x, cross, deterministic=deterministic),
+                             deterministic=deterministic)
+        y = x = self.norm2(x)
+        y = self.dropout(act(self.conv1(y)), deterministic=deterministic)
+        y = self.dropout(self.conv2(y), deterministic=deterministic)
+        return self.norm3(x + y)
+
+
+class TransDecoder(nnx.Module):
+    """Stack of ``decoder_layers`` decoder layers + LayerNorm + projection."""
+
+    def __init__(self, *, decoder_layers, hidden_size, n_heads, conv_hidden_size,
+                 dropout, activation="gelu", c_out=1, rngs: nnx.Rngs):
+        self.layers = [
+            TransDecoderLayer(
+                hidden_size=hidden_size, n_heads=n_heads,
+                conv_hidden_size=conv_hidden_size, dropout=dropout,
+                activation=activation, rngs=rngs,
+            )
+            for _ in range(decoder_layers)
+        ]
+        self.norm = nnx.LayerNorm(hidden_size, epsilon=1e-5, rngs=rngs)
+        self.projection = nnx.Linear(
+            hidden_size, c_out,
+            kernel_init=_TorchLinearInit(hidden_size),
+            bias_init=_TorchLinearInit(hidden_size), rngs=rngs,
+        )
+
+    def __call__(self, x, cross, deterministic: bool):
+        for layer in self.layers:
+            x = layer(x, cross, deterministic=deterministic)
+        x = self.norm(x)
+        return self.projection(x)
+
+
+class VanillaTransformerNet(nnx.Module):
+    """Full encoder-decoder backbone: ``[B, input_size, 1] -> [B, h, 1]``.
+
+    Identity scaling (NF default): operates in raw scale. During training pass
+    ``deterministic=False``; ``nnx.Rngs`` supplies the dropout stream.
+    """
+
+    def __init__(self, *, h, input_size, hidden_size, n_heads, conv_hidden_size,
+                 encoder_layers, decoder_layers, dropout, activation="gelu",
+                 decoder_input_size_multiplier=0.5, rngs: nnx.Rngs):
+        self.h = h
+        self.input_size = input_size
+        self.label_len = int(math.ceil(input_size * decoder_input_size_multiplier))
+        self.enc_embedding = DataEmbedding(hidden_size=hidden_size, dropout=dropout, rngs=rngs)
+        self.dec_embedding = DataEmbedding(hidden_size=hidden_size, dropout=dropout, rngs=rngs)
+        self.encoder = TransEncoder(
+            encoder_layers=encoder_layers, hidden_size=hidden_size, n_heads=n_heads,
+            conv_hidden_size=conv_hidden_size, dropout=dropout, activation=activation, rngs=rngs,
+        )
+        self.decoder = TransDecoder(
+            decoder_layers=decoder_layers, hidden_size=hidden_size, n_heads=n_heads,
+            conv_hidden_size=conv_hidden_size, dropout=dropout, activation=activation,
+            c_out=1, rngs=rngs,
+        )
+
+    def __call__(self, x: jnp.ndarray, deterministic: bool) -> jnp.ndarray:
+        x = x.astype(jnp.float32)                       # [B, L, 1]
+        b = x.shape[0]
+        zeros = jnp.zeros((b, self.h, 1), dtype=x.dtype)
+        x_dec = jnp.concatenate([x[:, -self.label_len:, :], zeros], axis=1)  # [B, label_len+h, 1]
+        enc_out = self.enc_embedding(x, deterministic=deterministic)
+        enc_out = self.encoder(enc_out, deterministic=deterministic)
+        dec_out = self.dec_embedding(x_dec, deterministic=deterministic)
+        dec_out = self.decoder(dec_out, enc_out, deterministic=deterministic)  # [B, label_len+h, 1]
+        return dec_out[:, -self.h:, :]

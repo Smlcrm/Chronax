@@ -133,3 +133,67 @@ def test_attention_layer_cross_shape():
 def test_attention_layer_requires_divisible_heads():
     with pytest.raises(ValueError):
         AttentionLayer(hidden_size=10, n_heads=4, attn_dropout=0.0, rngs=nnx.Rngs(0))
+
+
+from chronax.models.vanillatransformer.vanillatransformer_module import (
+    TransDecoder,
+    TransEncoder,
+    VanillaTransformerNet,
+)
+
+
+# ============================================================================
+# Module: encoder / decoder / backbone
+# ============================================================================
+
+def test_trans_encoder_shape():
+    enc = TransEncoder(
+        encoder_layers=2, hidden_size=16, n_heads=4, conv_hidden_size=8,
+        dropout=0.0, activation="gelu", rngs=nnx.Rngs(0),
+    )
+    x = jnp.ones((2, 6, 16))
+    out = enc(x, deterministic=True)
+    assert out.shape == (2, 6, 16)
+
+
+def test_trans_decoder_shape_projects_to_one_channel():
+    dec = TransDecoder(
+        decoder_layers=1, hidden_size=16, n_heads=4, conv_hidden_size=8,
+        dropout=0.0, activation="gelu", c_out=1, rngs=nnx.Rngs(0),
+    )
+    x = jnp.ones((2, 10, 16))      # label_len + h tokens
+    cross = jnp.ones((2, 6, 16))   # encoder output
+    out = dec(x, cross, deterministic=True)
+    assert out.shape == (2, 10, 1)
+
+
+def test_net_forward_shape():
+    net = VanillaTransformerNet(
+        h=4, input_size=12, hidden_size=16, n_heads=4, conv_hidden_size=8,
+        encoder_layers=2, decoder_layers=1, dropout=0.0, activation="gelu",
+        decoder_input_size_multiplier=0.5, rngs=nnx.Rngs(0),
+    )
+    x = jnp.ones((3, 12, 1))
+    out = net(x, deterministic=True)
+    assert out.shape == (3, 4, 1)
+
+
+def test_net_label_len_is_ceil():
+    net = VanillaTransformerNet(
+        h=4, input_size=7, hidden_size=16, n_heads=4, conv_hidden_size=8,
+        encoder_layers=1, decoder_layers=1, dropout=0.0, activation="gelu",
+        decoder_input_size_multiplier=0.5, rngs=nnx.Rngs(0),
+    )
+    assert net.label_len == math.ceil(7 * 0.5)  # == 4
+
+
+def test_net_deterministic_is_repeatable():
+    net = VanillaTransformerNet(
+        h=4, input_size=12, hidden_size=16, n_heads=4, conv_hidden_size=8,
+        encoder_layers=1, decoder_layers=1, dropout=0.5, activation="gelu",
+        decoder_input_size_multiplier=0.5, rngs=nnx.Rngs(0),
+    )
+    x = jnp.asarray(np.random.RandomState(0).randn(2, 12, 1), dtype=jnp.float32)
+    a = net(x, deterministic=True)
+    b = net(x, deterministic=True)
+    assert jnp.allclose(a, b)
