@@ -68,3 +68,68 @@ def test_resolve_callable_passes_through():
 def test_resolve_unknown_raises():
     with pytest.raises(ValueError):
         resolve("not_a_loss")
+
+
+from chronax.models.vanillatransformer.vanillatransformer_module import (
+    AttentionLayer,
+    DataEmbedding,
+    TokenEmbedding,
+    _positional_embedding,
+    _resolve_activation,
+)
+
+
+# ============================================================================
+# Module: inits / embeddings / attention
+# ============================================================================
+
+def test_resolve_activation_gelu_is_exact():
+    z = jnp.array([0.7, -1.3, 2.0])
+    got = _resolve_activation("gelu")(z)
+    want = jax.nn.gelu(z, approximate=False)
+    assert jnp.allclose(got, want)
+
+
+def test_resolve_activation_unknown_raises():
+    with pytest.raises(ValueError):
+        _resolve_activation("swish")
+
+
+def test_positional_embedding_shape_and_bounds():
+    pe = _positional_embedding(16, 8)
+    assert pe.shape == (1, 16, 8)
+    assert jnp.all(jnp.abs(pe) <= 1.0 + 1e-6)
+
+
+def test_token_embedding_shape():
+    tok = TokenEmbedding(hidden_size=12, rngs=nnx.Rngs(0))
+    x = jnp.ones((2, 7, 1))
+    out = tok(x)
+    assert out.shape == (2, 7, 12)
+
+
+def test_data_embedding_shape_and_dropout_identity_when_deterministic():
+    emb = DataEmbedding(hidden_size=12, dropout=0.5, rngs=nnx.Rngs(0))
+    x = jnp.ones((2, 7, 1))
+    out = emb(x, deterministic=True)
+    assert out.shape == (2, 7, 12)
+
+
+def test_attention_layer_self_shape():
+    attn = AttentionLayer(hidden_size=16, n_heads=4, attn_dropout=0.0, rngs=nnx.Rngs(0))
+    x = jnp.ones((3, 5, 16))
+    out = attn(x, x, deterministic=True)
+    assert out.shape == (3, 5, 16)
+
+
+def test_attention_layer_cross_shape():
+    attn = AttentionLayer(hidden_size=16, n_heads=4, attn_dropout=0.0, rngs=nnx.Rngs(0))
+    q = jnp.ones((3, 5, 16))
+    kv = jnp.ones((3, 9, 16))
+    out = attn(q, kv, deterministic=True)
+    assert out.shape == (3, 5, 16)
+
+
+def test_attention_layer_requires_divisible_heads():
+    with pytest.raises(ValueError):
+        AttentionLayer(hidden_size=10, n_heads=4, attn_dropout=0.0, rngs=nnx.Rngs(0))
