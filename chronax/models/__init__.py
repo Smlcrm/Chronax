@@ -57,6 +57,8 @@ except ImportError:
 
 from .itransformer import iTransformer
 
+from .vanillatransformer import VanillaTransformer
+
 from .batched_forecaster import BatchedForecaster
 
 __all__ = [
@@ -94,6 +96,7 @@ __all__ = [
     "GRU",
     "PatchTST",
     "iTransformer",
+    "VanillaTransformer",
     "KAN",
     "BatchedForecaster",
 ]

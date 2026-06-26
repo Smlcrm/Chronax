@@ -260,3 +260,122 @@ def test_predict_step_shape():
     out = predict_step(net, _make_y(60), h=4, input_size=12)
     assert out.shape == (4,)
     assert jnp.all(jnp.isfinite(out))
+
+
+from chronax.models.vanillatransformer.vanillatransformer_model import (
+    VanillaTransformer, _boxcox, _inv_boxcox, _select_boxcox_lambda,
+)
+from chronax.utils import ConformalIntervals
+
+
+# ============================================================================
+# Model wrapper
+# ============================================================================
+
+def _fast_model(**kw):
+    base = dict(h=4, input_size=12, hidden_size=16, n_heads=4, conv_hidden_size=8,
+                encoder_layers=1, decoder_layers=1, dropout=0.0, max_steps=40,
+                learning_rate=1e-3, windows_batch_size=16, random_seed=0)
+    base.update(kw)
+    return VanillaTransformer(**base)
+
+
+def test_is_base_forecaster():
+    assert issubclass(VanillaTransformer, BaseForecaster)
+
+
+def test_input_size_default_resolves_to_3h():
+    m = VanillaTransformer(h=10)
+    assert m.input_size == 30
+
+
+def test_fit_predict_shape_and_finite():
+    m = _fast_model()
+    m.fit(_make_y(120))
+    out = m.predict(h=4)
+    assert out["mean"].shape == (4,)
+    assert jnp.all(jnp.isfinite(out["mean"]))
+
+
+def test_predict_h_greater_than_trained_raises():
+    m = _fast_model()
+    m.fit(_make_y(120))
+    with pytest.raises(ValueError):
+        m.predict(h=5)
+
+
+def test_predict_before_fit_raises():
+    with pytest.raises(RuntimeError):
+        _fast_model().predict(h=4)
+
+
+def test_fit_rejects_2d():
+    with pytest.raises(ValueError):
+        _fast_model().fit(jnp.ones((10, 2)))
+
+
+def test_fit_rejects_exog():
+    with pytest.raises(NotImplementedError):
+        _fast_model().fit(_make_y(120), X=jnp.ones((120, 1)))
+
+
+def test_forecast_matches_fit_predict():
+    y = _make_y(120)
+    a = _fast_model().forecast(y, h=4)["mean"]
+    b = _fast_model().fit(y).predict(h=4)["mean"]
+    assert jnp.allclose(a, b)
+
+
+def test_forecast_fitted_values_shape_and_nan_head():
+    m = _fast_model()
+    out = m.forecast(_make_y(120), h=4, fitted=True)
+    fitted = out["fitted"]
+    assert fitted.shape == (120,)
+    assert bool(jnp.all(jnp.isnan(fitted[:12])))
+    assert bool(jnp.all(jnp.isfinite(fitted[12:])))
+
+
+def test_pickle_round_trip_preserves_predictions():
+    m = _fast_model()
+    m.fit(_make_y(120))
+    before = m.predict(h=4)["mean"]
+    m2 = pickle.loads(pickle.dumps(m))
+    after = m2.predict(h=4)["mean"]
+    assert jnp.allclose(before, after)
+
+
+def test_boxcox_round_trip_identity():
+    y = jnp.asarray(np.linspace(1.0, 5.0, 50), dtype=jnp.float32)
+    lam = _select_boxcox_lambda(y)
+    assert jnp.allclose(_inv_boxcox(_boxcox(y, lam), lam), y, atol=1e-4)
+
+
+def test_boxcox_requires_positive():
+    m = _fast_model(use_boxcox=True)
+    with pytest.raises(ValueError):
+        m.fit(_make_y(120))   # sine series has non-positive values
+
+
+def test_boxcox_fit_predict_positive_series():
+    y = jnp.asarray(50.0 + 40.0 * np.sin(np.arange(160) / 6.0), dtype=jnp.float32)
+    m = _fast_model(use_boxcox=True)
+    m.fit(y)
+    out = m.predict(h=4)
+    assert out["mean"].shape == (4,)
+    assert jnp.all(jnp.isfinite(out["mean"]))
+
+
+def test_conformal_intervals_present_when_level_set():
+    m = _fast_model()
+    m.fit(_make_y(160))
+    m.conformal_params = ConformalIntervals(n_windows=2, h=4)
+    out = m.predict(h=4, level=[80])
+    assert "lo-80" in out and "hi-80" in out
+    assert out["lo-80"].shape == (4,)
+
+
+def test_predict_level_without_conformal_params_raises():
+    m = _fast_model()
+    m.fit(_make_y(120))
+    with pytest.raises(ValueError):
+        m.predict(h=4, level=[80])
