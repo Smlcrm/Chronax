@@ -164,3 +164,7 @@ Deep Learning
 .. autoclass:: chronax.models.iTransformer
    :members:
    :undoc-members:
+
+.. autoclass:: chronax.models.VanillaTransformer
+   :members:
+   :undoc-members:
