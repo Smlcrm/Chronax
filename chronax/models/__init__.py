@@ -46,9 +46,12 @@ from .ces import AutoCES
 from .tsb import TSB
 from .randomWalkWithDrift import RandomWalkWithDrift
 
-# from .gru import GRU  # pinned to flax==0.10.x; disabled for newer flax envs
+# NOTE: GRU is imported lazily (see __getattr__ below) — it hard-pins flax 0.10.x,
+# so `import chronax.models` must not force a flax import on callers using other models.
 
-from .autoformer import Autoformer
+# The autoformer package exports the forecaster as ``AutoformerForecaster``; expose it
+# under the public registry name ``Autoformer`` that ``__all__`` advertises.
+from .autoformer import AutoformerForecaster as Autoformer
 
 try:
     from .kan import KAN
@@ -57,7 +60,18 @@ except ImportError:
 
 from .itransformer import iTransformer
 
+from .tft import TFT
+
+# PatchTST hard-pins flax 0.10.x (raises ImportError otherwise); guard like KAN so a
+# version/availability mismatch degrades to PatchTST=None instead of breaking the namespace.
+try:
+    from .patchtst import PatchTST
+except ImportError:
+    PatchTST = None
+
 from .batched_forecaster import BatchedForecaster
+
+from .xlstm import XLSTM
 
 __all__ = [
     "ARIMA",
@@ -89,12 +103,28 @@ __all__ = [
     "AutoCES",
     "TSB",
     "RandomWalkWithDrift",
-    # "GRU",
-    "Autoformer",
     "GRU",
-    "PatchTST",
+    "Autoformer",
     "iTransformer",
+    "TFT",
     "KAN",
+    "PatchTST",
     "BatchedForecaster",
+    "XLSTM",
 ]
+
+
+def __getattr__(name):
+    """Lazily import GRU on first access (PEP 562).
+
+    GRU hard-pins flax 0.10.x (see ``chronax/models/gru/__init__.py``); importing it
+    eagerly would make the whole ``chronax.models`` namespace fail to import wherever
+    flax is unavailable or version-incompatible. Accessing ``chronax.models.GRU`` (or
+    ``from chronax.models import GRU``) triggers the import — and its flax check — only
+    when GRU is actually used.
+    """
+    if name == "GRU":
+        from .gru import GRU as _GRU
+        return _GRU
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
