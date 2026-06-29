@@ -60,6 +60,8 @@ except ImportError:
 
 from .itransformer import iTransformer
 
+from .tft import TFT
+
 # PatchTST hard-pins flax 0.10.x (raises ImportError otherwise); guard like KAN so a
 # version/availability mismatch degrades to PatchTST=None instead of breaking the namespace.
 try:
@@ -104,6 +106,7 @@ __all__ = [
     "GRU",
     "Autoformer",
     "iTransformer",
+    "TFT",
     "KAN",
     "PatchTST",
     "BatchedForecaster",
