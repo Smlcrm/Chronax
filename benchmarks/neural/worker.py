@@ -140,7 +140,7 @@ def run_chronax_seed(cls: type, y_train: np.ndarray, y_test: np.ndarray, h: int,
     return row
 
 
-def run_nixtla_seed(nf_name, spec, h, input_size, nf_params, seed, threads) -> dict:
+def run_nixtla_seed(nf_name: str, spec: dict, h: int, input_size: int, nf_params: dict, seed: int, threads: int) -> dict:
     """Spawn a fresh .venv-nf process for one NF seed; return a metric row.
 
     Fresh process per seed = clean per-seed RNG + matches how baselines were
