@@ -6,7 +6,11 @@ load (Task 8), accept-gate (Task 9), orchestration/modes + baseline metadata
 """
 from __future__ import annotations
 
+import argparse
 import csv
+import json
+import subprocess
+import sys
 from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
@@ -231,11 +235,6 @@ def accept_gate_report(df: pd.DataFrame, models: Sequence[str], datasets: Sequen
     lines.append(f"OVERALL VERDICT: {verdict}")
     return "\n".join(lines)
 
-
-import argparse
-import json
-import subprocess
-import sys
 
 WORKER_PY = REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKER_PY = REPO_ROOT / "benchmarks" / "neural" / "worker.py"
