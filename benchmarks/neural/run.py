@@ -43,8 +43,16 @@ def validate_config(cfg: dict) -> None:
 
 
 def load_config(path: str) -> dict:
-    """Load and validate config.yaml."""
-    with open(path) as f:
+    """Load and validate config.yaml.
+
+    A missing or unreadable file surfaces as ConfigError (not a bare OSError) so
+    every config failure stays inside the NeuralBenchError taxonomy.
+    """
+    try:
+        f = open(path)
+    except OSError as e:  # FileNotFoundError / PermissionError / ...
+        raise ConfigError(f"cannot read config {path!r}: {e}") from e
+    with f:
         try:
             cfg = yaml.safe_load(f)
         except yaml.YAMLError as e:

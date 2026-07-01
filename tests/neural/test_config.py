@@ -64,3 +64,8 @@ def test_empty_yaml_raises_config_error(tmp_path):
     p.write_text("")
     with pytest.raises(ConfigError, match="config is empty or not a YAML mapping"):
         load_config(str(p))
+
+
+def test_missing_file_raises_config_error(tmp_path):
+    with pytest.raises(ConfigError, match="cannot read config"):
+        load_config(str(tmp_path / "does_not_exist.yaml"))
