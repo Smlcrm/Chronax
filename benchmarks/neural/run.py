@@ -7,6 +7,7 @@ load (Task 8), accept-gate (Task 9), orchestration/modes + baseline metadata
 from __future__ import annotations
 
 import csv
+from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -112,8 +113,6 @@ def remaining_seeds(model: str, dataset: str, library: str, seeds: Sequence[int]
     return [s for s in seeds if (model, dataset, library, int(s)) not in done]
 
 
-from collections import Counter
-
 # The accept-gate certifies a verdict only for a full paired run over BOTH
 # libraries — independent of which --libs the current invocation actually ran.
 REQUIRED_LIBS = ["chronax", "nixtla"]
@@ -145,7 +144,7 @@ def _paired(df, model, dataset, value_col, sub_filter=None):
     return c, n, seeds, delta
 
 
-def paired_accuracy(df, model, dataset) -> dict:
+def paired_accuracy(df: pd.DataFrame, model: str, dataset: str) -> dict:
     c, n, seeds, delta = _paired(df, model, dataset, "mae")
     return {
         "chronax_mean": float(c.mean()), "chronax_std": float(c.std(ddof=1)),
@@ -155,7 +154,7 @@ def paired_accuracy(df, model, dataset) -> dict:
     }
 
 
-def paired_speed(df, model, dataset, warmup_seeds) -> dict:
+def paired_speed(df: pd.DataFrame, model: str, dataset: str, warmup_seeds: int) -> dict:
     c, n, seeds, delta = _paired(
         df, model, dataset, "wallclock_s",
         sub_filter=lambda d: d.iter_idx >= warmup_seeds)
@@ -167,7 +166,7 @@ def paired_speed(df, model, dataset, warmup_seeds) -> dict:
     }
 
 
-def is_canonical(df, models, datasets, libs, seeds) -> bool:
+def is_canonical(df: pd.DataFrame, models: Sequence[str], datasets: Sequence[str], libs: Sequence[str], seeds: Sequence[int]) -> bool:
     """True iff df is exactly one clean, full, single-run set — the only file the
     gate will certify (spec §9). Requires:
       1. every (model,dataset,library,seed) present exactly once (no missing/dup),
@@ -200,7 +199,7 @@ def is_canonical(df, models, datasets, libs, seeds) -> bool:
     return True
 
 
-def accept_gate_report(df, models, datasets, libs, seeds, warmup_seeds) -> str:
+def accept_gate_report(df: pd.DataFrame, models: Sequence[str], datasets: Sequence[str], libs: Sequence[str], seeds: Sequence[int], warmup_seeds: int) -> str:
     """Per-cell paired accept-gate table + overall verdict, or a non-canonical
     notice (spec §8/§9). `libs` is the REQUIRED library set (both chronax and
     nixtla) — a run missing a library, resumed, incomplete, or carrying error
@@ -233,7 +232,7 @@ def accept_gate_report(df, models, datasets, libs, seeds, warmup_seeds) -> str:
     return "\n".join(lines)
 
 
-def check_committed_report(chronax_df, committed_summary, warmup_seeds) -> str:
+def check_committed_report(chronax_df: pd.DataFrame, committed_summary: pd.DataFrame, warmup_seeds: int) -> str:
     """Coarse (unpaired) chronax-vs-committed-NF-summary check (spec §8
     --check-committed). Not the paired canonical verdict; cheap iteration.
 
