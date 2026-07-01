@@ -10,8 +10,11 @@ import textwrap
 from math import isfinite
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[2]
 WORKER = REPO / "benchmarks" / "neural" / "worker.py"
+NF_VENV_PY = REPO / "benchmarks" / ".venv-nf" / "bin" / "python"
 
 
 def _tiny_config(tmp_path):
@@ -57,3 +60,18 @@ def test_all_models_construct_from_config():
     for m in cfg["models"]:
         cls = registry.resolve_chronax(m["name"])
         cls(h=exp["h"], input_size=exp["input_size"], random_seed=1, **m["chronax_params"])
+
+
+@pytest.mark.skipif(not NF_VENV_PY.exists(),
+                    reason="benchmarks/.venv-nf absent; run benchmarks/setup_nf_venv.sh")
+def test_worker_nixtla_smoke(tmp_path):
+    cfg = _tiny_config(tmp_path)
+    out = subprocess.run(
+        [sys.executable, str(WORKER), "--model", "GRU", "--dataset", "AirlinePassengers",
+         "--library", "nixtla", "--config", cfg],
+        cwd=str(REPO), capture_output=True, text=True, check=True,
+    )
+    rows = [json.loads(ln.split("RESULT_JSON:::")[-1])
+            for ln in out.stdout.splitlines() if "RESULT_JSON:::" in ln]
+    assert len(rows) == 1 and rows[0]["library"] == "nixtla"
+    assert rows[0]["error"] == "" and isfinite(rows[0]["mae"])

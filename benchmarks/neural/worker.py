@@ -140,6 +140,29 @@ def run_chronax_seed(cls: type, y_train: np.ndarray, y_test: np.ndarray, h: int,
     return row
 
 
+def run_nixtla_seed(nf_name, spec, h, input_size, nf_params, seed, threads) -> dict:
+    """Spawn a fresh .venv-nf process for one NF seed; return a metric row.
+
+    Fresh process per seed = clean per-seed RNG + matches how baselines were
+    captured (spec §7, §14).
+    """
+    row = {"mae": None, "smape": None, "wallclock_s": None, "error": ""}
+    code = nf_subprocess_code(nf_name, spec, h, input_size, nf_params, seed, threads)
+    env = dict(os.environ)
+    env["OMP_NUM_THREADS"] = str(int(threads))  # pin torch/MKL threads for the NF proc
+    try:
+        out = subprocess.run([str(NF_VENV_PY), "-c", code],
+                             capture_output=True, text=True, check=True, env=env)
+        d = json.loads(out.stdout.strip().splitlines()[-1])
+        row.update(mae=d["mae"], smape=d["smape"], wallclock_s=d["wallclock"])
+    except (subprocess.CalledProcessError, json.JSONDecodeError, IndexError) as e:
+        # Typed catch (spec §10): a failed NF subprocess / unparseable JSON becomes
+        # an error row; the orchestrator logs and moves on. Not the broad catch.
+        detail = getattr(e, "stderr", None) or str(e)
+        row["error"] = f"{type(e).__name__}: {detail}"
+    return row
+
+
 def emit_row(library: str, dataset: str, model: str, seed: int, iter_idx: int, warmup_seeds: int, row: dict) -> None:
     out = {
         "library": library, "dataset": dataset, "model": model, "seed": seed,
