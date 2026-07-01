@@ -43,6 +43,9 @@ def validate_config(cfg: dict) -> None:
 def load_config(path: str) -> dict:
     """Load and validate config.yaml."""
     with open(path) as f:
-        cfg = yaml.safe_load(f)
+        try:
+            cfg = yaml.safe_load(f)
+        except yaml.YAMLError as e:
+            raise ConfigError(f"invalid YAML: {e}") from e
     validate_config(cfg)
     return cfg

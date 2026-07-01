@@ -50,3 +50,10 @@ def test_model_entry_incomplete_raises(tmp_path):
 def test_validate_config_is_callable_directly():
     with pytest.raises(ConfigError, match="missing 'experiment'"):
         validate_config({"datasets": [], "models": []})
+
+
+def test_malformed_yaml_raises_config_error(tmp_path):
+    p = tmp_path / "config.yaml"
+    p.write_text("key: [unclosed bracket\n")
+    with pytest.raises(ConfigError, match="invalid YAML"):
+        load_config(str(p))
