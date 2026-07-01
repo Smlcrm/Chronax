@@ -52,7 +52,7 @@ def _nf_kwargs_str(params: dict) -> str:
     return ", ".join(parts)
 
 
-def nf_subprocess_code(nf_name, spec, h, input_size, params, seed, threads) -> str:
+def nf_subprocess_code(nf_name: str, spec: dict[str, str], h: int, input_size: int, params: dict, seed: int, threads: int) -> str:
     """Build the `python -c` source run inside .venv-nf for one NF seed.
 
     torch.set_num_threads pins CPU threads; the neuralforecast import is BEFORE
