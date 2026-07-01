@@ -6,6 +6,10 @@ load (Task 8), accept-gate (Task 9), orchestration/modes + baseline metadata
 """
 from __future__ import annotations
 
+import csv
+from pathlib import Path
+
+import pandas as pd
 import yaml
 
 
@@ -59,3 +63,49 @@ def load_config(path: str) -> dict:
             raise ConfigError(f"invalid YAML: {e}") from e
     validate_config(cfg)
     return cfg
+
+
+FIELDS = ["library", "dataset", "model", "seed", "iter_idx", "is_warmup",
+          "mae", "smape", "wallclock_s", "error"]
+
+_NUM_COLS = ["mae", "smape", "wallclock_s"]
+
+
+def load_results_tolerant(path) -> pd.DataFrame:
+    """Read the results CSV, dropping any torn line left by a crash.
+
+    The worker streams one full row per seed via csv.DictWriter, so a clean line
+    has exactly len(FIELDS) fields (error messages with commas/newlines are
+    quoted). We parse with the stdlib csv reader — quote-aware, so a multi-line
+    quoted error field is reassembled into one record — and keep only rows whose
+    field count is exactly len(FIELDS). A crash-truncated trailing line has too
+    few fields and is dropped. This does NOT rely on NaN-key/ParserError: pandas
+    NaN-pads a short final line instead of raising, so a torn line truncated
+    after the key columns must be caught by field count, not by dropna-on-keys.
+    """
+    p = Path(path)
+    if not p.exists() or p.stat().st_size == 0:
+        return pd.DataFrame(columns=FIELDS)
+    with p.open(newline="") as f:
+        rows = list(csv.reader(f))
+    if not rows or rows[0] != FIELDS:
+        return pd.DataFrame(columns=FIELDS)
+    good = [r for r in rows[1:] if len(r) == len(FIELDS)]
+    df = pd.DataFrame(good, columns=FIELDS)
+    if len(df):
+        df["seed"] = df["seed"].astype(int)
+        df["iter_idx"] = df["iter_idx"].astype(int)
+        for c in _NUM_COLS:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df["error"] = df["error"].fillna("").astype(str)
+    return df.reset_index(drop=True)
+
+
+def done_keys(df: pd.DataFrame) -> set:
+    """Set of (model, dataset, library, seed) rows already present."""
+    return {(r.model, r.dataset, r.library, int(r.seed)) for r in df.itertuples()}
+
+
+def remaining_seeds(model, dataset, library, seeds, done) -> list:
+    """Seeds not yet present for this {model,dataset,library}."""
+    return [s for s in seeds if (model, dataset, library, int(s)) not in done]
