@@ -83,3 +83,109 @@ denom = (np.abs(y_true) + np.abs(y_hat)) / 2
 smape = float(np.mean(np.where(denom == 0, 0, np.abs(y_true - y_hat) / denom)) * 100)
 print(json.dumps({{'mae': mae, 'smape': smape, 'wallclock': t}}))
 '''
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+
+import numpy as np
+
+sys.path.insert(0, str(REPO))
+from benchmarks.neural import metrics, registry  # noqa: E402
+from benchmarks.neural.run import load_config  # noqa: E402
+
+
+def _dataset_spec(cfg: dict, name: str) -> dict:
+    for d in cfg["datasets"]:
+        if d["name"] == name:
+            spec = dict(d)
+            p = Path(spec["path"])
+            spec["path"] = str(p if p.is_absolute() else (REPO / p).resolve())
+            return spec
+    raise KeyError(f"unknown dataset {name!r}")
+
+
+def _model_cfg(cfg: dict, name: str) -> dict:
+    for m in cfg["models"]:
+        if m["name"] == name:
+            return m
+    raise KeyError(f"unknown model {name!r}")
+
+
+def load_dataset_y(spec: dict) -> np.ndarray:
+    import pandas as pd
+    return pd.read_csv(spec["path"])[spec["y_col"]].to_numpy(dtype=np.float32)
+
+
+def run_chronax_seed(cls, y_train, y_test, h, input_size, chronax_params, seed) -> dict:
+    """Fit+predict one Chronax seed; return metric row with an `error` field."""
+    import jax.numpy as jnp
+    row = {"mae": None, "smape": None, "wallclock_s": None, "error": ""}
+    try:
+        model = cls(h=h, input_size=input_size, random_seed=seed, **chronax_params)
+        t0 = time.perf_counter()
+        model.fit(jnp.asarray(y_train))
+        pred = np.asarray(model.predict(h=h)["mean"])
+        elapsed = time.perf_counter() - t0
+        row.update(mae=metrics.mae(y_test, pred),
+                   smape=metrics.smape(y_test, pred), wallclock_s=elapsed)
+    except Exception as e:  # noqa: BLE001
+        # Documented broad catch (spec §10): a diverged Chronax fit raises a bare
+        # RuntimeError (gru_model.py); a typed exception is a chronax/ change out
+        # of scope. Record the message and continue so one seed can't kill a run.
+        row["error"] = f"{type(e).__name__}: {e}"
+    return row
+
+
+def emit_row(library, dataset, model, seed, iter_idx, warmup_seeds, row) -> None:
+    out = {
+        "library": library, "dataset": dataset, "model": model, "seed": seed,
+        "iter_idx": iter_idx, "is_warmup": iter_idx < warmup_seeds,
+        "mae": row["mae"], "smape": row["smape"], "wallclock_s": row["wallclock_s"],
+        "error": row.get("error", ""),
+    }
+    print(f"RESULT_JSON:::{json.dumps(out)}", flush=True)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Neural benchmark worker (one library).")
+    ap.add_argument("--model", required=True)
+    ap.add_argument("--dataset", required=True)
+    ap.add_argument("--library", required=True, choices=["chronax", "nixtla"])
+    ap.add_argument("--config", required=True)
+    ap.add_argument("--seeds", nargs="+", type=int, default=None,
+                    help="Override the seed list (used by --resume to run remaining seeds).")
+    args = ap.parse_args()
+
+    cfg = load_config(args.config)
+    exp = cfg["experiment"]
+    h, input_size = exp["h"], exp["input_size"]
+    seeds = args.seeds if args.seeds is not None else exp["seeds"]
+    warmup, threads = exp["warmup_seeds"], exp["threads"]
+    spec = _dataset_spec(cfg, args.dataset)
+    model_cfg = _model_cfg(cfg, args.model)
+
+    # Pin threads BEFORE importing jax/chronax (see module docstring).
+    os.environ.update(build_thread_env(threads))
+
+    if args.library == "chronax":
+        cls = registry.resolve_chronax(args.model)
+        y = load_dataset_y(spec)
+        y_train, y_test = y[:-h], y[-h:]
+        for i, seed in enumerate(seeds):
+            row = run_chronax_seed(cls, y_train, y_test, h, input_size,
+                                   model_cfg["chronax_params"], seed)
+            emit_row(args.library, args.dataset, args.model, seed, i, warmup, row)
+    else:
+        nf_name = registry.nf_model_name(args.model)
+        for i, seed in enumerate(seeds):
+            row = run_nixtla_seed(nf_name, spec, h, input_size,
+                                  model_cfg["nf_params"], seed, threads)
+            emit_row(args.library, args.dataset, args.model, seed, i, warmup, row)
+
+
+if __name__ == "__main__":
+    main()
