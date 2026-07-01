@@ -57,3 +57,10 @@ def test_malformed_yaml_raises_config_error(tmp_path):
     p.write_text("key: [unclosed bracket\n")
     with pytest.raises(ConfigError, match="invalid YAML"):
         load_config(str(p))
+
+
+def test_empty_yaml_raises_config_error(tmp_path):
+    p = tmp_path / "config.yaml"
+    p.write_text("")
+    with pytest.raises(ConfigError, match="config is empty or not a YAML mapping"):
+        load_config(str(p))

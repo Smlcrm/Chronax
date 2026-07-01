@@ -22,6 +22,8 @@ _REQUIRED_EXP = {"h", "input_size", "seeds", "warmup_seeds", "threads"}
 
 def validate_config(cfg: dict) -> None:
     """Raise ConfigError if `cfg` is missing required structure."""
+    if not isinstance(cfg, dict):
+        raise ConfigError("config is empty or not a YAML mapping")
     if "experiment" not in cfg:
         raise ConfigError("missing 'experiment' section")
     exp = cfg["experiment"]
