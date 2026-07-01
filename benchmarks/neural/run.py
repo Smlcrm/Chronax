@@ -7,6 +7,7 @@ load (Task 8), accept-gate (Task 9), orchestration/modes + baseline metadata
 from __future__ import annotations
 
 import csv
+from collections.abc import Sequence
 from pathlib import Path
 
 import pandas as pd
@@ -71,7 +72,7 @@ FIELDS = ["library", "dataset", "model", "seed", "iter_idx", "is_warmup",
 _NUM_COLS = ["mae", "smape", "wallclock_s"]
 
 
-def load_results_tolerant(path) -> pd.DataFrame:
+def load_results_tolerant(path: str | Path) -> pd.DataFrame:
     """Read the results CSV, dropping any torn line left by a crash.
 
     The worker streams one full row per seed via csv.DictWriter, so a clean line
@@ -106,6 +107,6 @@ def done_keys(df: pd.DataFrame) -> set:
     return {(r.model, r.dataset, r.library, int(r.seed)) for r in df.itertuples()}
 
 
-def remaining_seeds(model, dataset, library, seeds, done) -> list:
+def remaining_seeds(model: str, dataset: str, library: str, seeds: Sequence[int], done: set[tuple]) -> list[int]:
     """Seeds not yet present for this {model,dataset,library}."""
     return [s for s in seeds if (model, dataset, library, int(s)) not in done]
