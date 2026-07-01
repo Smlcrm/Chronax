@@ -232,6 +232,208 @@ def accept_gate_report(df: pd.DataFrame, models: Sequence[str], datasets: Sequen
     return "\n".join(lines)
 
 
+import argparse
+import json
+import subprocess
+import sys
+
+WORKER_PY = REPO_ROOT = Path(__file__).resolve().parents[2]
+WORKER_PY = REPO_ROOT / "benchmarks" / "neural" / "worker.py"
+NF_VENV_PY = REPO_ROOT / "benchmarks" / ".venv-nf" / "bin" / "python"
+RESULTS_DIR = REPO_ROOT / "benchmarks" / "benchmark_results" / "neural"
+BASELINES_DIR = REPO_ROOT / "benchmarks" / "baselines"
+
+# benchmarks/ is not an installed package; ensure the repo root is on sys.path
+# so `from benchmarks.neural import registry` resolves when run as a script.
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from benchmarks.neural import registry  # noqa: E402  (after sys.path fixup)
+
+
+def check_nf_venv(libs, venv_py=NF_VENV_PY) -> None:
+    """Fail fast up front if NF is requested but .venv-nf is absent (spec §10)."""
+    if "nixtla" in libs and not Path(venv_py).exists():
+        raise NeuralBenchError(
+            f"{venv_py} not found — run `benchmarks/setup_nf_venv.sh` first "
+            "to create the isolated neuralforecast venv.")
+
+
+def stream_worker_to_csv(model, dataset, library, config_path, csv_path, done, seeds) -> None:
+    """Spawn one worker for {model,dataset,library}; append each streamed
+    RESULT_JSON row to csv_path (skipping already-done keys). Resumable by
+    construction.
+
+    On resume the worker is handed only the remaining seeds, so it restarts
+    iter_idx at 0 — which is exactly what is_canonical (Task 9) uses to flag a
+    resumed file as non-canonical and refuse a verdict."""
+    remaining = remaining_seeds(model, dataset, library, seeds, done)
+    if not remaining:
+        print(f"  skip {model}/{dataset}/{library}: all seeds done", flush=True)
+        return
+    cmd = [sys.executable, str(WORKER_PY), "--model", model, "--dataset", dataset,
+           "--library", library, "--config", config_path,
+           "--seeds", *[str(s) for s in remaining]]
+    write_header = not Path(csv_path).exists()
+    Path(csv_path).parent.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=FIELDS)
+        if write_header:
+            writer.writeheader(); f.flush()
+        for line in proc.stdout:
+            if "RESULT_JSON:::" not in line:
+                continue
+            row = json.loads(line.split("RESULT_JSON:::")[-1].strip())
+            key = (row["model"], row["dataset"], row["library"], int(row["seed"]))
+            if key in done:
+                continue
+            writer.writerow({k: row.get(k, "") for k in FIELDS})
+            f.flush(); done.add(key)
+            tag = row.get("error") or f"mae={row['mae']:.4f} t={row['wallclock_s']:.1f}s"
+            print(f"  {library:8s} {model}/{dataset} seed={row['seed']} {tag}", flush=True)
+    proc.wait()
+    if proc.returncode != 0:
+        print(f"[warn] worker {model}/{dataset}/{library} exit {proc.returncode}:\n"
+              f"{proc.stderr.read()}", flush=True)
+
+
+_NF_PROBE = '''
+import json, sys, platform
+from importlib.metadata import version
+import torch
+from neuralforecast.losses.pytorch import MAE
+from neuralforecast.models import {nf_name}
+params = json.loads({params_json!r})
+params.pop("loss", None)
+m = {nf_name}(h={h}, input_size={input_size}, loss=MAE(), **params)
+def _safe(v):
+    if v is None or isinstance(v, (int, float, str, bool)):
+        return v
+    return type(v).__name__
+hp = {{k: _safe(v) for k, v in dict(m.hparams).items()}}
+print(json.dumps({{
+    "versions": {{"python": sys.version.split()[0], "torch": torch.__version__,
+                  "neuralforecast": version("neuralforecast"),
+                  "platform": platform.platform()}},
+    "model_args": hp}}))
+'''
+
+
+def nf_baseline_metadata(nf_name, h, input_size, nf_params, venv_py=NF_VENV_PY) -> dict:
+    """Query .venv-nf for env versions + the fully-resolved model hyperparameters
+    so protocol.json stays reconstructible even if NF's architecture defaults
+    drift later (spec §13). One short subprocess in the isolated venv."""
+    code = _NF_PROBE.format(nf_name=nf_name, h=h, input_size=input_size,
+                            params_json=json.dumps(nf_params))
+    out = subprocess.run([str(venv_py), "-c", code],
+                         capture_output=True, text=True, check=True)
+    return json.loads(out.stdout.strip().splitlines()[-1])
+
+
+def write_baseline(model, df, cfg) -> None:
+    """Write baselines/<model>/{protocol.json, baseline_nixtla_raw.csv,
+    baseline_nixtla_summary.csv} from an NF-only results frame (spec §8, §13).
+    protocol.json records env versions + the resolved NF architecture (encoder
+    sizes, layers, etc.) so numbers stay reproducible. Called by
+    --refresh-baseline. Does NOT commit — commit is gated (Task 14)."""
+    exp = cfg["experiment"]
+    out = BASELINES_DIR / model
+    out.mkdir(parents=True, exist_ok=True)
+    nf_params = next(m["nf_params"] for m in cfg["models"] if m["name"] == model)
+    meta = nf_baseline_metadata(registry.nf_model_name(model), exp["h"],
+                                exp["input_size"], nf_params)
+    protocol = {
+        "h": exp["h"], "input_size": exp["input_size"], "seeds": exp["seeds"],
+        "warmup_seeds": exp["warmup_seeds"], "threads": exp["threads"],
+        "config_nf_params": nf_params,
+        "resolved_model_args": meta["model_args"],
+        "versions": meta["versions"],
+    }
+    (out / "protocol.json").write_text(json.dumps(protocol, indent=2))
+    raw = df[["dataset", "seed", "mae", "smape", "wallclock_s"]].sort_values(["dataset", "seed"])
+    raw.to_csv(out / "baseline_nixtla_raw.csv", index=False)
+    summarize(df, exp["warmup_seeds"], group_cols=["dataset"]).to_csv(
+        out / "baseline_nixtla_summary.csv")
+
+
+def _run_grid(cfg, models, datasets, libs, csv_path, resume) -> pd.DataFrame:
+    seeds = cfg["experiment"]["seeds"]
+    csv_path = Path(csv_path)
+    if not resume and csv_path.exists():
+        csv_path.unlink()  # fresh run: start clean so a re-run never appends dup keys
+    done = done_keys(load_results_tolerant(csv_path)) if resume else set()
+    for m in models:
+        for d in datasets:
+            for lib in libs:
+                stream_worker_to_csv(m, d, lib, cfg["_config_path"], csv_path, done, seeds)
+    return load_results_tolerant(csv_path)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Neural benchmark orchestrator.")
+    ap.add_argument("--config", default=str(REPO_ROOT / "benchmarks" / "neural" / "config.yaml"))
+    ap.add_argument("--models", nargs="+", default=None)
+    ap.add_argument("--datasets", nargs="+", default=None)
+    ap.add_argument("--libs", nargs="+", default=["chronax", "nixtla"],
+                    choices=["chronax", "nixtla"])
+    ap.add_argument("--refresh-baseline", metavar="MODEL", default=None,
+                    help="Run NF only and (over)write baselines/<MODEL>/. Commit is gated (Task 14).")
+    ap.add_argument("--check-committed", action="store_true",
+                    help="Run chronax only; compare to committed baselines/<MODEL>/summary "
+                         "(requires a post-recapture summary — see --refresh-baseline).")
+    ap.add_argument("--resume", action="store_true")
+    args = ap.parse_args()
+
+    cfg = load_config(args.config)
+    cfg["_config_path"] = args.config
+    all_models = [m["name"] for m in cfg["models"]]
+    all_datasets = [d["name"] for d in cfg["datasets"]]
+    models = args.models or all_models
+    datasets = args.datasets or all_datasets
+
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    if args.refresh_baseline:
+        model = args.refresh_baseline
+        check_nf_venv(["nixtla"])
+        csv_path = RESULTS_DIR / f"baseline_{model}.csv"
+        df = _run_grid(cfg, [model], datasets, ["nixtla"], csv_path, args.resume)
+        write_baseline(model, df[df.library == "nixtla"], cfg)
+        print(f"Wrote baselines/{model}/ — REVIEW then commit with sign-off (Task 14).")
+        return
+
+    if args.check_committed:
+        csv_path = RESULTS_DIR / "neural_check.csv"
+        df = _run_grid(cfg, models, datasets, ["chronax"], csv_path, args.resume)
+        for model in models:
+            summary_path = BASELINES_DIR / model / "baseline_nixtla_summary.csv"
+            if not summary_path.exists():
+                raise NeuralBenchError(
+                    f"no committed baseline for {model} at {summary_path}; capture it with "
+                    f"`benchmarks/neural/run.py --refresh-baseline {model}` first (Task 14).")
+            committed = pd.read_csv(summary_path)
+            sub = df[(df.library == "chronax") & (df.model == model)]
+            print(f"\n--- {model} ---")
+            print(check_committed_report(sub, committed, cfg["experiment"]["warmup_seeds"]))
+        return
+
+    # full mode
+    check_nf_venv(args.libs)
+    csv_path = RESULTS_DIR / "neural_results.csv"
+    df = _run_grid(cfg, models, datasets, args.libs, csv_path, args.resume)
+    summarize(df, cfg["experiment"]["warmup_seeds"],
+              group_cols=["model", "library", "dataset"]).to_csv(
+        RESULTS_DIR / "neural_results_summary.csv")
+    print()
+    # The gate requires BOTH libraries (REQUIRED_LIBS), independent of --libs, so a
+    # chronax-only or nixtla-only run yields a non-canonical notice, not a bogus verdict.
+    print(accept_gate_report(df, models, datasets, REQUIRED_LIBS,
+                             cfg["experiment"]["seeds"], cfg["experiment"]["warmup_seeds"]))
+    print(f"\nWrote {csv_path.name} + neural_results_summary.csv under "
+          f"benchmarks/benchmark_results/neural/")
+
+
 def check_committed_report(chronax_df: pd.DataFrame, committed_summary: pd.DataFrame, warmup_seeds: int) -> str:
     """Coarse (unpaired) chronax-vs-committed-NF-summary check (spec §8
     --check-committed). Not the paired canonical verdict; cheap iteration.
@@ -256,3 +458,7 @@ def check_committed_report(chronax_df: pd.DataFrame, committed_summary: pd.DataF
             f"nf={nf['mae_mean']:.4f}  time(after) chx={row['wallclock_mean_after']:.2f} "
             f"nf={nf['wallclock_mean_after']:.2f}")
     return "\n".join(lines)
+
+
+if __name__ == "__main__":
+    main()
