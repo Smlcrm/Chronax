@@ -120,7 +120,7 @@ def load_dataset_y(spec: dict) -> np.ndarray:
     return pd.read_csv(spec["path"])[spec["y_col"]].to_numpy(dtype=np.float32)
 
 
-def run_chronax_seed(cls, y_train, y_test, h, input_size, chronax_params, seed) -> dict:
+def run_chronax_seed(cls: type, y_train: np.ndarray, y_test: np.ndarray, h: int, input_size: int, chronax_params: dict, seed: int) -> dict:
     """Fit+predict one Chronax seed; return metric row with an `error` field."""
     import jax.numpy as jnp
     row = {"mae": None, "smape": None, "wallclock_s": None, "error": ""}
@@ -140,7 +140,7 @@ def run_chronax_seed(cls, y_train, y_test, h, input_size, chronax_params, seed) 
     return row
 
 
-def emit_row(library, dataset, model, seed, iter_idx, warmup_seeds, row) -> None:
+def emit_row(library: str, dataset: str, model: str, seed: int, iter_idx: int, warmup_seeds: int, row: dict) -> None:
     out = {
         "library": library, "dataset": dataset, "model": model, "seed": seed,
         "iter_idx": iter_idx, "is_warmup": iter_idx < warmup_seeds,
