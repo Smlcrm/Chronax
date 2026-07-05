@@ -69,6 +69,13 @@ try:
 except ImportError:
     PatchTST = None
 
+# BiTCN hard-pins flax 0.10.x (raises ImportError otherwise); guard like PatchTST so a
+# version/availability mismatch degrades to BiTCN=None instead of breaking the namespace.
+try:
+    from .bitcn import BiTCN
+except ImportError:
+    BiTCN = None
+
 from .batched_forecaster import BatchedForecaster
 
 from .xlstm import XLSTM
@@ -109,6 +116,7 @@ __all__ = [
     "TFT",
     "KAN",
     "PatchTST",
+    "BiTCN",
     "BatchedForecaster",
     "XLSTM",
 ]
