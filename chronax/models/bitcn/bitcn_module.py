@@ -109,6 +109,7 @@ class CustomConv1d(nnx.Module):
 
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         """x: [B, C_in, L] -> [B, C_out, L]."""
+        x = x.astype(self.weight.value.dtype)   # enforce float32 (x64-safe)
         out = jax.lax.conv_general_dilated(
             x,
             self.weight.value,
