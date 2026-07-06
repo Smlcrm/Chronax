@@ -64,6 +64,7 @@ except ImportError:
 
 from .itransformer import iTransformer
 
+from .vanillatransformer import VanillaTransformer
 from .tft import TFT
 
 # PatchTST hard-pins flax 0.10.x (raises ImportError otherwise); guard like KAN so a
@@ -111,6 +112,7 @@ __all__ = [
     "Autoformer",
     "FEDformer",
     "iTransformer",
+    "VanillaTransformer",
     "TFT",
     "KAN",
     "PatchTST",
