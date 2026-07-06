@@ -168,3 +168,27 @@ Deep Learning
 .. autoclass:: chronax.models.Informer
    :members:
    :undoc-members:
+
+.. autoclass:: chronax.models.TFT
+   :members:
+   :undoc-members:
+
+.. autoclass:: chronax.models.PatchTST
+   :members:
+   :undoc-members:
+
+.. autoclass:: chronax.models.Autoformer
+   :members:
+   :undoc-members:
+
+.. autoclass:: chronax.models.KAN
+   :members:
+   :undoc-members:
+
+.. autoclass:: chronax.models.GRU
+   :members:
+   :undoc-members:
+
+.. autoclass:: chronax.models.XLSTM
+   :members:
+   :undoc-members:
