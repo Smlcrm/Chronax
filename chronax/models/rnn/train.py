@@ -40,6 +40,9 @@ def create_train_state(
     config: RNNConfig,
     learning_rate: float = 1e-3,
     weight_decay: float = 0.0,
+    grad_clip: float = 1.0,
+    cosine_decay_steps: int = 0,
+    warmup_steps: int = 0,
     optimizer: Optional[optax.GradientTransformation] = None,
 ) -> TrainState:
     """Initialise model parameters and optimiser state.
@@ -47,10 +50,14 @@ def create_train_state(
     Args:
         rng: PRNG key used for parameter initialisation only.
         config: model architecture config.
-        learning_rate: passed to the default Adam(W) optimiser.
-        weight_decay: if > 0 we use ``optax.adamw``, else ``optax.adam``.
-        optimizer: optional pre-built optax optimiser; overrides the
-            ``learning_rate`` / ``weight_decay`` defaults.
+        learning_rate: peak learning rate for the default Adam(W) optimiser.
+        weight_decay: if > 0 use ``optax.adamw``, else ``optax.adam``.
+        grad_clip: global gradient norm clipping threshold (0 = disabled).
+        cosine_decay_steps: if > 0 use a warmup + cosine decay schedule that
+            decays from ``learning_rate`` to ``learning_rate * 0.01`` over
+            this many steps.
+        warmup_steps: linear warmup steps at the start of cosine decay.
+        optimizer: optional pre-built optax transform; overrides all defaults.
     """
     model = RNN(config=config)
     init_rng, _ = jax.random.split(rng)
@@ -79,10 +86,26 @@ def create_train_state(
     )
 
     if optimizer is None:
-        if weight_decay > 0.0:
-            optimizer = optax.adamw(learning_rate=learning_rate, weight_decay=weight_decay)
+        if cosine_decay_steps > 0:
+            lr_schedule = optax.warmup_cosine_decay_schedule(
+                init_value=0.0,
+                peak_value=learning_rate,
+                warmup_steps=max(1, warmup_steps),
+                decay_steps=cosine_decay_steps,
+                end_value=learning_rate * 0.01,
+            )
         else:
-            optimizer = optax.adam(learning_rate=learning_rate)
+            lr_schedule = learning_rate
+
+        if weight_decay > 0.0:
+            base_opt = optax.adamw(learning_rate=lr_schedule, weight_decay=weight_decay)
+        else:
+            base_opt = optax.adam(learning_rate=lr_schedule)
+
+        if grad_clip > 0.0:
+            optimizer = optax.chain(optax.clip_by_global_norm(grad_clip), base_opt)
+        else:
+            optimizer = base_opt
 
     return TrainState.create(apply_fn=model.apply, params=params, tx=optimizer)
 
