@@ -95,7 +95,7 @@ import numpy as np
 
 sys.path.insert(0, str(REPO))
 from benchmarks.neural import metrics, registry  # noqa: E402
-from benchmarks.neural.run import load_config  # noqa: E402
+from benchmarks.neural.run import load_config, model_params  # noqa: E402
 
 
 def _dataset_spec(cfg: dict, name: str) -> dict:
@@ -106,13 +106,6 @@ def _dataset_spec(cfg: dict, name: str) -> dict:
             spec["path"] = str(p if p.is_absolute() else (REPO / p).resolve())
             return spec
     raise KeyError(f"unknown dataset {name!r}")
-
-
-def _model_cfg(cfg: dict, name: str) -> dict:
-    for m in cfg["models"]:
-        if m["name"] == name:
-            return m
-    raise KeyError(f"unknown model {name!r}")
 
 
 def load_dataset_y(spec: dict) -> np.ndarray:
@@ -189,7 +182,7 @@ def main() -> None:
     seeds = args.seeds if args.seeds is not None else exp["seeds"]
     warmup, threads = exp["warmup_seeds"], exp["threads"]
     spec = _dataset_spec(cfg, args.dataset)
-    model_cfg = _model_cfg(cfg, args.model)
+    chronax_params, nf_params = model_params(cfg, args.model)
 
     # Pin threads BEFORE importing jax/chronax (see module docstring).
     os.environ.update(build_thread_env(threads))
@@ -200,13 +193,13 @@ def main() -> None:
         y_train, y_test = y[:-h], y[-h:]
         for i, seed in enumerate(seeds):
             row = run_chronax_seed(cls, y_train, y_test, h, input_size,
-                                   model_cfg["chronax_params"], seed)
+                                   chronax_params, seed)
             emit_row(args.library, args.dataset, args.model, seed, i, warmup, row)
     else:
         nf_name = registry.nf_model_name(args.model)
         for i, seed in enumerate(seeds):
             row = run_nixtla_seed(nf_name, spec, h, input_size,
-                                  model_cfg["nf_params"], seed, threads)
+                                  nf_params, seed, threads)
             emit_row(args.library, args.dataset, args.model, seed, i, warmup, row)
 
 

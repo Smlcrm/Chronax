@@ -1,55 +1,68 @@
-"""Static model registry for the neural harness.
+"""Auto-discovering model registry for the neural harness.
 
-name -> {NF model-name string, lazy Chronax class}. Chronax classes are imported
-lazily (mirrors the statistical ModelRegistry) so importing this module never
-pulls in JAX. The NF side needs only the model-name string; the neuralforecast
-import happens inside the .venv-nf subprocess, not in the main env.
+A model is benchmarkable iff it is a ``chronax.models`` ``BaseForecaster`` whose
+``__init__`` accepts ``h``, ``input_size``, and ``random_seed`` — the neural
+windowed-model signature. That filter naturally selects the neural ports and
+excludes statistical models (no ``input_size``), models with a different
+constructor convention (e.g. ``XLSTM``), and non-``BaseForecaster`` classes.
+
+Every such model is a JAX port of the same-named ``neuralforecast`` class, so the
+NF name is the identity. Nothing is hardcoded: dropping a faithful port into
+``chronax/models/__init__.py`` makes it appear in the benchmark automatically.
 """
 from __future__ import annotations
 
 import importlib
-from typing import TYPE_CHECKING, Callable
+import inspect
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from chronax.models.base_forecaster import BaseForecaster
 
-# NF neuralforecast.models class names happen to equal the Chronax class names.
-_NF_NAMES = {
-    "GRU": "GRU",
-    "PatchTST": "PatchTST",
-    "KAN": "KAN",
-    "TFT": "TFT",
-    "iTransformer": "iTransformer",
-}
+_CORE_ARGS = {"h", "input_size", "random_seed"}
 
 
-def _make_factory(model_name: str) -> Callable[[], type[BaseForecaster]]:
-    def _factory() -> type[BaseForecaster]:
-        return getattr(importlib.import_module("chronax.models"), model_name)
-    return _factory
+def _discover() -> dict[str, type]:
+    """Map benchmarkable model name -> Chronax class, from chronax.models."""
+    from chronax.models.base_forecaster import BaseForecaster
 
-
-# Dispatch dict derived from _NF_NAMES: _NF_NAMES is the single source of truth.
-# Adding another model requires only one entry above (plus a config.yaml block).
-_CHRONAX_FACTORIES: dict[str, Callable[[], type[BaseForecaster]]] = {
-    name: _make_factory(name) for name in _NF_NAMES
-}
+    models = importlib.import_module("chronax.models")
+    names = getattr(models, "__all__", None) or dir(models)
+    out: dict[str, type] = {}
+    for name in names:
+        if name.startswith("_"):
+            continue
+        try:
+            obj = getattr(models, name)  # may trigger a lazy import
+        except Exception:
+            continue  # lazy import failed (e.g. flax version guard) -> not available
+        if not (inspect.isclass(obj) and issubclass(obj, BaseForecaster)):
+            continue
+        try:
+            params = set(inspect.signature(obj.__init__).parameters)
+        except (ValueError, TypeError):
+            continue
+        if _CORE_ARGS <= params:
+            out[name] = obj
+    return out
 
 
 def list_models() -> list[str]:
-    """Registered model names."""
-    return list(_NF_NAMES)
+    """Benchmarkable Chronax neural models, auto-discovered from chronax.models."""
+    return sorted(_discover())
+
+
+def resolve_chronax(name: str) -> "type[BaseForecaster]":
+    """Return the Chronax forecaster class for `name`."""
+    models = _discover()
+    if name not in models:
+        raise KeyError(f"{name!r} is not a benchmarkable Chronax model; known: {sorted(models)}")
+    return models[name]
 
 
 def nf_model_name(name: str) -> str:
-    """The neuralforecast.models class name for `name`."""
-    if name not in _NF_NAMES:
-        raise KeyError(f"unknown model {name!r}; known: {sorted(_NF_NAMES)}")
-    return _NF_NAMES[name]
-
-
-def resolve_chronax(name: str) -> type[BaseForecaster]:
-    """Lazily import and return the Chronax forecaster class for `name`."""
-    if name not in _CHRONAX_FACTORIES:
-        raise KeyError(f"unknown model {name!r}; known: {sorted(_NF_NAMES)}")
-    return _CHRONAX_FACTORIES[name]()
+    """The neuralforecast.models class name for `name` (identity — Chronax ports NF)."""
+    models = _discover()
+    if name not in models:
+        raise KeyError(f"{name!r} is not a benchmarkable Chronax model; known: {sorted(models)}")
+    return name
