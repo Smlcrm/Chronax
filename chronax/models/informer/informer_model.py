@@ -1,22 +1,25 @@
-"""TFT forecaster: BaseForecaster wrapper around the flax.nnx backbone.
+"""Informer forecaster: BaseForecaster wrapper around the flax.nnx backbone.
 
-Univariate + exogenous (static / historical / future-known) point and
-multi-quantile forecasting. Exog sizes are inferred at fit; intervals come from
-the conformal path (point loss, no temporal exog) or natively from the quantile
-heads. ``float32`` throughout.
+Univariate + future-known-exogenous point and multi-quantile forecasting via
+ProbSparse attention, a distilling encoder, and a generative decoder. Exog size
+is inferred at fit; intervals come from the conformal path (point loss, no
+temporal exog) or natively from the quantile heads. ``float32`` throughout.
 """
 from __future__ import annotations
 
+import math
+
+import jax
 import jax.numpy as jnp
 from flax import nnx
 
 from chronax.models.base_forecaster import BaseForecaster
-from chronax.models.tft.tft_losses import (
+from chronax.models.informer.informer_losses import (
     MultiQuantileLoss, outputsize_multiplier, resolve as _resolve_loss,
 )
-from chronax.models.tft.tft_module import TFTNet
-from chronax.models.tft.tft_scaler import resolve_scaler
-from chronax.models.tft.tft_training import predict_step, train
+from chronax.models.informer.informer_module import InformerNet
+from chronax.models.informer.informer_scaler import resolve_scaler
+from chronax.models.informer.informer_training import predict_step, train
 from chronax.utils import ConformalIntervals
 
 
@@ -26,27 +29,52 @@ def _nearest_q_index(quantiles, target: float) -> int:
     return min(range(len(quantiles)), key=lambda i: abs(quantiles[i] - target))
 
 
-class TFT(BaseForecaster):
-    """Temporal Fusion Transformer (flax.nnx port of neuralforecast.TFT)."""
+class Informer(BaseForecaster):
+    """Informer: ProbSparse-attention transformer for long-sequence forecasting
+    (flax.nnx port of neuralforecast.Informer).
+
+    Zhou et al., 2021 (AAAI best paper) -- https://arxiv.org/abs/2012.07436. The
+    encoder is a distilling stack of ProbSparse self-attention layers -- each
+    layer pair is followed by a conv+maxpool step that halves the sequence
+    length, giving ``O(L log L)`` memory/time instead of full attention's
+    ``O(L^2)`` -- and the decoder is "generative": it consumes the last
+    ``label_len`` observed steps followed by ``h`` zero placeholders and
+    produces the whole horizon in a single forward pass (no autoregressive
+    loop). Future-known exogenous inputs are supported (``uses_exog = True``);
+    historical and static exog are not modeled. Point or multi-quantile
+    losses; conformal or native quantile intervals. ``float32`` throughout.
+    """
 
     uses_exog = True
 
-    def __init__(self, h, input_size=-1, hidden_size=128, n_head=4, attn_dropout=0.0,
-                 dropout=0.1, grn_activation="ELU", rnn_type="lstm", n_rnn_layers=1,
-                 max_steps=1000, learning_rate=1e-3, windows_batch_size=1024,
-                 scaler_type="robust", loss="mae", quantile_sort=True,
-                 random_seed=1, alias="TFT"):
+    def __init__(self, h, input_size=-1, decoder_input_size_multiplier=0.5, hidden_size=128,
+                 n_head=4, factor=3, conv_hidden_size=32, encoder_layers=2, decoder_layers=1,
+                 distil=True, dropout=0.05, activation="gelu", max_steps=5000,
+                 learning_rate=1e-4, windows_batch_size=1024, scaler_type="identity",
+                 loss="mae", quantile_sort=True, random_seed=1, alias="Informer"):
         if input_size < 1:
             input_size = 3 * h
+        label_len = math.ceil(input_size * decoder_input_size_multiplier)
+        if not (0 < label_len < input_size):
+            raise ValueError(
+                f"decoder_input_size_multiplier={decoder_input_size_multiplier} implies "
+                f"label_len={label_len}, which must satisfy 0 < label_len < input_size={input_size}."
+            )
+        if activation not in ("relu", "gelu"):
+            raise ValueError(f"activation must be 'relu' or 'gelu'; got {activation!r}.")
         self.h = h
         self.input_size = input_size
+        self.decoder_input_size_multiplier = decoder_input_size_multiplier
+        self.label_len = label_len
         self.hidden_size = hidden_size
         self.n_head = n_head
-        self.attn_dropout = attn_dropout
+        self.factor = factor
+        self.conv_hidden_size = conv_hidden_size
+        self.encoder_layers = encoder_layers
+        self.decoder_layers = decoder_layers
+        self.distil = distil
         self.dropout = dropout
-        self.grn_activation = grn_activation
-        self.rnn_type = rnn_type
-        self.n_rnn_layers = n_rnn_layers
+        self.activation = activation
         self.max_steps = max_steps
         self.learning_rate = learning_rate
         self.windows_batch_size = windows_batch_size
@@ -56,15 +84,11 @@ class TFT(BaseForecaster):
         self.random_seed = random_seed
         self.alias = alias
         self.conformal_params: ConformalIntervals | None = None
-        self.model_: TFTNet | None = None
-        self._hist_size = 0
+        self.model_: InformerNet | None = None
         self._futr_size = 0
-        self._stat_size = 0
         self._context = None
         self._train_y = None
-        self._hist_ctx = None
         self._futr_ctx = None
-        self._stat = None
 
     # ---- helpers -------------------------------------------------------------
     @property
@@ -77,21 +101,25 @@ class TFT(BaseForecaster):
 
     @property
     def _has_temporal_exog(self) -> bool:
-        return self._hist_size > 0 or self._futr_size > 0
+        return self._futr_size > 0
 
-    def _build_net(self) -> TFTNet:
-        return TFTNet(
-            h=self.h, input_size=self.input_size, hidden_size=self.hidden_size,
-            n_head=self.n_head, attn_dropout=self.attn_dropout, dropout=self.dropout,
-            grn_activation=self.grn_activation, rnn_type=self.rnn_type,
-            n_rnn_layers=self.n_rnn_layers, stat_exog_size=self._stat_size,
-            hist_exog_size=self._hist_size, futr_exog_size=self._futr_size,
+    def _build_net(self) -> InformerNet:
+        return InformerNet(
+            h=self.h, input_size=self.input_size, label_len=self.label_len,
+            hidden_size=self.hidden_size, n_head=self.n_head, factor=self.factor,
+            conv_hidden_size=self.conv_hidden_size, encoder_layers=self.encoder_layers,
+            decoder_layers=self.decoder_layers, distil=self.distil, dropout=self.dropout,
+            activation=self.activation, futr_exog_size=self._futr_size,
             outputsize_multiplier=outputsize_multiplier(self._loss_fn),
             rngs=nnx.Rngs(self.random_seed),
         )
 
     # ---- fit -----------------------------------------------------------------
-    def fit(self, y, X=None, *, futr_exog=None, stat_exog=None) -> "TFT":
+    def fit(self, y, X=None, *, futr_exog=None) -> "Informer":
+        if X is not None:
+            raise NotImplementedError(
+                "Informer supports future-known exog only; pass futr_exog="
+            )
         y = jnp.asarray(y, dtype=jnp.float32)
         if y.ndim != 1:
             raise ValueError(f"y must be 1-D; got shape {y.shape}.")
@@ -99,32 +127,24 @@ class TFT(BaseForecaster):
             raise ValueError(
                 f"Series length {y.shape[0]} too short for input_size={self.input_size} + h={self.h}."
             )
-        X = None if X is None else jnp.asarray(X, jnp.float32)
         futr_exog = None if futr_exog is None else jnp.asarray(futr_exog, jnp.float32)
-        stat_exog = None if stat_exog is None else jnp.asarray(stat_exog, jnp.float32)
-        if X is not None and X.shape[0] != y.shape[0]:
-            raise ValueError(f"X (historical exog) must align with y (len {y.shape[0]}); got {X.shape[0]}.")
         if futr_exog is not None and futr_exog.shape[0] != y.shape[0]:
             raise ValueError(f"futr_exog must align with y at fit (len {y.shape[0]}); got {futr_exog.shape[0]}.")
 
-        self._hist_size = 0 if X is None else int(X.shape[1])
         self._futr_size = 0 if futr_exog is None else int(futr_exog.shape[1])
-        self._stat_size = 0 if stat_exog is None else int(stat_exog.shape[0])
 
         net = self._build_net()
         train(
             net, y, h=self.h, input_size=self.input_size, max_steps=self.max_steps,
             windows_batch_size=self.windows_batch_size, lr=self.learning_rate,
             seed=self.random_seed, loss_fn=self._loss_fn, scaler=self._scaler,
-            hist_exog=X, futr_exog=futr_exog, stat_exog=stat_exog,
+            futr_exog=futr_exog,
         )
         L = self.input_size
         self.model_ = net
         self._context = y[-L:]
         self._train_y = y
-        self._hist_ctx = None if X is None else X[-L:]
         self._futr_ctx = None if futr_exog is None else futr_exog[-L:]
-        self._stat = stat_exog
         return self
 
     # ---- predict -------------------------------------------------------------
@@ -133,7 +153,7 @@ class TFT(BaseForecaster):
         if self._futr_size > 0:
             if futr_exog is None:
                 raise ValueError(
-                    "This TFT was fit with future-known exog; predict requires futr_exog of shape "
+                    "This Informer was fit with future-known exog; predict requires futr_exog of shape "
                     f"(h={self.h}, F={self._futr_size})."
                 )
             futr_exog = jnp.asarray(futr_exog, jnp.float32)
@@ -142,7 +162,7 @@ class TFT(BaseForecaster):
             futr_full = jnp.concatenate([self._futr_ctx, futr_exog], axis=0)
         return predict_step(
             self.model_, self._context, h=self.h, input_size=self.input_size,
-            scaler=self._scaler, hist_context=self._hist_ctx, futr_full=futr_full, stat=self._stat,
+            scaler=self._scaler, futr_full=futr_full,
         )
 
     def predict(self, h, X=None, *, futr_exog=None, level=None) -> dict:
@@ -152,7 +172,7 @@ class TFT(BaseForecaster):
             raise ValueError(f"h must be a positive integer; got {h}.")
         if h > self.h:
             raise ValueError(
-                f"TFT was trained for h={self.h}; predict(h={h}) is unsupported. Pass h <= {self.h}."
+                f"Informer was trained for h={self.h}; predict(h={h}) is unsupported. Pass h <= {self.h}."
             )
         full = self._raw_predict(futr_exog=futr_exog)        # [h_train, mult]
         if full.shape[-1] == 1:
@@ -199,18 +219,19 @@ class TFT(BaseForecaster):
         return fcst
 
     # ---- forecast ------------------------------------------------------------
-    def forecast(self, y, h, X=None, X_future=None, *, futr_exog=None, stat_exog=None,
+    def forecast(self, y, h, X=None, X_future=None, *, futr_exog=None,
                  level=None, fitted=False) -> dict:
-        """Stateless fit-then-predict. ``X`` = historical exog over ``y``; ``X_future`` =
-        future-known exog for the horizon ``(h, F)``; ``futr_exog`` = its history ``(T, F)``."""
-        self.fit(y, X=X, futr_exog=futr_exog, stat_exog=stat_exog)
+        """Stateless fit-then-predict. ``X`` is unsupported (Informer models
+        future-known exog only); ``X_future`` = future-known exog for the horizon
+        ``(h, F)``; ``futr_exog`` = its history ``(T, F)``."""
+        self.fit(y, X=X, futr_exog=futr_exog)
         result = self.predict(h=h, futr_exog=X_future, level=level)
         if fitted:
             result["fitted"] = self._compute_fitted_values()
         return result
 
     def _compute_fitted_values(self) -> jnp.ndarray:
-        if self._has_temporal_exog or self._stat_size:
+        if self._has_temporal_exog:
             raise NotImplementedError("fitted=True is not supported with exogenous inputs in v1.")
         y = self._train_y
         L = self.input_size
@@ -222,7 +243,8 @@ class TFT(BaseForecaster):
         scaler = self._scaler
         shift, scale = scaler.stats(in_win, axis=1)
         z = scaler.transform(in_win, shift, scale)[..., None]
-        pred = self.model_(z, deterministic=True)            # [n, h, mult]
+        pred = self.model_(z, sample_key=jax.random.PRNGKey(0), deterministic=True,
+                           use_running_average=True)          # [n, h, mult]
         col = 0 if pred.shape[-1] == 1 else _nearest_q_index(self._loss_fn.quantiles, 0.5)
         one_step = scaler.inverse(pred[:, 0, col], shift[:, 0], scale[:, 0])
         return jnp.concatenate([jnp.full((L,), jnp.nan, dtype=jnp.float32), one_step])
@@ -242,7 +264,7 @@ class TFT(BaseForecaster):
             saved = m[1]
             state["model_"] = None
             self.__dict__.update(state)
-            net = self._build_net()           # uses restored _hist_size/_futr_size/_stat_size/loss
+            net = self._build_net()           # uses restored _futr_size/loss
             nnx.update(net, saved)
             self.model_ = net
             return

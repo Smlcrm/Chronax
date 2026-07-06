@@ -66,6 +66,7 @@ from .itransformer import iTransformer
 
 from .vanillatransformer import VanillaTransformer
 from .tft import TFT
+from .informer import Informer
 
 # PatchTST hard-pins flax 0.10.x (raises ImportError otherwise); guard like KAN so a
 # version/availability mismatch degrades to PatchTST=None instead of breaking the namespace.
@@ -121,6 +122,7 @@ __all__ = [
     "iTransformer",
     "VanillaTransformer",
     "TFT",
+    "Informer",
     "KAN",
     "PatchTST",
     "BiTCN",
