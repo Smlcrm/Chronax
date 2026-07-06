@@ -3,7 +3,7 @@ experiment:
   input_size: 72
   seeds: [42, 43, 44, 45, 46]   # first `warmup_seeds` per (model,dataset) = warmup for timing
   warmup_seeds: 1               # leading seeds excluded from the after-warmup wall-clock mean
-  threads: 1                    # equal CPU thread budget pinned for BOTH libraries; calibrated in Task 14
+  threads: 1                    # equal CPU thread budget pinned for BOTH libraries
 
 datasets:
   - { name: AirlinePassengers, path: benchmarks/benchmark_datasets/airline-passengers.csv,
@@ -23,3 +23,9 @@ models:
   - name: KAN
     chronax_params: { max_steps: 1000, learning_rate: 0.001, scaler: identity, loss: mae }
     nf_params:      { max_steps: 1000, learning_rate: 0.001, scaler_type: identity, loss: MAE }
+  - name: TFT
+    chronax_params: { max_steps: 1000, learning_rate: 0.001, scaler_type: robust, loss: mae }
+    nf_params:      { max_steps: 1000, learning_rate: 0.001, scaler_type: robust, loss: MAE }
+  - name: iTransformer
+    chronax_params: { max_steps: 1000, learning_rate: 0.001, loss: mae }   # natively multivariate; Chronax exposes a univariate adaptation
+    nf_params:      { max_steps: 1000, learning_rate: 0.001, scaler_type: identity, loss: MAE, n_series: 1 }
