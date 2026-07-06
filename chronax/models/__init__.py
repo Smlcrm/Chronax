@@ -53,6 +53,10 @@ from .randomWalkWithDrift import RandomWalkWithDrift
 # under the public registry name ``Autoformer`` that ``__all__`` advertises.
 from .autoformer import AutoformerForecaster as Autoformer
 
+# Likewise, the fedformer package exports ``FEDformerForecaster``; expose it under
+# the public registry name ``FEDformer``.
+from .fedformer import FEDformerForecaster as FEDformer
+
 try:
     from .kan import KAN
 except ImportError:
@@ -60,6 +64,7 @@ except ImportError:
 
 from .itransformer import iTransformer
 
+from .vanillatransformer import VanillaTransformer
 from .tft import TFT
 
 # PatchTST hard-pins flax 0.10.x (raises ImportError otherwise); guard like KAN so a
@@ -112,7 +117,9 @@ __all__ = [
     "RandomWalkWithDrift",
     "GRU",
     "Autoformer",
+    "FEDformer",
     "iTransformer",
+    "VanillaTransformer",
     "TFT",
     "KAN",
     "PatchTST",

@@ -1,6 +1,11 @@
-"""Chronax Autoformer — JAX/Flax/Optax univariate forecaster."""
+"""Chronax FEDformer -- JAX/Flax/Optax univariate forecaster.
 
-from chronax.models.autoformer.data import (
+Public entry point is :class:`FEDformerForecaster` (exported under the registry
+name ``FEDformer`` from ``chronax.models``). The lower-level Flax modules and
+math primitives are re-exported for advanced use and testing.
+"""
+
+from chronax.models.fedformer.data import (
     RobustScaler,
     batch_generator,
     build_windows,
@@ -8,8 +13,8 @@ from chronax.models.autoformer.data import (
     pad_sequence,
     split_train_val_windows,
 )
-from chronax.models.autoformer.forecaster import AutoformerForecaster
-from chronax.models.autoformer.loss import (
+from chronax.models.fedformer.forecaster import FEDformerForecaster
+from chronax.models.fedformer.loss import (
     LOSSES,
     LossFn,
     huber,
@@ -19,20 +24,23 @@ from chronax.models.autoformer.loss import (
     mse,
     resolve,
 )
-from chronax.models.autoformer.model import (
-    AutoCorrelationLayer,
-    AutoformerConfig,
-    AutoformerModel,
+from chronax.models.fedformer.model import (
     Decoder,
     DecoderLayer,
     Encoder,
     EncoderLayer,
+    FEDformerConfig,
+    FEDformerModel,
+    FourierBlock,
+    FourierCrossAttention,
+    MultiHeadProjection,
     SeasonalLayerNorm,
-    auto_correlation,
+    TokenEmbedding,
+    get_frequency_modes,
     moving_avg,
     series_decomp,
 )
-from chronax.models.autoformer.train import (
+from chronax.models.fedformer.train import (
     TrainState,
     create_train_state,
     eval_step,
@@ -45,18 +53,18 @@ from chronax.models.autoformer.train import (
     train_window_step,
 )
 
-# Public alias expected by the chronax.models registry
-# (`from .autoformer import Autoformer`), matching the iTransformer naming
-# convention where the user-facing class is the bare model name.
-Autoformer = AutoformerForecaster
+# Public registry alias: ``from chronax.models import FEDformer``.
+FEDformer = FEDformerForecaster
 
 __all__ = [
-    "Autoformer",
     # Config + model
-    "AutoformerConfig",
-    "AutoformerModel",
-    "AutoCorrelationLayer",
+    "FEDformerConfig",
+    "FEDformerModel",
+    "FourierBlock",
+    "FourierCrossAttention",
+    "MultiHeadProjection",
     "SeasonalLayerNorm",
+    "TokenEmbedding",
     "EncoderLayer",
     "Encoder",
     "DecoderLayer",
@@ -64,9 +72,10 @@ __all__ = [
     # Math primitives
     "moving_avg",
     "series_decomp",
-    "auto_correlation",
+    "get_frequency_modes",
     # High-level forecaster
-    "AutoformerForecaster",
+    "FEDformerForecaster",
+    "FEDformer",
     # Data utilities
     "RobustScaler",
     "build_windows",

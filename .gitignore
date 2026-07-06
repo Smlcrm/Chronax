@@ -46,6 +46,9 @@ coverage.xml
 .pytest_cache/
 cover/
 
+# Neural benchmark per-run outputs (statistical benchmark_results/*.csv stay tracked)
+benchmarks/benchmark_results/neural/
+
 # Translations
 *.mo
 *.pot
