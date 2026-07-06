@@ -173,7 +173,9 @@ class TFT(BaseForecaster):
                 "predict(level=...) requires `model.conformal_params` (a ConformalIntervals). "
                 "conformity_scores re-fits per CV window under vmap -- expect minutes."
             )
-        cs = self.conformity_scores(self._train_y)
+        # Run the walk-forward on a clone: conformity_scores re-fits under vmap, and
+        # those fit() writes would leave leaked tracers on this fitted estimator.
+        cs = self.new().conformity_scores(self._train_y)
         return BaseForecaster.add_confidence_intervals(fcst, cs, level, self.conformal_params.method)
 
     def _format_quantiles(self, full, h, level) -> dict:
