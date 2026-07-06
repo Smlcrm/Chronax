@@ -53,6 +53,10 @@ from .randomWalkWithDrift import RandomWalkWithDrift
 # under the public registry name ``Autoformer`` that ``__all__`` advertises.
 from .autoformer import AutoformerForecaster as Autoformer
 
+# Likewise, the fedformer package exports ``FEDformerForecaster``; expose it under
+# the public registry name ``FEDformer``.
+from .fedformer import FEDformerForecaster as FEDformer
+
 try:
     from .kan import KAN
 except ImportError:
@@ -105,6 +109,7 @@ __all__ = [
     "RandomWalkWithDrift",
     "GRU",
     "Autoformer",
+    "FEDformer",
     "iTransformer",
     "TFT",
     "KAN",
