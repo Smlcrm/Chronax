@@ -14,9 +14,7 @@ datasets:
       ds_col: Datetime, y_col: Hourly_Temp, freq: h }
 
 # Models are auto-discovered from chronax.models (any BaseForecaster taking
-# h/input_size/random_seed). Both libraries fall back to matching defaults and MAE
-# loss, so most models need nothing here. List a model under `overrides` only to
-# change a param — e.g. a multivariate model that needs `n_series` on the NF side.
-overrides:
-  iTransformer:
-    nf_params: { n_series: 1 }
+# h/input_size/random_seed). Both libraries use matching defaults + MAE loss, and
+# multivariate models get n_series=1 automatically — so nothing is listed per model.
+# Add an optional `overrides:` mapping (model -> chronax_params / nf_params) only to
+# change a param for a specific model.

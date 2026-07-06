@@ -37,30 +37,35 @@ def build_thread_env(threads: int) -> dict[str, str]:
     }
 
 
-def _nf_kwargs_str(params: dict) -> str:
-    """Render NF constructor kwargs from config nf_params. loss -> MAE()."""
-    parts: list[str] = []
+def _nf_extra_dict(params: dict) -> str:
+    """Render non-loss nf_params as a Python dict literal for the subprocess.
+
+    Loss is fixed to MAE in the constructor template (only loss=MAE is supported).
+    n_series is injected at runtime for models that require it (see
+    nf_subprocess_code), so it never needs to appear here.
+    """
+    items = []
     for k, v in params.items():
         if k == "loss":
             if v != "MAE":
                 raise ValueError(f"only loss=MAE is supported for NF, got {v!r}")
-            parts.append("loss=MAE()")
-        elif isinstance(v, str):
-            parts.append(f"{k}={v!r}")
-        else:
-            parts.append(f"{k}={v}")
-    return ", ".join(parts)
+            continue
+        items.append(f"{k!r}: {v!r}")
+    return "{" + ", ".join(items) + "}"
 
 
 def nf_subprocess_code(nf_name: str, spec: dict[str, str], h: int, input_size: int, params: dict, seed: int, threads: int) -> str:
     """Build the `python -c` source run inside .venv-nf for one NF seed.
 
     torch.set_num_threads pins CPU threads; the neuralforecast import is BEFORE
-    t0 so the timer measures only fit+predict (fair timing, spec §1).
+    t0 so the timer measures only fit+predict (fair timing). Loss is MAE. Any model
+    that *requires* n_series (i.e. a multivariate model) is given n_series=1 — this
+    is a univariate benchmark — detected by inspecting the model, so no per-model
+    config is needed.
     """
-    kwargs = _nf_kwargs_str(params)
+    extra = _nf_extra_dict(params)
     return f'''
-import json, time, numpy as np, pandas as pd
+import json, time, inspect, numpy as np, pandas as pd
 import torch
 torch.set_num_threads({int(threads)})
 from neuralforecast import NeuralForecast
@@ -72,9 +77,13 @@ df['ds'] = pd.to_datetime(df['ds']); df['unique_id'] = {spec['name']!r}
 df = df[['unique_id','ds','y']].sort_values('ds').reset_index(drop=True)
 train, test = df.iloc[:-{h}], df.iloc[-{h}:]
 y_true = test['y'].to_numpy()
-m = {nf_name}(h={h}, input_size={input_size}, {kwargs},
-    random_seed={seed}, accelerator='cpu', enable_progress_bar=False,
-    logger=False, enable_model_summary=False, enable_checkpointing=False)
+kw = {extra}
+sig = inspect.signature({nf_name}).parameters
+if 'n_series' in sig and sig['n_series'].default is inspect.Parameter.empty:
+    kw.setdefault('n_series', 1)   # univariate benchmark
+m = {nf_name}(h={h}, input_size={input_size}, loss=MAE(), random_seed={seed},
+    accelerator='cpu', enable_progress_bar=False, logger=False,
+    enable_model_summary=False, enable_checkpointing=False, **kw)
 nf = NeuralForecast(models=[m], freq={spec['freq']!r})
 t0 = time.perf_counter(); nf.fit(df=train); fcst = nf.predict(); t = time.perf_counter() - t0
 y_hat = fcst[{nf_name!r}].to_numpy()
