@@ -53,6 +53,10 @@ from .randomWalkWithDrift import RandomWalkWithDrift
 # under the public registry name ``Autoformer`` that ``__all__`` advertises.
 from .autoformer import AutoformerForecaster as Autoformer
 
+# Likewise, the fedformer package exports ``FEDformerForecaster``; expose it under
+# the public registry name ``FEDformer``.
+from .fedformer import FEDformerForecaster as FEDformer
+
 try:
     from .kan import KAN
 except ImportError:
@@ -60,6 +64,7 @@ except ImportError:
 
 from .itransformer import iTransformer
 
+from .vanillatransformer import VanillaTransformer
 from .tft import TFT
 from .informer import Informer
 
@@ -69,6 +74,13 @@ try:
     from .patchtst import PatchTST
 except ImportError:
     PatchTST = None
+
+# BiTCN hard-pins flax 0.10.x (raises ImportError otherwise); guard like PatchTST so a
+# version/availability mismatch degrades to BiTCN=None instead of breaking the namespace.
+try:
+    from .bitcn import BiTCN
+except ImportError:
+    BiTCN = None
 
 from .batched_forecaster import BatchedForecaster
 
@@ -106,11 +118,14 @@ __all__ = [
     "RandomWalkWithDrift",
     "GRU",
     "Autoformer",
+    "FEDformer",
     "iTransformer",
+    "VanillaTransformer",
     "TFT",
     "Informer",
     "KAN",
     "PatchTST",
+    "BiTCN",
     "BatchedForecaster",
     "XLSTM",
 ]

@@ -192,3 +192,11 @@ Deep Learning
 .. autoclass:: chronax.models.XLSTM
    :members:
    :undoc-members:
+
+.. autoclass:: chronax.models.BiTCN
+   :members:
+   :undoc-members:
+
+.. autoclass:: chronax.models.VanillaTransformer
+   :members:
+   :undoc-members:
