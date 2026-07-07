@@ -134,6 +134,7 @@ docs/_build/
 # private claude-md repo, never through Smlcrm; session artifacts stay local)
 CLAUDE.md
 .claude/
+tests/test_model_contracts.py
 docs/superpowers/
 .superpowers/
 .remember/
