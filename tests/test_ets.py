@@ -3,7 +3,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import jax.numpy as jnp
-from chronax.models import ETS
+from chronax.models import ETS, AutoETS
 from chronax.utils import ConformalIntervals
 # -------------------------------------------------------------------
 # Coverage Tests (run this file directly)
@@ -216,7 +216,9 @@ if __name__ == "__main__":
         rng = np.random.RandomState(19)
         y = jnp.asarray(5.0 + 0.5 * rng.randn(n), dtype=jnp.float64)
 
-        cfg = ConformalIntervals(n_windows=4, h=2, method="conformal_distribution")
+        # h must match conformal_params.h: scores cover exactly h steps
+        # (guarded with a ValueError, sibling convention).
+        cfg = ConformalIntervals(n_windows=4, h=6, method="conformal_distribution")
         et = ETS(season_length=1, model="ANN", max_iter=200, prediction_intervals=cfg)
 
         out = et.forecast(y=y, h=6, level=[90], fitted=False)
@@ -226,6 +228,39 @@ if __name__ == "__main__":
         lo90 = np.asarray(out["lo-90"]); hi90 = np.asarray(out["hi-90"])
         assert np.all(lo90 <= mean + 1e-12) and np.all(mean <= hi90 + 1e-12)
         _print_ok("test_stateless_forecast_with_conformal_intervals")
+
+    def test_native_intervals_multiplicative_classes():
+        """Native intervals across interval-formula classes 2/3/4-5.
+
+        The conformal CV path never exercises these branches (level=None), and
+        the contract suite pins ETS to ANN — so the multiplicative interval
+        formulas (class 2: M-error; class 3: M-error+M-season; class 4/5:
+        simulation fallback, e.g. M-trend combos) ship untested without this.
+        Mirrors contract invariant C: predict(level) twice, pickle, predict.
+        """
+        import pickle
+        m_seas = 4
+        rng = np.random.RandomState(42)
+        t = np.arange(64, dtype=np.float64)
+        seasonal = 1.0 + 0.2 * np.sin(2 * np.pi * t / m_seas)
+        y_pos = jnp.asarray((50.0 + 0.5 * t) * seasonal + 0.5 * rng.randn(64) + 5.0,
+                            dtype=jnp.float64)
+
+        for spec, season_length in [("MNN", 1), ("MNM", m_seas), ("MMN", 1)]:
+            et = ETS(season_length=season_length, model=spec, max_iter=100)
+            et.fit(y_pos)
+            p1 = et.predict(h=4, level=[80, 95])
+            p2 = et.predict(h=4, level=[80, 95])
+            for p in (p1, p2):
+                for lv in (80, 95):
+                    lo = np.asarray(p[f"lo-{lv}"]); hi = np.asarray(p[f"hi-{lv}"])
+                    mean = np.asarray(p["mean"])
+                    assert np.all(np.isfinite(lo)) and np.all(np.isfinite(hi)), f"{spec}: non-finite bands"
+                    assert np.all(lo <= mean + 1e-9) and np.all(mean <= hi + 1e-9), f"{spec}: mean outside {lv}% band"
+            et2 = pickle.loads(pickle.dumps(et))
+            p3 = et2.predict(h=4, level=[80])
+            assert "lo-80" in p3 and "hi-80" in p3, f"{spec}: post-pickle intervals missing"
+        _print_ok("test_native_intervals_multiplicative_classes")
 
     # ================= Forward & errors =================
 
@@ -343,6 +378,7 @@ if __name__ == "__main__":
     test_predict_native_intervals_ETS()
     test_forecast_adds_fitted_and_fitted_intervals_ETS()
     test_predict_in_sample_intervals_monotonicity_ETS()
+    test_native_intervals_multiplicative_classes()
     test_fit_caches_conformal_then_predict_uses_cache()
     test_stateless_forecast_with_conformal_intervals()
 

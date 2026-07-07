@@ -6,14 +6,14 @@
 [![Python 3.11](https://img.shields.io/badge/python-3.11-blue.svg)](https://www.python.org/downloads/)
 [![PyPI](https://img.shields.io/pypi/v/chronax.svg)](https://pypi.org/project/chronax/)
 
-A high-performance, JAX-accelerated time-series forecasting library. `chronax` provides a comprehensive suite of classical and modern forecasting models — including AutoARIMA, AutoETS, AutoTheta, TBATS, MFLES, GARCH, and more — with a unified `fit` / `predict` interface and hardware-accelerated execution via JAX.
+A high-performance, JAX-accelerated time-series forecasting library. `chronax` provides a comprehensive suite of classical and neural forecasting models — including AutoARIMA, AutoETS, AutoTheta, TBATS, MFLES, GARCH, TFT, Informer, PatchTST, and more — with a unified `fit` / `predict` interface and hardware-accelerated execution via JAX.
 
 ---
 
 ## Features
 
 - ⚡ **JAX-accelerated** — JIT-compiled model fitting and forecasting on CPU, GPU, or TPU
-- 📈 **20+ forecasting models** including AutoARIMA, AutoETS, AutoTheta, TBATS, MFLES, GARCH, STL, and more
+- 📈 **35+ forecasting models** — classical (AutoARIMA, AutoETS, AutoTheta, TBATS, MFLES, GARCH, STL, and more) and neural (TFT, Informer, PatchTST, XLSTM, and more)
 - 🔁 **Unified API** — every model follows the same `fit()` → `predict()` pattern
 - 📊 **Prediction intervals** — built-in conformal and native interval support
 - ✅ **NumPy compatible** — accepts and returns standard array types
@@ -218,6 +218,24 @@ Forecasters tailored to sparse series with many zeros or irregular demand arriva
 | `IMAPA` | ✓ | ✓ | — | Conformal |
 | `TSB` | ✓ | ✓ | — | Native + conformal |
 
+### Deep Learning
+
+Neural forecasters implemented in JAX/Flax, ported from the Nixtla `neuralforecast` family.
+
+| Model | Point Forecast | Probabilistic Forecast | Exogenous Regressors | Interval Type |
+|-------|----------------|------------------------|----------------------|---------------|
+| `TFT` | ✓ | ✓ | ✓ | Conformal |
+| `Informer` | ✓ | ✓ | ✓ | Conformal |
+| `iTransformer` | ✓ | ✓ | — | Conformal |
+| `VanillaTransformer` | ✓ | ✓ | — | Conformal |
+| `PatchTST` | ✓ | ✓ | — | Conformal |
+| `KAN` | ✓ | ✓ | — | Conformal |
+| `BiTCN` | ✓ | ✓ | — | Conformal |
+| `GRU` | ✓ | ✓ | — | Conformal |
+| `XLSTM` | ✓ | ✓ | — | Conformal |
+| `Autoformer` | ✓ | — | — | — |
+| `FEDformer` | ✓ | — | — | — |
+
 All models are importable from `chronax.models`.
 
 ---
@@ -288,6 +306,8 @@ pip install statsforecast pandas matplotlib
 python benchmarks/benchmark_suite.py
 ```
 
+A separate neural benchmark harness lives under `benchmarks/neural/` and compares Chronax neural forecasters against their Nixtla `neuralforecast` counterparts under a symmetric training budget. Set up the reference environment with `bash benchmarks/setup_nf_venv.sh`, then run it via `python benchmarks/neural/run.py` (models and settings are configured in `benchmarks/neural/config.yaml`).
+
 ---
 
 ## Documentation
@@ -309,7 +329,7 @@ If you use `chronax` in your research, please cite the library using the followi
 @software{chronax,
   title = {Chronax: High-performance, JAX-accelerated time-series forecasting},
   author = {Simulacrum},
-  url = {https://github.com/Smlcrm/Chronax},
+  url = {https://github.com/Smlcrm/ml-library-chronax},
   year = {2026}
 }
 ```

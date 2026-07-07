@@ -302,11 +302,13 @@ def test_attention_layer_divisibility_error():
 
 
 def test_conv_layer_halves_length():
-    # Distilling conv: length-preserving circular conv -> BN -> ELU -> maxpool(k=3,s=2,pad=1).
-    # Output length (L-1)//2 + 1, exercised for even, odd, and small L.
+    # Distilling conv, NF-parity: torch Conv1d(k=3, padding=2, circular) EXPANDS the
+    # sequence to L+2 (NF pins padding=2; the paper repo's padding is torch-version-
+    # conditional), then BN -> ELU -> maxpool(k=3,s=2,pad=1) gives (L+1)//2 + 1.
+    # Exercised for even, odd, and small L.
     c_in = 4
     layer = ConvLayer(c_in, rngs=nnx.Rngs(0))
-    for L, expected in [(12, 6), (13, 7), (7, 4)]:
+    for L, expected in [(12, 7), (13, 8), (7, 5)]:
         x = jnp.asarray(np.random.RandomState(0).randn(2, L, c_in), jnp.float32)
         out = layer(x, use_running_average=False)
         assert out.shape == (2, expected, c_in)
@@ -373,9 +375,11 @@ from chronax.models.informer.informer_module import (  # noqa: E402
 
 
 def test_distilled_length():
-    assert distilled_length(72, 1) == 36
-    assert distilled_length(13, 1) == 7
-    assert distilled_length(72, 2) == 18
+    # NF-parity: each conv expands L -> L+2 (circular padding=2) before the
+    # stride-2 pool, so one distil step maps L -> (L+1)//2 + 1.
+    assert distilled_length(72, 1) == 37
+    assert distilled_length(13, 1) == 8
+    assert distilled_length(72, 2) == 20
 
 
 def test_encoder_distil_output_length():

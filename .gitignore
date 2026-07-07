@@ -130,9 +130,16 @@ prof/
 # Sphinx build output
 docs/_build/
 
-# Claude Code
+# Claude Code (CLAUDE.md protocol: brief + enforcement assets sync via the
+# private claude-md repo, never through Smlcrm; session artifacts stay local)
 CLAUDE.md
 .claude/
+docs/superpowers/
+.superpowers/
+.remember/
 
 # Cursor
 .cursor/
+
+# JAX persistent compile cache (benchmark harness, worker.py build_thread_env)
+benchmarks/.jax-compilation-cache/

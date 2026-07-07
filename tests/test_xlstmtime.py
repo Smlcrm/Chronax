@@ -466,5 +466,19 @@ def test_harness_protocol_construct_fit_predict():
     assert bool(jnp.all(jnp.isfinite(mean)))
 
 
+def test_xlstm_pickle_roundtrip():
+    """Fitted-estimator pickle round-trip (long-standing deferred gap): the
+    params-only __getstate__/__setstate__ path must survive serialization with
+    bit-identical predictions from the restored estimator."""
+    import pickle
+
+    y = jnp.sin(jnp.arange(48, dtype=jnp.float32) / 4.0)
+    m = XLSTM(ctx_len=16, n_epochs=2, seed=0).fit(y)
+    p1 = np.asarray(m.predict(h=6)["mean"])
+    m2 = pickle.loads(pickle.dumps(m))
+    p2 = np.asarray(m2.predict(h=6)["mean"])
+    np.testing.assert_array_equal(p1, p2)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

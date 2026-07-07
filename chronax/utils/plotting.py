@@ -11,6 +11,21 @@ import jax.numpy as jnp
 from . import utils
 from typing import Optional, Tuple, List, Any
 
+
+def _require_plotting() -> None:
+    """Raise a clear ImportError when matplotlib/seaborn are absent.
+
+    The module deliberately imports with plt/sns as None so chronax works
+    headless; every plot_* entry point calls this guard instead of crashing
+    with an opaque AttributeError on ``plt.<attr>``.
+    """
+    if not _HAS_PLOTTING:
+        raise ImportError(
+            "Plotting requires matplotlib and seaborn: "
+            "pip install matplotlib seaborn"
+        )
+
+
 # Plot actual values vs forecast.
 def plot_forecast(y: jnp.ndarray, y_hat: jnp.ndarray, y_train: Optional[jnp.ndarray] = None, ax: Optional[Any] = None) -> Any:
     """
@@ -25,6 +40,7 @@ def plot_forecast(y: jnp.ndarray, y_hat: jnp.ndarray, y_train: Optional[jnp.ndar
     Returns:
         Any: The matplotlib Axes object containing the generated plot.
     """
+    _require_plotting()
     if ax is None:
         fig, ax = plt.subplots(figsize=(8, 4))
 
@@ -59,6 +75,7 @@ def plot_forecast_intervals(y: jnp.ndarray, y_hat: jnp.ndarray, lower: jnp.ndarr
     Returns:
         Any: The matplotlib Axes object containing the generated plot.
     """
+    _require_plotting()
     if ax is None:
         fig, ax = plt.subplots(figsize=(8, 4))
 
@@ -88,6 +105,7 @@ def plot_forecast_distribution(y: jnp.ndarray, y_samples: jnp.ndarray, ax: Optio
     Returns:
         Any: The matplotlib Axes object containing the generated fan chart.
     """
+    _require_plotting()
     if ax is None:
         fig, ax = plt.subplots(figsize=(8, 4))
 
@@ -123,6 +141,7 @@ def plot_forecast_pdf(y_samples: jnp.ndarray, horizon_idx: int = -1, bins: int =
     Returns:
         Any: The matplotlib Axes object containing the plotted PDF.
     """
+    _require_plotting()
     if ax is None:
         fig, ax = plt.subplots(figsize=(6, 4))
 
@@ -146,6 +165,7 @@ def plot_chained_window(y: jnp.ndarray, y_preds: List[jnp.ndarray], horizon: int
     Returns:
         Any: The matplotlib Axes object containing the chained cross-validation plot.
     """
+    _require_plotting()
     if ax is None:
         fig, ax = plt.subplots(figsize=(10, 5))
 
@@ -194,6 +214,7 @@ def plot_acf(x: jnp.ndarray, nlags: int = 40) -> None:
     Returns:
         None: Displays the plot via plt.show().
     """
+    _require_plotting()
     acf_vals = acf(x, nlags)
     lags = jnp.arange(len(acf_vals))
 

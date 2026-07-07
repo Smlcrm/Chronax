@@ -321,10 +321,10 @@ def test_basic_single_seasonality():
         print(f"StatsForecast forecast (first 6): {sf_mean[:6]}")
         res = compare_forecasts(jax_mean, sf_mean, rtol=0.10, atol=2.0)
         print_comparison(res, "Forecast Comparison")
-        return res["close"]
-
-    print("✓ JAX model.forecast runs successfully")
-    return True
+        assert res["close"]
+    else:
+        assert np.all(np.isfinite(jax_mean))
+        print("✓ JAX model.forecast runs successfully")
 
 
 def test_multiple_seasonality():
@@ -356,10 +356,10 @@ def test_multiple_seasonality():
         print(f"StatsForecast forecast (first 7): {sf_mean[:7]}")
         res = compare_forecasts(jax_mean, sf_mean, rtol=0.15, atol=3.0)
         print_comparison(res, "Forecast Comparison (approx; seasonality mismatch)")
-        return res["close"]
-
-    print("✓ JAX multiple-season path runs successfully")
-    return True
+        assert res["close"]
+    else:
+        assert np.all(np.isfinite(jax_mean))
+        print("✓ JAX multiple-season path runs successfully")
 
 
 def test_boxcox_transformation():
@@ -386,10 +386,10 @@ def test_boxcox_transformation():
         # the comparison is apples-to-apples:
         res = compare_forecasts(jax_mean, sf_mean, rtol=0.15, atol=5.0)
         print_comparison(res, "Forecast Comparison")
-        return res["close"]
-
-    print("✓ JAX model.forecast runs successfully (Box-Cox)")
-    return True
+        assert res["close"]
+    else:
+        assert np.all(np.isfinite(jax_mean))
+        print("✓ JAX model.forecast runs successfully (Box-Cox)")
 
 def test_boxcox_transformation1_compare():
     print("\n" + "="*70)
@@ -432,10 +432,10 @@ def test_boxcox_transformation1_compare():
         # Compare with slightly generous tolerances (small sample, BC transform)
         res = compare_forecasts(jax_mean, sf_mean, rtol=0.15, atol=1.0)
         print_comparison(res, "Forecast Comparison (simple series, Box-Cox)")
-        return res["close"]
-
-    print("✓ JAX fit+predict runs successfully (Box-Cox, simple series)")
-    return True
+        assert res["close"]
+    else:
+        assert np.all(np.isfinite(jax_mean))
+        print("✓ JAX fit+predict runs successfully (Box-Cox, simple series)")
 
 def test_damped_trend():
     print("\n" + "="*70)
@@ -461,10 +461,10 @@ def test_damped_trend():
         print(f"StatsForecast (18-month): {sf_mean[18:24]}")
         res = compare_forecasts(jax_mean, sf_mean, rtol=0.10, atol=2.0)
         print_comparison(res, "Forecast Comparison")
-        return res["close"]
-
-    print("✓ JAX model.forecast runs successfully (damped)")
-    return True
+        assert res["close"]
+    else:
+        assert np.all(np.isfinite(jax_mean))
+        print("✓ JAX model.forecast runs successfully (damped)")
 
 
 def test_prediction_intervals():
@@ -491,110 +491,84 @@ def test_prediction_intervals():
 
     if HAS_STATSFORECAST:
         print("StatsForecast TBATS does not consistently expose sigma(h); skipping direct compare.")
-    return is_increasing
+    assert is_increasing
 
 
 def test_edge_cases():
     print("\n" + "="*70)
     print("TEST 6: Edge Cases (AutoTBATS.forecast)")
     print("="*70)
-    ok = True
 
     # Short series
-    try:
-        y = generate_seasonal_data(n=20, season_length=12, seed=42)
-        y_jax = jnp.array(y, dtype=jnp.float32)
-        model = AutoTBATS(season_length=12, use_boxcox=False, use_arma_errors=False)
-        _ = model.forecast(y=y_jax, h=5)
-        print("   ✓ Handles short series")
-    except Exception as e:
-        print("   ✗ Short series failed:", e); ok = False
+    y = generate_seasonal_data(n=20, season_length=12, seed=42)
+    y_jax = jnp.array(y, dtype=jnp.float32)
+    model = AutoTBATS(season_length=12, use_boxcox=False, use_arma_errors=False)
+    r = model.forecast(y=y_jax, h=5)
+    assert np.all(np.isfinite(np.asarray(r["mean"])))
+    print("   ✓ Handles short series")
 
     # Long horizon
-    try:
-        y = generate_seasonal_data(n=100, season_length=12, seed=42)
-        y_jax = jnp.array(y, dtype=jnp.float32)
-        model = AutoTBATS(season_length=12, use_boxcox=False)
-        _ = model.forecast(y=y_jax, h=100)
-        print("   ✓ Handles long horizon")
-    except Exception as e:
-        print("   ✗ Long horizon failed:", e); ok = False
+    y = generate_seasonal_data(n=100, season_length=12, seed=42)
+    y_jax = jnp.array(y, dtype=jnp.float32)
+    model = AutoTBATS(season_length=12, use_boxcox=False)
+    r = model.forecast(y=y_jax, h=100)
+    assert r["mean"].shape == (100,)
+    print("   ✓ Handles long horizon")
 
-    # NaN handling
+    # NaN handling: fit() raises eagerly; the stateless (vmap-traceable)
+    # forecast() cannot raise on data VALUES — NaN propagates instead.
+    y = generate_seasonal_data(n=50, season_length=12, seed=42)
+    y_jax = jnp.array(y, dtype=jnp.float32).at[25].set(jnp.nan)
+    model = AutoTBATS(season_length=12)
     try:
-        y = generate_seasonal_data(n=50, season_length=12, seed=42)
-        y_jax = jnp.array(y, dtype=jnp.float32).at[25].set(jnp.nan)
-        model = AutoTBATS(season_length=12)
-        _ = model.forecast(y=y_jax, h=5)
-        print("   ✗ Should have raised ValueError for NaN"); ok = False
+        model.fit(y_jax)
+        assert False, "fit should raise ValueError for NaN"
     except ValueError as e:
-        if "NaN" in str(e):
-            print("   ✓ Properly rejects NaN values")
-        else:
-            print("   ✗ Wrong error:", e); ok = False
+        assert "NaN" in str(e)
+    r = model.forecast(y=y_jax, h=5)
+    assert np.any(np.isnan(np.asarray(r["mean"])))  # NaN in, NaN out
+    print("   ✓ NaN: fit raises, forecast propagates")
 
-    # Box-Cox + negative
+    # Box-Cox + negative: fit() raises when Box-Cox is FORCED; the auto grid
+    # (use_boxcox=None) degrades gracefully — the Box-Cox candidates are
+    # masked out of the AIC argmin and a non-Box-Cox candidate wins.
+    y = generate_seasonal_data(n=50, season_length=12, seed=42) - 110
+    y_jax = jnp.array(y, dtype=jnp.float32)
     try:
-        y = generate_seasonal_data(n=50, season_length=12, seed=42) - 110
-        y_jax = jnp.array(y, dtype=jnp.float32)
-        model = AutoTBATS(season_length=12, use_boxcox=True)
-        _ = model.forecast(y=y_jax, h=5)
-        print("   ✗ Should have raised ValueError for negative values"); ok = False
+        AutoTBATS(season_length=12, use_boxcox=True).fit(y_jax)
+        assert False, "fit should raise ValueError for negative with forced Box-Cox"
     except ValueError as e:
-        if "positive" in str(e).lower():
-            print("   ✓ Properly rejects negative values with Box-Cox")
-        else:
-            print("   ✗ Wrong error:", e); ok = False
-
-    return ok
+        assert "positive" in str(e).lower()
+    r = AutoTBATS(season_length=12, use_boxcox=None).forecast(y=y_jax, h=5)
+    assert np.all(np.isfinite(np.asarray(r["mean"])))
+    print("   ✓ Box-Cox + negative: fit raises, auto grid degrades gracefully")
 
 
 def test_numerical_stability():
     print("\n" + "="*70)
     print("TEST 7: Numerical Stability (AutoTBATS.forecast)")
     print("="*70)
-    ok = True
 
     # Large scale
-    try:
-        y = generate_seasonal_data(n=100, season_length=12, seed=42) * 1e6
-        y_jax = jnp.array(y, dtype=jnp.float32)
-        model = AutoTBATS(season_length=12, use_boxcox=False)
-        r = model.forecast(y=y_jax, h=12)
-        if not (np.any(np.isnan(r["mean"])) or np.any(np.isinf(r["mean"]))):
-            print("   ✓ Handles large values")
-        else:
-            print("   ✗ Produced NaN/Inf"); ok = False
-    except Exception as e:
-        print("   ✗ Failed (large):", e); ok = False
+    y = generate_seasonal_data(n=100, season_length=12, seed=42) * 1e6
+    r = AutoTBATS(season_length=12, use_boxcox=False).forecast(
+        y=jnp.array(y, dtype=jnp.float32), h=12)
+    assert np.all(np.isfinite(np.asarray(r["mean"])))
+    print("   ✓ Handles large values")
 
     # Small scale
-    try:
-        y = generate_seasonal_data(n=100, season_length=12, seed=42) * 1e-3
-        y_jax = jnp.array(y, dtype=jnp.float32)
-        model = AutoTBATS(season_length=12, use_boxcox=False)
-        r = model.forecast(y=y_jax, h=12)
-        if not (np.any(np.isnan(r["mean"])) or np.any(np.isinf(r["mean"]))):
-            print("   ✓ Handles small values")
-        else:
-            print("   ✗ Produced NaN/Inf"); ok = False
-    except Exception as e:
-        print("   ✗ Failed (small):", e); ok = False
+    y = generate_seasonal_data(n=100, season_length=12, seed=42) * 1e-3
+    r = AutoTBATS(season_length=12, use_boxcox=False).forecast(
+        y=jnp.array(y, dtype=jnp.float32), h=12)
+    assert np.all(np.isfinite(np.asarray(r["mean"])))
+    print("   ✓ Handles small values")
 
     # High variance
-    try:
-        y = generate_seasonal_data(n=100, season_length=12, noise_level=50.0, seed=42)
-        y_jax = jnp.array(y, dtype=jnp.float32)
-        model = AutoTBATS(season_length=12, use_boxcox=False)
-        r = model.forecast(y=y_jax, h=12)
-        if not (np.any(np.isnan(r["mean"])) or np.any(np.isinf(r["mean"]))):
-            print("   ✓ Handles high variance")
-        else:
-            print("   ✗ Produced NaN/Inf"); ok = False
-    except Exception as e:
-        print("   ✗ Failed (high var):", e); ok = False
-
-    return ok
+    y = generate_seasonal_data(n=100, season_length=12, noise_level=50.0, seed=42)
+    r = AutoTBATS(season_length=12, use_boxcox=False).forecast(
+        y=jnp.array(y, dtype=jnp.float32), h=12)
+    assert np.all(np.isfinite(np.asarray(r["mean"])))
+    print("   ✓ Handles high variance")
 
 
 import jax.numpy as jnp
@@ -830,8 +804,8 @@ def test_conformal_intervals_shapes_and_monotonicity():
         lo, hi = f"lo-{lvl}", f"hi-{lvl}"
         assert lo in out and hi in out
         assert out[lo].shape == (5,) and out[hi].shape == (5,)
-        assert jnp.all(out[lo] <= out["mean"]) <= True
-        assert jnp.all(out["mean"] <= out[hi]) <= True
+        assert bool(jnp.all(out[lo] <= out["mean"]))
+        assert bool(jnp.all(out["mean"] <= out[hi]))
     print("✓ Conformal intervals: shapes and ordering OK")
 
 def test_core_returns_original_scale_mean_when_boxcox_used():
@@ -1118,11 +1092,13 @@ def test_arma_order_selection_ar_only_ma_only_higher_orders():
     t = np.arange(n)
     base = 100 + 0.03 * t + 6 * np.sin(2 * np.pi * t / 12)
 
+    # forecast() is stateless (never writes model_) — fit first, then predict.
     # AR(2) noise
     y_ar = base + _gen_arma_noise(n, ar=[0.6, -0.3], ma=None, seed=1)
     m_ar = AutoTBATS(season_length=12, use_boxcox=False, use_trend=True,
                      use_damped_trend=False, use_arma_errors=True)
-    out_ar = m_ar.forecast(jnp.array(y_ar, dtype=jnp.float32), h=12)
+    m_ar.fit(jnp.array(y_ar, dtype=jnp.float32))
+    out_ar = m_ar.predict(h=12)
     assert np.all(np.isfinite(np.asarray(out_ar["mean"])))
     # Expect some AR structure discovered (p>0 OR q>0 OK, but AR likely >0)
     assert m_ar.model_["p"] >= 0 and m_ar.model_["q"] >= 0
@@ -1131,7 +1107,8 @@ def test_arma_order_selection_ar_only_ma_only_higher_orders():
     y_ma = base + _gen_arma_noise(n, ar=None, ma=[-0.5, 0.4], seed=2)
     m_ma = AutoTBATS(season_length=12, use_boxcox=False, use_trend=True,
                      use_damped_trend=False, use_arma_errors=True)
-    out_ma = m_ma.forecast(jnp.array(y_ma, dtype=jnp.float32), h=12)
+    m_ma.fit(jnp.array(y_ma, dtype=jnp.float32))
+    out_ma = m_ma.predict(h=12)
     assert np.all(np.isfinite(np.asarray(out_ma["mean"])))
     assert m_ma.model_["p"] >= 0 and m_ma.model_["q"] >= 0
 
@@ -1139,7 +1116,8 @@ def test_arma_order_selection_ar_only_ma_only_higher_orders():
     y_arma = base + _gen_arma_noise(n, ar=[0.5, -0.2], ma=[0.4], seed=3)
     m_arma = AutoTBATS(season_length=12, use_boxcox=False, use_trend=True,
                        use_damped_trend=False, use_arma_errors=True)
-    out_arma = m_arma.forecast(jnp.array(y_arma, dtype=jnp.float32), h=12)
+    m_arma.fit(jnp.array(y_arma, dtype=jnp.float32))
+    out_arma = m_arma.predict(h=12)
     assert np.all(np.isfinite(np.asarray(out_arma["mean"])))
     assert m_arma.model_["p"] >= 0 and m_arma.model_["q"] >= 0
     print("✓ AR/MA/ARMA selection yields finite forecasts with nonnegative orders")
@@ -1152,7 +1130,8 @@ def test_stationarity_invertibility_constraints_enforced():
     y = 50 + 0.02 * t + 4 * np.sin(2 * np.pi * t / 6) + _gen_arma_noise(n, ar=[0.7], ma=[-0.4], seed=44)
     m = AutoTBATS(season_length=6, use_boxcox=False, use_trend=True,
                   use_damped_trend=False, use_arma_errors=True)
-    _ = m.forecast(jnp.array(y, dtype=jnp.float32), h=24)
+    m.fit(jnp.array(y, dtype=jnp.float32))  # forecast() is stateless; fit stores model_
+    _ = m.predict(h=24)
     ar = m.model_.get("ar_coeffs", None)
     ma = m.model_.get("ma_coeffs", None)
     if ar is not None:
@@ -1172,15 +1151,16 @@ def test_boxcox_lambda_edge_behavior_and_roundtrip():
     m = AutoTBATS(season_length=12, use_boxcox=True, use_trend=True,
                   use_damped_trend=False, use_arma_errors=False,
                   )
-    r = m.forecast(y, h=6)
+    m.fit(y)  # forecast() is stateless; fit stores model_
+    r = m.predict(h=6)
     lam = m.model_.get("BoxCox_lambda", None)
-    assert lam is not None and np.isfinite(lam)
+    assert lam is not None and np.isfinite(np.asarray(lam))
     # Roundtrip check on the forecast mean value (smoke)
     from chronax.models.tbats.tbats_core import _boxcox as _bc, _inv_boxcox as _ibc
     bc = _bc(r["mean"], lam)
     inv = _ibc(bc, lam)
     assert np.allclose(np.asarray(r["mean"]), np.asarray(inv), rtol=1e-6, atol=1e-6)
-    print(f"✓ Box–Cox λ finite and roundtrip ok (λ≈{lam:.4f})")
+    print(f"✓ Box–Cox λ finite and roundtrip ok (λ≈{float(lam):.4f})")
 
 
 # ---------- Seasonal harmonics ----------
@@ -1193,7 +1173,8 @@ def test_find_harmonics_small_and_prime_periods():
                   dtype=jnp.float32)
     for m in (2, 5, 11, 13):  # small & prime
         k, z = find_harmonics(y, m)
-        assert isinstance(k, int) and k >= 1
+        # k is a jnp int32 scalar (traced-safe); concrete when called eagerly
+        assert int(k) >= 1
         assert z.shape[0] == n
         assert jnp.all(jnp.isfinite(z))
     print("✓ find_harmonics stable on small/prime periods")
@@ -1216,7 +1197,8 @@ def test_multiperiod_harmonics_selection_smoke():
         use_damped_trend=False,
         use_arma_errors=False,
     )
-    r = m.forecast(y, h=14)
+    m.fit(y)  # forecast() is stateless; fit stores model_
+    r = m.predict(h=14)
     kv = m.model_.get("k_vector", None)
 
     # Assert k_vector length matches the number of periods provided
@@ -1422,16 +1404,25 @@ def test_damped_without_trend_raises_in_selection():
         assert "damped" in str(e).lower()
         print("✓ error: damped trend without trend raises")
 
-def test_forecast_boxcox_negative_input_raises():
-    """Forecast path: negative values with Box–Cox True should raise."""
+def test_boxcox_negative_input_semantics():
+    """Negative values + forced Box–Cox: fit raises; stateless forecast degrades.
+
+    forecast() must trace under vmap (conformity_scores), so it cannot raise
+    on data VALUES — a forced-Box-Cox fit on non-positive data instead
+    degrades lax-natively to an UNTRANSFORMED fit (the core's NaN-lambda
+    sentinel marks the transform as identity) and still produces a finite,
+    honestly-optimized forecast. fit() keeps the eager raise.
+    """
     y = jnp.array([-1., 2., 3., 4., 5., 6., 7., 8.], dtype=jnp.float32)
     m = AutoTBATS(season_length=4, use_boxcox=True, use_trend=True, use_damped_trend=False, use_arma_errors=False)
     try:
-        _ = m.forecast(y, h=2)
-        assert False, "Expected ValueError for negative inputs with Box–Cox"
+        m.fit(y)
+        assert False, "Expected ValueError for negative inputs with forced Box–Cox"
     except ValueError as e:
         assert "positive" in str(e).lower()
-        print("✓ error: negative values + Box–Cox raises in forecast path")
+    out = m.forecast(y, h=2)
+    assert np.all(np.isfinite(np.asarray(out["mean"])))  # degraded to untransformed fit
+    print("✓ negative + forced Box–Cox: fit raises, forecast degrades to untransformed")
 
 
 # ============================================================================
@@ -1445,16 +1436,27 @@ def run_all_tests():
     if not HAS_STATSFORECAST:
         print("\nWARNING: StatsForecast not available. Install with:\n  pip install -U statsforecast\n")
 
+    # Tests assert internally (pytest-style); a test "passes" here iff it
+    # returns without raising.
+    suite = {
+        "basic_single": test_basic_single_seasonality,
+        "multiple_seasonal": test_multiple_seasonality,
+        "boxcox": test_boxcox_transformation,
+        "damped_trend": test_damped_trend,
+        "prediction_intervals": test_prediction_intervals,
+        "edge_cases": test_edge_cases,
+        "numerical_stability": test_numerical_stability,
+    }
     results = {}
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        results["basic_single"] = test_basic_single_seasonality()
-        results["multiple_seasonal"] = test_multiple_seasonality()
-        results["boxcox"] = test_boxcox_transformation()
-        results["damped_trend"] = test_damped_trend()
-        results["prediction_intervals"] = test_prediction_intervals()
-        results["edge_cases"] = test_edge_cases()
-        results["numerical_stability"] = test_numerical_stability()
+        for name, fn in suite.items():
+            try:
+                fn()
+                results[name] = True
+            except AssertionError as e:
+                print(f"✗ {name}: {e}")
+                results[name] = False
 
     print("\n" + "="*70)
     print("TEST SUMMARY")
@@ -1531,7 +1533,7 @@ if __name__ == "__main__":
     test_model_selection_picks_lowest_aic_deterministically()
     test_performance_long_series_long_horizon_smoke()
     test_damped_without_trend_raises_in_selection()
-    test_forecast_boxcox_negative_input_raises()
+    test_boxcox_negative_input_semantics()
     test_performance_long_series_long_horizon_sf_parity()
 
     print("\n" + "=" * 60)

@@ -2,15 +2,15 @@ Chronax
 =======
 
 A high-performance, JAX-accelerated time-series forecasting library. Chronax provides
-a comprehensive suite of classical and modern forecasting models — including AutoARIMA,
-AutoETS, AutoTheta, TBATS, MFLES, GARCH, and more — with a unified ``fit`` / ``predict``
-interface and hardware-accelerated execution via JAX.
+a comprehensive suite of classical and neural forecasting models — including AutoARIMA,
+AutoETS, AutoTheta, TBATS, MFLES, GARCH, TFT, Informer, PatchTST, and more — with a
+unified ``fit`` / ``predict`` interface and hardware-accelerated execution via JAX.
 
 Features
 --------
 
 - **JAX-accelerated** — JIT-compiled model fitting and forecasting on CPU, GPU, or TPU
-- **20+ forecasting models** including AutoARIMA, AutoETS, AutoTheta, TBATS, MFLES, GARCH, STL, and more
+- **35+ forecasting models** — classical (AutoARIMA, AutoETS, AutoTheta, TBATS, MFLES, GARCH, STL, and more) and neural (TFT, Informer, PatchTST, XLSTM, and more)
 - **Unified API** — every model follows the same ``fit()`` → ``predict()`` pattern
 - **Prediction intervals** — built-in conformal and native interval support
 - **NumPy compatible** — accepts and returns standard array types

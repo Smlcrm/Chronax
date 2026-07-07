@@ -234,6 +234,22 @@ def test_imha_rows_sum_to_one():
     np.testing.assert_allclose(np.asarray(w).sum(-1), np.ones((1, 2, 4)), rtol=1e-5)
 
 
+def test_imha_out_dropout_applied_in_training_mode():
+    """NF parity: InterpretableMultiHeadAttention applies out_dropout (rate =
+    `dropout`, NOT attn_dropout) after the output projection (NF tft.py:229,267).
+    Training-mode forwards must be stochastic when dropout > 0; deterministic
+    forwards must be reproducible and match the eval path."""
+    attn = InterpretableMultiHeadAttention(
+        n_head=2, hidden_size=16, attn_dropout=0.0, dropout=0.5, rngs=nnx.Rngs(0))
+    x = jnp.asarray(np.random.RandomState(0).randn(2, 6, 16), jnp.float32)
+    out_a, _ = attn(x, deterministic=False)
+    out_b, _ = attn(x, deterministic=False)
+    assert not bool(jnp.allclose(out_a, out_b)), "out_dropout inactive in training mode"
+    det_a, _ = attn(x, deterministic=True)
+    det_b, _ = attn(x, deterministic=True)
+    np.testing.assert_allclose(np.asarray(det_a), np.asarray(det_b), rtol=1e-6)
+
+
 # =============================================================================
 # Module (encoders, fusion decoder, top-level net)
 # =============================================================================
