@@ -91,6 +91,21 @@ class XLSTM(BaseForecaster):
     slstm_stabilizer : {"per_head", "per_cell"}
         sLSTM log-space stabilizer granularity. ``"per_head"`` (default) keeps the
         original collapsed stabilizer; ``"per_cell"`` matches the paper (Eq. 15).
+
+    NF-convention aliases
+    ---------------------
+    h, input_size, random_seed : int, optional
+        Aliases for ``horizon``, ``ctx_len`` and ``seed``, matching the
+        constructor convention of the other neural forecasters and the neural
+        benchmark harness (``benchmarks/neural/worker.py``). ``h`` raises on an
+        unequal explicit ``horizon``; ``input_size``/``random_seed`` take
+        precedence over ``ctx_len``/``seed`` when given.
+    max_steps : int, optional
+        Exact total optimizer step count (NF semantics). Overrides the
+        epochs-derived budget ``n_epochs * (n_windows // batch_size)``, making
+        training compute independent of series length.
+    learning_rate : float, optional
+        Alias for ``lr``; takes precedence when given.
     """
 
     uses_exog = False
@@ -122,7 +137,28 @@ class XLSTM(BaseForecaster):
         conv1d_kernel: int = 4,
         slstm_forget_gate: str = "exp",
         slstm_stabilizer: str = "per_head",
+        # ── NF-convention aliases (see docstring) ─────────────────────────────
+        h: Optional[int] = None,
+        input_size: Optional[int] = None,
+        random_seed: Optional[int] = None,
+        max_steps: Optional[int] = None,
+        learning_rate: Optional[float] = None,
     ) -> None:
+        if h is not None:
+            if horizon is not None and int(horizon) != int(h):
+                raise ValueError(
+                    f"h ({h}) conflicts with horizon ({horizon}); pass only one."
+                )
+            horizon = int(h)
+        if input_size is not None:
+            ctx_len = int(input_size)
+        if random_seed is not None:
+            seed = int(random_seed)
+        if learning_rate is not None:
+            lr = float(learning_rate)
+        if max_steps is not None and max_steps < 1:
+            raise ValueError(f"max_steps must be >= 1, got {max_steps}")
+
         if ctx_len < 4:
             raise ValueError(f"ctx_len must be >= 4, got {ctx_len}")
         if horizon_train < 1:
@@ -171,6 +207,7 @@ class XLSTM(BaseForecaster):
         self.num_heads = int(num_heads)
         self.n_epochs = int(n_epochs)
         self.batch_size = int(batch_size)
+        self.max_steps = None if max_steps is None else int(max_steps)
         self.lr = float(lr)
         self.weight_decay = float(weight_decay)
         self.gate_clip = float(gate_clip)
@@ -260,6 +297,7 @@ class XLSTM(BaseForecaster):
             batch_size=self.batch_size,
             lr=self.lr,
             weight_decay=self.weight_decay,
+            max_steps=self.max_steps,
         )
         self.model_ = {
             "params": result["params"],

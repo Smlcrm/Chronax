@@ -3,7 +3,13 @@ experiment:
   input_size: 72
   seeds: [42, 43, 44, 45, 46]   # first `warmup_seeds` per (model,dataset) = warmup for timing
   warmup_seeds: 1               # leading seeds excluded from the after-warmup wall-clock mean
-  threads: 1                    # equal CPU thread budget pinned for BOTH libraries
+  threads: 10                   # = all physical cores. Owner principle
+                                # (2026-07-07): harness settings must let each model run at its
+                                # best under a fair symmetric budget — measurements should reflect
+                                # MODEL performance, not artificial harness constraints. XLA cannot
+                                # be capped at N threads on macOS anyway (the pin never bound the
+                                # chronax side), so "all cores for both, cells sequential" is the
+                                # only genuinely symmetric configuration on this machine.
 
 datasets:
   - { name: AirlinePassengers, path: benchmarks/benchmark_datasets/airline-passengers.csv,
@@ -24,8 +30,26 @@ models:
     chronax_params: { max_steps: 1000, learning_rate: 0.001, scaler: identity, loss: mae }
     nf_params:      { max_steps: 1000, learning_rate: 0.001, scaler_type: identity, loss: MAE }
   - name: TFT
-    chronax_params: { max_steps: 1000, learning_rate: 0.001, scaler_type: robust, loss: mae }
-    nf_params:      { max_steps: 1000, learning_rate: 0.001, scaler_type: robust, loss: MAE }
+    # windows_batch_size=128 deviates from the NF default (1024) SYMMETRICALLY: with-replacement
+    # sampling pads every step to 1024 windows even on 25-window datasets (both libraries),
+    # putting chronax TFT/Informer at ~2 h PER SEED on CPU. 128 = NF's own RNN-family default.
+    chronax_params: { max_steps: 1000, learning_rate: 0.001, scaler_type: robust, loss: mae, windows_batch_size: 128 }
+    nf_params:      { max_steps: 1000, learning_rate: 0.001, scaler_type: robust, loss: MAE, windows_batch_size: 128 }
   - name: iTransformer
     chronax_params: { max_steps: 1000, learning_rate: 0.001, loss: mae }   # natively multivariate; Chronax exposes a univariate adaptation
     nf_params:      { max_steps: 1000, learning_rate: 0.001, scaler_type: identity, loss: MAE, n_series: 1 }
+  - name: Informer
+    # Two SYMMETRIC deviations from NF Informer defaults (5000 steps, identity scaler):
+    # steps=1000 — at 1 pinned CPU thread the NF side costs hours/seed at 5000; and
+    # scaler_type=robust — identity feeds raw-scale data and structurally underfits at
+    # 1000 steps x lr 1e-4 (chronax MAE 427 on airline, 2026-07-06; predicted-by-arithmetic
+    # for both libraries). Robust matches the TFT/GRU entries and chronax's tested operating point.
+    chronax_params: { max_steps: 1000, learning_rate: 0.0001, scaler_type: robust, loss: mae, windows_batch_size: 128 }
+    nf_params:      { max_steps: 1000, learning_rate: 0.0001, scaler_type: robust, loss: MAE, windows_batch_size: 128 }  # wbs=128: see TFT comment
+  # XLSTM excluded from paired runs (owner, 2026-07-06): Chronax XLSTM is xLSTMTime
+  # (Alharthi & Mahmood 2024) — NOT architecture-1:1 with NF's xLSTM, so the paired
+  # accept-gate comparison is not meaningful. The wrapper takes the NF-convention
+  # params below and remains registered for ad-hoc runs; uncomment to re-enable.
+  # - name: XLSTM
+  #   chronax_params: { max_steps: 1000, learning_rate: 0.001 }   # NF-alias params (map to horizon/ctx_len/seed/lr); built-in z-score scaling (no knob)
+  #   nf_params:      { max_steps: 1000, learning_rate: 0.001, scaler_type: robust, loss: MAE }  # NF xLSTM defaults (mLSTM backbone, robust scaler); needs xlstm+mlstm_kernels in .venv-nf

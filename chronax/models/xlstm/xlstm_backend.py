@@ -726,17 +726,29 @@ def decode(params, z_tail, h_steps: int, cfg: XLSTMConfig):
     Parameters
     ----------
     params : float32 pytree.
-    z_tail : (ctx_len,) float32, normalized.
+    z_tail : (ctx_len,) float32 — caller-normalized (z-score) when RevIN is off,
+        RAW original-scale when RevIN is on (RevIN normalizes internally).
     h_steps : Python int (static). Number of forecast steps.
     cfg : XLSTMConfig (must have decode_mode == "ar").
 
     Returns
     -------
-    preds : (h_steps,) float32, normalized predictions.
+    preds : (h_steps,) float32 — normalized scale when RevIN is off (caller
+        denormalizes with its z-score stats), original scale when RevIN is on.
     """
     assert cfg.decode_mode == "ar", "decode() is AR-only; use decode_direct for direct mode."
     _, final_states = xlstm_forward(params, z_tail, cfg)
-    last = z_tail[-1].astype(jnp.float32)
+    # With RevIN the recurrent states above were built from the RevIN-normalized
+    # sequence and the trained out_proj emits normalized-space values (training
+    # denormalizes via revin_denormalize in xlstm_forward). Roll the AR loop in
+    # that same normalized space and denormalize the emissions at the end.
+    if cfg.use_revin:
+        revin_p = params.get("revin", {})
+        z_norm, revin_stats = revin_normalize(z_tail.astype(jnp.float32), revin_p)
+        last = z_norm[-1].astype(jnp.float32)
+    else:
+        revin_p, revin_stats = None, None
+        last = z_tail[-1].astype(jnp.float32)
     params_bf = _cast_pytree(params, jnp.bfloat16)
 
     W_in = params_bf["input_embed"]["W"]
@@ -763,6 +775,9 @@ def decode(params, z_tail, h_steps: int, cfg: XLSTMConfig):
         return (pred, tuple(new_states)), pred
 
     _, preds = lax.scan(ar_step, (last, final_states), xs=None, length=h_steps)
+    if cfg.use_revin:
+        preds = revin_denormalize(preds, revin_p, revin_stats)
+        preds = jnp.reshape(preds, (h_steps,))
     return preds
 
 

@@ -16,13 +16,22 @@ REPO = Path(__file__).resolve().parents[2]
 NF_VENV_PY = REPO / "benchmarks" / ".venv-nf" / "bin" / "python"
 
 
+JAX_CACHE_DIR = REPO / "benchmarks" / ".jax-compilation-cache"
+
+
 def build_thread_env(threads: int) -> dict[str, str]:
     """Env vars pinning XLA (Chronax) CPU parallelism to `threads`.
 
     NOTE: `intra_op_parallelism_threads` is a TensorFlow session option and may
     be ignored by XLA; the effective CPU pin rests on OMP_NUM_THREADS +
-    xla_cpu_multi_thread_eigen. The actual Chronax thread pin is validated
-    empirically during the Task 14 calibration, not assumed here.
+    xla_cpu_multi_thread_eigen. Measured 2026-07-07: the pin does NOT bind XLA
+    on macOS (only eigen off=1-thread or on=unbounded), so `threads` should be
+    the machine's core count for a genuinely symmetric budget (see config.yaml).
+
+    Also enables the JAX persistent compilation cache so re-runs/--resume of an
+    identical (dataset, config) cell skip the minutes-scale XLA compile. The
+    compile lands in the excluded warmup seed either way, so cached vs cold
+    never changes the after-warmup timing the accept-gate certifies.
     """
     threads = int(threads)
     if threads < 1:
@@ -34,6 +43,7 @@ def build_thread_env(threads: int) -> dict[str, str]:
             f"--xla_cpu_multi_thread_eigen={multithread} "
             f"intra_op_parallelism_threads={threads}"
         ),
+        "JAX_COMPILATION_CACHE_DIR": str(JAX_CACHE_DIR),
     }
 
 

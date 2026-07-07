@@ -13,13 +13,16 @@ from typing import TYPE_CHECKING, Callable
 if TYPE_CHECKING:
     from chronax.models.base_forecaster import BaseForecaster
 
-# NF neuralforecast.models class names happen to equal the Chronax class names.
+# Keys are Chronax class names (resolved from chronax.models); values are the
+# neuralforecast.models class names. They coincide except XLSTM -> xLSTM.
 _NF_NAMES = {
     "GRU": "GRU",
     "PatchTST": "PatchTST",
     "KAN": "KAN",
     "TFT": "TFT",
     "iTransformer": "iTransformer",
+    "Informer": "Informer",
+    "XLSTM": "xLSTM",
 }
 
 

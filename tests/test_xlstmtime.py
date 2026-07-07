@@ -395,5 +395,76 @@ def test_slstm_paper_faithful_is_vmappable():
     )
 
 
+# ===========================================================================
+# NF-convention constructor aliases (neural benchmark harness protocol)
+# ===========================================================================
+
+
+def test_nf_alias_params_map_onto_native_names():
+    m = XLSTM(h=24, input_size=72, random_seed=7)
+    assert m.ctx_len == 72
+    assert m.seed == 7
+    assert m.horizon == 24
+    # direct mode satisfied by `h` alone (no separate `horizon` needed)
+    md = XLSTM(h=24, decode_mode="direct")
+    assert md.horizon == 24
+
+
+def test_nf_alias_h_conflicting_with_horizon_raises():
+    with pytest.raises(ValueError, match="horizon"):
+        XLSTM(h=24, horizon=12)
+    m = XLSTM(h=24, horizon=24)  # equal values are not a conflict
+    assert m.horizon == 24
+
+
+def test_nf_alias_ar_predictions_unchanged():
+    """In AR mode `h` only records the configured horizon: cfg.horizon feeds
+    direct-mode branches exclusively, so fitted params and predictions must be
+    bit-identical with or without the alias."""
+    y = jnp.sin(jnp.arange(48, dtype=jnp.float32) / 4.0)
+    base = XLSTM(ctx_len=16, n_epochs=2, seed=0).fit(y)
+    alias = XLSTM(ctx_len=16, n_epochs=2, seed=0, h=6).fit(y)
+    np.testing.assert_array_equal(
+        np.asarray(base.predict(h=6)["mean"]),
+        np.asarray(alias.predict(h=6)["mean"]),
+    )
+
+
+def test_nf_alias_max_steps_sets_total_optimizer_steps():
+    """`max_steps` must be the exact total optimizer step count (NF semantics),
+    overriding the epochs-derived budget — observable as len(losses)."""
+    y = jnp.sin(jnp.arange(60, dtype=jnp.float32) / 4.0)
+    m = XLSTM(input_size=16, n_epochs=100, max_steps=7).fit(y)
+    assert m.model_["losses"].shape[0] == 7
+
+
+def test_nf_alias_learning_rate_maps_to_lr():
+    assert XLSTM(learning_rate=0.01).lr == 0.01
+
+
+def test_ar_decode_with_revin_returns_original_scale():
+    """AR decode with RevIN must denormalize: training wraps the out_proj head in
+    revin_denormalize (xlstm_forward), so raw rollout emissions are in normalized
+    space — decode() must map them back and roll the recurrence in normalized
+    space. Regression test for the AR+RevIN scale-mismatch bug (2026-07-06)."""
+    y = 500.0 + jnp.sin(jnp.arange(64, dtype=jnp.float32) / 3.0) * 5.0
+    m = XLSTM(ctx_len=16, n_epochs=2, seed=0, use_revin=True)
+    m.fit(y)
+    pred = m.predict(h=4)["mean"]
+    assert bool(jnp.all(jnp.abs(pred - 500.0) < 250.0)), f"pred not in original scale: {pred}"
+
+
+def test_harness_protocol_construct_fit_predict():
+    """The neural benchmark worker constructs cls(h=..., input_size=...,
+    random_seed=..., **params) then fit(y) / predict(h)["mean"]
+    (benchmarks/neural/worker.py:128)."""
+    y = jnp.asarray(np.random.default_rng(0).normal(size=60), jnp.float32)
+    m = XLSTM(h=4, input_size=16, random_seed=1, n_epochs=1)
+    m.fit(y)
+    mean = m.predict(h=4)["mean"]
+    assert mean.shape == (4,)
+    assert bool(jnp.all(jnp.isfinite(mean)))
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
