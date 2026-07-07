@@ -62,9 +62,18 @@ try:
 except ImportError:
     KAN = None
 
-from .itransformer import iTransformer
+# iTransformer/VanillaTransformer raise ImportError off the flax pin; guard like
+# KAN/PatchTST so an off-pin flax degrades to None instead of breaking the namespace.
+try:
+    from .itransformer import iTransformer
+except ImportError:
+    iTransformer = None
 
-from .vanillatransformer import VanillaTransformer
+try:
+    from .vanillatransformer import VanillaTransformer
+except ImportError:
+    VanillaTransformer = None
+
 from .tft import TFT
 from .informer import Informer
 

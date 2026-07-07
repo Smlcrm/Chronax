@@ -196,7 +196,8 @@ class InterpretableMultiHeadAttention(nnx.Module):
     computed with ``jnp.tril`` (no stored buffer) so the module is vmap/scan-pure.
     """
 
-    def __init__(self, n_head: int, hidden_size: int, attn_dropout: float = 0.0, *, rngs: nnx.Rngs):
+    def __init__(self, n_head: int, hidden_size: int, attn_dropout: float = 0.0,
+                 dropout: float = 0.0, *, rngs: nnx.Rngs):
         if hidden_size % n_head != 0:
             raise ValueError(f"hidden_size ({hidden_size}) must be divisible by n_head ({n_head}).")
         self.n_head = n_head
@@ -211,6 +212,9 @@ class InterpretableMultiHeadAttention(nnx.Module):
             kernel_init=_TorchLinearInit(self.d_head), rngs=rngs,
         )
         self.attn_dropout = nnx.Dropout(rate=attn_dropout, rngs=rngs)
+        # NF parity: a second dropout at rate `dropout` (not attn_dropout) after
+        # the output projection (NF tft.py:229,267) — missing until 2026-07-07.
+        self.out_dropout = nnx.Dropout(rate=dropout, rngs=rngs)
 
     def __call__(self, x: jnp.ndarray, deterministic: bool = True):
         B, T, _ = x.shape
@@ -227,4 +231,4 @@ class InterpretableMultiHeadAttention(nnx.Module):
         attn = self.attn_dropout(attn, deterministic=deterministic)
         ctx = jnp.einsum("bhqk,bkd->bhqd", attn, v)                          # v broadcast over heads
         ctx = jnp.mean(ctx, axis=1)                                          # average heads -> [B, T, d_head]
-        return self.out_proj(ctx), attn
+        return self.out_dropout(self.out_proj(ctx), deterministic=deterministic), attn

@@ -192,6 +192,15 @@ class DeepARForecaster:
         if self.model is None or self.params is None:
             raise ValueError("Call fit() before predict().")
 
+        # The model is float32 throughout (init + training batches are cast in
+        # create_batch); coerce inference inputs likewise so a float64 series
+        # (easy to produce when the global x64 flag is on) cannot poison the
+        # LSTM scan carry dtype.
+        y_series = jnp.asarray(y_series, jnp.float32)
+        x_futr_hist = None if x_futr_hist is None else jnp.asarray(x_futr_hist, jnp.float32)
+        x_futr = None if x_futr is None else jnp.asarray(x_futr, jnp.float32)
+        x_stat = None if x_stat is None else jnp.asarray(x_stat, jnp.float32)
+
         return forecast_mc(
             self.params,
             self.model,
@@ -202,6 +211,10 @@ class DeepARForecaster:
             H=self.h,
             N=num_samples,
             seed=seed,
+            # The forecaster's training pipeline (train.py loss path) does NOT
+            # use the lag-feature augmentation, so inference must not either —
+            # otherwise the encoder input width no longer matches the params.
+            use_lags=False,
         )
 
     def quantile(

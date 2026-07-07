@@ -493,6 +493,9 @@ class AutoMFLES(BaseForecaster):
         self.metric: str = metric
         self.verbose: bool = verbose
         self.prediction_intervals: Optional[Any] = prediction_intervals
+        # Base-class conformal contract reads `conformal_params` (the ctor
+        # name `prediction_intervals` is kept for API compatibility).
+        self.conformal_params = prediction_intervals
         self.alias: str = alias
         self.n_jobs: int = n_jobs
         
@@ -623,8 +626,74 @@ class AutoMFLES(BaseForecaster):
         dict
             Keys: 'mean', and optionally 'lo-{lv}', 'hi-{lv}', 'fitted'.
         """
-        self.fit(y, X=X)
-        res = self.predict(h=h, X=X_future, level=level)
+        if self.best_params_ is None or self.model_ is None:
+            # First call: the grid search is a host-side threaded loop by
+            # design (AutoARIMA pattern — selection stays eager) and needs
+            # concrete data.
+            self.fit(y, X=X)
+            res = self.predict(h=h, X=X_future, level=level)
+            if fitted:
+                res['fitted'] = self.model_['fitted']
+            return res
+
+        # Fitted fast path — fully traceable and writes NOTHING to self (the
+        # base conformity_scores vmaps this method). Delegates to the inner
+        # MFLES's stateless forecast, which replays the resolved fit config,
+        # so every CV window re-fits the selected configuration on its own y.
+        # Fit at the selected model's precision regardless of caller dtype so
+        # scores match the _cs cached at fit (f32-vs-f64 window fits can flip
+        # lax.cond accept/reject decisions in the MFLES loop).
+        y = _ensure_float(y)
+        if X is not None:
+            if self.scaling_stats_ is None:
+                raise ValueError("Model trained without X, but X provided.")
+            X = jnp.asarray(X, dtype=jnp.float32)
+            if X.ndim == 1:
+                X = X.reshape(-1, 1)
+            X = _standardize_data(X, *self.scaling_stats_)
+        if X_future is not None:
+            if self.scaling_stats_ is None:
+                raise ValueError("Model trained without X, but X_future provided.")
+            X_future = jnp.asarray(X_future, dtype=jnp.float32)
+            if X_future.ndim == 1:
+                X_future = X_future.reshape(-1, 1)
+            X_future = _standardize_data(X_future, *self.scaling_stats_)
+
+        # Mirror predict(): delegate level to the inner conformal machinery
+        # only when intervals were configured; otherwise fall back to the
+        # Gaussian bands so the fitted path matches the unfitted path.
+        inner_level = level if self.prediction_intervals is not None else None
+        res = self.model_["model"].forecast(
+            y=y, h=h, X=X, X_future=X_future, level=inner_level
+        )
+        if level is not None and self.prediction_intervals is None:
+            res = add_gaussian_intervals(res, _validate_levels(level), self.sigma_)
         if fitted:
+            # In-sample fitted values from the full-series fit (eager cache);
+            # no current traced path requests fitted=True.
             res['fitted'] = self.model_['fitted']
         return res
+
+    def conformity_scores(
+        self, y: jnp.ndarray, X: Optional[jnp.ndarray] = None
+    ) -> jnp.ndarray:
+        """Conformity scores with eager selection, vmapped per-window re-fit.
+
+        The base implementation vmaps ``self.forecast`` over CV windows. The
+        grid search (threaded Python loop, ``.item()``/``np.argmin`` scoring)
+        cannot trace, so it runs ONCE, eagerly, here; the vmapped ``forecast``
+        then re-fits the SELECTED config independently per window via MFLES's
+        traceable config-replay path.
+
+        Calibration caveat (AutoARIMA/xLSTM class, CLAUDE.md §3.1): the CONFIG
+        is selected with sight of the full series; per-window parameters are
+        still honestly re-fit, so scores vary across windows.
+        """
+        if self.best_params_ is None or self.model_ is None:
+            self.fit(y, X)
+            # fit() already ran the walk-forward on exactly this y via the
+            # inner model's _cs cache — reuse instead of paying CV twice.
+            inner_cs = getattr(self.model_["model"], "_cs", None)
+            if inner_cs is not None:
+                return inner_cs
+        return super().conformity_scores(y, X)

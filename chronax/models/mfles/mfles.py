@@ -736,7 +736,8 @@ def _fit_body(
         mu = jnp.mean(resids)
         ssres = jnp.sum((resids - tren) ** 2)
         sstot = jnp.sum((resids - mu) ** 2) + 1e-12
-        return jnp.float32(1.0 - (ssres / sstot))
+        # Match the carry leg's dtype (threaded from y — §10 weak-type trap).
+        return (1.0 - (ssres / sstot)).astype(state.penalty.dtype)
 
     new_penalty = lax.cond(
         (i == 1) & trend_improves & (~used_ses),
@@ -877,6 +878,9 @@ class MFLES(BaseForecaster):
         self.predicted = None
         self._exo_beta = None
         self.penalty = None
+        self._cs = None
+        self._seas_len = None
+        self._fit_config = None
 
     def fit(
         self,
@@ -953,12 +957,33 @@ class MFLES(BaseForecaster):
         # - if seasonality is provided, prefer multiplicative mode
         # - disable multiplicative when the series contains non-positive values
         if multiplicative is None:
-            if seasonal_period is None:
-                multiplicative = False
-            else:
-                multiplicative = True
-            if bool(jnp.min(y) <= 0):
-                multiplicative = False
+            # Auto decision needs concrete data (log-space validity). It is
+            # resolved ONCE, eagerly, at fit time; the CV path replays the
+            # resolved value via _fit_config (captured below) so per-window
+            # fits trace statically. Same selection-with-sight class as
+            # AutoARIMA's cached order (CLAUDE.md §3.1).
+            multiplicative = seasonal_period is not None
+            if multiplicative:
+                multiplicative = bool(jnp.min(y) > 0)
+        multiplicative = bool(multiplicative)
+
+        # Resolved fit configuration. forecast() replays this when called with
+        # no explicit config (the base conformity_scores path), so CV windows
+        # re-fit the SAME model configuration — not the bare defaults — and
+        # every auto decision above stays static under the vmap trace.
+        self._fit_config = dict(
+            seasonal_period=seasonal_period, fourier_order=fourier_order,
+            ma=ma, alpha=alpha, decay=decay, n_changepoints=n_changepoints,
+            seasonal_lr=seasonal_lr, rs_lr=rs_lr, exogenous_lr=exogenous_lr,
+            linear_lr=linear_lr, cov_threshold=cov_threshold,
+            moving_medians=moving_medians, max_rounds=max_rounds,
+            min_alpha=min_alpha, max_alpha=max_alpha,
+            round_penalty=round_penalty, trend_penalty=trend_penalty,
+            multiplicative=multiplicative, changepoints=changepoints,
+            smoother=smoother, ses_mode=ses_mode,
+            seasonality_weights=seasonality_weights,
+            gradient_strategy=gradient_strategy,
+        )
         if multiplicative:
             const = jnp.min(y)
             y_tr = jnp.log(y)
@@ -973,10 +998,15 @@ class MFLES(BaseForecaster):
         self.const, self.mean, self.std = const, mean, std
         self.trend_penalty = bool(trend_penalty)
 
-        if n < 4 or jnp.all(y_tr == jnp.mean(y_tr)):
+        # Static short-series guard only. (The old `jnp.all(y_tr == mean)`
+        # constant-series test is a traced bool under vmap; the main loop is
+        # flat on constants anyway — AutoCES precedent.)
+        if n < 4:
             base = y_tr[-1]
             self.trend = jnp.array([base, base], dtype=y.dtype)
             self.seasonality = None
+            self._seas_len = None
+            self.penalty = jnp.zeros((), dtype=y.dtype)
             self.linear_component = jnp.zeros(n, y.dtype)
             self.seasonal_component = jnp.zeros(n, y.dtype)
             self.ses_component = jnp.zeros(n, y.dtype)
@@ -984,7 +1014,9 @@ class MFLES(BaseForecaster):
             self.exogenous_component = jnp.zeros(n, y.dtype)
             self._exo_beta = None
             fitted = jnp.full(n, base, y.dtype)
-            return self._finalize_fit(fitted, multiplicative)
+            self._finalize_fit(fitted, multiplicative)
+            self._cache_cs(y, X)
+            return self
 
         sp_list = None
         if seasonal_period is not None:
@@ -1170,7 +1202,7 @@ class MFLES(BaseForecaster):
             best=jnp.array(jnp.inf, dtype=y.dtype),  # Match dtype with y
             stalls=jnp.int32(0),
             robust=jnp.bool_(robust_init_value if robust_init_value is not None else False),
-            penalty=jnp.float32(0.0),
+            penalty=jnp.array(0.0, dtype=y.dtype),
             exo_beta=jnp.zeros(max(n_exo_features, 1), dtype=y.dtype),
             converged=jnp.bool_(False),
         )
@@ -1206,26 +1238,43 @@ class MFLES(BaseForecaster):
         # (trend updates add tren[-2:], residual smoother adds tren[-1]).
         self.trend = final_state.trend_tail.astype(fitted.dtype)
         
-        # Extract seasonality tail (dynamic slice based on seas_tail_len)
-        if has_seasonality and final_state.seas_tail_len > 0:
-            self.seasonality = lax.dynamic_slice(
-                final_state.seas_tail, 
-                (0,), 
-                (final_state.seas_tail_len,)
-            )
+        # Seasonality: keep the STATIC-size buffer plus its traced length.
+        # (A lax.dynamic_slice with a traced SIZE cannot trace under vmap;
+        # predict() gathers modulo the length instead.)
+        if has_seasonality:
+            self.seasonality = final_state.seas_tail
+            self._seas_len = final_state.seas_tail_len
         else:
             self.seasonality = None
-        
-        # Update robust and penalty if they were auto-detected
+            self._seas_len = None
+
+        # Auto-detected flags stay jnp scalars end-to-end (§1 rule 2).
         if init_robust:
-            self.robust = bool(final_state.robust)
-        self.penalty = float(final_state.penalty) if final_state.penalty > 0 else None
-        
-        # Update exogenous coefficients
-        if has_exogenous and jnp.any(final_state.exo_beta != 0):
+            self.robust = final_state.robust
+        # penalty <= 0 encodes the old `None` sentinel; predict() masks it.
+        self.penalty = final_state.penalty
+
+        # exo_beta is all-zeros whenever exogenous never improved the fit, so
+        # the X @ beta contribution is exactly 0 — no traced any() guard.
+        if has_exogenous:
             self._exo_beta = final_state.exo_beta
 
-        return self._finalize_fit(fitted, multiplicative)
+        self._finalize_fit(fitted, multiplicative)
+        self._cache_cs(y, X)
+        return self
+
+    def _cache_cs(self, y: jnp.ndarray, X: jnp.ndarray | None) -> None:
+        """Cache conformity scores on the TRAINING series (sibling convention).
+
+        Runs the base-class walk-forward CV once, eagerly, at fit time so
+        predict(level=...) is a cheap lookup. forecast() strips
+        ``conformal_params`` from its internal clone, so the CV-window fits
+        this triggers cannot recurse into their own CV.
+        """
+        if self.conformal_params is not None:
+            self._cs = self.conformity_scores(y=y, X=X)
+        else:
+            self._cs = None
 
     def _finalize_fit(self, fitted_tr: jnp.ndarray, multiplicative: bool) -> "MFLES":
         """Reverse scaling on fitted values and populate ``model_`` dict.
@@ -1284,11 +1333,22 @@ class MFLES(BaseForecaster):
         last, prev = self.trend[1], self.trend[0]
         slope = (last - prev)
         if self.trend_penalty and (self.penalty is not None):
-            slope = slope * jnp.maximum(0.0, self.penalty)
-        trend_fcst = slope * jnp.arange(1, h + 1, dtype=jnp.float32) + last
+            # penalty <= 0 encodes the pre-refactor "no damping" None sentinel.
+            pen = jnp.asarray(self.penalty)
+            slope = jnp.where(pen > 0, slope * pen, slope)
+        trend_fcst = slope * jnp.arange(1, h + 1, dtype=jnp.asarray(last).dtype) + last
 
         if self.seasonality is not None and self.seasonality.size > 0:
-            seas_fcst = utils._repeat_val_seas(self.seasonality, h)
+            seas = jnp.asarray(self.seasonality)
+            seas_len = getattr(self, "_seas_len", None)
+            if seas_len is None:
+                # Pre-refactor fit/pickle stored the exact-length tail.
+                seas_len = jnp.int32(seas.shape[0])
+            # Modular gather over the static buffer (traced-length-safe tiling;
+            # replaces _repeat_val_seas, which needs a static pattern length).
+            idx = jnp.arange(h) % jnp.maximum(seas_len, 1)
+            seas_fcst = jnp.where(seas_len > 0, seas[idx],
+                                  jnp.zeros((), dtype=seas.dtype))
         else:
             seas_fcst = jnp.zeros(h, dtype=trend_fcst.dtype)
 
@@ -1305,8 +1365,24 @@ class MFLES(BaseForecaster):
 
         out = {"mean": mean}
         if level:
-            cs = self.conformity_scores(self.model_["fitted"])
-            out = self.add_confidence_intervals(out, cs, level, "conformal_distribution")
+            if self.conformal_params is None:
+                raise ValueError(
+                    "predict(level=...) requires conformal_params to be set "
+                    "before fit()."
+                )
+            if getattr(self, "_cs", None) is None:
+                raise ValueError(
+                    "No cached conformity scores — set conformal_params and "
+                    "re-run fit() before predict(level=...)."
+                )
+            if h != self.conformal_params.h:
+                raise ValueError(
+                    f"h={h} != conformal_params.h={self.conformal_params.h}; "
+                    "conformity scores cover exactly conformal_params.h steps."
+                )
+            out = self.add_confidence_intervals(
+                out, self._cs, level, self.conformal_params.method
+            )
         return out
 
     def forecast(
@@ -1336,7 +1412,45 @@ class MFLES(BaseForecaster):
         Returns:
             dict: Same output as predict() -- "mean" and optional interval keys.
         """
-        return self.new().fit(y, X=X, seasonal_period=seasonal_period, **fit_kwargs).predict(h, X=X_future, level=level)
+        # Replay the fitted configuration when the caller passed none: the base
+        # conformity_scores path calls forecast(h=..., y=..., X=..., X_future=...)
+        # with no hyperparameters, and the CV windows must re-fit the SAME
+        # config the estimator was fit with (auto decisions already resolved
+        # there, so this branch traces statically under vmap).
+        if seasonal_period is None and not fit_kwargs:
+            replay = getattr(self, "_fit_config", None)
+            if replay:
+                fit_kwargs = dict(replay)
+                seasonal_period = fit_kwargs.pop("seasonal_period")
+
+        m = self.new()
+        # CV-window fits must not recurse into their own walk-forward CV.
+        m.conformal_params = None
+        m.fit(y, X=X, seasonal_period=seasonal_period, **fit_kwargs)
+        out = m.predict(h, X=X_future, level=None)
+
+        if level:
+            if self.conformal_params is None:
+                raise ValueError(
+                    "forecast(level=...) requires conformal_params to be set."
+                )
+            if int(h) != self.conformal_params.h:
+                raise ValueError(
+                    f"h={h} != conformal_params.h={self.conformal_params.h}; "
+                    "conformity scores cover exactly conformal_params.h steps."
+                )
+            # Score from the JUST-FITTED clone so the CV windows replay the
+            # same config the point forecast used (self._fit_config may be
+            # stale or absent — e.g. stateless forecast on an unfitted model
+            # or explicit kwargs overriding the fitted config). The clone's
+            # own window-fits still get conformal_params=None → no recursion.
+            cs_model = m.new()
+            cs_model.conformal_params = self.conformal_params
+            cs = cs_model.conformity_scores(y=y, X=X)
+            out = self.add_confidence_intervals(
+                out, cs, level, self.conformal_params.method
+            )
+        return out
 
     def optimize(
         self,

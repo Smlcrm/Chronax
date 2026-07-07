@@ -121,7 +121,10 @@ def _seasonal_window_average(
     
     def insufficient_data(_):
         """Return NaN when we don't have enough data."""
-        return jnp.full(h, jnp.nan, dtype=jnp.float32)
+        # dtype must match the sufficient_data branch exactly: lax.cond requires
+        # identical abstract values (shape AND dtype) from both branches, and the
+        # sufficient branch inherits y's dtype (float64 when x64 is enabled).
+        return jnp.full(h, jnp.nan, dtype=y.dtype)
     
     # Use lax.cond for true conditional branching (only one branch executes)
     # This is required for JIT compilation with traced values (y.size is not known at compile time)
@@ -198,7 +201,7 @@ class SeasonalWindowAverage(BaseForecaster):
         Fit SeasonalWindowAverage model to time series y.
         
         Computes and stores the seasonal pattern (averages for each position in season).
-        Also sets up fast conformity scoring function for parallel interval computation.
+        Also caches conformity scores on the training series when `conformal_params` is set.
         
         Args:
             y: Time series of shape (t,)
@@ -208,31 +211,23 @@ class SeasonalWindowAverage(BaseForecaster):
             self: Fitted model
         """
         y = utils.ensure_float(y)
-        
+
         # Compute and store seasonal pattern (will be tiled in predict)
         mod = _seasonal_window_average(
-            y, 
+            y,
             h=self.season_length,  # compute one full seasonal cycle
-            fitted=False, 
-            season_length=self.season_length, 
+            fitted=False,
+            season_length=self.season_length,
             window_size=self.window_size
         )
         self.model_ = mod
-        
-        # Set up fast conformity scoring via inline jitted closure
-        # This enables efficient vmap over windows in base.conformity_scores()
-        @jax.jit
-        def forecast_fn(y_full, X_full, te, h):
-            """Pure function for vmapped conformity scoring."""
-            return _seasonal_window_average(
-                y_full[:te],  # use only data up to train_end
-                h, 
-                False, 
-                self.season_length, 
-                self.window_size
-            )["mean"]
-        
-        self.forecast_fn = forecast_fn
+        # Pre-compute and cache conformity scores on the TRAINING series for
+        # predict() intervals (the fitted seasonal pattern alone is too short
+        # and is not the series the CV residuals must come from).
+        if self.conformal_params is not None:
+            self._cs = self.conformity_scores(y=y, X=X)
+        else:
+            self._cs = None
         return self
 
     def predict(self, h: int, X: jnp.ndarray | None = None, level: list[int] | None = None) -> dict:
@@ -264,14 +259,24 @@ class SeasonalWindowAverage(BaseForecaster):
         level = sorted(level)
         if self.conformal_params is None:
             raise Exception("You must pass `conformal_params` to compute them.")
-        
+        if getattr(self, "_cs", None) is None:
+            raise ValueError(
+                "Conformity scores are not available. Fit the model first (fit(...)) "
+                "with `conformal_params` set so predict() can use cached scores."
+            )
+        if h != self.conformal_params.h:
+            raise ValueError(
+                f"h={h} does not match conformal_params.h={self.conformal_params.h}; "
+                "conformity scores cover exactly conformal_params.h steps."
+            )
+
         res = self.add_confidence_intervals(
-            res, 
-            self.conformity_scores(self.model_["mean"], X=None),  # compute conformity scores
-            level, 
-            "conformal_distribution"
+            res,
+            self._cs,  # cached at fit() on the training series
+            level,
+            self.conformal_params.method,
         )
-        
+
         return res
 
     def predict_in_sample(self, level: list[int] | None = None) -> dict:
@@ -331,14 +336,19 @@ class SeasonalWindowAverage(BaseForecaster):
         level = sorted(level)
         if self.conformal_params is None:
             raise Exception("You must pass `conformal_params` to compute them.")
-        
+        if h != self.conformal_params.h:
+            raise ValueError(
+                f"h={h} does not match conformal_params.h={self.conformal_params.h}; "
+                "conformity scores cover exactly conformal_params.h steps."
+            )
+
         res = self.add_confidence_intervals(
-            res, 
+            res,
             self.conformity_scores(y, X=None),  # compute conformity scores on-the-fly
-            level, 
-            "conformal_distribution"
+            level,
+            self.conformal_params.method,
         )
-        
+
         return res
 
 

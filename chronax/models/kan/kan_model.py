@@ -119,7 +119,9 @@ class KAN(BaseForecaster):
                     "Note: conformity_scores re-fits per CV window.")
             if self._train_y is None:
                 raise RuntimeError("Call fit(y) before predict(h, level=...).")
-            cs = self.conformity_scores(self._train_y)
+            # Run the walk-forward on a clone: conformity_scores re-fits under vmap,
+            # and those fit() writes would leave leaked tracers on this fitted estimator.
+            cs = self.new().conformity_scores(self._train_y)
             fcst = BaseForecaster.add_confidence_intervals(fcst, cs, level, self.conformal_params.method)
         return fcst
 

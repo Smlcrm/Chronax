@@ -152,7 +152,7 @@ class TemporalFusionDecoder(nnx.Module):
             activation=activation, rngs=rngs,
         )
         self.attention = InterpretableMultiHeadAttention(
-            n_head, hidden_size, attn_dropout=attn_dropout, rngs=rngs,
+            n_head, hidden_size, attn_dropout=attn_dropout, dropout=dropout, rngs=rngs,
         )
         self.attention_gate = GLU(hidden_size, hidden_size, rngs=rngs)
         self.attention_ln = nnx.LayerNorm(hidden_size, epsilon=1e-3, rngs=rngs)

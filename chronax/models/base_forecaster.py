@@ -58,7 +58,6 @@ Notes
 - Known signature inconsistencies in subclasses (future fixes):
   Naive and RandomWalkWithDrift use reversed (h, y) order in forecast/forward.
   RandomWalkWithDrift.predict is missing the X parameter.
-  AutoCES.forecast is missing level and fitted parameters.
 """
 import jax
 import jax.numpy as jnp

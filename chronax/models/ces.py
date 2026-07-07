@@ -60,7 +60,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax, jit
 
-from chronax.utils import ensure_float, calculate_information_criteria, _get_conformal_method, ConformalIntervals
+from chronax.utils import ensure_float, calculate_information_criteria, ConformalIntervals
 from chronax.models.base_forecaster import BaseForecaster
 
 NONE = 0
@@ -158,8 +158,10 @@ def _init_state_n(y: jnp.ndarray, m: int) -> jnp.ndarray:
     # Use masking for JIT compatibility
     mask = jnp.arange(len(y)) < idx
     mean_val = jnp.sum(jnp.where(mask, y, 0.0)) / jnp.maximum(jnp.sum(mask), 1.0)
-    # Pad to (m, 4) for compatibility with other variants
-    base_state = jnp.array([[mean_val, mean_val / 1.1]], dtype=jnp.float32)
+    # Pad to (m, 4) for compatibility with other variants.
+    # Buffers follow y.dtype: hardcoded float32 caused f64->f32 downcast scatters
+    # under the repo-global x64 (a FutureWarning today, a hard error in future JAX).
+    base_state = jnp.array([[mean_val, mean_val / 1.1]], dtype=y.dtype)
     # Replicate to (m, 2) then pad to (m, 4)
     states = jnp.tile(base_state, (m, 1))
     return jnp.pad(states, ((0, 0), (0, 2)), constant_values=0.0)
@@ -180,7 +182,7 @@ def _init_state_s(y: jnp.ndarray, m: int) -> jnp.ndarray:
     Returns:
         State array of shape (m, 4) with columns [real, imag, 0, 0]
     """
-    states = jnp.zeros((m, 4), dtype=jnp.float32)
+    states = jnp.zeros((m, 4), dtype=y.dtype)
     states = states.at[:, 0].set(y[:m])
     states = states.at[:, 1].set(y[:m] / 1.1)
     # Columns 2-3 remain zero (not used in SIMPLE)
@@ -202,26 +204,26 @@ def _init_state_p(y: jnp.ndarray, m: int) -> jnp.ndarray:
     Returns:
         State array of shape (m, 4) with columns [real, imag, seasonal, 0]
     """
-    states = jnp.zeros((m, 4), dtype=jnp.float32)
+    states = jnp.zeros((m, 4), dtype=y.dtype)
     mean_val = jnp.mean(y[:m])
     states = states.at[:, 0].set(mean_val)
     states = states.at[:, 1].set(mean_val / 1.1)
-    
+
     n = len(y)
     has_enough_data = n >= 2 * m
-    
+
     def compute_seasonal():
         kernel = jnp.ones(m) / m
         trend = jnp.convolve(y, kernel, mode='same')
         detrended = y[:m] - trend[:m]
         return detrended - jnp.mean(detrended)
-    
+
     seasonal = jnp.where(
         has_enough_data,
         compute_seasonal(),
         y[:m] - mean_val
     )
-    
+
     states = states.at[:, 2].set(seasonal)
     return states
 
@@ -241,7 +243,7 @@ def _init_state_f(y: jnp.ndarray, m: int) -> jnp.ndarray:
     Returns:
         State array of shape (m, 4) with columns [real, imag, seasonal_real, seasonal_imag]
     """
-    states = jnp.zeros((m, 4), dtype=jnp.float32)
+    states = jnp.zeros((m, 4), dtype=y.dtype)
     mean_val = jnp.mean(y[:m])
     states = states.at[:, 0].set(mean_val)
     states = states.at[:, 1].set(mean_val / 1.1)
@@ -663,7 +665,7 @@ def ces_forecast(
         
         return (states_buffer, forecasts, current_idx + 1)
     
-    forecasts = jnp.zeros(h, dtype=jnp.float32)
+    forecasts = jnp.zeros(h, dtype=final_state.dtype)
     states_buffer = final_state.copy()
     
     (states_buffer, forecasts, _) = lax.fori_loop(
@@ -720,7 +722,7 @@ def ces_fit_single(
     n_params = n_components + 1
     n_residuals = n - m
     
-    fitted = jnp.empty(n, dtype=jnp.float32)
+    fitted = jnp.empty(n, dtype=y.dtype)
     fitted = fitted.at[:m].set(y[:m])
     fitted = fitted.at[m:].set(forecasts)
     
@@ -738,8 +740,8 @@ def ces_fit_single(
         'aic': ic_dict['aic'],
         'bic': ic_dict['bic'],
         'aicc': ic_dict['aicc'],
-        'mse': float(mse),
-        'amse': float(mse),
+        'mse': mse,
+        'amse': mse,
         'fitted': fitted,
         'residuals': residuals,
         'states': final_states,
@@ -747,7 +749,7 @@ def ces_fit_single(
         'm': m,
         'n': n,
         'seasontype': season_type,
-        'sigma2': float(sigma2),
+        'sigma2': sigma2,
     }
 
 
@@ -760,8 +762,13 @@ def auto_ces(
     """Fit CES with automatic or fixed model selection.
 
     When model="Z", fits all applicable variants (NONE always; SIMPLE/PARTIAL/FULL
-    when n >= 2*m) and returns the fit with the lowest information criterion.
-    Otherwise, fits the specified variant directly.
+    when n >= 2*m) and selects the fit with the lowest information criterion.
+    Otherwise, fits only the specified variant.
+
+    vmap-native: the variant loop is over *config* (each variant traces the jitted
+    kernels with its own static season_type), NaN ICs are masked to +inf instead of
+    being skipped eagerly, and the winner is chosen with `jnp.argmin` — no
+    float()/int() casts, no try/except, no Python control flow on traced values.
 
     Args:
         y: Time series of shape (n,).
@@ -772,42 +779,86 @@ def auto_ces(
             One of "aic", "bic", "aicc". Default is "aicc".
 
     Returns:
-        Dict from ces_fit_single() for the selected variant, containing fitted
-        values, residuals, states, parameters, and information criteria.
-
-    Raises:
-        ValueError: If model="Z" and no variant could be fitted successfully.
+        Dict with the selected fit's fields (loglik/aic/bic/aicc/mse/amse/sigma2 as
+        jnp scalars; fitted/residuals/states arrays; seasontype as a jnp int scalar;
+        m/n static ints) plus a candidate block used for traceable forecasting:
+            - "variants" (tuple[int]): static candidate variant codes.
+            - "candidate_states" (jnp.ndarray): stacked final states, (k, m, 4).
+            - "best" (jnp.ndarray): argmin index into the candidate axis.
     """
     y = ensure_float(y)
-    
+
     model_map = {"N": NONE, "S": SIMPLE, "P": PARTIAL, "F": FULL}
-    
+
     if model == "Z":
         variants = [NONE, SIMPLE, PARTIAL, FULL]
+        # Both conditions are static under trace: m is config, len(y) is shape.
         if m < 2 or len(y) < 2 * m:
             variants = [NONE]
-        
-        fits = []
-        ic_values = []
-        
-        for variant in variants:
-            try:
-                fit = ces_fit_single(y, m, variant)
-                ic_val = fit[ic]
-                if not jnp.isnan(ic_val):
-                    fits.append(fit)
-                    ic_values.append(float(ic_val))
-            except:
-                continue
-        
-        if not fits:
-            raise ValueError("No valid model could be fitted")
-        
-        best_idx = int(jnp.argmin(jnp.array(ic_values)))
-        return fits[best_idx]
     else:
-        season_type = model_map.get(model, NONE)
-        return ces_fit_single(y, m, season_type)
+        variants = [model_map.get(model, NONE)]
+
+    fits = [ces_fit_single(y, m, variant) for variant in variants]
+
+    ic_values = jnp.stack([jnp.asarray(fit[ic]) for fit in fits])
+    ic_values = jnp.where(jnp.isnan(ic_values), jnp.inf, ic_values)
+    best = jnp.argmin(ic_values)
+    # Raising on all-invalid ICs is impossible under trace; expose a flag instead
+    # (argmin over all-inf silently picks index 0 and the winner's fields are NaN).
+    valid = jnp.isfinite(ic_values).any()
+
+    def _select(key):
+        return jnp.take(jnp.stack([jnp.asarray(fit[key]) for fit in fits]), best, axis=0)
+
+    return {
+        'loglik': _select('loglik'),
+        'aic': _select('aic'),
+        'bic': _select('bic'),
+        'aicc': _select('aicc'),
+        'mse': _select('mse'),
+        'amse': _select('amse'),
+        'sigma2': _select('sigma2'),
+        'fitted': _select('fitted'),
+        'residuals': _select('residuals'),
+        'states': _select('states'),
+        'seasontype': jnp.take(jnp.asarray(variants), best),
+        'm': m,
+        'n': len(y),
+        'variants': tuple(variants),
+        'candidate_states': jnp.stack([fit['states'] for fit in fits]),
+        'best': best,
+        'valid': valid,
+    }
+
+
+def _forecast_candidates(mod: Dict, h: int) -> jnp.ndarray:
+    """Forecast every candidate variant and select the winner's row.
+
+    `ces_forecast` requires a *static* season_type, so the selected variant
+    (a traced argmin index) cannot be dispatched on directly. Instead each
+    candidate is forecast with its own static config (a Python loop over
+    config, fine under trace) and the winning row is picked with `jnp.take`.
+
+    Args:
+        mod: Dict returned by auto_ces() (needs the candidate block).
+        h: Forecast horizon (static).
+
+    Returns:
+        Point forecasts of shape (h,) for the IC-selected variant.
+    """
+    m = mod['m']
+    forecasts = []
+    for i, variant in enumerate(mod['variants']):
+        params = CESParams.for_variant(variant)
+        beta_0 = params.beta_0 if params.beta_0 is not None else 0.0
+        beta_1 = params.beta_1 if params.beta_1 is not None else 0.0
+        forecasts.append(
+            ces_forecast(
+                mod['candidate_states'][i], params.alpha_0, params.alpha_1,
+                beta_0, beta_1, variant, m, h
+            )
+        )
+    return jnp.take(jnp.stack(forecasts), mod['best'], axis=0)
 
 
 class AutoCES(BaseForecaster):
@@ -862,8 +913,9 @@ class AutoCES(BaseForecaster):
     def fit(self, y: jnp.ndarray, X: Optional[jnp.ndarray] = None) -> "AutoCES":
         """Fit the CES model to a time series.
 
-        Handles the constant-series edge case separately (stores a trivial state).
-        Otherwise delegates to auto_ces() which runs variant selection and back-fitting.
+        Delegates to auto_ces(), which runs variant selection and back-fitting
+        (constant series need no special casing: innovations are zero, so
+        forecasts stay flat at the series mean).
 
         Args:
             y (jnp.ndarray): Input time series of shape (n,).
@@ -875,23 +927,17 @@ class AutoCES(BaseForecaster):
             AutoCES: Self (fitted model instance) for method chaining.
         """
         y = ensure_float(y)
-
-        if jnp.std(y) < 1e-10:
-            # Constant series - create proper state for forecasting
-            mean_val = jnp.mean(y)
-            init_states = jnp.array([[mean_val, mean_val]], dtype=jnp.float32)
-            self.model_ = {
-                'fitted': y,
-                'residuals': jnp.zeros_like(y),
-                'par': {'alpha_0': 0.0, 'alpha_1': 0.0, 'beta_0': None, 'beta_1': None},
-                'm': self.season_length,
-                'n': len(y),
-                'seasontype': NONE,
-                'states': init_states,
-            }
-            return self
-        
+        # No eager constant-series special case: `jnp.std(y) < 1e-10` is Python
+        # control flow on a traced value. The normal path already yields flat
+        # forecasts on constant series (innovations are zero throughout).
         self.model_ = auto_ces(y, m=self.season_length, model=self.model)
+        # Pre-compute and cache conformity scores on the training series for
+        # predict() intervals (sibling convention: WindowAverage/SES/SeasWA) —
+        # avoids paying n_windows re-fits on every predict(level=...) call.
+        if self.conformal_params is not None:
+            self._cs = self.conformity_scores(y=y, X=X)
+        else:
+            self._cs = None
         return self
     
     def forecast(
@@ -903,46 +949,53 @@ class AutoCES(BaseForecaster):
         level: Optional[List[int]] = None,
         fitted: bool = False,
     ) -> Dict:
-        """Stateless fit+forecast: fit if not already done, then generate forecasts.
+        """Stateless fit+forecast: always re-fits on the passed y.
 
-        If ``model_`` is None, fits the model on y first. Otherwise uses existing state.
-        Does not support conformal intervals (use predict() after fit() for that).
+        Deliberately ignores any stored ``model_``: the base class's
+        conformity_scores vmaps this method over CV windows, and reusing
+        fitted full-series state would return identical (future-leaking)
+        forecasts for every window (CLAUDE.md §4 #2). Writes nothing to self.
 
         Args:
-            y (jnp.ndarray): Input time series of shape (n,). Used only if not fitted.
+            y (jnp.ndarray): Input time series of shape (n,).
             h (int): Forecast horizon (number of steps ahead).
             X (Optional[jnp.ndarray]): Exogenous variables (unused). Default is None.
             X_future (Optional[jnp.ndarray]): Future exogenous variables (unused). Default is None.
-            level (Optional[List[int]]): Confidence levels (unused; included for BaseForecaster compliance). Default is None.
-            fitted (bool): Whether to return fitted values (unused; included for BaseForecaster compliance). Default is False.
+            level (Optional[List[int]]): Confidence levels (0-100) for conformal
+                prediction intervals. Requires conformal_params. Default is None.
+            fitted (bool): Whether to include in-sample fitted values under the
+                "fitted" key. Default is False.
 
         Returns:
-            Dict: Dictionary with key "mean" containing forecasts of shape (h,).
+            Dict: "mean" forecasts of shape (h,), plus "fitted" when requested and
+            "lo-{l}"/"hi-{l}" bounds when level is given.
         """
-        if self.model_ is None:
-            self.fit(y, X)
-        
-        final_state = self.model_['states']
-        params_dict = self.model_['par']
-        season_type = self.model_['seasontype']
-        m = self.model_['m']
-        
-        params = CESParams(**params_dict)
-        beta_0 = params.beta_0 if params.beta_0 is not None else 0.0
-        beta_1 = params.beta_1 if params.beta_1 is not None else 0.0
-        
-        forecasts = ces_forecast(
-            final_state, params.alpha_0, params.alpha_1,
-            beta_0, beta_1, season_type, m, h
-        )
-        
-        return {'mean': forecasts}
+        y = ensure_float(y)
+        mod = auto_ces(y, m=self.season_length, model=self.model)
+
+        res = {'mean': _forecast_candidates(mod, h)}
+        if fitted:
+            res['fitted'] = mod['fitted']
+
+        if level is None:
+            return res
+
+        level = sorted(level)
+        if self.conformal_params is None:
+            raise Exception("You must pass `conformal_params` to compute them.")
+        if h != self.conformal_params.h:
+            raise ValueError(
+                f"h={h} does not match conformal_params.h={self.conformal_params.h}; "
+                "conformity scores cover exactly conformal_params.h steps."
+            )
+        cs = self.conformity_scores(y=y, X=X)
+        return self.add_confidence_intervals(res, cs, level, self.conformal_params.method)
     
     def predict(self, h: int, X: Optional[jnp.ndarray] = None, level: Optional[List[int]] = None) -> Dict:
         """Generate h-step ahead forecasts from the fitted CES model.
 
-        Runs the JIT-compiled ces_forecast() function from the stored final state.
-        Handles the constant-series edge case (alpha=0) by returning flat forecasts.
+        Forecasts every stored candidate variant via the JIT-compiled
+        ces_forecast() and selects the IC winner's row (see _forecast_candidates).
         Optionally adds conformal prediction intervals.
 
         Args:
@@ -966,35 +1019,26 @@ class AutoCES(BaseForecaster):
         """
         if self.model_ is None:
             raise ValueError("Model must be fitted before prediction")
-        
-        final_state = self.model_['states']
-        params_dict = self.model_['par']
-        season_type = self.model_['seasontype']
-        m = self.model_['m']
-        
-        params = CESParams(**params_dict)
-        beta_0 = params.beta_0 if params.beta_0 is not None else 0.0
-        beta_1 = params.beta_1 if params.beta_1 is not None else 0.0
-        
-        # Handle constant series case (alpha=0)
-        if params.alpha_0 == 0.0 and params.alpha_1 == 0.0:
-            # For constant series, just repeat the mean value
-            mean_val = final_state[0, 0]
-            forecasts = jnp.full(h, mean_val, dtype=jnp.float32)
-        else:
-            forecasts = ces_forecast(
-                final_state, params.alpha_0, params.alpha_1,
-                beta_0, beta_1, season_type, m, h
+
+        result = {'mean': _forecast_candidates(self.model_, h)}
+
+        if level is None:
+            return result
+
+        level = sorted(level)
+        if self.conformal_params is None:
+            raise Exception("You must pass `conformal_params` to compute them.")
+        if getattr(self, "_cs", None) is None:
+            raise ValueError(
+                "Conformity scores are not available. Fit the model first (fit(...)) "
+                "with `conformal_params` set so predict() can use cached scores."
             )
-        
-        result = {'mean': forecasts}
-        
-        if level is not None and self.conformal_params is not None:
-            cs = self.conformity_scores(y=self.model_['fitted'], X=X)
-            conformal_fn = _get_conformal_method(self.conformal_params.method)
-            result = conformal_fn(fcst=result, cs=cs, level=level)
-        
-        return result
+        if h != self.conformal_params.h:
+            raise ValueError(
+                f"h={h} does not match conformal_params.h={self.conformal_params.h}; "
+                "conformity scores cover exactly conformal_params.h steps."
+            )
+        return self.add_confidence_intervals(result, self._cs, level, self.conformal_params.method)
 
 
 if __name__ == "__main__":
@@ -1018,8 +1062,9 @@ if __name__ == "__main__":
     print(f"  Fitted shape: {model1.model_['fitted'].shape}")
     print(f"  Forecast shape: {forecast1['mean'].shape}")
     print(f"  Season type: {model1.model_['seasontype']} (NONE)")
-    print(f"  Alpha_0: {model1.model_['par']['alpha_0']:.4f}")
-    print(f"  Alpha_1: {model1.model_['par']['alpha_1']:.4f}")
+    par1 = CESParams.for_variant(int(model1.model_['seasontype'])).to_dict()
+    print(f"  Alpha_0: {par1['alpha_0']:.4f}")
+    print(f"  Alpha_1: {par1['alpha_1']:.4f}")
     assert model1.model_['fitted'].shape == (n1,), "Fitted shape mismatch!"
     assert forecast1['mean'].shape == (10,), "Forecast shape mismatch!"
     assert jnp.all(jnp.isfinite(forecast1['mean'])), "Forecast contains NaN/Inf!"
@@ -1055,10 +1100,11 @@ if __name__ == "__main__":
     forecast3 = model3.predict(h=12)
     
     print(f"  Season type: {model3.model_['seasontype']} (PARTIAL)")
-    print(f"  Beta_0: {model3.model_['par']['beta_0']}")
+    par3 = CESParams.for_variant(int(model3.model_['seasontype'])).to_dict()
+    print(f"  Beta_0: {par3['beta_0']}")
     print(f"  Forecast variance: {jnp.var(forecast3['mean']):.4f}")
     assert model3.model_['seasontype'] == PARTIAL, "Should be PARTIAL variant!"
-    assert model3.model_['par']['beta_0'] is not None, "Should have beta_0!"
+    assert par3['beta_0'] is not None, "Should have beta_0!"
     assert jnp.all(jnp.isfinite(forecast3['mean'])), "Forecast contains NaN/Inf!"
     print("  OK: PARTIAL seasonality OK")
     
@@ -1069,11 +1115,12 @@ if __name__ == "__main__":
     forecast4 = model4.predict(h=12)
     
     print(f"  Season type: {model4.model_['seasontype']} (FULL)")
-    print(f"  Beta_0: {model4.model_['par']['beta_0']}")
-    print(f"  Beta_1: {model4.model_['par']['beta_1']}")
+    par4 = CESParams.for_variant(int(model4.model_['seasontype'])).to_dict()
+    print(f"  Beta_0: {par4['beta_0']}")
+    print(f"  Beta_1: {par4['beta_1']}")
     assert model4.model_['seasontype'] == FULL, "Should be FULL variant!"
-    assert model4.model_['par']['beta_0'] is not None, "Should have beta_0!"
-    assert model4.model_['par']['beta_1'] is not None, "Should have beta_1!"
+    assert par4['beta_0'] is not None, "Should have beta_0!"
+    assert par4['beta_1'] is not None, "Should have beta_1!"
     assert jnp.all(jnp.isfinite(forecast4['mean'])), "Forecast contains NaN/Inf!"
     print("  OK: FULL seasonality OK")
     

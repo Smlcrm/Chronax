@@ -243,7 +243,8 @@ def _optimize_hw(y: jnp.ndarray, l0_decomp: float, b0_decomp: float,
         updates, new_state = adam_opt.update(grads, state, p)
         new_p = optax.apply_updates(p, updates)
         improved = jnp.isfinite(loss) & (loss < best_loss)
-        best_p = jnp.where(improved, new_p, best_p)
+        # loss was evaluated at p, so p (not new_p) is what best_loss labels
+        best_p = jnp.where(improved, p, best_p)
         best_loss = jnp.where(improved, loss, best_loss)
         return (new_p, new_state, best_p, best_loss), None
 
@@ -351,32 +352,34 @@ class HoltWinters(BaseForecaster):
         n = len(y)
         n_seasons = n // m
 
+        # All branches below are static (shapes/config only); l0/b0 stay jnp
+        # scalars — float() on values derived from y breaks the vmapped CV path.
         if n_seasons < 2:
-            l0 = float(jnp.mean(y[:m])) if n >= m else float(y[0])
+            l0 = jnp.mean(y[:m]) if n >= m else y[0]
             b0 = 0.0
             if n >= m:
                 s0 = y[:m] - l0 if self.season_type == 'A' else y[:m] / jnp.maximum(l0, _EPSILON)
             else:
-                s0 = jnp.zeros(m, dtype=jnp.float32) if self.season_type == 'A' else jnp.ones(m, dtype=jnp.float32)
-            return l0, b0, s0.astype(jnp.float32)
+                s0 = jnp.zeros(m, dtype=y.dtype) if self.season_type == 'A' else jnp.ones(m, dtype=y.dtype)
+            return l0, b0, s0.astype(y.dtype)
 
         n_complete = n_seasons * m
         y_reshaped = y[:n_complete].reshape(n_seasons, m)
         seasonal_avgs = jnp.mean(y_reshaped, axis=1)
 
         # OLS on seasonal averages for trend
-        t = jnp.arange(n_seasons, dtype=jnp.float32)
+        t = jnp.arange(n_seasons, dtype=y.dtype)
         t_mean = jnp.mean(t)
         avg_mean = jnp.mean(seasonal_avgs)
         cov_ta = jnp.sum((t - t_mean) * (seasonal_avgs - avg_mean))
         var_t = jnp.sum((t - t_mean) ** 2)
-        b0_per_season = float(cov_ta / jnp.maximum(var_t, _EPSILON))
-        l0 = float(avg_mean - b0_per_season * t_mean)
+        b0_per_season = cov_ta / jnp.maximum(var_t, _EPSILON)
+        l0 = avg_mean - b0_per_season * t_mean
         b0 = b0_per_season / m
         l0 = l0 - b0 * (m - 1) / 2.0
 
         # Detrend and compute seasonal pattern
-        trend_vals = l0 + b0 * jnp.arange(n_complete, dtype=jnp.float32)
+        trend_vals = l0 + b0 * jnp.arange(n_complete, dtype=y.dtype)
         y_complete = y[:n_complete]
         if self.season_type == 'A':
             detrended = y_complete - trend_vals
@@ -391,7 +394,7 @@ class HoltWinters(BaseForecaster):
         else:
             s0 = s0 / jnp.maximum(jnp.mean(s0), _EPSILON)
 
-        return l0, b0, s0.astype(jnp.float32)
+        return l0, b0, s0.astype(y.dtype)
 
     def _get_phi(self) -> float:
         """Return the damping factor: self.phi (or 0.9) if damped, else 1.0."""
@@ -447,7 +450,7 @@ class HoltWinters(BaseForecaster):
         return {
             'fitted': fitted, 'level': level, 'trend': trend,
             'seasonal': seasonal, 'residuals': residuals,
-            'alpha': float(alpha), 'beta': float(beta), 'gamma': float(gamma),
+            'alpha': alpha, 'beta': beta, 'gamma': gamma,
             'sigma': utils.calculate_sigma(residuals, len(y) - n_params),
         }
 
@@ -520,16 +523,12 @@ class HoltWinters(BaseForecaster):
         if level is not None:
             level = sorted(level)
             if self.conformal_params is not None:
-                temp_model = getattr(self, 'model_', None)
-                self.model_ = result
+                # conformity_scores only calls self.forecast (never reads
+                # model_), so no state needs to be swapped in or restored.
                 cs = self.conformity_scores(y=y, X=X)
                 res = self.add_confidence_intervals(
                     fcst=res, cs=cs, level=level,
                     method=self.conformal_params.method)
-                if temp_model is not None:
-                    self.model_ = temp_model
-                else:
-                    delattr(self, 'model_')
             else:
                 sigmah = self._calculate_native_intervals(
                     mean, result['sigma'], result['alpha'],

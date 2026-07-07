@@ -11,19 +11,33 @@ This module wires together the following components into a single entry-point
   states via OLS regression, Fourier decomposition, or seasonal averages.
 * **Admissibility** — :func:`check_param` and :func:`admissible` enforce
   classical ETS constraints and characteristic-polynomial root checks.
-* **Model selection** — :func:`ets_f` iterates over candidate
-  (error, trend, season, damped) tuples, fits each via :func:`etsmodel`,
-  and picks the winner by AICc (or AIC / BIC).
+* **Model selection** — :func:`ets_f` fits every candidate
+  (error, trend, season, damped) tuple via :func:`etsmodel` and selects the
+  winner by AICc (or AIC / BIC) with a NaN/validity-masked ``jnp.argmin``.
 * **Forecasting** — :func:`forecast_ets` / :func:`pegelsfcast_C` produce
   mean paths, while :func:`_compute_pred_intervals` adds analytical or
   simulation-based prediction intervals.
+
+vmap contract (CLAUDE.md §1 rule 2): ``ets_f`` and the point-forecast path
+(:func:`ets_point_forecast`, :func:`ets_forward_stacked`) are natively
+traceable under ``jax.vmap`` — candidate structure is *config/shape-static*
+(a Python loop over static specs), while the winner is a traced
+``jnp.argmin`` index resolved with ``jnp.take``. Only the *native-interval*
+machinery (:func:`_compute_pred_intervals`, :func:`ets_winner_view` with
+more than one candidate) is eager-only, because interval formulas dispatch
+on the winner's class string; the conformal path never needs it.
 """
 
-__all__ = ['ets_f']
+__all__ = [
+    'ets_f',
+    'ets_point_forecast',
+    'ets_winner_view',
+    'ets_forward_stacked',
+    'forecast_ets',
+    'forward_ets',
+]
 
 import math
-import os
-import time
 from functools import partial
 from typing import Dict, Any, Optional
 import jax
@@ -42,170 +56,6 @@ _PHI_UPPER = 0.98
 _AICC_RATIO_THRESHOLD = 40.0
 EPS = 1e-3
 EPS_PURE = 2e-2
-
-
-def _estimate_ets_iterations(
-    y: jnp.ndarray,
-    m: int,
-    error_type: str,
-    trend_type: str,
-    season_type: str,
-    allow_extended: bool = False,
-) -> int:
-    """Heuristically choose the number of optax optimisation steps.
-
-    The iteration budget is determined by a weighted combination of data
-    *complexity* signals:
-
-    * **Noise score** — coefficient of variation of first-differences.
-    * **Trend difficulty** — ``1 − R²`` of a simple linear fit.
-    * **Seasonality difficulty** — ``1 − ACF(m)`` of the detrended series.
-    * **Model complexity** — extra budget for multiplicative components.
-    * **Coverage penalty** — boost when fewer than 3 full seasonal cycles
-      are available.
-
-    Parameters
-    ----------
-    y : jnp.ndarray
-        Observed series.
-    m : int
-        Seasonal period.
-    error_type, trend_type, season_type : str
-        ETS component flags (``"A"`` / ``"M"`` / ``"N"``).
-    allow_extended : bool
-        If ``True``, the upper cap is raised from 350 to 600 iterations.
-
-    Returns
-    -------
-    int
-        Recommended number of optimisation steps (between 50 and 350 / 600).
-    """
-    y = jnp.asarray(y, dtype=jnp.float64)
-    n = int(y.shape[0])
-    if n < 3:
-        return 50
-
-    diffs = y[1:] - y[:-1]
-    cv = jnp.std(diffs) / jnp.maximum(jnp.abs(jnp.mean(diffs)), 1e-10)
-    noise_score = float(jnp.clip(cv / 5.0, 0.0, 1.0))
-
-    t = jnp.arange(n, dtype=jnp.float64)
-    y_mean = jnp.mean(y)
-    t_mean = jnp.mean(t)
-    slope = jnp.sum((t - t_mean) * (y - y_mean)) / jnp.maximum(
-        jnp.sum((t - t_mean) ** 2), 1e-10
-    )
-    y_pred = y_mean + slope * (t - t_mean)
-    ss_res = jnp.sum((y - y_pred) ** 2)
-    ss_tot = jnp.sum((y - y_mean) ** 2)
-    r2 = 1.0 - ss_res / jnp.maximum(ss_tot, 1e-10)
-    trend_difficulty = float(1.0 - jnp.clip(r2, 0.0, 1.0))
-
-    if m > 1 and n >= 2 * m:
-        y_detrended = y - y_pred
-        y_c = y_detrended - jnp.mean(y_detrended)
-        var_y = jnp.var(y_detrended)
-        n_acf = n - m
-        acf_m = jnp.sum(y_c[:n_acf] * y_c[m:]) / (n_acf * jnp.maximum(var_y, 1e-10))
-        seasonality_difficulty = float(
-            1.0 - jnp.maximum(jnp.clip(acf_m, -1.0, 1.0), 0.0)
-        )
-    else:
-        seasonality_difficulty = 0.0
-
-    model_complexity = 0.0
-    if error_type == "M":
-        model_complexity += 0.2
-    if trend_type == "M":
-        model_complexity += 0.15
-    if season_type == "M":
-        model_complexity += 0.15
-
-    n_seasons = n // m if m > 1 else 0
-    if n_seasons < 3:
-        coverage_penalty = 0.3
-    elif n_seasons < 5:
-        coverage_penalty = 0.15
-    else:
-        coverage_penalty = 0.0
-
-    complexity = (
-        0.30 * noise_score
-        + 0.25 * trend_difficulty
-        + 0.20 * seasonality_difficulty
-        + 0.15 * model_complexity
-        + 0.10 * coverage_penalty
-    )
-
-    # Use a reasonably wide iteration range; `allow_extended=True` lets callers trade
-    # cold-start time for extra accuracy on harder series.
-    min_iters = 50
-    max_iters = 600 if allow_extended else 350
-    iterations = int(min_iters + (complexity**2) * (max_iters - min_iters))
-    return max(min_iters, min(max_iters, iterations))
-
-
-# ---------------------------------------------------------------------------
-# Caches — avoid redundant computation for repeated (y, m, structure) combos
-# ---------------------------------------------------------------------------
-_strength_cache: dict[tuple[int, int], tuple[float, float]] = {}
-"""Module-level cache for ``(_trend_strength, _seasonal_strength)`` pairs."""
-
-
-class _TemplateCache:
-    """In-memory cache for initial ETS state vectors.
-
-    Keyed on ``(hash(y), m, trendtype, seasontype)`` so that the same
-    initial state is reused across candidate models that share a trend /
-    season structure during model selection.
-    """
-
-    def __init__(self) -> None:
-        """Initialize the in-memory template cache."""
-        self._cache: dict[tuple[int, int, str, str], jnp.ndarray] = {}
-
-    def get_init_state(
-        self, y: jnp.ndarray, m: int, trendtype: str, seasontype: str
-    ) -> jnp.ndarray:
-        """Return the cached initial state, computing it on first access."""
-        try:
-            y_hash = hash(jnp.asarray(y).tobytes())
-        except Exception:
-            y_hash = id(y)
-        key = (y_hash, m, trendtype, seasontype)
-        cached = self._cache.get(key)
-        if cached is not None:
-            return cached
-        init_state = _prepare_init_state(y, m, trendtype, seasontype)
-        self._cache[key] = init_state
-        return init_state
-
-
-_template_cache = _TemplateCache()
-
-
-def _get_cached_strengths(y: jnp.ndarray, m: int) -> tuple[float, float]:
-    """Return ``(trend_strength, seasonal_strength)``, caching the result.
-
-    On the first call for a given ``(y, m)`` pair the strengths are computed
-    via :func:`_trend_strength` and :func:`_seasonal_strength` and stored in
-    ``_strength_cache``; subsequent calls return the cached values.
-    """
-    try:
-        y_hash = hash(y.tobytes())
-        cache_key = (y_hash, m)
-        cached = _strength_cache.get(cache_key)
-        if cached is not None:
-            return cached
-    except Exception:
-        cache_key = None
-
-    ts = _trend_strength(y)
-    ss = _seasonal_strength(y, m) if m > 1 else 0.0
-
-    if cache_key is not None:
-        _strength_cache[cache_key] = (ts, ss)
-    return ts, ss
 
 
 def _aicc(aic: float, n: int, k: int) -> float:
@@ -240,46 +90,6 @@ def _aicc(aic: float, n: int, k: int) -> float:
     return base_aicc
 
 
-def _trend_strength(y: jnp.ndarray) -> float:
-    """Calculate trend strength as ``|slope| / std(residuals)``."""
-    y = jnp.asarray(y, dtype=jnp.float64)
-    n = int(y.shape[0])
-    t = jnp.arange(n, dtype=jnp.float64)
-    t = t - jnp.mean(t)
-    y0 = y - jnp.mean(y)
-    denom = jnp.sum(t * t) + 1e-8
-    slope = jnp.sum(t * y0) / denom
-
-    # FIXED: Use detrended residual variance
-    trend_line = jnp.mean(y) + slope * t
-    resid_std = jnp.std(y - trend_line) + 1e-8
-
-    return float(jnp.abs(slope) / resid_std)
-
-
-def _seasonal_strength(y: jnp.ndarray, m: int) -> float:
-    """Calculate seasonal strength as ``std(seasonal_means) / std(detrended)``."""
-    y = jnp.asarray(y, dtype=jnp.float64)
-    if m <= 1 or y.shape[0] < 2 * m:
-        return 0.0
-
-    n = int(y.shape[0])
-
-    # FIXED: Detrend first
-    t = jnp.arange(n, dtype=jnp.float64)
-    t = t - jnp.mean(t)
-    y0 = y - jnp.mean(y)
-    slope = jnp.sum(t * y0) / (jnp.sum(t * t) + 1e-8)
-    y_detrended = y - (jnp.mean(y) + slope * t)
-
-    # Now measure seasonality on detrended series
-    n_periods = n // m
-    y_trim = y_detrended[: n_periods * m].reshape(n_periods, m)
-    seasonal_means = jnp.mean(y_trim, axis=0)
-
-    return float(jnp.std(seasonal_means) / (jnp.std(y_detrended) + 1e-8))
-
-
 def _prepare_init_state(
     y: jnp.ndarray, m: int, trendtype: str, seasontype: str
 ) -> jnp.ndarray:
@@ -296,12 +106,16 @@ def _prepare_init_state(
     return jnp.hstack([init_state, jnp.array([tail], dtype=jnp.float64)])
 
 
-def _compute_ic(lik: float, n: int, k: int) -> tuple[float, float, float]:
+def _compute_ic(lik: jnp.ndarray, n: int, k: int) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Compute AIC, BIC, and AICc from the likelihood-style scalar *lik*.
+
+    *lik* may be a traced jnp scalar (the fit runs under vmap in the
+    conformal CV path); *n* and *k* are shape/config-static ints, so all
+    branching happens on statics and the returned ICs stay traced.
 
     Parameters
     ----------
-    lik : float
+    lik : jnp.ndarray
         Gaussian log-likelihood proxy (as returned by the rollout).
     n : int
         Number of observations.
@@ -310,104 +124,13 @@ def _compute_ic(lik: float, n: int, k: int) -> tuple[float, float, float]:
 
     Returns
     -------
-    tuple[float, float, float]
-        ``(AIC, BIC, AICc)``.
+    tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]
+        ``(AIC, BIC, AICc)`` as jnp scalars.
     """
-    aic = float(lik) + 2 * k
-    bic = float(lik) + math.log(n) * k
+    aic = lik + 2.0 * k
+    bic = lik + math.log(n) * k
     aicc = _aicc(aic=aic, n=n, k=k)
-    return aic, bic, float(aicc)
-
-
-def _infer_season_length(y: jnp.ndarray, max_m: int = 24) -> int:
-    """
-    Infer a plausible season length from the series using a simple FFT peak.
-
-    Returns 1 if no clear seasonal peak is found.
-    """
-    y = jnp.asarray(y, dtype=jnp.float64)
-    n = int(y.shape[0])
-    if n < 8:
-        return 1
-    max_m = int(min(max_m, n // 2))
-    if max_m <= 1:
-        return 1
-
-    y0 = y - jnp.mean(y)
-    # FFT over full series; ignore DC component
-    fft = jnp.fft.rfft(y0)
-    power = jnp.abs(fft) ** 2
-    power = power.at[0].set(0.0)
-
-    # Consider only candidate seasonal periods in [2, max_m]
-    periods = jnp.arange(2, max_m + 1, dtype=jnp.int32)
-    # map period -> frequency bin ~ n/period
-    bins = jnp.clip(jnp.round(n / periods).astype(jnp.int32), 1, power.shape[0] - 1)
-    cand_power = power[bins]
-    idx = int(jnp.argmax(cand_power))
-    best_m = int(periods[idx])
-
-    # Require a minimum signal-to-noise for seasonality
-    if float(cand_power[idx]) < 0.05 * float(jnp.max(power)):
-        return 1
-    return best_m
-
-
-def _choose_unified_components(
-    y: jnp.ndarray,
-    m: int,
-    allow_multiplicative_trend: bool,
-) -> tuple[str, str, str]:
-    """Heuristic pre-selection of ETS (error, trend, season) components.
-
-    Uses coefficient-of-variation, trend-strength, and seasonal-strength
-    scores to narrow the full model grid down to a single ``(E, T, S)``
-    triple before the main candidate-selection loop.
-
-    Parameters
-    ----------
-    y : jnp.ndarray
-        Observed series.
-    m : int
-        Seasonal period.
-    allow_multiplicative_trend : bool
-        If ``True``, ``"M"`` trend is a possible output.
-
-    Returns
-    -------
-    tuple[str, str, str]
-        ``(error, trend, season)`` each in ``{"A", "M", "N"}``.
-    """
-    y = jnp.asarray(y, dtype=jnp.float64)
-    n = int(y.shape[0])
-    positive = float(jnp.min(y)) > 0
-    cv = float(jnp.std(y) / (jnp.mean(y) + 1e-8))
-    trend_strength, seas_strength = _get_cached_strengths(y, m)
-    
-
-    cycles = n // max(m, 1)
-    if positive and cv > 0.3 and cycles > 10:
-        err = "M"
-    else:
-        err = "A"
-    
-
-    season = "N"
-    if m > 1 and cycles >= 10:
-        if positive and seas_strength > 0.12 and cv > 0.2 and cycles > 10:
-            season = "M"
-        elif seas_strength > 0.05:  # FIXED: was 0.1
-            season = "A"
-    
-
-    # FIXED: Lowered threshold from 0.08 to 0.03
-    if trend_strength < 0.03 or n < 50:
-        trend = "N"
-    else:
-        trend = "M" if (allow_multiplicative_trend and positive and cv > 0.4 and n > 100) else "A"
-    
-
-    return err, trend, season
+    return aic, bic, aicc
 
 
 def _inv_sigmoid_scaled(val: float, low: float, high: float) -> float:
@@ -415,84 +138,6 @@ def _inv_sigmoid_scaled(val: float, low: float, high: float) -> float:
     z = (val - low) / (high - low)
     z = jnp.clip(z, 1e-4, 1.0 - 1e-4)
     return float(jnp.log(z / (1.0 - z)))
-
-
-def _transform_smoothing_params_unconstrained(
-    p: jnp.ndarray,
-    opt_names: list[str],
-    alpha: float,
-    beta: float,
-    gamma: float,
-    phi: float,
-    lower: jnp.ndarray,
-    upper: jnp.ndarray,
-    pure_sigmoid: bool = False,
-) -> tuple[float, float, float, float]:
-    """Decode optimised smoothing parameters from unconstrained space.
-
-    This is the Python-side mirror of
-    :func:`ets_backend._transform_smoothing_params` used *after*
-    optimisation to recover human-readable parameter values from the
-    raw optimiser output.
-
-    Parameters
-    ----------
-    p : jnp.ndarray
-        Unconstrained parameter vector (only the entries named in
-        *opt_names* are consumed).
-    opt_names : list[str]
-        Ordered list of parameter names being optimised, e.g.
-        ``["alpha", "beta"]``.
-    alpha, beta, gamma, phi : float
-        Current / default values for parameters *not* in *opt_names*.
-    lower, upper : jnp.ndarray
-        Box-constraint bounds (length 4).
-    pure_sigmoid : bool
-        Which parameterisation mode was used during optimisation.
-
-    Returns
-    -------
-    tuple[float, float, float, float]
-        ``(alpha, beta, gamma, phi)`` in constrained space.
-    """
-    idx = 0
-    lower = jnp.asarray(lower, dtype=jnp.float64)
-    upper = jnp.asarray(upper, dtype=jnp.float64)
-    if pure_sigmoid:
-        if "alpha" in opt_names:
-            alpha = float(jax.nn.sigmoid(p[idx]))
-            alpha = float(EPS_PURE + (1.0 - 2.0 * EPS_PURE) * alpha)
-            idx += 1
-        if "beta" in opt_names:
-            beta = float(jax.nn.sigmoid(p[idx]))
-            beta = float(alpha * beta)
-            idx += 1
-        if "gamma" in opt_names:
-            gamma = float(jax.nn.sigmoid(p[idx]))
-            gamma = float((1.0 - alpha) * gamma)
-            idx += 1
-        if "phi" in opt_names:
-            ph = float(jax.nn.sigmoid(p[idx]))
-            ph = float(EPS_PURE + (1.0 - 2.0 * EPS_PURE) * ph)
-            phi = float(lower[3] + (upper[3] - lower[3]) * ph)
-        return alpha, beta, gamma, phi
-
-    if "alpha" in opt_names:
-        a = float(jax.nn.sigmoid(p[idx] * 0.1))
-        alpha = float(lower[0] + (upper[0] - lower[0]) * a)
-        idx += 1
-    if "beta" in opt_names:
-        b = float(jax.nn.sigmoid(p[idx]))
-        beta = float(alpha * b)
-        idx += 1
-    if "gamma" in opt_names:
-        g = float(jax.nn.sigmoid(p[idx]))
-        gamma = float((1.0 - alpha) * g)
-        idx += 1
-    if "phi" in opt_names:
-        ph = float(jax.nn.sigmoid(p[idx]))
-        phi = float(lower[3] + (upper[3] - lower[3]) * ph)
-    return alpha, beta, gamma, phi
 
 
 @partial(jax.jit, static_argnames=("m", "error", "trend", "season", "h"))
@@ -967,58 +612,82 @@ def check_param(
     return True
 
 
-def fourier(
-    x: Any, period: list[int], K: list[int], h: Optional[int] = None
+def _admissible_root_ok(
+    alpha: jnp.ndarray,
+    beta: jnp.ndarray,
+    gamma: jnp.ndarray,
+    phi: jnp.ndarray,
+    m: int,
 ) -> jnp.ndarray:
+    """Seasonal-model stability check via companion-matrix eigenvalues (traced).
+
+    jnp mirror of the characteristic-polynomial root test inside
+    :func:`admissible`. The polynomial is monic by construction (leading
+    coefficient 1.0), so no trailing-zero trimming is needed and the
+    companion matrix has a static shape — safe under jit/vmap.
     """
-    Build a simple Fourier design matrix for seasonality.
+    P = jnp.zeros((m + 2,), dtype=jnp.float64)
+    P = P.at[0].set(phi * (1.0 - alpha - gamma))
+    P = P.at[1].set(alpha + beta - alpha * phi + gamma - 1.0)
+    if m - 2 > 0:
+        P = P.at[2:m].set(alpha + beta - alpha * phi)
+    P = P.at[m].set(alpha + beta - phi)
+    P = P.at[m + 1].set(1.0)
+    n_deg = m + 1
+    C = jnp.zeros((n_deg, n_deg), dtype=jnp.float64)
+    C = C.at[1:, :-1].set(jnp.eye(n_deg - 1, dtype=jnp.float64))
+    C = C.at[0, :].set(-P[:-1][::-1])
+    roots = jnp.linalg.eigvals(C.astype(jnp.complex128))
+    return jnp.max(jnp.abs(roots)) <= 1.0 + 1e-10
 
-    Parameters
-    ----------
-    x : array-like
-        Input series (used only for length alignment).
-    period : list[int]
-        Seasonal periods to include (e.g., [m]).
-    K : list[int]
-        Number of harmonics per period.
-    h : Optional[int]
-        If provided, build the matrix for the *future* h steps; else fit window.
 
-    Returns
-    -------
-    jnp.ndarray
-        Matrix with sin/cos columns for selected harmonics, with degenerate
-        sinpi=0 columns removed.
+def _valid_params_jnp(
+    alpha: jnp.ndarray,
+    beta: jnp.ndarray,
+    gamma: jnp.ndarray,
+    phi: jnp.ndarray,
+    lower: jnp.ndarray,
+    upper: jnp.ndarray,
+    bounds: str,
+    m: int,
+    damped: bool,
+    has_beta: bool,
+    has_gamma: bool,
+) -> jnp.ndarray:
+    """Traced mirror of :func:`check_param` + :func:`admissible` for post-fit params.
+
+    The eager originals branch with ``math.isnan``/``float()`` on parameter
+    *values*, which cannot run on optimizer output under vmap. Here the
+    presence of each parameter is a *static* fact of the model structure
+    (``damped``/``has_beta``/``has_gamma``), so all Python branching is on
+    config and the returned validity is a traced boolean scalar. NaN
+    parameters fail every comparison, so a diverged fit is invalid for free.
     """
-    n = len(x)
-    if h is None:
-        times = jnp.arange(1, n + 1, dtype=jnp.float64)
-    else:
-        times = jnp.arange(n + 1, n + h + 1, dtype=jnp.float64)
-
-    if len(period) == 0:
-        return jnp.zeros((times.shape[0], 0), dtype=jnp.float64)
-
-    period_arr = jnp.asarray(period, dtype=jnp.float64)
-    k_arr = jnp.asarray(K, dtype=jnp.int32)
-    max_k = int(jnp.max(k_arr)) if k_arr.size > 0 else 0
-    if max_k <= 0:
-        return jnp.zeros((times.shape[0], 0), dtype=jnp.float64)
-
-    ks = jnp.arange(1, max_k + 1, dtype=jnp.float64)
-    vals = ks[None, :] / period_arr[:, None]
-    mask = ks[None, :] <= k_arr[:, None]
-    vals = jnp.where(mask, vals, jnp.nan)
-    p = jnp.unique(vals[~jnp.isnan(vals)])
-    k = jnp.abs(2 * p - jnp.round(2 * p)) > _smalno
-
-    angles = 2 * jnp.pi * times[:, None] * p[None, :]
-    sin_cols = jnp.sin(angles)
-    cos_cols = jnp.cos(angles)
-    X = jnp.stack([sin_cols, cos_cols], axis=2).reshape(times.shape[0], -1)
-
-    mask = jnp.stack([k, jnp.ones_like(k, dtype=bool)], axis=1).reshape(-1)
-    return X[:, mask]
+    one = jnp.asarray(True)
+    phi_e = phi if damped else jnp.asarray(1.0, dtype=jnp.float64)
+    ok = one
+    if bounds != "admissible":
+        ok = ok & (alpha >= lower[0]) & (alpha <= upper[0])
+        if has_beta:
+            ok = ok & (beta >= lower[1]) & (beta <= alpha) & (beta <= upper[1])
+        if damped:
+            ok = ok & (phi_e >= lower[3]) & (phi_e <= upper[3])
+        if has_gamma:
+            ok = ok & (gamma >= lower[2]) & (gamma <= 1.0 - alpha) & (gamma <= upper[2])
+    if bounds != "usual":
+        ok = ok & (phi_e >= 0.0) & (phi_e <= 1.0 + 1e-8)
+        if not has_gamma:
+            ok = ok & (alpha >= 1.0 - 1.0 / phi_e) & (alpha <= 1.0 + 1.0 / phi_e)
+            if has_beta:
+                ok = ok & (beta >= alpha * (phi_e - 1.0)) & (beta <= (1.0 + phi_e) * (2.0 - alpha))
+        elif m > 1:
+            beta_e = beta if has_beta else jnp.asarray(0.0, dtype=jnp.float64)
+            ok = ok & (gamma >= jnp.maximum(1.0 - 1.0 / phi_e - alpha, 0.0))
+            ok = ok & (gamma <= 1.0 + 1.0 / phi_e - alpha)
+            ok = ok & (alpha >= 1.0 - 1.0 / phi_e - gamma * (1.0 - m + phi_e + phi_e * m) / (2.0 * phi_e * m))
+            ok = ok & (beta_e >= -(1.0 - phi_e) * (gamma / m + alpha))
+            ok = ok & _admissible_root_ok(alpha, beta_e, gamma, phi_e, m)
+    return ok
 
 
 @partial(jax.jit, static_argnames=("m", "multiplicative"))
@@ -1116,10 +785,9 @@ def initstate(y: jnp.ndarray, m: int, trendtype: str, seasontype: str) -> jnp.nd
                 seasonal = seasonal - jnp.mean(seasonal)
                 y_d = {"seasonal": seasonal}
             else:
-                if not float(jnp.min(y)) > 0:
-                    raise Exception(
-                        "Multiplicative seasonality is not appropriate for zero and negative values"
-                    )
+                # Multiplicative seasonality on zero/negative data cannot raise
+                # under trace; the guarded divide keeps values finite and the
+                # positivity mask in ets_f() invalidates such candidates.
                 seasonal = seasonal / jnp.maximum(jnp.mean(seasonal), 1e-8)
                 y_d = {"seasonal": seasonal}
         else:
@@ -1138,8 +806,11 @@ def initstate(y: jnp.ndarray, m: int, trendtype: str, seasontype: str) -> jnp.nd
             y_sa = y - y_d["seasonal"]
         else:
             init_seas = jnp.clip(init_seas, a_min=1e-2)
-            if float(jnp.sum(init_seas)) > m:
-                init_seas = init_seas / jnp.sum(init_seas + 1e-2)
+            init_seas = jnp.where(
+                jnp.sum(init_seas) > m,
+                init_seas / jnp.sum(init_seas + 1e-2),
+                init_seas,
+            )
             y_sa = y / jnp.clip(y_d["seasonal"], a_min=1e-2)
     else:
         m = 1
@@ -1148,34 +819,32 @@ def initstate(y: jnp.ndarray, m: int, trendtype: str, seasontype: str) -> jnp.nd
 
     maxn = min(max(10, 2 * m), int(y_sa.shape[0]))
     if trendtype == "N":
-        l0 = float(jnp.mean(y_sa[:maxn]))
-        return jnp.concatenate([jnp.array([l0]), init_seas])
+        l0 = jnp.mean(y_sa[:maxn])
+        return jnp.concatenate([l0[None], init_seas])
     else:
         X = jnp.full((n, 2), jnp.nan)
         X = X.at[:, 0].set(1.0)
         X = X.at[:, 1].set(jnp.arange(1, n + 1, dtype=jnp.float64))
         (l, b), *_ = jnp.linalg.lstsq(X[:maxn], y_sa[:maxn], rcond=-1.0)
-        l = float(l); b = float(b)
+        # The remaining safeguards branch on regression *values* (traced under
+        # vmap) — expressed as jnp.where chains that preserve the original
+        # sequential-mutation order exactly.
         if trendtype == "A":
-            l0 = l
-            b0 = b
-            if abs(l0 + b0) < 1e-8:
-                l0 = l0 * (1 + 1e-3)
-                b0 = b0 * (1 - 1e-3)
+            degenerate = jnp.abs(l + b) < 1e-8
+            l0 = jnp.where(degenerate, l * (1.0 + 1e-3), l)
+            b0 = jnp.where(degenerate, b * (1.0 - 1e-3), b)
         else:
             l0 = l + b
-            if abs(l0) < 1e-8:
-                l0 = 1e-7
-            b0 = (l + 2 * b) / l0
-            div = b0 if not math.isclose(b0, 0.0, abs_tol=1e-8) else 1e-8
+            l0 = jnp.where(jnp.abs(l0) < 1e-8, 1e-7, l0)
+            b0 = (l + 2.0 * b) / l0
+            div = jnp.where(jnp.abs(b0) <= 1e-8, 1e-8, b0)
             l0 = l0 / div
-            if abs(b0) > 1e10:
-                b0 = math.copysign(1e10, b0)
-            if l0 < 1e-8 or b0 < 1e-8:
-                l0 = max(float(y_sa[0]), 1e-3)
-                div2 = float(y_sa[0]) if not math.isclose(float(y_sa[0]), 0.0, abs_tol=1e-8) else 1e-8
-                b0 = max(float(y_sa[1]) / div2, 1e-3)
-        return jnp.concatenate([jnp.array([l0, b0]), init_seas])
+            b0 = jnp.where(jnp.abs(b0) > 1e10, jnp.sign(b0) * 1e10, b0)
+            fallback = (l0 < 1e-8) | (b0 < 1e-8)
+            div2 = jnp.where(jnp.abs(y_sa[0]) <= 1e-8, 1e-8, y_sa[0])
+            l0 = jnp.where(fallback, jnp.maximum(y_sa[0], 1e-3), l0)
+            b0 = jnp.where(fallback, jnp.maximum(y_sa[1] / div2, 1e-3), b0)
+        return jnp.concatenate([jnp.stack([l0, b0]), init_seas])
 
 
 def switch(x: str) -> _ets.Component:
@@ -1288,17 +957,18 @@ def pegelsresid_C(
         switch(errortype),
         switch(trendtype),
         switch(seasontype),
-        float(alpha),
-        float(beta),
-        float(gamma),
-        float(phi),
+        jnp.asarray(alpha, dtype=jnp.float64),
+        jnp.asarray(beta, dtype=jnp.float64),
+        jnp.asarray(gamma, dtype=jnp.float64),
+        jnp.asarray(phi, dtype=jnp.float64),
         int(m),
     )
     xs = x.reshape((n + 1, p))
-    if not jnp.isnan(lik):
-        if float(jnp.abs(lik + 99999)) < _ets.TOL:
-            lik = jnp.nan
-    return amse, e, xs, float(lik)
+    # Legacy NA sentinel (-99999) → NaN, branch-free: if lik is already NaN the
+    # comparison is False and NaN propagates unchanged (same as the old
+    # eager double-if, but traceable under vmap).
+    lik = jnp.where(jnp.abs(lik + 99999.0) < _ets.TOL, jnp.nan, lik)
+    return amse, e, xs, lik
 
 
 def optimize_ets_target_fn(
@@ -1519,7 +1189,6 @@ def etsmodel(
     bucket_size: Optional[int] = None,
     stabilize: bool = True,
     pure_sigmoid: bool = False,
-    selection_mode: bool = False,
     init_state_override: jnp.ndarray | None = None,
 ) -> dict[str, Any]:
     """Fit a *single* ETS specification to the data and return a result dict.
@@ -1527,13 +1196,22 @@ def etsmodel(
     Pipeline
     --------
     1. Initialise / sanitise smoothing parameters via :func:`initparam`.
-    2. Check ranges and admissibility via :func:`check_param`.
-    3. Build initial states via :func:`initstate` (cached).
-    4. Optimise the smoothing + (optional) state vector with
-       :func:`ets_backend.optimize_bfgs_smoothing`.
+    2. Check ranges and admissibility of the *starting* values via
+       :func:`check_param` (config-level, eager).
+    3. Build initial states via :func:`initstate`.
+    4. Optimise the smoothing vector with
+       :func:`ets_backend.optimize_bfgs_smoothing` (scan-based, vmap-safe).
     5. Re-run the full rollout to obtain likelihood, residuals, and fitted
        values.
-    6. Compute information criteria (AIC, BIC, AICc) and σ².
+    6. Compute information criteria (AIC, BIC, AICc), σ², and a traced
+       ``valid`` flag (:func:`_valid_params_jnp` on the *fitted* params).
+
+    The model structure (errortype/trendtype/seasontype/damped, m, bounds)
+    is static config; everything derived from ``y`` stays a traced jnp value,
+    so this whole function is traceable under ``jax.vmap`` (the conformal CV
+    path). Instead of returning early with ``inf`` ICs when fitted parameters
+    are out of range (untraceable), the ICs are real and the ``valid`` flag
+    marks the fit for masking at selection time.
 
     Parameters
     ----------
@@ -1559,17 +1237,20 @@ def etsmodel(
     maxit : int
         Maximum iterations passed to the optimiser.
     optax_steps : int | None
-        Explicit number of optax steps (``None`` → auto-estimate).
-    selection_mode : bool
-        If ``True``, skip state-history storage (fast path for model
-        selection; ``fitted`` and ``states`` will be ``None``).
+        Explicit number of optax steps (``None`` → use *maxit*).
 
     Returns
     -------
     dict
         Keys: ``loglik``, ``aic``, ``bic``, ``aicc``, ``mse``, ``amse``,
         ``sigma2``, ``fit``, ``residuals``, ``fitted``, ``components``,
-        ``m``, ``nstate``, ``states``, ``par``, ``n_params``.
+        ``m``, ``nstate``, ``states``, ``par``, ``n_params``, ``valid``.
+
+    Raises
+    ------
+    ValueError
+        If the series is too short to estimate this specification
+        (a shape/config-static condition, so safe under trace).
     """
     if seasontype == "N":
         m = 1
@@ -1595,7 +1276,7 @@ def etsmodel(
 
     # initialize state (closed-form)
     if init_state_override is None:
-        init_state_full = _template_cache.get_init_state(y, m, trendtype, seasontype)
+        init_state_full = _prepare_init_state(y, m, trendtype, seasontype)
     else:
         init_state_full = jnp.asarray(init_state_override, dtype=jnp.float64)
     nstate = int(init_state_full.shape[0])
@@ -1618,15 +1299,11 @@ def etsmodel(
     n_state_opt = int(init_state_full.shape[0]) if opt_init_state else 0
     np_eff = np_ + n_state_opt
     if np_eff >= len(y) - 1:
-        return dict(
-            aic=jnp.inf,
-            bic=jnp.inf,
-            aicc=jnp.inf,
-            mse=jnp.inf,
-            amse=jnp.inf,
-            fit=None,
-            par=par_vec,
-            states=init_state_full,
+        # Shape/config-static condition — raising is trace-safe and replaces
+        # the old inf-IC early return (whose shape differed from a real fit).
+        raise ValueError(
+            f"Not enough observations ({len(y)}) to estimate the "
+            f"ETS({errortype},{trendtype},{seasontype}) specification."
         )
     if np_ > 0:
         x0_unconstrained = []
@@ -1695,102 +1372,62 @@ def etsmodel(
     init_state_fit = init_state_full
     nstate = int(init_state_fit.shape[0])
 
+    valid = jnp.asarray(True)
     if np_ > 0:
         if opt_init_state and n_state_opt > 0:
             fit_par_smooth = fit_par[:-n_state_opt]
             init_state_fit = fit_par[-n_state_opt:]
         else:
             fit_par_smooth = fit_par
-        alpha, beta, gamma, phi = _transform_smoothing_params_unconstrained(
-            fit_par_smooth, opt_names, alpha, beta, gamma, phi, lower, upper, pure_sigmoid
+        # Decode the (traced) optimizer output with the backend's jnp-native
+        # transform; the fitted params stay traced end-to-end.
+        alpha, beta, gamma, phi = _ets._transform_smoothing_params(
+            fit_par_smooth,
+            "alpha" in opt_names, "beta" in opt_names,
+            "gamma" in opt_names, "phi" in opt_names,
+            alpha, beta, gamma, phi, lower, upper, pure_sigmoid,
         )
-        if not check_param(alpha, beta, gamma, phi,
-                           jnp.asarray(lower, dtype=jnp.float64),
-                           jnp.asarray(upper, dtype=jnp.float64),
-                           bounds, m):
-            return dict(
-                aic=jnp.inf,
-                bic=jnp.inf,
-                aicc=jnp.inf,
-                mse=jnp.inf,
-                amse=jnp.inf,
-                fit=None,
-                par=fit_par,
-                states=init_state_fit,
-            )
+        valid = _valid_params_jnp(
+            jnp.asarray(alpha, dtype=jnp.float64),
+            jnp.asarray(beta, dtype=jnp.float64),
+            jnp.asarray(gamma, dtype=jnp.float64),
+            jnp.asarray(phi, dtype=jnp.float64),
+            lower, upper, bounds, m,
+            damped=bool(damped),
+            has_beta=(trendtype != "N"),
+            has_gamma=(seasontype != "N"),
+        )
 
-    if selection_mode:
-        e_tmp = jnp.zeros_like(jnp.asarray(y, dtype=jnp.float64))
-        amse_tmp = jnp.zeros((nmse,), dtype=jnp.float64)
-        n_obs = int(jnp.asarray(y).shape[0])
-        e, amse, lik = _ets._calc_roll_nohist(
-            init_state_fit,
-            e_tmp,
-            amse_tmp,
-            nmse,
-            jnp.asarray(y, dtype=jnp.float64),
-            jnp.asarray(n_obs, dtype=jnp.int32),
-            switch(errortype),
-            switch(trendtype),
-            switch(seasontype),
-            float(alpha),
-            float(beta),
-            float(gamma),
-            float(phi),
-            int(m),
-            clip_multiplicative_errors=stabilize,
-            fcst_h=1 if opt_crit == "lik" else nmse,
-        )
-        states = None
-    else:
-        amse, e, states, lik = pegelsresid_C(
-            y=jnp.asarray(y, dtype=jnp.float64),
-            m=m,
-            init_state=init_state_fit,
-            errortype=errortype,
-            trendtype=trendtype,
-            seasontype=seasontype,
-            damped=damped,
-            alpha=alpha,
-            beta=beta,
-            gamma=gamma,
-            phi=phi,
-            nmse=nmse,
-        )
-    lik_opt = None
-    if opt_crit == "lik" and pure_sigmoid and (not stabilize):
-        try:
-            lik_opt = float(fred.fn)
-        except Exception:
-            lik_opt = None
+    amse, e, states, lik = pegelsresid_C(
+        y=jnp.asarray(y, dtype=jnp.float64),
+        m=m,
+        init_state=init_state_fit,
+        errortype=errortype,
+        trendtype=trendtype,
+        seasontype=seasontype,
+        damped=damped,
+        alpha=alpha,
+        beta=beta,
+        gamma=gamma,
+        phi=phi,
+        nmse=nmse,
+    )
     k = np_ + n_state_opt + 1
     ny = len(y)
-    lik_ic = float(lik_opt) if lik_opt is not None else float(lik)
-    aic, bic, aicc = _compute_ic(lik_ic, ny, k)
+    aic, bic, aicc = _compute_ic(lik, ny, k)
 
-    mse = float(amse[0])
-    amse_mean = float(jnp.mean(amse))
+    mse = amse[0]
+    amse_mean = jnp.mean(amse)
 
-    fit_par_full = jnp.concatenate([jnp.array([alpha, beta, gamma, phi], dtype=jnp.float64), init_state_fit])
-    if selection_mode:
-        return dict(
-            loglik=-0.5 * float(lik),
-            aic=aic,
-            bic=bic,
-            aicc=float(aicc),
-            mse=mse,
-            amse=amse_mean,
-            fit=fred,
-            residuals=None,
-            components=f"{errortype}{trendtype}{seasontype}{'D' if damped else 'N'}",
-            m=m,
-            nstate=nstate,
-            fitted=None,
-            states=None,
-            par=fit_par_full,
-            sigma2=jnp.nan,
-            n_params=k,
-        )
+    fit_par_full = jnp.concatenate([
+        jnp.stack([
+            jnp.asarray(alpha, dtype=jnp.float64),
+            jnp.asarray(beta, dtype=jnp.float64),
+            jnp.asarray(gamma, dtype=jnp.float64),
+            jnp.asarray(phi, dtype=jnp.float64),
+        ]),
+        init_state_fit,
+    ])
 
     if errortype == "A":
         fits = jnp.asarray(y) - e
@@ -1800,14 +1437,15 @@ def etsmodel(
         fits = jnp.asarray(y) / (1.0 + aux_e)
 
     sq_e = e * e
-    finites = ~jnp.isinf(sq_e)
-    sigma2 = float(jnp.sum(sq_e[finites]) / (ny - k - 1))
+    # Exclude infs from the sum but let NaN propagate (matches the old eager
+    # boolean-mask indexing, which cannot trace: masked shapes are dynamic).
+    sigma2 = jnp.sum(jnp.where(jnp.isinf(sq_e), 0.0, sq_e)) / (ny - k - 1)
 
     return dict(
-        loglik=-0.5 * float(lik),
+        loglik=-0.5 * lik,
         aic=aic,
         bic=bic,
-        aicc=float(aicc),
+        aicc=aicc,
         mse=mse,
         amse=amse_mean,
         fit=fred,
@@ -1820,13 +1458,8 @@ def etsmodel(
         par=fit_par_full,
         sigma2=sigma2,
         n_params=k,
+        valid=valid,
     )
-
-
-def is_constant(x: jnp.ndarray) -> bool:
-    """Return ``True`` if every element of *x* equals the first element."""
-    x = jnp.asarray(x)
-    return bool(jnp.all(x[0] == x))
 
 
 def ets_f(
@@ -1864,20 +1497,24 @@ def ets_f(
     """Top-level ETS entry-point: automatic model selection **and** fitting.
 
     When *model* is a three-character string (e.g. ``"ZZZ"``), every ``"Z"``
-    is expanded into a grid of candidate component types.  Each candidate is
-    fitted via :func:`etsmodel` and scored by the chosen information
-    criterion; the winner is returned.
+    is expanded into a grid of candidate component types. The grid is
+    *config/shape-static*: every candidate is fitted via :func:`etsmodel`
+    (a static Python loop) and the winner is a NaN/validity-masked
+    ``jnp.argmin`` over the chosen information criterion — a traced index,
+    never a concretized value. This makes the whole function traceable under
+    ``jax.vmap`` (the conformity_scores CV path).
 
-    When *model* is a ``dict`` (a previously-fitted result), this function
-    acts as a **forward** step — rolling the stored parameters over new
-    data without re-optimisation.
+    When *model* is a ``dict`` (a previously-fitted classic dict), this
+    function acts as a **forward** step — rolling the stored parameters over
+    new data without re-optimisation (see :func:`forward_ets`).
 
     Parameters
     ----------
     y : array-like
         Time series (cast to float64 internally).
     m : int
-        Seasonal period (``1`` for non-seasonal data).
+        Seasonal period (``1`` for non-seasonal data). Config-only: array
+        shapes derive from it, so it is never inferred from the data.
     model : str | dict
         ``"ZZZ"`` for full auto-selection, a fixed spec like ``"AAN"``
         for a single fit, or a previously-fitted dict for the forward path.
@@ -1912,26 +1549,56 @@ def ets_f(
     maxit : int
         Maximum iteration budget passed to the optimiser.
     optax_steps : int | None
-        Explicit optax step count (``None`` → auto-estimated from data).
+        Explicit optax step count (``None`` → a static table keyed on the
+        series *length*, which is shape-static under vmap).
+    early_stop_patience, early_stop_min_delta, allow_extended_iterations,
+    adaptive_tol
+        *(Inert — retained for API compatibility. Early stopping and
+        data-adaptive iteration budgets require concretizing traced values;
+        the optimizer instead runs a fixed budget with monotone best-iterate
+        tracking, so extra steps can never make the fit worse.)*
 
     Returns
     -------
     dict
-        Best-fitted model dictionary (see :func:`etsmodel`) with an added
-        ``"method"`` key, e.g. ``"ETS(A,Ad,M)"``.
+        A **stacked** model dictionary (see Notes) for string *model* input,
+        or a classic single-model dictionary for dict input (forward path).
 
     Raises
     ------
     ValueError
-        If no admissible model can be found, or if parameter bounds are
-        inconsistent.
+        For invalid model strings, forbidden combinations, or inconsistent
+        bounds (all config-static conditions).
 
     Notes
     -----
-    * Constant series fall back to ``ANN`` with ``α ≈ 1``.
-    * The candidate grid is aggressively pruned using heuristic
-      strength scores and early-stopping so that cold-start latency
-      remains low even for ``"ZZZ"`` on long series.
+    The stacked dictionary contains, with ``C`` candidates and state width
+    ``S = max(nstate)``:
+
+    * static metadata — ``m``, ``n``, ``ic_name``, ``candidates``
+      (tuple of ``(error, trend, season, damped)``), ``cand_m`` /
+      ``cand_nstate`` / ``cand_k`` (per-candidate ints);
+    * per-candidate stacks (axis 0 = candidate) — ``cand_par`` ``(C, 4)``,
+      ``cand_init_state`` / ``cand_last_state`` ``(C, S)`` (zero-padded),
+      ``cand_fitted`` / ``cand_residuals`` ``(C, n)``, ``cand_sigma2`` /
+      ``cand_loglik`` / ``cand_aic`` / ``cand_bic`` / ``cand_aicc`` /
+      ``cand_mse`` / ``cand_amse`` / ``cand_valid`` ``(C,)``, and ``ic``
+      (criterion values masked to ``inf`` where invalid);
+    * selection — ``best`` (traced argmin index), ``valid`` (traced "any
+      candidate finite" flag);
+    * winner conveniences under the classic keys (``jnp.take``-selected,
+      traced) — ``fitted``, ``residuals``, ``sigma2``, ``loglik``, ``aic``,
+      ``bic``, ``aicc``, ``mse``, ``amse``, ``par`` (4,), ``n_params``.
+
+    Use :func:`ets_point_forecast` for traceable point forecasts,
+    :func:`ets_winner_view` for an eager classic-dict view of the winner
+    (needed by the native-interval machinery), and
+    :func:`ets_forward_stacked` / :func:`forward_ets` to re-roll on new data.
+
+    Multiplicative-component candidates are *masked out* (IC → ``inf``) when
+    the data are not strictly positive, instead of raising — a raise on a
+    data value cannot trace. A fixed multiplicative spec on non-positive
+    data therefore yields NaN forecasts rather than an exception.
     """
     y = jnp.asarray(y, dtype=jnp.float64)
     n = len(y)
@@ -1939,36 +1606,24 @@ def ets_f(
     if season_forced:
         m = 1
     auto_model = isinstance(model, str) and ("Z" in model)
-    # Parse model string early so errortype/trendtype/seasontype are
-    # available for the optax_steps heuristic below.
-    # When model is a dict (forward_ets path), these stay None and the
-    # isinstance check in the optax_steps block will pick the default branch.
     errortype = trendtype = seasontype = None
     if isinstance(model, str):
         errortype, trendtype, seasontype = model
         if season_forced:
             seasontype = "N"
-    if auto_model and m > 1 and (n / max(m, 1)) < 2:
-        m_infer = _infer_season_length(y, max_m=min(24, n // 2))
-        if m_infer != m and m_infer > 1:
-            m = m_infer
     if optax_steps is None:
-        if isinstance(errortype, str) and isinstance(trendtype, str) and isinstance(seasontype, str):
-            optax_steps = _estimate_ets_iterations(
-                y, m, errortype, trendtype, seasontype, allow_extended=allow_extended_iterations
-            )
+        # Static iteration table keyed on series *length* (shape-static under
+        # vmap). The old data-adaptive estimator concretized traced values.
+        if n < 100:
+            optax_steps = 50
+        elif n < 200:
+            optax_steps = 75
+        elif n < 500:
+            optax_steps = 100
+        elif n < 2000:
+            optax_steps = 120
         else:
-            # Optimized: Reduced default iterations for faster training
-            if n < 100:
-                optax_steps = 50
-            elif n < 200:
-                optax_steps = 75
-            elif n < 500:
-                optax_steps = 100
-            elif n < 2000:
-                optax_steps = 120
-            else:
-                optax_steps = 100
+            optax_steps = 100
 
     if alpha is None:
         alpha = jnp.nan
@@ -1995,38 +1650,6 @@ def ets_f(
     if jnp.any(upper < lower):
         raise ValueError("Lower limits must be less than upper limits")
 
-    timing_enabled = os.environ.get("CHRONAX_ETS_TIMING", "0") == "1"
-    t_start = time.perf_counter() if timing_enabled else 0.0
-
-    if is_constant(y):
-        return etsmodel(
-            y=y,
-            m=m,
-            errortype="A",
-            trendtype="N",
-            seasontype="N",
-            alpha=0.9999,
-            beta=beta,
-            gamma=gamma,
-            phi=phi,
-            damped=False,
-            lower=lower,
-            upper=upper,
-            opt_crit=opt_crit,
-            nmse=nmse,
-            bounds=bounds,
-            maxit=maxit,
-            optax_steps=optax_steps,
-            optax_lr=optax_lr,
-            optax_clip=optax_clip,
-            early_stop_patience=early_stop_patience,
-            early_stop_min_delta=early_stop_min_delta,
-            adaptive_tol=adaptive_tol,
-            is_final_model=True,
-            pad_to=pad_to,
-            bucket_size=bucket_size,
-        )
-
     if isinstance(model, dict):
         m = model["m"]
         errortype, trendtype, seasontype = model["components"][:3]
@@ -2052,28 +1675,25 @@ def ets_f(
         np_ = model["n_params"] - 1
         np_ = np_ + 1
         ny = len(y)
-        aic = float(lik) + 2 * np_
-        bic = float(lik) + math.log(ny) * np_
-        aicc = _aicc(aic=aic, n=ny, k=np_)
+        aic, bic, aicc = _compute_ic(lik, ny, np_)
 
-        mse = float(amse[0])
-        amse_mean = float(jnp.mean(amse))
+        mse = amse[0]
+        amse_mean = jnp.mean(amse)
 
-        fit_par = jnp.concatenate([jnp.array([alpha, beta, gamma, phi], dtype=jnp.float64), init_state])
+        fit_par = jnp.concatenate([jnp.asarray(model["par"][:4], dtype=jnp.float64), init_state])
         if errortype == "A":
             fits = y - e
         else:
             aux_e = jnp.where(e == -1.0, -1 + 1e-3, e)
             fits = y / (1 + aux_e)
         sq_e = e * e
-        finites = ~jnp.isinf(sq_e)
-        sigma2 = float(jnp.sum(sq_e[finites]) / (ny - np_ - 1))
+        sigma2 = jnp.sum(jnp.where(jnp.isinf(sq_e), 0.0, sq_e)) / (ny - np_ - 1)
 
         return dict(
-            loglik=-0.5 * float(lik),
+            loglik=-0.5 * lik,
             aic=aic,
             bic=bic,
-            aicc=float(aicc),
+            aicc=aicc,
             mse=mse,
             amse=amse_mean,
             fit=fred,
@@ -2112,12 +1732,9 @@ def ets_f(
             )
         ):
             raise ValueError("Forbidden model combination")
-    data_positive = float(jnp.min(y)) > 0
-    if (not data_positive) and errortype == "M":
-        raise ValueError("Inappropriate model for data with negative or zero values")
     if damped is not None:
         if damped and trendtype == "N":
-            ValueError("Forbidden model combination")
+            raise ValueError("Forbidden model combination")
     n = len(y)
     npars = 2
     if trendtype in ["A", "M"]:
@@ -2130,190 +1747,94 @@ def ets_f(
         raise NotImplementedError("tiny datasets")
 
     cycles = n / max(m, 1)
-    unify = os.environ.get("CHRONAX_ETS_UNIFIED", "1") == "1"
-    if cycles < 10 or n < 100:
-        unify = False
-    if unify:
-        err_u, trend_u, seas_u = _choose_unified_components(
-            y, m, allow_multiplicative_trend
-        )
-        if errortype == "Z":
-            errortype = [err_u]
-        if trendtype == "Z":
-            trendtype = [trend_u]
-        if seasontype == "Z":
-            seasontype = [seas_u]
-    elif auto_model and (errortype == "Z" or trendtype == "Z" or seasontype == "Z"):
-        # Reduce candidate grid for small samples to limit JIT churn.
-        err_u, trend_u, seas_u = _choose_unified_components(
-            y, m, allow_multiplicative_trend
-        )
-        if errortype == "Z":
-            errortype = [err_u]
-        if trendtype == "Z":
-            trendtype = ["N"] if n < 50 else [trend_u]
-        if seasontype == "Z":
-            if m <= 1 or cycles < 6:
-                seasontype = ["N"]
-            elif cycles < 10 and seas_u == "M":
-                seasontype = ["A", "N"]
-            else:
-                seasontype = [seas_u]
+    # Expand Z components into their full candidate lists; all pruning below
+    # is config/shape-static. Data-dependent gates (positivity) are applied
+    # as traced IC masks after fitting, never by shrinking the static grid.
     if errortype == "Z":
         errortype = ["A", "M"]
+    else:
+        errortype = [errortype]
     if trendtype == "Z":
         trendtype = ["N", "A"] + (["M"] if allow_multiplicative_trend else [])
+    else:
+        trendtype = [trendtype]
     if seasontype == "Z":
         seasontype = ["N", "A", "M"]
+    else:
+        seasontype = [seasontype]
     prefer_damped_small_n = auto_model and n < 200
     force_additive_error = auto_model and n < 80
     if damped is None:
-        damped = [True, False]
+        damped_opts = [True, False]
     else:
-        damped = [damped]
+        damped_opts = [bool(damped)]
 
-    best_ic = jnp.inf
-    best = None
-    selection_stabilize = not auto_model
-    nmse_sel = 1 if opt_crit == "lik" else nmse
-    init_state_cache: dict[tuple[str, str], jnp.ndarray] = {}
-    no_improve = 0
-    # Optimized: More aggressive early stopping in model selection
-    max_no_improve = int(os.environ.get("CHRONAX_ETS_NO_IMPROVE_STOP", "1"))
-    min_evals = int(os.environ.get("CHRONAX_ETS_MIN_EVALS", "1"))  # Reduced from 2
-    evals = 0
-    stop_search = False
-    candidates = []
+    candidates: list[tuple[str, str, str, bool]] = []
+
     def _maybe_add_candidate(etype: str, ttype: str, stype: str, dtype: bool) -> None:
-        """Append an admissible candidate spec to the local search grid."""
-        if force_additive_error and etype == "M":
-            return
+        """Append an admissible candidate spec to the static search grid."""
         if restrict:
+            # Additive error with any multiplicative component is numerically
+            # unstable (forecast::ets forbids A+M-trend and A+M-season under
+            # restrict; the legacy hand-built grid never generated them, so
+            # the full static grid must exclude them here — matches the
+            # fixed-spec "Forbidden model combination" raise above).
+            if etype == "A" and (ttype == "M" or stype == "M"):
+                return
             if etype == "M" and ttype == "M" and stype == "A":
                 return
             if additive_only and (etype == "M" or ttype == "M" or stype == "M"):
                 return
-            # Exclude ETS(A,N,M) only (no trend + multiplicative season)
-            if etype == "A" and stype == "M" and ttype == "N":
-                return
-            if (not data_positive) and etype == "M":
-                return
-            if (not data_positive) and stype == "M":
-                return
         if stype != "N" and m == 1:
-            return
-        if etype == "M" and cycles < 10:
-            return
-        if stype == "M" and cycles < 10:
             return
         if ttype == "N" and dtype:
             return
-        if prefer_damped_small_n and ttype != "N" and (not dtype):
-            return
+        if auto_model:
+            # Shape-static pruning heuristics — auto grid only; a user-fixed
+            # spec must never be silently dropped by a heuristic.
+            if force_additive_error and etype == "M":
+                return
+            if etype == "M" and cycles < 10:
+                return
+            if stype == "M" and cycles < 10:
+                return
+            if prefer_damped_small_n and ttype != "N" and (not dtype):
+                return
         candidates.append((etype, ttype, stype, dtype))
 
+    for etype in errortype:
+        for ttype in trendtype:
+            for stype in seasontype:
+                for dtype in damped_opts:
+                    _maybe_add_candidate(etype, ttype, stype, dtype)
+
     if auto_model:
-        ts_strength, ss_strength = _get_cached_strengths(y, m)
-        candidates.append(("A", "N", "N", False))
-
-        if ts_strength > 0.1:
-            _maybe_add_candidate("A", "A", "N", False)
-            if n > 50:
-                _maybe_add_candidate("A", "A", "N", True)
-
-        if ss_strength > 0.1 and m > 1:
-            _maybe_add_candidate("A", "N", "A", False)
-            if ts_strength > 0.1:
-                _maybe_add_candidate("A", "A", "A", False)
-
-        if data_positive:
-            if ts_strength > 0.3:
-                _maybe_add_candidate("M", "A", "N", False)
-            if ss_strength > 0.3 and m > 1:
-                _maybe_add_candidate("M", "N", "M", False)
-                if ts_strength > 0.2:
-                    _maybe_add_candidate("M", "A", "M", False)
-
-        # Prioritize a richer set of candidates for accuracy; we still cap the
-        # total to avoid pathological runtimes on large grids.
-        candidates = candidates[:12]
-
-        priority = ["ANN", "AAN", "ANA", "AAA", "MAN", "MNM", "MAM", "AAM", "MMM"]
+        priority = ["ANN", "AAN", "ANA", "AAA", "MAN", "MNM", "MAM", "MMM"]
         priority_index = {k: i for i, k in enumerate(priority)}
 
         def _rank(c: tuple[str, str, str, bool]) -> tuple[float, str]:
-            """Rank candidate ETS specifications for selection ordering."""
+            """Rank candidate ETS specifications for deterministic ordering."""
             et, tt, st, dt = c
             key = f"{et}{tt}{st}"
             base = priority_index.get(key, len(priority))
             damp_penalty = 0.5 if dt else 0.0
             return (base + damp_penalty, key)
 
+        # Deterministic order (argmin tie-break follows priority) and a cap
+        # that bounds per-shape compile cost for very large grids.
         candidates.sort(key=_rank)
-    else:
-        for etype in errortype:
-            for ttype in trendtype:
-                for stype in seasontype:
-                    for dtype in damped:
-                        _maybe_add_candidate(etype, ttype, stype, dtype)
+        candidates = candidates[:12]
 
-    if auto_model and len(candidates) > 3:
-        # Quick pre-screening pass: use a modest number of steps to rank
-        # candidates, then keep only the best few for full optimization.
-        quick_steps = 20 if optax_steps is None else min(int(optax_steps), 20)
-        quick_scores = []
-        for etype, ttype, stype, dtype in candidates:
-            init_key = (ttype, stype)
-            init_state_override = _template_cache.get_init_state(y, m, ttype, stype)
-            quick_fit = etsmodel(
-                y,
-                m,
-                etype,
-                ttype,
-                stype,
-                dtype,
-                alpha,
-                beta,
-                gamma,
-                phi,
-                lower=lower,
-                upper=upper,
-                opt_crit=opt_crit,
-                nmse=nmse_sel,
-                bounds=bounds,
-                maxit=maxit,
-                optax_steps=quick_steps,
-                optax_lr=optax_lr,
-                optax_clip=optax_clip,
-                early_stop_patience=max(5, early_stop_patience // 2),  # Optimized: More aggressive for quick selection
-                early_stop_min_delta=early_stop_min_delta * 2,  # Optimized: Relaxed for quick selection
-                adaptive_tol=adaptive_tol,
-                is_final_model=False,
-                pad_to=pad_to,
-                bucket_size=bucket_size,
-                stabilize=selection_stabilize,
-                pure_sigmoid=auto_model,
-                selection_mode=True,
-                init_state_override=init_state_override,
-            )
-            quick_scores.append((quick_fit[ic], (etype, ttype, stype, dtype)))
-        quick_scores.sort(key=lambda item: float(item[0]))
-        # Keep the top few candidates for final selection to balance speed/accuracy.
-        candidates = [c for _, c in quick_scores[:4]]
+    if not candidates:
+        raise ValueError("No admissible ETS model found")
 
-    t_select_start = time.perf_counter() if timing_enabled else 0.0
-    # For non-auto (fixed-spec) models there is only one candidate, so
-    # skip the selection_mode=True fast path and go straight to a full fit.
-    # selection_mode=True uses _calc_roll_nohist which returns NaN for some
-    # model specs (e.g. AAN, AAA), causing the selection to fail.
-    use_selection_mode = auto_model
+    # ── Fit every candidate (static loop) and select by masked argmin ──
+    init_state_cache: dict[tuple[str, str], jnp.ndarray] = {}
+    fits: list[dict[str, Any]] = []
     for etype, ttype, stype, dtype in candidates:
         init_key = (ttype, stype)
-        if init_key in init_state_cache:
-            init_state_override = init_state_cache[init_key]
-        else:
-            init_state_override = _template_cache.get_init_state(y, m, ttype, stype)
-            init_state_cache[init_key] = init_state_override
+        if init_key not in init_state_cache:
+            init_state_cache[init_key] = _prepare_init_state(y, m, ttype, stype)
         fit = etsmodel(
             y,
             m,
@@ -2328,98 +1849,305 @@ def ets_f(
             lower=lower,
             upper=upper,
             opt_crit=opt_crit,
-            nmse=nmse_sel,
-            bounds=bounds,
-            maxit=maxit,
-            optax_steps=optax_steps,
-            optax_lr=optax_lr,
-            optax_clip=optax_clip,
-            early_stop_patience=early_stop_patience,
-            early_stop_min_delta=early_stop_min_delta,
-            adaptive_tol=adaptive_tol,
-            is_final_model=True,
-            pad_to=pad_to,
-            bucket_size=bucket_size,
-            stabilize=selection_stabilize,
-            pure_sigmoid=auto_model,
-            selection_mode=use_selection_mode,
-            init_state_override=init_state_override,
-        )
-        fit_ic = fit[ic]
-        if not math.isnan(float(fit_ic)):
-            aicc_delta = float(fit_ic - best_ic)
-            if float(fit_ic) < float(best_ic):
-                best = fit
-                best_ic = fit_ic
-                best_e = etype
-                best_t = ttype
-                best_s = stype
-                best_d = dtype
-                no_improve = 0
-            else:
-                no_improve += 1
-            evals += 1
-            # Selection early-stopping tuned slightly toward accuracy: require
-            # more evidence before giving up on exploring candidates.
-            if (evals >= min_evals and no_improve >= max_no_improve) or (
-                evals >= 4 and aicc_delta > 4.0
-            ) or (evals >= 12):
-                stop_search = True
-                break
-    if best is None:
-        raise ValueError("No admissible ETS model found")
-    t_select_end = time.perf_counter() if timing_enabled else 0.0
-    # For auto_model, the selection loop used selection_mode=True (fast path)
-    # so we need a final re-fit with selection_mode=False to get full results
-    # (fitted values, residuals, states). For non-auto models, the selection
-    # loop already used selection_mode=False, so the result is complete.
-    if auto_model:
-        init_key = (best_t, best_s)
-        init_state_override = init_state_cache.get(init_key)
-    t_opt_start = time.perf_counter() if timing_enabled else 0.0
-    if auto_model:
-        best = etsmodel(
-            y,
-            m,
-            best_e,
-            best_t,
-            best_s,
-            best_d,
-            alpha,
-            beta,
-            gamma,
-            phi,
-            lower=lower,
-            upper=upper,
-            opt_crit=opt_crit,
             nmse=nmse,
             bounds=bounds,
             maxit=maxit,
             optax_steps=optax_steps,
             optax_lr=optax_lr,
             optax_clip=optax_clip,
-            early_stop_patience=early_stop_patience,
-            early_stop_min_delta=early_stop_min_delta,
-            adaptive_tol=adaptive_tol,
-            is_final_model=True,
             pad_to=pad_to,
             bucket_size=bucket_size,
             stabilize=True,
             pure_sigmoid=auto_model,
-            init_state_override=init_state_override,
+            init_state_override=init_state_cache[init_key],
         )
-    t_opt_end = time.perf_counter() if timing_enabled else 0.0
-    if best is None or jnp.isinf(best_ic):
-        raise Exception("no model able to be fitted")
-    best["method"] = f"ETS({best_e},{best_t}{'d' if best_d else ''},{best_s})"
-    if timing_enabled:
-        best["_timing"] = {
-            "selection_sec": float(t_select_end - t_select_start),
-            "final_fit_sec": float(t_opt_end - t_opt_start),
-            "total_ets_f_sec": float(time.perf_counter() - t_start),
-        }
-        print(f"[Chronax ETS timing] {best['_timing']}")
-    return best
+        fits.append(fit)
+
+    data_positive = jnp.min(y) > 0
+    ic_rows = []
+    for spec, fit in zip(candidates, fits):
+        ok = fit["valid"]
+        if spec[0] == "M" or spec[2] == "M":
+            ok = ok & data_positive
+        ic_val = jnp.asarray(fit[ic], dtype=jnp.float64)
+        ic_rows.append(jnp.where(ok & jnp.isfinite(ic_val), ic_val, jnp.inf))
+    ic_vec = jnp.stack(ic_rows)
+    best = jnp.argmin(ic_vec)
+    # Raising on "no admissible model" is impossible under trace; expose a
+    # traced flag instead (argmin over all-inf picks index 0).
+    valid_any = jnp.isfinite(ic_vec).any()
+
+    cand_nstate = tuple(int(f["nstate"]) for f in fits)
+    S = max(cand_nstate)
+
+    def _pad_state(v: jnp.ndarray) -> jnp.ndarray:
+        return jnp.pad(v, (0, S - v.shape[0]))
+
+    def _stack(key: str) -> jnp.ndarray:
+        return jnp.stack([jnp.asarray(f[key], dtype=jnp.float64) for f in fits])
+
+    def _take(stack: jnp.ndarray) -> jnp.ndarray:
+        return jnp.take(stack, best, axis=0)
+
+    cand_fitted = _stack("fitted")
+    cand_residuals = _stack("residuals")
+    cand_sigma2 = _stack("sigma2")
+    cand_loglik = _stack("loglik")
+    cand_aic = _stack("aic")
+    cand_bic = _stack("bic")
+    cand_aicc = _stack("aicc")
+    cand_mse = _stack("mse")
+    cand_amse = _stack("amse")
+    cand_k = jnp.asarray([f["n_params"] for f in fits])
+    cand_par = jnp.stack([f["par"][:4] for f in fits])
+    cand_init_state = jnp.stack([_pad_state(f["par"][4:]) for f in fits])
+    cand_last_state = jnp.stack([_pad_state(f["states"][-1, :]) for f in fits])
+
+    return dict(
+        # static metadata
+        m=m,
+        n=n,
+        ic_name=ic,
+        candidates=tuple(candidates),
+        cand_m=tuple(int(f["m"]) for f in fits),
+        cand_nstate=cand_nstate,
+        cand_k=tuple(int(f["n_params"]) for f in fits),
+        # per-candidate stacks
+        cand_par=cand_par,
+        cand_init_state=cand_init_state,
+        cand_last_state=cand_last_state,
+        cand_fitted=cand_fitted,
+        cand_residuals=cand_residuals,
+        cand_sigma2=cand_sigma2,
+        cand_loglik=cand_loglik,
+        cand_aic=cand_aic,
+        cand_bic=cand_bic,
+        cand_aicc=cand_aicc,
+        cand_mse=cand_mse,
+        cand_amse=cand_amse,
+        cand_valid=jnp.stack([f["valid"] for f in fits]),
+        ic=ic_vec,
+        # selection
+        best=best,
+        valid=valid_any,
+        # winner conveniences under the classic keys (traced take-selection)
+        fitted=_take(cand_fitted),
+        residuals=_take(cand_residuals),
+        sigma2=_take(cand_sigma2),
+        loglik=_take(cand_loglik),
+        aic=_take(cand_aic),
+        bic=_take(cand_bic),
+        aicc=_take(cand_aicc),
+        mse=_take(cand_mse),
+        amse=_take(cand_amse),
+        par=_take(cand_par),
+        n_params=_take(cand_k),
+    )
+
+
+def ets_point_forecast(mod: dict[str, Any], h: int) -> jnp.ndarray:
+    """Traceable point forecasts from a stacked :func:`ets_f` result.
+
+    ``etsforecast`` needs *static* structure flags, so the traced winner
+    index cannot be dispatched on directly. Each candidate is forecast with
+    its own static config (a Python loop over config) and the winning row is
+    selected with ``jnp.take`` — the AutoCES ``_forecast_candidates`` pattern.
+
+    Parameters
+    ----------
+    mod : dict
+        Stacked model dictionary from :func:`ets_f` (string-model input) or
+        :func:`ets_forward_stacked`.
+    h : int
+        Forecast horizon (static).
+
+    Returns
+    -------
+    jnp.ndarray
+        Point forecasts of shape ``(h,)`` for the IC-selected candidate.
+    """
+    fcsts = []
+    for i, (etype, ttype, stype, dtype) in enumerate(mod["candidates"]):
+        nst = mod["cand_nstate"][i]
+        m_i = mod["cand_m"][i]
+        x = mod["cand_last_state"][i, :nst]
+        phi_i = mod["cand_par"][i, 3] if dtype else 1.0
+        f = jnp.full((h,), jnp.nan, dtype=jnp.float64)
+        f = etsforecast(
+            x=x, m=m_i, trend=switch(ttype), season=switch(stype),
+            phi=phi_i, h=h, f=f,
+        )
+        fcsts.append(f)
+    return jnp.take(jnp.stack(fcsts), mod["best"], axis=0)
+
+
+def ets_winner_view(mod: dict[str, Any]) -> dict[str, Any]:
+    """Materialize the winning candidate of a stacked fit as a classic dict.
+
+    With a single candidate the winner index is static and this stays fully
+    traceable. With multiple candidates the traced ``best`` index must be
+    concretized (``int(...)``) to recover the winner's *strings* (components,
+    method) — an **eager-only** operation, acceptable because its only
+    consumers are the native-interval formulas and display paths, which run
+    on concrete post-fit values (the conformal CV path never needs strings).
+
+    Returns
+    -------
+    dict
+        Classic model dictionary compatible with :func:`forecast_ets`,
+        :func:`pegelsfcast_C`, :func:`_compute_pred_intervals`, and the
+        dict-input forward path of :func:`ets_f`.
+    """
+    n_cand = len(mod["candidates"])
+    b = 0 if n_cand == 1 else int(mod["best"])
+    etype, ttype, stype, dtype = mod["candidates"][b]
+    nst = mod["cand_nstate"][b]
+    par4 = mod["cand_par"][b]
+    return dict(
+        loglik=mod["cand_loglik"][b],
+        aic=mod["cand_aic"][b],
+        bic=mod["cand_bic"][b],
+        aicc=mod["cand_aicc"][b],
+        mse=mod["cand_mse"][b],
+        amse=mod["cand_amse"][b],
+        fit=results(x=par4, fn=jnp.nan, nit=0, simplex=jnp.empty((0,), dtype=jnp.float64)),
+        residuals=mod["cand_residuals"][b],
+        fitted=mod["cand_fitted"][b],
+        components=f"{etype}{ttype}{stype}{'D' if dtype else 'N'}",
+        m=mod["cand_m"][b],
+        nstate=nst,
+        states=mod["cand_last_state"][b, :nst][None, :],
+        par=jnp.concatenate([par4, mod["cand_init_state"][b, :nst]]),
+        sigma2=mod["cand_sigma2"][b],
+        n_params=mod["cand_k"][b],
+        method=f"ETS({etype},{ttype}{'d' if dtype else ''},{stype})",
+    )
+
+
+def ets_forward_stacked(mod: dict[str, Any], y: jnp.ndarray) -> dict[str, Any]:
+    """Re-roll a stacked fit's stored parameters over *new* data (traceable).
+
+    Mirrors the dict-input forward path of :func:`ets_f`, but for every
+    candidate: each candidate's stored smoothing parameters and fit-time
+    initial state are rolled over the new series with :func:`pegelsresid_C`
+    (no re-optimisation), and the *fit-time* winner index is kept.
+
+    Parameters
+    ----------
+    mod : dict
+        Stacked model dictionary from :func:`ets_f`.
+    y : array-like
+        New time series.
+
+    Returns
+    -------
+    dict
+        A stacked dictionary with the same schema as :func:`ets_f`'s.
+    """
+    y = jnp.asarray(y, dtype=jnp.float64)
+    ny = len(y)
+    S = mod["cand_init_state"].shape[1]
+
+    def _pad_state(v: jnp.ndarray) -> jnp.ndarray:
+        return jnp.pad(v, (0, S - v.shape[0]))
+
+    rolled: dict[str, list] = {k: [] for k in (
+        "fitted", "residuals", "sigma2", "loglik", "aic", "bic", "aicc",
+        "mse", "amse", "last_state",
+    )}
+    for i, (etype, ttype, stype, dtype) in enumerate(mod["candidates"]):
+        nst = mod["cand_nstate"][i]
+        m_i = mod["cand_m"][i]
+        k_i = mod["cand_k"][i]
+        par4 = mod["cand_par"][i]
+        amse, e, states, lik = pegelsresid_C(
+            y=y,
+            m=m_i,
+            init_state=mod["cand_init_state"][i, :nst],
+            errortype=etype,
+            trendtype=ttype,
+            seasontype=stype,
+            damped=dtype,
+            alpha=par4[0],
+            beta=par4[1],
+            gamma=par4[2],
+            phi=par4[3],
+            nmse=3,
+        )
+        aic, bic, aicc = _compute_ic(lik, ny, k_i)
+        if etype == "A":
+            fits_i = y - e
+        else:
+            aux_e = jnp.where(e == -1.0, -1 + 1e-3, e)
+            fits_i = y / (1 + aux_e)
+        sq_e = e * e
+        sigma2_i = jnp.sum(jnp.where(jnp.isinf(sq_e), 0.0, sq_e)) / (ny - k_i - 1)
+        rolled["fitted"].append(fits_i)
+        rolled["residuals"].append(e)
+        rolled["sigma2"].append(sigma2_i)
+        rolled["loglik"].append(-0.5 * lik)
+        rolled["aic"].append(aic)
+        rolled["bic"].append(bic)
+        rolled["aicc"].append(aicc)
+        rolled["mse"].append(amse[0])
+        rolled["amse"].append(jnp.mean(amse))
+        rolled["last_state"].append(_pad_state(states[-1, :]))
+
+    best = mod["best"]
+
+    def _stackrow(key: str) -> jnp.ndarray:
+        return jnp.stack([jnp.asarray(v, dtype=jnp.float64) for v in rolled[key]])
+
+    def _take(stack: jnp.ndarray) -> jnp.ndarray:
+        return jnp.take(stack, best, axis=0)
+
+    cand_fitted = _stackrow("fitted")
+    cand_residuals = _stackrow("residuals")
+    cand_sigma2 = _stackrow("sigma2")
+    cand_loglik = _stackrow("loglik")
+    cand_aic = _stackrow("aic")
+    cand_bic = _stackrow("bic")
+    cand_aicc = _stackrow("aicc")
+    cand_mse = _stackrow("mse")
+    cand_amse = _stackrow("amse")
+    cand_k = jnp.asarray(list(mod["cand_k"]))
+
+    return dict(
+        m=mod["m"],
+        n=ny,
+        ic_name=mod["ic_name"],
+        candidates=mod["candidates"],
+        cand_m=mod["cand_m"],
+        cand_nstate=mod["cand_nstate"],
+        cand_k=mod["cand_k"],
+        cand_par=mod["cand_par"],
+        cand_init_state=mod["cand_init_state"],
+        cand_last_state=jnp.stack(rolled["last_state"]),
+        cand_fitted=cand_fitted,
+        cand_residuals=cand_residuals,
+        cand_sigma2=cand_sigma2,
+        cand_loglik=cand_loglik,
+        cand_aic=cand_aic,
+        cand_bic=cand_bic,
+        cand_aicc=cand_aicc,
+        cand_mse=cand_mse,
+        cand_amse=cand_amse,
+        cand_valid=mod["cand_valid"],
+        ic=mod["ic"],
+        best=best,
+        valid=mod["valid"],
+        fitted=_take(cand_fitted),
+        residuals=_take(cand_residuals),
+        sigma2=_take(cand_sigma2),
+        loglik=_take(cand_loglik),
+        aic=_take(cand_aic),
+        bic=_take(cand_bic),
+        aicc=_take(cand_aicc),
+        mse=_take(cand_mse),
+        amse=_take(cand_amse),
+        par=jnp.take(mod["cand_par"], best, axis=0),
+        n_params=_take(cand_k),
+    )
 
 
 def pegelsfcast_C(
@@ -2448,7 +2176,8 @@ def pegelsfcast_C(
     """
     states = jnp.asarray(obj["states"][-1, :], dtype=jnp.float64)
     etype, ttype, stype = [switch(comp) for comp in obj["components"][:3]]
-    phi = 1.0 if obj["components"][3] == "N" else float(obj["par"][3])
+    # Damping is a static fact of the components string; par[3] may be traced.
+    phi = 1.0 if obj["components"][3] == "N" else obj["par"][3]
     m = int(obj["m"])
 
     # allocate and CAPTURE the result of etsforecast
@@ -2484,17 +2213,25 @@ def _compute_sigmah(
     """
     theta = jnp.zeros((h,), dtype=pf.dtype)
     theta = theta.at[0].set(pf[0] ** 2)
+    idx = jnp.arange(h)
 
     def body(k: int, theta_acc: jnp.ndarray) -> jnp.ndarray:
-        """Advance the multiplicative-error variance recursion."""
-        sum_val = jnp.dot(cvals[:k] ** 2, theta_acc[:k][::-1])
+        """Advance the multiplicative-error variance recursion.
+
+        Computes sum_{j<k} cvals[j]^2 * theta[k-1-j] with a masked
+        full-length gather — the loop index k is traced inside fori_loop,
+        so dynamic slices (cvals[:k], theta_acc[:k][::-1]) cannot compile
+        (slice bounds must be static under jit).
+        """
+        rev = theta_acc[jnp.clip(k - 1 - idx, 0, h - 1)]
+        sum_val = jnp.sum(jnp.where(idx < k, cvals[idx] ** 2 * rev, 0.0))
         return theta_acc.at[k].set(pf[k] ** 2 + sigma * sum_val)
 
     theta = lax.fori_loop(1, h, body, theta)
     return (1 + sigma) * theta - pf**2
 
 
-@partial(jax.jit, static_argnames=("h", "season_length", "trend", "damped"))
+@partial(jax.jit, static_argnames=("h", "season_length", "error", "trend", "seasonality", "damped"))
 def _class3models(
     h: int,
     sigma: float,
@@ -2731,8 +2468,10 @@ def _compute_pred_intervals(
 
         lower_q = 0.5 - jnp.asarray(level) / 200.0
         upper_q = 0.5 + jnp.asarray(level) / 200.0
-        lower = jnp.quantile(y_path, lower_q.reshape(-1, 1), axis=0)
-        upper = jnp.quantile(y_path, upper_q.reshape(-1, 1), axis=0)
+        # q must be rank <= 1 for jnp.quantile; the result is already
+        # (len(level), h), so per-level row indexing below stands.
+        lower = jnp.quantile(y_path, lower_q, axis=0)
+        upper = jnp.quantile(y_path, upper_q, axis=0)
         pi = {
             **{f"lo-{int(lv)}": lower[i] for i, lv in enumerate(level)},
             **{f"hi-{int(lv)}": upper[i] for i, lv in enumerate(level)},
@@ -2778,21 +2517,26 @@ def forward_ets(fitted_model: dict, y: jnp.ndarray) -> dict:
     """Roll a previously fitted ETS model forward on *new* data.
 
     The stored model structure and smoothing parameters are reused — no
-    re-optimisation takes place.  Internally this calls :func:`ets_f`
-    with ``model=fitted_model`` which triggers the dict-input branch.
+    re-optimisation takes place. Stacked dictionaries (from string-model
+    :func:`ets_f`) are re-rolled per candidate via
+    :func:`ets_forward_stacked`; classic single-model dictionaries go
+    through the dict-input branch of :func:`ets_f`. Both paths are
+    traceable under vmap.
 
     Parameters
     ----------
     fitted_model : dict
-        Output of :func:`ets_f` / :func:`etsmodel` (must contain
-        ``"m"``, ``"components"``, ``"par"``, ``"fit"``, ``"n_params"``).
+        Output of :func:`ets_f` (stacked) or a classic dict from
+        :func:`etsmodel` / :func:`ets_winner_view`.
     y : array-like
         New time series segment.
 
     Returns
     -------
     dict
-        Fresh model dict with updated residuals, fitted values, and states
-        computed on *y*, but the same structure and parameters.
+        Fresh model dict (same schema as the input's) with residuals,
+        fitted values, and states recomputed on *y*.
     """
+    if "candidates" in fitted_model:
+        return ets_forward_stacked(fitted_model, y)
     return ets_f(y=y, m=fitted_model["m"], model=fitted_model)

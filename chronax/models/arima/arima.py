@@ -55,14 +55,13 @@ Date:
 """
 
 from __future__ import annotations
-from typing import Any, Dict, Optional, Tuple
-import numpy as np
+from typing import Any, Dict, List, Optional, Tuple
 import jax
 import jax.numpy as jnp
 
 from .auto_arima import (
     arima_fit,
-    _fit_model_bfgs,
+    _fit_model_scan,
     _objective_css,
     _objective_ml,
     _forecast_from_params,
@@ -73,6 +72,7 @@ from .auto_arima import (
 )
 from chronax.models.base_forecaster import BaseForecaster
 from chronax.utils import _quantiles
+from chronax.utils.conformal_intervals import ConformalIntervals
 
 Array = jnp.ndarray
 
@@ -141,6 +141,7 @@ class ARIMA(BaseForecaster):
         method: str = "CSS",
         alias: str = "ARIMA",
         standardize: bool = True,
+        conformal_params: Optional[ConformalIntervals] = None,
     ) -> None:
         """
         Initialize a fixed-order ARIMA estimator.
@@ -157,6 +158,9 @@ class ARIMA(BaseForecaster):
             method (str): Objective method strategy.
             alias (str): User-facing model name.
             standardize (bool): Enables series standardization.
+            conformal_params (ConformalIntervals | None): Conformal prediction
+                configuration; when set, ``fit`` caches conformity scores and
+                interval requests use conformal (not analytic) bounds.
 
         Returns:
             None: Constructor initializes estimator state.
@@ -182,6 +186,8 @@ class ARIMA(BaseForecaster):
         self.alias = alias
         self.model_: dict[str, Any] | None = None
         self.standardize = standardize
+        self.conformal_params = conformal_params
+        self._cs: jnp.ndarray | None = None
         self._y_mean: jnp.ndarray | None = None
         self._y_std: jnp.ndarray | None = None
 
@@ -232,7 +238,9 @@ class ARIMA(BaseForecaster):
             Forecast reconstruction assumes the same differencing specification
             that was used during fitting.
         """
-        y_jax = jnp.asarray(np.array(y), dtype=jnp.float64)
+        # No host round-trip: np.array(y) here concretized traced inputs and
+        # broke conformity_scores' vmapped forecast->fit path (CLAUDE.md §2).
+        y_jax = jnp.asarray(y, dtype=jnp.float64)
         if X is not None:
             X = jnp.asarray(X, dtype=jnp.float64)
 
@@ -256,7 +264,15 @@ class ARIMA(BaseForecaster):
         p, d, q = self.order
         P, D, Q = self.seasonal_order
         self.model_['arma'] = (p, q, P, Q, self.period, d, D)
-        
+
+        # Pre-compute and cache conformity scores on the training series for
+        # predict() intervals (sibling convention: AutoCES/WindowAverage/SES).
+        # Safe without a clone: forecast() below writes nothing to self.
+        if self.conformal_params is not None:
+            self._cs = self.conformity_scores(y=y_jax, X=X)
+        else:
+            self._cs = None
+
         return self
 
     def forecast(self, h: int, y: jnp.ndarray, X: Optional[jnp.ndarray] = None, X_future: Optional[jnp.ndarray] = None, level: Optional[list] = None, fitted: bool = False) -> Dict[str, jnp.ndarray]:
@@ -273,11 +289,14 @@ class ARIMA(BaseForecaster):
             y (jnp.ndarray): Source training series.
             X (jnp.ndarray | None, optional): Exogenous regressors. The fast path currently does not use exogenous variables.
             X_future (jnp.ndarray | None, optional): Future exogenous regressors (unused; included for BaseForecaster compliance). Default is None.
-            level (list | None, optional): Confidence levels (unused; included for BaseForecaster compliance). Default is None.
-            fitted (bool, optional): Whether to return fitted values (unused; included for BaseForecaster compliance). Default is False.
+            level (list | None, optional): Confidence levels (0-100) for conformal
+                prediction intervals. Requires ``conformal_params``. Default is None.
+            fitted (bool, optional): Whether to return fitted values (unused; the
+                fast path computes forecasts only). Default is False.
 
         Returns:
-            dict[str, jnp.ndarray]: Forecast dictionary containing `mean`.
+            dict[str, jnp.ndarray]: Forecast dictionary containing `mean`, plus
+            `lo-{l}`/`hi-{l}` conformal bounds when `level` is given.
 
         Raises:
             RuntimeError: Propagated if optimizer objective diverges.
@@ -294,7 +313,7 @@ class ARIMA(BaseForecaster):
         Notes:
             Uses cached polynomial metadata from constructor configuration.
         """
-        y_jax = jnp.asarray(np.array(y), dtype=jnp.float64)
+        y_jax = jnp.asarray(y, dtype=jnp.float64)
 
         # Standardize input series for fast one-shot fit if enabled
         if self.standardize:
@@ -324,15 +343,19 @@ class ARIMA(BaseForecaster):
         current_params = init_params
         maxiter = 50  # Reduced: CSS converges fast for low-order models
         
+        # _fit_model_scan (not jax.scipy BFGS): this path runs under
+        # conformity_scores' vmap; the scan optimizer is batch-stable by
+        # construction and robust to BFGS's inconsistent line-search-failure
+        # returns.
         if "CSS" in method:
             css_iter = maxiter // 2 if method == "CSS-ML" else maxiter
-            current_params = _fit_model_bfgs(
+            current_params = _fit_model_scan(
                 current_params, y_fit, None, self._delta, _objective_css,
                 self._arma, self._ncxreg, self._n_exog, self.include_mean, css_iter
             )
         if "ML" in method:
             ml_iter = maxiter // 2 if method == "CSS-ML" else maxiter
-            current_params = _fit_model_bfgs(
+            current_params = _fit_model_scan(
                 current_params, y_fit, None, self._delta, _objective_ml,
                 self._arma, self._ncxreg, self._n_exog, self.include_mean, ml_iter
             )
@@ -347,7 +370,20 @@ class ARIMA(BaseForecaster):
         fc_norm = _reconstruct_forecast(raw_fc, y_fit, self._arma, h)
         fc = _aa_denormalize(fc_norm, f_mean, f_std)
 
-        return {"mean": fc}
+        res = {"mean": fc}
+        if level is None:
+            return res
+
+        level = sorted(level)
+        if self.conformal_params is None:
+            raise Exception("You must pass `conformal_params` to compute them.")
+        if h != self.conformal_params.h:
+            raise ValueError(
+                f"h={h} does not match conformal_params.h={self.conformal_params.h}; "
+                "conformity scores cover exactly conformal_params.h steps."
+            )
+        cs = self.conformity_scores(y=y_jax, X=X)
+        return self.add_confidence_intervals(res, cs, level, self.conformal_params.method)
 
     def predict(
         self,
@@ -389,8 +425,15 @@ class ARIMA(BaseForecaster):
             raise RuntimeError("Model not fitted.")
         if X is not None:
             X = jnp.asarray(X, dtype=jnp.float64)
-        
-        preds = predict_arima(self.model_, n_ahead=h, newxreg=X, se_fit=(level is not None))
+
+        # Conformal intervals take over whenever conformal_params is set;
+        # analytic z-score intervals remain the fallback. Standard errors are
+        # only computed when the analytic path will actually use them.
+        use_conformal = level is not None and self.conformal_params is not None
+        preds = predict_arima(
+            self.model_, n_ahead=h, newxreg=X,
+            se_fit=(level is not None and not use_conformal),
+        )
         
         if isinstance(preds, tuple):
             mean_pred, se_pred = preds
@@ -417,7 +460,21 @@ class ARIMA(BaseForecaster):
 
         result = {}
         result["mean"] = mean_orig
-            
+
+        if use_conformal:
+            level = sorted([level] if isinstance(level, int) else list(level))
+            if self._cs is None:
+                raise ValueError(
+                    "Conformity scores are not available. Fit the model (fit(...)) "
+                    "with `conformal_params` set so predict() can use cached scores."
+                )
+            if h != self.conformal_params.h:
+                raise ValueError(
+                    f"h={h} does not match conformal_params.h={self.conformal_params.h}; "
+                    "conformity scores cover exactly conformal_params.h steps."
+                )
+            return self.add_confidence_intervals(result, self._cs, level, self.conformal_params.method)
+
         if level is not None and se_orig is not None:
             if isinstance(level, int): level = (level,)
             z_scores = _quantiles(level)

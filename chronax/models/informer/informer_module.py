@@ -31,13 +31,14 @@ from chronax.models.informer.informer_layers import (
 def distilled_length(input_size: int, n_conv: int) -> int:
     """Sequence length remaining after ``n_conv`` distilling ``ConvLayer``s.
 
-    Each conv applies ``L -> (L-1)//2 + 1`` (the stride-2 maxpool arithmetic from
-    ``ConvLayer``). Pure Python int arithmetic on static shapes, so callers (e.g.
-    the training/model wrappers) can size buffers without invoking the net.
+    Each conv applies ``L -> (L+1)//2 + 1`` (NF-parity circular padding=2 conv
+    expands to L+2, then the stride-2 maxpool arithmetic from ``ConvLayer``).
+    Pure Python int arithmetic on static shapes, so callers (e.g. the
+    training/model wrappers) can size buffers without invoking the net.
     """
     L = input_size
     for _ in range(n_conv):
-        L = (L - 1) // 2 + 1
+        L = (L + 1) // 2 + 1
     return L
 
 

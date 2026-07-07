@@ -22,8 +22,8 @@ Instance Attributes:
 4. phi: float | None - Damping parameter (0.8-0.98), used only if damped=True
 5. alias: str - Custom name for the model
 6. conformal_params: ConformalIntervals | None - Parameters for conformal prediction intervals
-7. allow_extended_iterations: bool - Whether to allow extended iteration counts for difficult series
-8. iteration_scaling: str - Scaling method for adaptive iterations ("quadratic" or "cubic")
+7. allow_extended_iterations: bool - Whether to use the extended iteration budget (400 vs 200)
+8. iteration_scaling: str - Deprecated/inert (formerly scaled a data-adaptive iteration count)
 9. model_: dict - Fitted model parameters (created after fit())
    - fitted: In-sample fitted values
    - level: Final level state
@@ -50,7 +50,6 @@ Helper Methods:
 - _validate_level() - Validate prediction interval levels
 - _initialize_states() - Initialize level and trend via linear regression
 - _get_phi() - Get damping factor
-- _estimate_iterations() - Estimate optimal iteration count based on data complexity
 - _fit_parameters() - Core optimization routine using JAX/optax
 - _generate_forecasts() - Compute h-step ahead point forecasts
 - _calculate_native_intervals() - Analytical prediction interval formulas
@@ -58,7 +57,9 @@ Helper Methods:
 
 Implementation Notes:
 - Uses optax.adam optimizer with exponential learning rate decay
-- Adaptive iteration count based on data complexity (30-400 iterations)
+- Fixed config-derived iteration budget (200, or 400 with allow_extended_iterations)
+  with best-parameters tracking; the former data-adaptive count was incompatible
+  with vmap (data-dependent jit static arg)
 - Module-level JIT functions for efficient compilation caching
 - Supports both native (analytical) and conformal prediction intervals
 - Level and trend initialized via linear regression on first 10 observations
@@ -85,8 +86,8 @@ _LR_DECAY_STEPS = 500
 _LR_DECAY_RATE = 0.9
 _EPSILON = 1e-10  # For numerical stability
 
-# Adaptive iteration constants
-_MIN_ITER = 30
+# Iteration budgets (static, config-derived — a data-dependent count cannot
+# feed jit static_argnums under the vmapped conformal CV path)
 _MAX_ITER = 200
 _MAX_ITER_EXTENDED = 400
 
@@ -150,6 +151,14 @@ def _run_holt_optimization(y, l0, b0, phi, is_additive, n_iters):
 
     step_fn = step_additive if is_additive else step_multiplicative
 
+    # One common dtype for the whole optimizer: l0/b0 arrive as strongly-typed
+    # jnp scalars (no more float() weak types), so every scan-carry leg must
+    # match y.dtype or the carry input/output types differ (crashes on
+    # float32/int inputs under the repo-global x64).
+    dtype = y.dtype
+    l0 = jnp.asarray(l0, dtype=dtype)
+    b0 = jnp.asarray(b0, dtype=dtype)
+
     def raw_fit(params_ab):
         alpha, beta = params_ab
         init_carry = (l0, b0, alpha, beta)
@@ -171,7 +180,6 @@ def _run_holt_optimization(y, l0, b0, phi, is_additive, n_iters):
     def opt_step(carry, _):
         params, opt_state, best_params, best_loss = carry
         loss, grads = value_and_grad_fn(params)
-        loss = jnp.float32(loss)
 
         updates, opt_state = optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
@@ -184,9 +192,9 @@ def _run_holt_optimization(y, l0, b0, phi, is_additive, n_iters):
 
         return (new_params, opt_state, new_best_params, new_best_loss), loss
 
-    init_params = jnp.array([_INIT_ALPHA, _INIT_BETA])
+    init_params = jnp.array([_INIT_ALPHA, _INIT_BETA], dtype=dtype)
     opt_state = optimizer.init(init_params)
-    init_carry = (init_params, opt_state, init_params, jnp.float32(jnp.inf))
+    init_carry = (init_params, opt_state, init_params, jnp.asarray(jnp.inf, dtype=dtype))
     (_, _, best_params, _), _ = lax.scan(opt_step, init_carry, None, length=n_iters)
 
     # Get final results with best parameters
@@ -230,7 +238,7 @@ class Holt(BaseForecaster):
 
         if n_init >= 2:
             # Linear regression: y = l0 + b0 * t
-            t = jnp.arange(n_init, dtype=jnp.float32)
+            t = jnp.arange(n_init, dtype=y.dtype)
             y_init = y[:n_init]
 
             t_mean = jnp.mean(t)
@@ -241,12 +249,13 @@ class Holt(BaseForecaster):
             var_t = jnp.sum((t - t_mean) ** 2)
             b0 = cov_ty / jnp.maximum(var_t, _EPSILON)
 
-            # Intercept
+            # Intercept — stays a jnp scalar: float() on values derived from y
+            # breaks the vmapped conformal CV path.
             l0 = y_mean - b0 * t_mean
 
-            return float(l0), float(b0)
+            return l0, b0
         else:
-            return float(y[0]), 0.0
+            return y[0], 0.0
 
     def _get_phi(self) -> float:
         """Get damping factor phi."""
@@ -255,43 +264,16 @@ class Holt(BaseForecaster):
         else:
             return 1.0
 
-    def _estimate_iterations(self, y: jnp.ndarray) -> int:
-        """Estimate iterations based on noise and trend clarity."""
-        n = len(y)
-
-        # 1. Noise: CV of first differences
-        diffs = y[1:] - y[:-1]
-        cv_diffs = jnp.std(diffs) / jnp.maximum(jnp.abs(jnp.mean(diffs)), _EPSILON)
-        noise_score = float(jnp.clip(cv_diffs / 5.0, 0.0, 1.0))
-
-        # 2. Trend clarity: 1 - R^2 of linear fit
-        t = jnp.arange(n, dtype=jnp.float32)
-        y_mean, t_mean = jnp.mean(y), jnp.mean(t)
-        slope = jnp.sum((t - t_mean) * (y - y_mean)) / jnp.maximum(jnp.sum((t - t_mean)**2), _EPSILON)
-        y_pred = y_mean + slope * (t - t_mean)
-        ss_res = jnp.sum((y - y_pred)**2)
-        ss_tot = jnp.sum((y - y_mean)**2)
-        r_sq = 1 - ss_res / jnp.maximum(ss_tot, _EPSILON)
-        trend_difficulty = float(1.0 - jnp.clip(r_sq, 0.0, 1.0))
-
-        # 3. Length penalty for short series
-        length_score = float(jnp.clip((50 - n) / 50, 0.0, 1.0)) if n < 50 else 0.0
-
-        # Weighted combination
-        complexity = 0.50 * noise_score + 0.35 * trend_difficulty + 0.15 * length_score
-
-        # Scale to range
-        min_iters = _MIN_ITER
-        max_iters = _MAX_ITER_EXTENDED if self.allow_extended_iterations else _MAX_ITER
-        exponent = {"cubic": 3.0, "quadratic": 2.0}[self.iteration_scaling]
-
-        return int(min_iters + (complexity ** exponent) * (max_iters - min_iters))
-
     def _fit_parameters(self, y: jnp.ndarray) -> dict:
         """Fit model parameters and return results dictionary."""
         l0, b0 = self._initialize_states(y)
         phi = self._get_phi()
-        n_iters = self._estimate_iterations(y)
+        # The iteration budget must derive from CONFIG only: it feeds a jit
+        # static_argnum, and a data-dependent count (the old noise/R^2
+        # heuristic) cannot concretize under the vmapped conformal CV path.
+        # Best-params tracking in the optimizer is monotone, so running the
+        # full budget converges equal-or-better than the old adaptive cutoff.
+        n_iters = _MAX_ITER_EXTENDED if self.allow_extended_iterations else _MAX_ITER
         is_additive = self.error_type == 'A'
 
         # Use module-level JIT function
@@ -299,9 +281,10 @@ class Holt(BaseForecaster):
             y, l0, b0, phi, is_additive, n_iters
         )
 
-        # Convert to Python floats for storage
-        result['alpha'] = float(best_params[0])
-        result['beta'] = float(best_params[1])
+        # alpha/beta stay jnp scalars (float() would leak concretization
+        # into the vmapped CV path).
+        result['alpha'] = best_params[0]
+        result['beta'] = best_params[1]
         result['sigma'] = utils.calculate_sigma(result['residuals'], len(y) - _N_PARAMS)
         return result
 
@@ -413,11 +396,12 @@ class Holt(BaseForecaster):
             Parameters for conformal prediction intervals. If None, uses native
             analytical prediction intervals.
         allow_extended_iterations : bool, default=False
-            Whether to allow extended iteration counts (up to 400) for difficult
-            series. Default max is 200.
+            Whether to use the extended iteration budget (400 instead of 200).
         iteration_scaling : str, default="quadratic"
-            Scaling method for adaptive iterations. "quadratic" (default) gives
-            moderate scaling, "cubic" gives more aggressive scaling for complex series.
+            Deprecated/inert. Formerly scaled a data-adaptive iteration count,
+            which was incompatible with vmap (data-dependent jit static arg);
+            the budget is now fixed by allow_extended_iterations alone. The
+            parameter is still accepted and validated for API compatibility.
 
         Raises
         ------
@@ -682,8 +666,8 @@ class Holt(BaseForecaster):
         if level is not None:
             level = sorted(level)
             if self.conformal_params is not None:
-                temp_model = self.model_ if hasattr(self, 'model_') else None
-                self.model_ = result
+                # conformity_scores only calls self.forecast (never reads
+                # model_), so no state needs to be swapped in or restored.
                 cs = self.conformity_scores(y=y, X=X)
                 res = self.add_confidence_intervals(
                     fcst=res,
@@ -691,10 +675,6 @@ class Holt(BaseForecaster):
                     level=level,
                     method=self.conformal_params.method
                 )
-                if temp_model is not None:
-                    self.model_ = temp_model
-                else:
-                    delattr(self, 'model_')
             else:
                 sigmah = self._calculate_native_intervals(
                     mean,
@@ -780,8 +760,8 @@ class Holt(BaseForecaster):
         if level is not None:
             level = sorted(level)
             if self.conformal_params is not None:
-                temp_model = self.model_
-                self.model_ = result
+                # conformity_scores only calls self.forecast (never reads
+                # model_), so no state needs to be swapped in or restored.
                 cs = self.conformity_scores(y=y, X=X)
                 res = self.add_confidence_intervals(
                     fcst=res,
@@ -789,7 +769,6 @@ class Holt(BaseForecaster):
                     level=level,
                     method=self.conformal_params.method
                 )
-                self.model_ = temp_model
             else:
                 sigmah = self._calculate_native_intervals(
                     mean,

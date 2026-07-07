@@ -115,13 +115,6 @@ class HistoricAverage(BaseForecaster):
             "sigma": utils.calculate_sigma(residuals, len(y) - 1),
             "n": len(y),
         }
-        
-        # Fast conformity: vmap over dynamic slices
-        @jax.jit
-        def forecast_fn(y_full, X_full, te, h):
-            return jnp.full((h,), jnp.nanmean(y_full[:te]), dtype=jnp.float32)
-        
-        self.forecast_fn = forecast_fn
         return self
 
     def predict(self, h: int, X: jnp.ndarray | None = None, level: list[int] | None = None) -> dict:

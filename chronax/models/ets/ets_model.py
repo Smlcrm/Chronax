@@ -18,7 +18,7 @@ import jax.numpy as jnp
 
 from chronax.utils import ConformalIntervals, ensure_float, _add_fitted_pi, calculate_sigma
 from chronax.models.base_forecaster import BaseForecaster
-from .ets_functions import ets_f, forecast_ets, forward_ets
+from .ets_functions import ets_f, ets_winner_view, forecast_ets, forward_ets
 
 _PHI_LOWER: float = 0.8
 _PHI_UPPER: float = 0.98
@@ -155,7 +155,9 @@ class ETS(BaseForecaster):
             ``self``, for method chaining.
         """
         y = ensure_float(y)
-        self.model_ = ets_f(
+        # A fixed spec always yields exactly one candidate, so the winner view
+        # is a static index-0 selection — no concretization, fit stays traceable.
+        self.model_ = ets_winner_view(ets_f(
             y,
             m=self.season_length,
             model=self.model,
@@ -164,9 +166,11 @@ class ETS(BaseForecaster):
             optax_steps=self.max_iter,
             optax_lr=self.optax_lr,
             optax_clip=self.optax_clip,
-        )
+        ))
         self.model_["actual_residuals"] = y - self.model_["fitted"]
 
+        # forecast() below is write-free, so the vmapped CV re-fits inside
+        # conformity_scores cannot leak tracers onto this fitted estimator.
         if self.conformal_params is not None:
             self._cs = self.conformity_scores(y=y, X=X)
         else:
@@ -206,7 +210,7 @@ class ETS(BaseForecaster):
         """
         if not hasattr(self, "model_"):
             raise Exception("You have to use the `fit` method first")
-        fcst = forecast_ets(self.model_, h=h, level=level)
+        fcst = forecast_ets(self.model_, h=h, level=None)
         out = {"mean": fcst["mean"]}
 
         if level is None:
@@ -214,15 +218,24 @@ class ETS(BaseForecaster):
 
         level_sorted = sorted(level)
         if self.conformal_params is not None:
-            if self._cs is None:
+            if getattr(self, "_cs", None) is None:
                 raise ValueError(
                     "Conformity scores not cached. Fit with conformal_params set, "
                     "or use forecast(y, ...) which recomputes them."
+                )
+            if h != self.conformal_params.h:
+                raise ValueError(
+                    f"h={h} does not match conformal_params.h={self.conformal_params.h}; "
+                    "conformity scores cover exactly conformal_params.h steps."
                 )
             return self.add_confidence_intervals(
                 fcst=out, cs=self._cs, level=level_sorted, method=self.conformal_params.method
             )
 
+        # Native intervals only when actually taken — the interval machinery
+        # is eager-only and class-dependent, so it must not run (and possibly
+        # crash) just to be discarded on the conformal path.
+        fcst = forecast_ets(self.model_, h=h, level=level_sorted)
         out.update({f"lo-{l}": fcst[f"lo-{l}"] for l in reversed(level_sorted)})
         out.update({f"hi-{l}": fcst[f"hi-{l}"] for l in level_sorted})
         return out
@@ -304,7 +317,9 @@ class ETS(BaseForecaster):
             ``"fitted-lo-{level}"``, and ``"fitted-hi-{level}"``.
         """
         y = ensure_float(y)
-        mod = ets_f(
+        # Single-candidate winner view: static index-0 selection, traceable
+        # under the conformity_scores vmap (level is None on that path).
+        mod = ets_winner_view(ets_f(
             y,
             m=self.season_length,
             model=self.model,
@@ -313,8 +328,8 @@ class ETS(BaseForecaster):
             optax_steps=self.optax_steps,
             optax_lr=self.optax_lr,
             optax_clip=self.optax_clip,
-        )
-        fcst = forecast_ets(mod, h=h, level=level)
+        ))
+        fcst = forecast_ets(mod, h=h, level=None)
 
         keys = ["mean"]
         if fitted:
@@ -326,11 +341,18 @@ class ETS(BaseForecaster):
 
         level_sorted = sorted(level)
         if self.conformal_params is not None:
+            if h != self.conformal_params.h:
+                raise ValueError(
+                    f"h={h} does not match conformal_params.h={self.conformal_params.h}; "
+                    "conformity scores cover exactly conformal_params.h steps."
+                )
             cs = self.conformity_scores(y=y, X=X)
             out = self.add_confidence_intervals(
                 fcst=out, cs=cs, level=level_sorted, method=self.conformal_params.method
             )
         else:
+            # Native intervals only when actually taken (eager-only machinery).
+            fcst = forecast_ets(mod, h=h, level=level_sorted)
             out = {
                 **out,
                 **{f"lo-{l}": fcst[f"lo-{l}"] for l in reversed(level_sorted)},
@@ -338,7 +360,6 @@ class ETS(BaseForecaster):
             }
 
         if fitted:
-            # se = _calculate_sigma(y - mod["fitted"], len(y) - mod["n_params"])
             se = calculate_sigma(y - mod["fitted"], len(y) - mod["n_params"])
             out = _add_fitted_pi(res=out, se=se, level=level_sorted)
         return out
@@ -388,7 +409,7 @@ class ETS(BaseForecaster):
             raise Exception("You have to use the `fit` method first")
         y = ensure_float(y)
         mod = forward_ets(self.model_, y=y)
-        fcst = forecast_ets(mod, h=h, level=level)
+        fcst = forecast_ets(mod, h=h, level=None)
 
         keys = ["mean"]
         if fitted:
@@ -400,17 +421,23 @@ class ETS(BaseForecaster):
 
         level_sorted = sorted(level)
         if self.conformal_params is not None:
+            if h != self.conformal_params.h:
+                raise ValueError(
+                    f"h={h} does not match conformal_params.h={self.conformal_params.h}; "
+                    "conformity scores cover exactly conformal_params.h steps."
+                )
             cs = self.conformity_scores(y=y, X=X)
             out = self.add_confidence_intervals(
                 fcst=out, cs=cs, level=level_sorted, method=self.conformal_params.method
             )
         else:
+            # Native intervals only when actually taken (eager-only machinery).
+            fcst = forecast_ets(mod, h=h, level=level_sorted)
             out.update({f"lo-{l}": fcst[f"lo-{l}"] for l in reversed(level_sorted)})
             out.update({f"hi-{l}": fcst[f"hi-{l}"] for l in level_sorted})
 
             if fitted:
-                # se = _calculate_sigma(y - mod["fitted"], len(y) - int(mod["n_params"]))
-                se = calculate_sigma(y - mod["fitted"], len(y) - int(mod["n_params"]))
+                se = calculate_sigma(y - mod["fitted"], len(y) - mod["n_params"])
                 out = _add_fitted_pi(res=out, se=se, level=level_sorted)
 
         return out

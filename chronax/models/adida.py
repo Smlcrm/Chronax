@@ -1,6 +1,7 @@
 
 """ADIDA forecaster implementation."""
 
+import jax
 import jax.numpy as jnp
 from jax import jit, lax
 from functools import lru_cache
@@ -34,14 +35,13 @@ def _interval_mean(y: jnp.ndarray) -> jnp.ndarray:
     """Compute the average interval between non-zero observations."""
     nonzero_mask = y != 0
     nonzero_count = jnp.count_nonzero(nonzero_mask)
-    if nonzero_count == 0:
-        return jnp.array(1.0, dtype=y.dtype)
-
     # mean(diff(nonzero_idxs + 1, prepend=0)) == (last_nonzero_idx + 1) / count_nonzero
     last_nonzero_idx = jnp.max(
         jnp.where(nonzero_mask, jnp.arange(y.shape[0], dtype=jnp.int32), 0)
     )
-    return (last_nonzero_idx.astype(y.dtype) + 1.0) / nonzero_count.astype(y.dtype)
+    safe_count = jnp.maximum(nonzero_count, 1).astype(y.dtype)
+    mean = (last_nonzero_idx.astype(y.dtype) + 1.0) / safe_count
+    return jnp.where(nonzero_count == 0, jnp.array(1.0, dtype=y.dtype), mean)
 
 
 def _ses_sse(alpha: jnp.ndarray, x: jnp.ndarray) -> jnp.ndarray:
@@ -187,15 +187,102 @@ def _repeat_val_jax(val: jnp.ndarray, h: int) -> jnp.ndarray:
     return jnp.full((h,), val)
 
 
+def _masked_ses_sse(
+    alpha: jnp.ndarray, x: jnp.ndarray, n_valid: jnp.ndarray
+) -> jnp.ndarray:
+    """SES sum of squared one-step errors over the first ``n_valid`` entries."""
+    complement = 1.0 - alpha
+    init_carry = (x[0], jnp.array(0.0, dtype=x.dtype))
+
+    def body(
+        i: int, carry: Tuple[jnp.ndarray, jnp.ndarray]
+    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        forecast, sse = carry
+        new_forecast = alpha * x[i - 1] + complement * forecast
+        err = x[i] - new_forecast
+        valid = i < n_valid
+        return (
+            jnp.where(valid, new_forecast, forecast),
+            jnp.where(valid, sse + err * err, sse),
+        )
+
+    _, sse = lax.fori_loop(1, x.shape[0], body, init_carry)
+    return sse
+
+
+def _masked_ses_forecast(
+    alpha: jnp.ndarray, x: jnp.ndarray, n_valid: jnp.ndarray
+) -> jnp.ndarray:
+    """Next SES forecast using only the first ``n_valid`` entries of ``x``."""
+    complement = 1.0 - alpha
+
+    def body(i: int, forecast: jnp.ndarray) -> jnp.ndarray:
+        return jnp.where(i < n_valid, alpha * x[i - 1] + complement * forecast, forecast)
+
+    fitted_last = lax.fori_loop(1, x.shape[0], body, x[0])
+    x_last = jnp.take(x, jnp.clip(n_valid - 1, 0, x.shape[0] - 1))
+    return alpha * x_last + complement * fitted_last
+
+
+def _masked_optimized_ses_forecast(
+    x: jnp.ndarray, n_valid: jnp.ndarray
+) -> jnp.ndarray:
+    """Golden-section alpha search + SES forecast over a masked prefix."""
+    left = jnp.array(_ALPHA_LOWER, dtype=x.dtype)
+    right = jnp.array(_ALPHA_UPPER, dtype=x.dtype)
+    ratio = jnp.array(_GOLDEN_RATIO, dtype=x.dtype)
+    c = right - ratio * (right - left)
+    d = left + ratio * (right - left)
+    fc = _masked_ses_sse(c, x, n_valid)
+    fd = _masked_ses_sse(d, x, n_valid)
+
+    def step(_, state):
+        left, right, c, d, fc, fd = state
+
+        def keep_left(curr):
+            left, right, c, d, fc, fd = curr
+            right, d, fd = d, c, fc
+            c = right - ratio * (right - left)
+            return left, right, c, d, _masked_ses_sse(c, x, n_valid), fd
+
+        def keep_right(curr):
+            left, right, c, d, fc, fd = curr
+            left, c, fc = c, d, fd
+            d = left + ratio * (right - left)
+            return left, right, c, d, fc, _masked_ses_sse(d, x, n_valid)
+
+        return lax.cond(fc <= fd, keep_left, keep_right, state)
+
+    left, right, _, _, _, _ = lax.fori_loop(
+        0, _ALPHA_SEARCH_ITERS, step, (left, right, c, d, fc, fd)
+    )
+    alpha = 0.5 * (left + right)
+    return _masked_ses_forecast(alpha, x, n_valid)
+
+
 def _adida_point(
     y: jnp.ndarray,  # time series
     h: int,  # forecasting horizon
 ) -> ForecastDict:
-    """Generate ADIDA point forecasts for horizon ``h``."""
+    """Generate ADIDA point forecasts for horizon ``h`` (vmap/jit-traceable).
+
+    The aggregation level is data-dependent, so all shapes stay static:
+    positions map to chunk ids, sums land in a fixed length-n buffer via
+    segment_sum, and SES runs over the masked ``n_chunks`` prefix.
+    """
+    n = y.shape[0]
     mean_interval = _interval_mean(y)
-    aggregation_level = max(1, int(jnp.round(mean_interval).item()))
-    sums_forecast = _chunk_forecast_fast(y, aggregation_level)
-    forecast = sums_forecast / aggregation_level
+    agg_level = jnp.clip(jnp.round(mean_interval).astype(jnp.int32), 1, n)
+    lost = jnp.mod(n, agg_level)          # leading remainder is dropped
+    n_chunks = n // agg_level
+    idx = jnp.arange(n)
+    valid = idx >= lost
+    chunk_id = jnp.clip((idx - lost) // agg_level, 0, n - 1)
+    contrib = jnp.where(valid, y, jnp.zeros((), dtype=y.dtype))
+    aggregation_sums = jax.ops.segment_sum(contrib, chunk_id, num_segments=n)
+    ses = _masked_optimized_ses_forecast(aggregation_sums, n_chunks)
+    sums_forecast = jnp.where(n_chunks == 1, aggregation_sums[0], ses)
+    forecast = sums_forecast / agg_level.astype(y.dtype)
     return {"mean": _repeat_val_jax(val=forecast, h=h)}
 
 

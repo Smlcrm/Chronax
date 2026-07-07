@@ -108,26 +108,28 @@ class OptimResult(NamedTuple):
 
     Attributes
     ----------
-    success : bool
-        Whether termination was successful under the convergence test.
+    success : jnp.ndarray
+        Traced boolean scalar — whether the best parameters and loss are finite.
+        (A jnp value, not a Python bool: the optimizer must stay traceable
+        under vmap, so no concretizing casts are allowed here.)
     status : int
-        0 for success; 2 for non-finite parameters.
+        Always 0 (kept for API compatibility).
     message : str
         Human-readable status message.
     x : jnp.ndarray
         Best-found parameter vector.
-    fun : float
-        Objective value at `x`.
+    fun : jnp.ndarray
+        Objective value at `x` (traced scalar).
     nit : int
-        Number of iterations performed.
+        Number of iterations performed (static).
     nfev : int
-        Number of objective evaluations performed.
+        Number of objective evaluations performed (static).
     """
-    success: bool
+    success: jnp.ndarray
     status: int
     message: str
     x: jnp.ndarray
-    fun: float
+    fun: jnp.ndarray
     nit: int
     nfev: int
 
@@ -1182,6 +1184,126 @@ def _objective_smoothing_only(
 
 
 
+_LBFGS_STEPS = 30
+"""Fixed L-BFGS refinement budget (quasi-Newton steps after the Adam warm-up)."""
+
+
+@lru_cache(maxsize=256)
+def _get_optimizer_runner(
+    error: Component,
+    trend: Component,
+    season: Component,
+    opt_crit: Criterion,
+    n_mse: int,
+    m: int,
+    opt_alpha: bool,
+    opt_beta: bool,
+    opt_gamma: bool,
+    opt_phi: bool,
+    clip_multiplicative_errors: bool,
+    pure_sigmoid: bool,
+    opt_init_state: bool,
+    n_state: int,
+    n_obs: int,
+    adam_steps: int,
+    adam_lr: float,
+) -> Callable[..., Tuple[jnp.ndarray, jnp.ndarray]]:
+    """Build (and cache) the jitted two-phase scan optimizer for one static config.
+
+    All arguments are *config/shape-static* (Component enums, ints, bools,
+    the learning rate). Caching on them keeps the returned jitted callable's
+    identity stable across calls, so XLA compiles once per (structure, shape)
+    instead of re-tracing freshly-created closures on every fit.
+
+    The returned callable takes only data-level arrays
+    ``(x0, y, init_state, alpha, beta, gamma, phi, lower, upper)`` and returns
+    ``(best_params, best_loss)`` as traced values — the whole optimizer is a
+    pair of ``lax.scan`` loops (Adam warm-up, then L-BFGS refinement) with
+    best-iterate tracking in the carry, so it is natively traceable under
+    ``jax.vmap`` (no host loop, no ``device_get``, no try/except).
+    """
+    core_obj = _get_objective_closure(
+        error, trend, season, opt_crit, n_mse, m,
+        opt_alpha, opt_beta, opt_gamma, opt_phi,
+        clip_multiplicative_errors, pure_sigmoid, opt_init_state, n_state,
+    )
+
+    def _run(
+        x0: jnp.ndarray,
+        y: jnp.ndarray,
+        init_state: jnp.ndarray,
+        alpha: jnp.float64,
+        beta: jnp.float64,
+        gamma: jnp.float64,
+        phi: jnp.float64,
+        lower: jnp.ndarray,
+        upper: jnp.ndarray,
+    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        def _obj(p: jnp.ndarray) -> jnp.float64:
+            return core_obj(p, y, init_state, n_obs, alpha, beta, gamma, phi, lower, upper)
+
+        vg_fn = jax.value_and_grad(_obj)
+
+        # Both phases share one step shape: evaluate at p, update, and track
+        # the best *evaluated* point (never the post-update point, whose loss
+        # is unknown — storing new_p with p's loss mislabels the optimum).
+        # A NaN/Inf loss can never become the best, so a diverging line
+        # search or exploding rollout degrades gracefully to the best finite
+        # iterate instead of needing a try/except escape hatch.
+        def _tracked_step(opt_update):
+            def step(carry, _):
+                p, opt_state, best_p, best_loss = carry
+                loss, grads = vg_fn(p)
+                grads = jnp.where(jnp.isfinite(grads), grads, 0.0)
+                updates, opt_state = opt_update(grads, opt_state, p, loss)
+                new_p = optax.apply_updates(p, updates)
+                improved = jnp.isfinite(loss) & (loss < best_loss)
+                best_p = jnp.where(improved, p, best_p)
+                best_loss = jnp.where(improved, loss, best_loss)
+                return (new_p, opt_state, best_p, best_loss), None
+            return step
+
+        inf = jnp.asarray(jnp.inf, dtype=jnp.float64)
+
+        # ── Phase 1: Adam warm-up ─────────────────────────────────────
+        adam = optax.adam(adam_lr)
+
+        def _adam_update(grads, state, p, loss):
+            return adam.update(grads, state, p)
+
+        if adam_steps > 0:
+            (_, _, adam_p, adam_loss), _ = lax.scan(
+                _tracked_step(_adam_update),
+                (x0, adam.init(x0), x0, inf),
+                None,
+                length=adam_steps,
+            )
+        else:
+            adam_p, adam_loss = x0, inf
+
+        # ── Phase 2: L-BFGS refinement, seeded from Adam's best point ─
+        lbfgs = optax.lbfgs(
+            memory_size=8,
+            linesearch=optax.scale_by_zoom_linesearch(
+                max_linesearch_steps=15,
+                initial_guess_strategy="one",
+            ),
+        )
+
+        def _lbfgs_update(grads, state, p, loss):
+            return lbfgs.update(grads, state, p, value=loss, grad=grads, value_fn=_obj)
+
+        (_, _, best_p, best_loss), _ = lax.scan(
+            _tracked_step(_lbfgs_update),
+            (adam_p, lbfgs.init(adam_p), adam_p, adam_loss),
+            None,
+            length=_LBFGS_STEPS,
+        )
+        return best_p, best_loss
+
+    return jax.jit(_run)
+
+
 def optimize_bfgs_smoothing(
     x0: jnp.ndarray,
     y: jnp.ndarray,
@@ -1223,10 +1345,12 @@ def optimize_bfgs_smoothing(
     1. **Adam warm-up** — a short burst of momentum-based first-order steps
        (15–30 iterations depending on series length) that moves ``x0`` into
        a reasonable basin.
-    2. **L-BFGS refinement** — 30 quasi-Newton steps compiled via
-       ``lax.scan`` into a single XLA kernel for minimal dispatch overhead.
+    2. **L-BFGS refinement** — 30 quasi-Newton steps.
 
-    The best parameter vector seen across *both* phases is returned.
+    Both phases run as ``lax.scan`` loops with best-iterate tracking in the
+    carry, so the whole optimizer is natively traceable under ``jax.vmap``
+    (the conformity_scores CV path). The best parameter vector seen across
+    *both* phases is returned.
 
     Parameters
     ----------
@@ -1260,7 +1384,8 @@ def optimize_bfgs_smoothing(
     clip_norm : float
         *(Unused — kept for caller API compatibility.)*
     early_stop_patience : int
-        *(Unused — ``lax.scan`` runs a fixed number of iterations.)*
+        *(Unused — ``lax.scan`` runs a fixed number of iterations; host-side
+        early stopping would require concretizing the traced loss.)*
     early_stop_min_delta : float
         *(Unused — kept for API compatibility.)*
     adaptive_tol : bool
@@ -1281,6 +1406,7 @@ def optimize_bfgs_smoothing(
     OptimResult
         Named tuple with fields ``success``, ``status``, ``message``,
         ``x`` (best params), ``fun`` (best loss), ``nit``, ``nfev``.
+        ``x``/``fun``/``success`` are jnp values (traced under vmap).
     """
     # ── Input normalisation ───────────────────────────────────────────
     x0 = jnp.asarray(x0, dtype=jnp.float64)
@@ -1289,56 +1415,9 @@ def optimize_bfgs_smoothing(
     lower = jnp.asarray(lower, dtype=jnp.float64)
     upper = jnp.asarray(upper, dtype=jnp.float64)
 
-    # Build objective closure — cached per model structure so JAX traces once.
-    core_obj = _get_objective_closure(
-        error,
-        trend,
-        season,
-        opt_crit,
-        int(n_mse),
-        int(m),
-        bool(opt_alpha),
-        bool(opt_beta),
-        bool(opt_gamma),
-        bool(opt_phi),
-        bool(clip_multiplicative_errors),
-        bool(pure_sigmoid),
-        bool(opt_init_state),
-        int(n_state),
-    )
-
-    # Thin wrapper capturing data arrays so optax only passes/differentiates p.
-    def _core_obj(p: jnp.ndarray) -> jnp.float64:
-        """Evaluate the cached objective closure against the captured data arrays."""
-        return core_obj(
-            p,
-            y,
-            init_state,
-            n_obs,
-            alpha,
-            beta,
-            gamma,
-            phi,
-            lower,
-            upper,
-        )
-
-    # JIT-compile value-and-grad for the Adam phase (called from Python loop).
-    _jit_val_and_grad = jax.jit(jax.value_and_grad(_core_obj))
-
-    best_loss = float("inf")
-    best_params = jnp.array(x0)
-    nit = 0
-
-    # ══════════════════════════════════════════════════════════════════
-    # Phase 1: Adam warm-up (Python loop, ~15-30 steps)
-    # ──────────────────────────────────────────────────────────────────
-    # Adam is a momentum-based first-order optimizer that handles noisy
-    # gradients well.  A short burst moves x0 into a reasonable basin
-    # before handing off to L-BFGS.
-    # Step counts are inversely scaled with series length because each
-    # grad eval is O(n) in the ETS rollout.
-    # ══════════════════════════════════════════════════════════════════
+    # Adam budget: static, derived from *shape* (n_obs) and config only.
+    # Step counts are inversely scaled with series length because each grad
+    # eval is O(n) in the ETS rollout.
     if int(n_obs) <= 200:
         adam_steps = min(int(steps), 30)
         adam_lr = float(lr) if lr is not None else 5e-2
@@ -1349,109 +1428,25 @@ def optimize_bfgs_smoothing(
         adam_steps = min(int(steps), 15)
         adam_lr = float(lr) if lr is not None else 2e-2
 
-    try:
-        adam_opt = optax.adam(adam_lr)
-        adam_state = adam_opt.init(x0)
+    runner = _get_optimizer_runner(
+        error, trend, season, opt_crit, int(n_mse), int(m),
+        bool(opt_alpha), bool(opt_beta), bool(opt_gamma), bool(opt_phi),
+        bool(clip_multiplicative_errors), bool(pure_sigmoid),
+        bool(opt_init_state), int(n_state),
+        int(n_obs), adam_steps, adam_lr,
+    )
+    best_params, best_loss = runner(x0, y, init_state, alpha, beta, gamma, phi, lower, upper)
 
-        for _ in range(int(adam_steps)):
-            loss, grads = _jit_val_and_grad(x0)
-            grads = jnp.where(jnp.isfinite(grads), grads, 0.0)  # sanitise NaN/Inf grads
-            updates, adam_state = adam_opt.update(grads, adam_state, x0)
-            x0 = optax.apply_updates(x0, updates)
-            nit += 1
-
-            # Track best point seen (Adam can overshoot).
-            loss_val = float(jax.device_get(loss))
-            if loss_val < best_loss:
-                best_loss = loss_val
-                best_params = jnp.array(x0)
-    except Exception:
-        pass  # AD or numerical issue — keep best point found so far
-
-    # Seed L-BFGS from the best Adam iterate.
-    x0 = best_params
-
-    # ══════════════════════════════════════════════════════════════════
-    # Phase 2: L-BFGS refinement (lax.scan — single XLA kernel)
-    # ──────────────────────────────────────────────────────────────────
-    # L-BFGS is a quasi-Newton method with super-linear convergence near
-    # a minimum.  30 steps is typically more than enough.
-    #
-    # The loop is implemented via lax.scan so that JAX compiles the full
-    # iteration (including the zoom line-search inside each step) into
-    # one fused XLA kernel.  This eliminates Python dispatch overhead and
-    # is critical for cold-start performance where many candidate models
-    # must each be optimized during model selection.
-    #
-    # Best-parameter tracking is done purely in JAX arrays inside the
-    # scan carry — no Python side-effects are needed.
-    # ══════════════════════════════════════════════════════════════════
-    _LBFGS_STEPS = 30
-
-    try:
-        lbfgs_solver = optax.lbfgs(
-            memory_size=8,       # number of past (s, y) pairs for Hessian approx
-            linesearch=optax.scale_by_zoom_linesearch(
-                max_linesearch_steps=15,     # cap per-step line-search evals
-                initial_guess_strategy="one",
-            ),
-        )
-
-        def _run_lbfgs(x0_in: jnp.ndarray) -> tuple[jnp.ndarray, jnp.float64]:
-            """Run the full L-BFGS loop inside lax.scan (JIT-friendly)."""
-            lbfgs_state = lbfgs_solver.init(x0_in)
-            vg_fn = jax.value_and_grad(_core_obj)
-
-            def _step(carry: tuple[Any, ...], _: jnp.ndarray) -> tuple[tuple[Any, ...], None]:
-                """Run one L-BFGS update and track the best point seen so far."""
-                p, state, best_p, best_loss = carry
-                loss, grads = vg_fn(p)
-                grads = jnp.where(jnp.isfinite(grads), grads, 0.0)  # sanitise grads
-                updates, new_state = lbfgs_solver.update(
-                    grads, state, p,
-                    value=loss, grad=grads, value_fn=_core_obj,
-                )
-                new_p = optax.apply_updates(p, updates)
-                # Track best point purely in JAX arrays (no Python side-effects).
-                improved = jnp.isfinite(loss) & (loss < best_loss)
-                best_p = jnp.where(improved, p, best_p)
-                best_loss = jnp.where(improved, loss, best_loss)
-                return (new_p, new_state, best_p, best_loss), None
-
-            init_loss = _core_obj(x0_in)
-            init_carry = (x0_in, lbfgs_state, x0_in, init_loss)
-            (_, _, best_p, best_l), _ = lax.scan(
-                _step, init_carry, jnp.arange(_LBFGS_STEPS),
-            )
-            return best_p, best_l
-
-        # JIT the entire L-BFGS loop — one compilation per unique array shape.
-        lbfgs_p, lbfgs_l = jax.jit(_run_lbfgs)(x0)
-        lbfgs_loss_val = float(jax.device_get(lbfgs_l))
-        if lbfgs_loss_val < best_loss:
-            best_loss = lbfgs_loss_val
-            best_params = lbfgs_p
-        nit += _LBFGS_STEPS
-    except Exception:
-        # If L-BFGS fails (e.g. line-search divergence), keep Adam's best.
-        pass
-
-    # ── Assemble result ───────────────────────────────────────────────
-    params = best_params
-    fun = best_loss
-
-    success = bool(jnp.isfinite(jnp.asarray(params)).all())
-    status = 0 if success else 2
-    msg = "ok" if status == 0 else "Non-finite parameters encountered."
-    fun_out = fun if isinstance(fun, jax.core.Tracer) else float(jax.device_get(fun))
+    nit = adam_steps + _LBFGS_STEPS
+    success = jnp.isfinite(best_params).all() & jnp.isfinite(best_loss)
     return OptimResult(
         success=success,
-        status=status,
-        message=msg,
-        x=jnp.asarray(params, dtype=jnp.float64),
-        fun=fun_out,
-        nit=int(nit),
-        nfev=int(nit),
+        status=0,
+        message="ok",
+        x=best_params,
+        fun=best_loss,
+        nit=nit,
+        nfev=nit,
     )
 
 

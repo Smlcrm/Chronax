@@ -259,31 +259,38 @@ class AttentionLayer(nnx.Module):
 class ConvLayer(nnx.Module):
     """Self-attention distilling layer (NF ``ConvLayer``).
 
-    Halves the sequence length between encoder stacks: a length-preserving
-    circular conv (torch ``Conv1d(kernel_size=3, padding=1, padding_mode=
-    'circular')`` default init — same ``U(-1/sqrt(fan_in), 1/sqrt(fan_in))``
-    bound as ``_torch_linear``, with ``fan_in = 3 * c_in`` for both kernel and
-    bias) feeds a ``BatchNorm`` + ELU, then a stride-2 max-pool. ``BatchNorm``
-    (rather than dropout/LayerNorm) is what the reference actually uses here,
-    so — like ``patchtst_module.py``'s ``TSTEncoderLayer`` — the running-stat
-    toggle is threaded as its own ``use_running_average`` flag; there is no
-    dropout in this layer, so there is no ``deterministic`` argument.
+    Roughly halves the sequence length between encoder stacks. NF pins torch
+    ``Conv1d(kernel_size=3, padding=2, padding_mode='circular')`` — the paper
+    repo's padding is torch-version-conditional and the NF benchmark twin uses
+    padding=2, which EXPANDS the sequence to ``L + 2`` before the pool (the
+    length-preserving padding=1 variant used here until 2026-07-07 was a parity
+    bug, not a decision). Torch circular padding draws the left pad from the
+    sequence tail and the right pad from its head, so we pre-pad explicitly and
+    run a VALID conv. Init matches torch ``Conv1d`` default — same
+    ``U(-1/sqrt(fan_in), 1/sqrt(fan_in))`` bound as ``_torch_linear``, with
+    ``fan_in = 3 * c_in`` for both kernel and bias. The conv feeds a
+    ``BatchNorm`` + ELU, then a stride-2 max-pool. ``BatchNorm`` (rather than
+    dropout/LayerNorm) is what the reference actually uses here, so — like
+    ``patchtst_module.py``'s ``TSTEncoderLayer`` — the running-stat toggle is
+    threaded as its own ``use_running_average`` flag; there is no dropout in
+    this layer, so there is no ``deterministic`` argument.
 
     The max-pool ``padding=((1, 1),)`` pads with ``-inf`` (flax's ``max_pool``
     convention), matching torch's ``MaxPool1d(kernel_size=3, stride=2,
-    padding=1)`` behavior on the boundary. Output length is ``(L-1)//2 + 1``.
+    padding=1)`` behavior on the boundary. Output length is ``(L+1)//2 + 1``.
     """
 
     def __init__(self, c_in: int, *, rngs: nnx.Rngs) -> None:
         self.conv = nnx.Conv(
-            c_in, c_in, kernel_size=(3,), padding="CIRCULAR", use_bias=True,
+            c_in, c_in, kernel_size=(3,), padding="VALID", use_bias=True,
             kernel_init=_TorchLinearInit(3 * c_in), bias_init=_TorchLinearInit(3 * c_in), rngs=rngs,
         )
         self.norm = nnx.BatchNorm(c_in, axis=-1, momentum=0.9, epsilon=1e-5, rngs=rngs)
 
     def __call__(self, x: jnp.ndarray, *, use_running_average: bool) -> jnp.ndarray:
-        """x: ``[B, L, C]`` -> ``[B, (L-1)//2 + 1, C]``."""
-        x = self.conv(x)
+        """x: ``[B, L, C]`` -> ``[B, (L+1)//2 + 1, C]``."""
+        x = jnp.concatenate([x[:, -2:], x, x[:, :2]], axis=1)  # torch circular padding=2
+        x = self.conv(x)  # VALID k=3 on L+4 -> L+2
         x = self.norm(x, use_running_average=use_running_average)
         x = jax.nn.elu(x)
         return nnx.max_pool(x, window_shape=(3,), strides=(2,), padding=((1, 1),))

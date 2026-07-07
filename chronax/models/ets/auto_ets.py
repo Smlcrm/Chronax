@@ -2,8 +2,6 @@ from __future__ import annotations
 from typing import Any, List, Optional
 
 import jax.numpy as jnp
-import os
-import time
 
 from chronax.utils import (
     ConformalIntervals,
@@ -14,7 +12,14 @@ from chronax.utils import (
 
 from chronax.models.base_forecaster import BaseForecaster
 
-from .ets_functions import ets_f, forecast_ets, forward_ets, _infer_season_length
+from .ets_functions import (
+    ets_f,
+    ets_point_forecast,
+    ets_winner_view,
+    forecast_ets,
+    forward_ets,
+)
+
 _PHI_LOWER = 0.8
 _PHI_UPPER = 0.98
 
@@ -33,11 +38,29 @@ class AutoETS(BaseForecaster):
     If the component is selected as 'Z', it operates as a placeholder to ask the AutoETS model
     to figure out the best parameter.
 
+    vmap contract: every candidate in the (config/shape-static) grid is fitted
+    and the winner is a traced ``jnp.argmin`` over information criteria, so
+    ``fit``/``forecast`` trace natively under ``jax.vmap`` — the base class's
+    ``conformity_scores`` CV path. ``forecast()`` is fully stateless (never
+    reads or writes ``model_``). Only the *native-interval* branch of
+    ``predict``/``forecast``/``forward`` is eager-only, because the interval
+    formulas dispatch on the winner's class string; conformal intervals are
+    fully supported under the base-class contract.
+
     Args:
         season_length (int, default=1): Number of observations per unit of time. Ex: 24 Hourly data.
+            Config-only — array shapes derive from it, so it is never inferred from the data.
         model (str, default="ZZZ"): Controlling state-space-equations.
         damped (bool, optional): A parameter that 'dampens' the trend.
         phi (float, optional): Smoothing parameter for trend damping. Only used when `damped=True`.
+        max_iter (int, optional): Optimizer step budget; ``None`` derives a
+            static budget from the series length.
+        optax_lr (float, default=7e-2): Learning rate for the Adam warm-up phase.
+        optax_clip (float, default=5.0): Retained for API compatibility.
+        early_stop_patience (int): *Inert* — early stopping would require
+            concretizing traced losses; the optimizer runs a fixed budget with
+            monotone best-iterate tracking instead.
+        early_stop_min_delta (float): *Inert* — see ``early_stop_patience``.
         alias (str, default="AutoETS"): Custom name of the model.
         prediction_intervals (Optional[ConformalIntervals], optional): Information to compute conformal prediction intervals. By default, the model will compute the native prediction intervals.
 
@@ -74,6 +97,17 @@ class AutoETS(BaseForecaster):
                 f"Series too short: need >= {min_len} observations, got {len(y)}"
             )
 
+    @staticmethod
+    def _default_optax_steps(n: int) -> int:
+        """Static optimizer budget keyed on series *length* (shape-static)."""
+        if n < 200:
+            return 200
+        if n < 1000:
+            return 300
+        if n < 5000:
+            return 400
+        return 500
+
     def __init__(
         self,
         season_length: int = 1,
@@ -81,10 +115,10 @@ class AutoETS(BaseForecaster):
         damped: Optional[bool] = None,
         phi: Optional[float] = None,
         max_iter: Optional[int] = None,
-        optax_lr: float = 7e-2,  # Optimized: Slightly higher LR for faster convergence
+        optax_lr: float = 7e-2,
         optax_clip: float = 5.0,
-        early_stop_patience: int = 10,  # Optimized: More aggressive early stopping
-        early_stop_min_delta: float = 1e-5,  # Optimized: Slightly relaxed for faster convergence
+        early_stop_patience: int = 10,  # inert — see class docstring
+        early_stop_min_delta: float = 1e-5,  # inert — see class docstring
         alias: str = "AutoETS",
         prediction_intervals: Optional[ConformalIntervals] = None,
     ) -> None:
@@ -107,6 +141,22 @@ class AutoETS(BaseForecaster):
         self.conformal_params = prediction_intervals
         self.optax_steps = self.max_iter
 
+    def _fit_stacked(self, y: jnp.ndarray) -> dict[str, Any]:
+        """Run the stacked candidate fit on *y* (shared by fit/forecast)."""
+        steps = self.max_iter if self.max_iter is not None else self._default_optax_steps(len(y))
+        return ets_f(
+            y,
+            m=self.season_length,
+            model=self.model,
+            damped=self.damped,
+            phi=self.phi,
+            # Allow multiplicative trend for richer models on positive series.
+            allow_multiplicative_trend=True,
+            optax_steps=steps,
+            optax_lr=self.optax_lr,
+            optax_clip=self.optax_clip,
+        )
+
     def fit(
         self,
         y: jnp.ndarray,
@@ -126,51 +176,12 @@ class AutoETS(BaseForecaster):
         """
         y = ensure_float(y)
         self._validate_series_length(y)
-
-        # Infer an effective season length from the data when possible.
-        # This helps avoid config-level seasonality mismatches (e.g. m=24
-        # for clearly monthly data), which are a major source of accuracy loss.
-        m_eff = int(self.season_length)
-        try:
-            m_infer = int(_infer_season_length(y, max_m=min(24, len(y) // 2)))
-            if m_infer > 1:
-                m_eff = m_infer
-        except Exception:
-            # Fall back silently to the configured season_length
-            m_eff = int(self.season_length)
-
-        self._y_fit = y
-        self._m_eff = m_eff
-        # Heuristic: give more iterations to longer / more complex series for accuracy.
-        if self.max_iter is None:
-            n = len(y)
-            if n < 200:
-                self.optax_steps = 200
-            elif n < 1000:
-                self.optax_steps = 300
-            elif n < 5000:
-                self.optax_steps = 400
-            else:
-                self.optax_steps = 500
-        else:
-            self.optax_steps = self.max_iter
-        self.model_ = ets_f(
-            y,
-            m=m_eff,
-            model=self.model,
-            damped=self.damped,
-            phi=self.phi,
-            # Use default likelihood-based criterion; allow multiplicative trend
-            # for richer models on positive series.
-            allow_multiplicative_trend=True,
-            allow_extended_iterations=True,
-            optax_steps=self.optax_steps,
-            optax_lr=self.optax_lr,
-            optax_clip=self.optax_clip,
-            early_stop_patience=self.early_stop_patience,
-            early_stop_min_delta=self.early_stop_min_delta,
-        )
+        self.optax_steps = self.max_iter if self.max_iter is not None else self._default_optax_steps(len(y))
+        self.model_ = self._fit_stacked(y)
         self.model_["actual_residuals"] = y - self.model_["fitted"]
+        # Cache conformity scores on the training series (sibling convention);
+        # forecast() below is write-free, so the vmapped CV re-fits inside
+        # conformity_scores cannot leak tracers onto this fitted estimator.
         if self.conformal_params is not None:
             self._cs = self.conformity_scores(y=y, X=X)
         else:
@@ -192,16 +203,22 @@ class AutoETS(BaseForecaster):
         """
         self._validate_h(h)
         self._validate_level(level)
-        fcst = forecast_ets(self.model_, h=h, level=level)
-        res = {"mean": fcst["mean"]}
+        if not hasattr(self, "model_"):
+            raise Exception("You have to use the `fit` method first")
+        res = {"mean": ets_point_forecast(self.model_, h)}
         if level is None:
             return res
         level = sorted(level)
         if self.conformal_params is not None:
-            if self._cs is None:
+            if getattr(self, "_cs", None) is None:
                 raise ValueError(
                     "Conformity scores not cached. Fit the model with conformal_params set, "
                     "or use forecast(y, ...) which recomputes them."
+                )
+            if h != self.conformal_params.h:
+                raise ValueError(
+                    f"h={h} does not match conformal_params.h={self.conformal_params.h}; "
+                    "conformity scores cover exactly conformal_params.h steps."
                 )
             return self.add_confidence_intervals(
                 fcst=res,
@@ -210,7 +227,9 @@ class AutoETS(BaseForecaster):
                 method=self.conformal_params.method,
             )
 
-        # Native ETS intervals
+        # Native ETS intervals (eager-only: dispatches on the winner's
+        # class string via ets_winner_view).
+        fcst = forecast_ets(ets_winner_view(self.model_), h=h, level=level)
         res.update({f"lo-{l}": fcst[f"lo-{l}"] for l in reversed(level)})
         res.update({f"hi-{l}": fcst[f"hi-{l}"] for l in level})
         return res
@@ -227,113 +246,44 @@ class AutoETS(BaseForecaster):
         res = {"fitted": self.model_["fitted"]}
         if level is not None:
             residuals = self.model_["actual_residuals"]
-            # se = _calculate_sigma(residuals, len(residuals) - self.model_["n_params"])
             se = calculate_sigma(residuals, len(residuals) - self.model_["n_params"])
             res = _add_fitted_pi(res=res, se=se, level=level)
         return res
 
-    def _compute_forecast_with_intervals(
+    def _compose_output(
         self,
+        mod: dict[str, Any],
         y: jnp.ndarray,
         h: int,
         X: Optional[jnp.ndarray],
         level: Optional[List[int]],
         fitted: bool,
-        use_forward: bool,
     ) -> dict[str, Any]:
-        """Compute forecasts plus optional native or conformal intervals."""
-        y = ensure_float(y)
-        self._validate_h(h)
-        self._validate_level(level)
-        self._validate_series_length(y)
-
-        # Reuse effective season length from fit when available; otherwise,
-        # attempt to infer from the new series.
-        m_eff = int(getattr(self, "_m_eff", self.season_length))
-        try:
-            if not hasattr(self, "_m_eff"):
-                m_infer = int(_infer_season_length(y, max_m=min(24, len(y) // 2)))
-                if m_infer > 1:
-                    m_eff = m_infer
-        except Exception:
-            m_eff = int(self.season_length)
-
-        if use_forward:
-            if not hasattr(self, "model_"):
-                raise Exception("You have to use the `fit` method first")
-            mod = forward_ets(self.model_, y=y)
-        else:
-            mod = None
-            if hasattr(self, "model_") and hasattr(self, "_y_fit"):
-                try:
-                    same_y = y.shape == self._y_fit.shape and bool(jnp.all(y == self._y_fit))
-                except Exception:
-                    same_y = False
-                if same_y:
-                    mod = self.model_
-            if mod is None:
-                # Stateless path: mirror the fit-time iteration heuristic.
-                if self.max_iter is None:
-                    n = len(y)
-                    if n < 200:
-                        optax_steps = 200
-                    elif n < 1000:
-                        optax_steps = 300
-                    elif n < 5000:
-                        optax_steps = 400
-                    else:
-                        optax_steps = 500
-                else:
-                    optax_steps = self.max_iter
-                mod = ets_f(
-                    y,
-                    m=m_eff,
-                    model=self.model,
-                    damped=self.damped,
-                    phi=self.phi,
-                    allow_multiplicative_trend=True,
-                    allow_extended_iterations=True,
-                    optax_steps=optax_steps,
-                    optax_lr=self.optax_lr,
-                    optax_clip=self.optax_clip,
-                    early_stop_patience=self.early_stop_patience,
-                    early_stop_min_delta=self.early_stop_min_delta,
-                )
-                # Cache fitted model for warm calls (same y), so we don't refit on every forecast.
-                self.model_ = mod
-                self._y_fit = y
-
-        timing_enabled = os.environ.get("CHRONAX_ETS_TIMING", "0") == "1"
-        t_fcst_start = time.perf_counter() if timing_enabled else 0.0
-        fcst = forecast_ets(mod, h=h, level=level)
-        t_fcst_end = time.perf_counter() if timing_enabled else 0.0
-        keys = ["mean"]
+        """Build the forecast dict (mean + optional fitted/intervals) from a stacked fit."""
+        res = {"mean": ets_point_forecast(mod, h)}
         if fitted:
-            keys.append("fitted")
-        res = {key: fcst[key] for key in keys}
+            res["fitted"] = mod["fitted"]
         if level is None:
             return res
 
         level_sorted = sorted(level)
         if self.conformal_params is not None:
+            if h != self.conformal_params.h:
+                raise ValueError(
+                    f"h={h} does not match conformal_params.h={self.conformal_params.h}; "
+                    "conformity scores cover exactly conformal_params.h steps."
+                )
             cs = self.conformity_scores(y=y, X=X)
             res = self.add_confidence_intervals(res, cs, level_sorted, self.conformal_params.method)
         else:
-            res = {
-                **res,
-                **{f"lo-{l}": fcst[f"lo-{l}"] for l in reversed(level_sorted)},
-                **{f"hi-{l}": fcst[f"hi-{l}"] for l in level_sorted},
-            }
+            fcst = forecast_ets(ets_winner_view(mod), h=h, level=level_sorted)
+            res.update({f"lo-{l}": fcst[f"lo-{l}"] for l in reversed(level_sorted)})
+            res.update({f"hi-{l}": fcst[f"hi-{l}"] for l in level_sorted})
         if fitted:
             se = calculate_sigma(y - mod["fitted"], len(y) - mod["n_params"])
             res = _add_fitted_pi(res=res, se=se, level=level_sorted)
-        if timing_enabled and isinstance(mod, dict) and "_timing" in mod:
-            res["_timing"] = {
-                **mod["_timing"],
-                "forecast_sec": float(t_fcst_end - t_fcst_start),
-            }
         return res
-    
+
     def forecast(
         self,
         y: jnp.ndarray,
@@ -349,6 +299,11 @@ class AutoETS(BaseForecaster):
         It is analogous to `fit_predict` without storing information.
         It assumes you know the forecast horizon in advance.
 
+        Stateless by contract: the base class's ``conformity_scores`` vmaps
+        this method over CV windows, so it never reads or writes ``model_``
+        (stored state would leak tracers and future information — the
+        pre-refactor AutoCES bug, CLAUDE.md §4 #2).
+
         Args:
             y (numpy.array): Clean time series of shape (n, ).
             h (int): Forecast horizon.
@@ -360,9 +315,12 @@ class AutoETS(BaseForecaster):
         Returns:
             dict: Dictionary with entries `mean` for point predictions and `level_*` for probabilistic predictions.
         """
-        return self._compute_forecast_with_intervals(
-            y=y, h=h, X=X, level=level, fitted=fitted, use_forward=False
-        )
+        y = ensure_float(y)
+        self._validate_h(h)
+        self._validate_level(level)
+        self._validate_series_length(y)
+        mod = self._fit_stacked(y)
+        return self._compose_output(mod, y, h, X, level, fitted)
 
     def forward(
         self,
@@ -375,6 +333,10 @@ class AutoETS(BaseForecaster):
     ) -> dict[str, Any]:
         r"""Apply fitted Exponential Smoothing model to a new time series.
 
+        Reuses the fitted candidates' structures and smoothing parameters
+        (no re-optimisation) and keeps the fit-time winner; each candidate is
+        re-rolled on *y* via ``forward_ets``.
+
         Args:
             y (numpy.array): Clean time series of shape (n, ).
             h (int): Forecast horizon.
@@ -386,9 +348,14 @@ class AutoETS(BaseForecaster):
         Returns:
             dict: Dictionary with entries `mean` for point predictions and `level_*` for probabilistic predictions.
         """
-        return self._compute_forecast_with_intervals(
-            y=y, h=h, X=X, level=level, fitted=fitted, use_forward=True
-        )
+        if not hasattr(self, "model_"):
+            raise Exception("You have to use the `fit` method first")
+        y = ensure_float(y)
+        self._validate_h(h)
+        self._validate_level(level)
+        self._validate_series_length(y)
+        mod = forward_ets(self.model_, y)
+        return self._compose_output(mod, y, h, X, level, fitted)
 
 
 # -------------------------------------------------------------------
@@ -589,12 +556,14 @@ def test_stateless_forecast_with_conformal_intervals() -> None:
     """
     Stateless forecast with conformal intervals; series long enough that the
     internal rolling windows used for conformity scores are also large.
+    The forecast horizon must match conformal_params.h — scores cover
+    exactly h steps (guarded with a ValueError, sibling convention).
     """
     n = 36
     t = np.arange(n, dtype=np.float64)
     y = jnp.asarray(5.0 + 0.1 * t + 0.3 * np.sin(2 * np.pi * t / 6), dtype=jnp.float64)
 
-    cfg = ConformalIntervals(n_windows=4, h=2, method="conformal_distribution")
+    cfg = ConformalIntervals(n_windows=4, h=6, method="conformal_distribution")
     ae = AutoETS(season_length=1, model="ZZZ", prediction_intervals=cfg)
 
     out = ae.forecast(y=y, h=6, level=[90], fitted=False)
@@ -638,6 +607,8 @@ def test_predict_before_fit_raises() -> None:
     try:
         _ = ae.predict(h=1)
         raise AssertionError("Expected an error when calling predict() before fit()")
+    except AssertionError:
+        raise
     except Exception:
         pass
     _print_ok("test_predict_before_fit_raises")
@@ -649,6 +620,8 @@ def test_forward_before_fit_raises() -> None:
     try:
         _ = ae.forward(y=jnp.asarray([1., 2., 3.]), h=1)
         raise AssertionError("Expected an error when calling forward() before fit()")
+    except AssertionError:
+        raise
     except Exception:
         pass
     _print_ok("test_forward_before_fit_raises")
