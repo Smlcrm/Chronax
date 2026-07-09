@@ -13,19 +13,8 @@ datasets:
   - { name: RoomTemperature,   path: "benchmarks/benchmark_datasets/room temperature data.csv",
       ds_col: Datetime, y_col: Hourly_Temp, freq: h }
 
-models:
-  - name: GRU
-    chronax_params: { max_steps: 1000, learning_rate: 0.001, loss: mae }   # scaler: RobustScaler is hardwired in the Chronax GRU (no knob)
-    nf_params:      { max_steps: 1000, learning_rate: 0.001, scaler_type: robust, loss: MAE }
-  - name: PatchTST
-    chronax_params: { max_steps: 5000, learning_rate: 0.0001, loss: mae }  # scaler: RevIN is internal (no scaler_type knob)
-    nf_params:      { max_steps: 5000, learning_rate: 0.0001, scaler_type: identity, loss: MAE }  # scaler_type=identity is NF's native PatchTST default made explicit (not a protocol change)
-  - name: KAN
-    chronax_params: { max_steps: 1000, learning_rate: 0.001, scaler: identity, loss: mae }
-    nf_params:      { max_steps: 1000, learning_rate: 0.001, scaler_type: identity, loss: MAE }
-  - name: TFT
-    chronax_params: { max_steps: 1000, learning_rate: 0.001, scaler_type: robust, loss: mae }
-    nf_params:      { max_steps: 1000, learning_rate: 0.001, scaler_type: robust, loss: MAE }
-  - name: iTransformer
-    chronax_params: { max_steps: 1000, learning_rate: 0.001, loss: mae }   # natively multivariate; Chronax exposes a univariate adaptation
-    nf_params:      { max_steps: 1000, learning_rate: 0.001, scaler_type: identity, loss: MAE, n_series: 1 }
+# Models are auto-discovered from chronax.models (any BaseForecaster taking
+# h/input_size/random_seed). Both libraries use matching defaults + MAE loss, and
+# multivariate models get n_series=1 automatically — so nothing is listed per model.
+# Add an optional `overrides:` mapping (model -> chronax_params / nf_params) only to
+# change a param for a specific model.

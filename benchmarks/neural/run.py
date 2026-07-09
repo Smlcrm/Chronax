@@ -42,14 +42,31 @@ def validate_config(cfg: dict) -> None:
         raise ConfigError(f"experiment missing keys: {sorted(missing)}")
     if not cfg.get("datasets"):
         raise ConfigError("no datasets defined")
-    if not cfg.get("models"):
-        raise ConfigError("no models defined")
-    for m in cfg["models"]:
-        if not {"name", "chronax_params", "nf_params"} <= set(m):
-            raise ConfigError(f"model entry incomplete: {m}")
+    overrides = cfg.get("overrides")
+    if overrides is not None:
+        if not isinstance(overrides, dict):
+            raise ConfigError("'overrides' must be a mapping of model -> params")
+        for name, ov in overrides.items():
+            if not isinstance(ov, dict) or not set(ov) <= {"chronax_params", "nf_params"}:
+                raise ConfigError(
+                    f"override for {name!r} may only contain 'chronax_params' / 'nf_params'")
     warm, n = exp["warmup_seeds"], len(exp["seeds"])
     if not (0 <= warm < n):
         raise ConfigError(f"warmup_seeds {warm} out of range for {n} seeds")
+
+
+def model_params(cfg: dict, name: str) -> tuple[dict, dict]:
+    """Resolve (chronax_params, nf_params) for `name`.
+
+    Models are auto-discovered, so config carries no per-model block by default;
+    `cfg['overrides'][name]` is an optional override. MAE loss is forced on both
+    sides. A standard model needs no override — both libraries fall back to their
+    (matching) defaults.
+    """
+    ov = (cfg.get("overrides") or {}).get(name, {})
+    chronax_params = {"loss": "mae", **(ov.get("chronax_params") or {})}
+    nf_params = {"loss": "MAE", **(ov.get("nf_params") or {})}
+    return chronax_params, nf_params
 
 
 def load_config(path: str) -> dict:
@@ -339,7 +356,7 @@ def write_baseline(model, df, cfg) -> None:
     exp = cfg["experiment"]
     out = BASELINES_DIR / model
     out.mkdir(parents=True, exist_ok=True)
-    nf_params = next(m["nf_params"] for m in cfg["models"] if m["name"] == model)
+    _, nf_params = model_params(cfg, model)
     meta = nf_baseline_metadata(registry.nf_model_name(model), exp["h"],
                                 exp["input_size"], nf_params)
     protocol = {
@@ -386,7 +403,7 @@ def main() -> None:
 
     cfg = load_config(args.config)
     cfg["_config_path"] = args.config
-    all_models = [m["name"] for m in cfg["models"]]
+    all_models = registry.list_models()
     all_datasets = [d["name"] for d in cfg["datasets"]]
     models = args.models or all_models
     datasets = args.datasets or all_datasets

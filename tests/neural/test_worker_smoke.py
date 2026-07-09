@@ -24,10 +24,10 @@ def _tiny_config(tmp_path):
     datasets:
       - { name: AirlinePassengers, path: benchmarks/benchmark_datasets/airline-passengers.csv,
           ds_col: Month, y_col: Passengers, freq: MS }
-    models:
-      - name: GRU
-        chronax_params: { max_steps: 2, learning_rate: 0.001, loss: mae }
-        nf_params: { max_steps: 2, learning_rate: 0.001, scaler_type: robust, loss: MAE }
+    overrides:
+      GRU:
+        chronax_params: { max_steps: 2 }
+        nf_params: { max_steps: 2 }
     """))
     return str(p)
 
@@ -50,16 +50,19 @@ def test_worker_chronax_smoke(tmp_path):
 
 
 def test_all_models_construct_from_config():
-    """§6: assert each model's config chronax_params against its Chronax
-    constructor (all three: GRU/PatchTST/KAN). Construction only — no fit — so
-    this is cheap; a bad param raises TypeError here."""
+    """Every auto-discovered model constructs with its resolved params (no fit).
+
+    Construction only — cheap; a bad param raises TypeError here. Exercises
+    auto-discovery + param resolution across all wired models, not just GRU.
+    """
     from benchmarks.neural import registry
-    from benchmarks.neural.run import load_config
+    from benchmarks.neural.run import load_config, model_params
     cfg = load_config(str(REPO / "benchmarks" / "neural" / "config.yaml"))
     exp = cfg["experiment"]
-    for m in cfg["models"]:
-        cls = registry.resolve_chronax(m["name"])
-        cls(h=exp["h"], input_size=exp["input_size"], random_seed=1, **m["chronax_params"])
+    for name in registry.list_models():
+        cls = registry.resolve_chronax(name)
+        chronax_params, _ = model_params(cfg, name)
+        cls(h=exp["h"], input_size=exp["input_size"], random_seed=1, **chronax_params)
 
 
 @pytest.mark.skipif(not NF_VENV_PY.exists(),
