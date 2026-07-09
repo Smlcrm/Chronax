@@ -32,8 +32,10 @@ python benchmarks/neural/run.py --libs chronax
 python benchmarks/neural/run.py --resume
 ```
 
-The models, datasets, and all run parameters (horizon, lookback, seeds, threads)
-are defined in `benchmarks/neural/config.yaml`.
+Models are auto-discovered from `chronax.models` — any neural forecaster in the
+library's public list is benchmarked automatically, no wiring needed. Datasets and
+run parameters (horizon, lookback, seeds, threads) are defined in
+`benchmarks/neural/config.yaml`, along with optional per-model overrides.
 
 > If `python` isn't the project interpreter, use `.venv/bin/python`.
 
