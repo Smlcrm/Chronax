@@ -1,4 +1,4 @@
-![Simulacrum Logo](https://github.com/Smlcrm/assets/blob/main/Asset%201@4x-8.png?raw=true "Simulacrum — Chronax")
+![Simulacrum Logo](https://github.com/Smlcrm/smlcrm-brand-assets/blob/main/Asset%201@4x-8.png?raw=true "Simulacrum — Chronax")
 
 # chronax
 
