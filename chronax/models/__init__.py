@@ -82,6 +82,13 @@ try:
 except ImportError:
     BiTCN = None
 
+# DeepNPTS hard-pins flax 0.10.x (raises ImportError otherwise); guard like BiTCN so a
+# version/availability mismatch degrades to DeepNPTS=None instead of breaking the namespace.
+try:
+    from .deepnpts import DeepNPTS
+except ImportError:
+    DeepNPTS = None
+
 from .batched_forecaster import BatchedForecaster
 
 from .xlstm import XLSTM
@@ -126,6 +133,7 @@ __all__ = [
     "KAN",
     "PatchTST",
     "BiTCN",
+    "DeepNPTS",
     "BatchedForecaster",
     "XLSTM",
 ]
