@@ -9,6 +9,7 @@
 
 substitutions:
   _GEMINI_API_KEY: ""                       # set in the trigger; empty => keyless hybrid
+  _DOCGEN_TOKEN: ""                          # GitHub PAT while web-doc-generator is private; empty if public
   _SERVICE_NAME: web-docs-chronax-dev
   _DEPLOY_REGION: us-central1
   _IMAGE: us-central1-docker.pkg.dev/sml-web-doc-gen-dev/cloud-run-source-deploy/chronax/web-docs-chronax-dev
@@ -19,6 +20,7 @@ steps:
       - build
       - --no-cache
       - --build-arg=GEMINI_API_KEY=${_GEMINI_API_KEY}
+      - --build-arg=DOCGEN_TOKEN=${_DOCGEN_TOKEN}
       - -t
       - ${_IMAGE}:${COMMIT_SHA}
       - .
