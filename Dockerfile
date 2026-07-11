@@ -29,8 +29,18 @@ RUN pip install --no-cache-dir -r /docgen/requirements.txt
 ENV PYTHONPATH=/docgen
 
 # Generate the site from this repo (docgen.toml at the root is auto-loaded).
+# With a key: full real docs. Without: keyless --hybrid fallback so the build
+# never fails for lack of a key. The Cloud Build trigger supplies the key via a
+# _GEMINI_API_KEY substitution passed as this build arg.
+ARG GEMINI_API_KEY=""
 COPY . /src
-RUN python -m docgen --repo /src --out /docgen/site --hybrid
+RUN if [ -n "$GEMINI_API_KEY" ]; then \
+        echo "Generating real docs (Gemini)..." ; \
+        GEMINI_API_KEY="$GEMINI_API_KEY" python -m docgen --repo /src --out /docgen/site ; \
+    else \
+        echo "No GEMINI_API_KEY set, building keyless --hybrid preview..." ; \
+        python -m docgen --repo /src --out /docgen/site --hybrid ; \
+    fi
 
 ENV PORT=8080
 EXPOSE 8080
