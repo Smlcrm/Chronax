@@ -1,0 +1,10 @@
+# Documentation config for docgen (github.com/Smlcrm/web-doc-generator).
+# Auto-loaded when generating docs for this repo.
+
+[project]
+name = "Chronax"
+description = "A JAX-accelerated time-series forecasting library with a unified fit / predict interface."
+package = "chronax"
+
+[theme]
+preset = "simulacrum"
