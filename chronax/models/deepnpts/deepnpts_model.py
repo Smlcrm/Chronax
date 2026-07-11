@@ -206,7 +206,10 @@ class DeepNPTS(BaseForecaster):
                 )
             if self._train_y is None:
                 raise RuntimeError("Call fit(y) before predict(h, level=...).")
-            cs = self.conformity_scores(self._train_y)
+            # conformity_scores re-fits the model inside a vmap; run it on a
+            # throwaway copy so the tracer-valued refits never overwrite this
+            # instance's fitted nnx weights (self.model_).
+            cs = self.new().conformity_scores(self._train_y)
             method = self.conformal_params.method
             fcst = BaseForecaster.add_confidence_intervals(fcst, cs, level, method)
         return fcst

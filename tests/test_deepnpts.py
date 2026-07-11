@@ -351,6 +351,21 @@ def test_predict_level_without_conformal_params_raises():
         m.predict(h=4, level=[80])
 
 
+def test_conformal_does_not_corrupt_fitted_model():
+    # conformity_scores re-fits inside a vmap; it must run on a throwaway copy
+    # (self.new()) so the tracer-valued refits don't overwrite self.model_.
+    # Regression for the "cs = self.conformity_scores(...)" bug: without the fix
+    # the second predict below returns different values or raises a tracer leak.
+    m = _fast_model()
+    m.fit(_make_y(160))
+    before = np.asarray(m.predict(h=4)["mean"])
+    m.conformal_params = ConformalIntervals(n_windows=2, h=4)
+    _ = m.predict(h=4, level=[80])                 # triggers conformity_scores
+    after = np.asarray(m.predict(h=4)["mean"])     # model_ must be untouched
+    assert np.all(np.isfinite(after))
+    assert np.allclose(before, after)
+
+
 # ============================================================================
 # Parity vs neuralforecast (batch_norm=False)
 # ============================================================================
