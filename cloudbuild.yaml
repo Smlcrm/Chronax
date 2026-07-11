@@ -1,0 +1,47 @@
+# Cloud Build config: build the docs image (passing the Gemini key as a build
+# arg) and deploy it to Cloud Run. Point the trigger at this file instead of the
+# auto-generated inline Dockerfile config, and set the _GEMINI_API_KEY
+# substitution to your key in the trigger's substitution variables.
+#
+# Note: without Secret Manager, the key value lives in the trigger config (and
+# may appear in build logs). That is the agreed "share directly" tradeoff; switch
+# to availableSecrets/secretEnv later to mask it.
+
+substitutions:
+  _GEMINI_API_KEY: ""                       # set in the trigger; empty => keyless hybrid
+  _SERVICE_NAME: web-docs-chronax-dev
+  _DEPLOY_REGION: us-central1
+  _IMAGE: us-central1-docker.pkg.dev/sml-web-doc-gen-dev/cloud-run-source-deploy/chronax/web-docs-chronax-dev
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --no-cache
+      - --build-arg=GEMINI_API_KEY=${_GEMINI_API_KEY}
+      - -t
+      - ${_IMAGE}:${COMMIT_SHA}
+      - .
+      - -f
+      - Dockerfile
+
+  - name: gcr.io/cloud-builders/docker
+    args: [push, "${_IMAGE}:${COMMIT_SHA}"]
+
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: gcloud
+    args:
+      - run
+      - services
+      - update
+      - ${_SERVICE_NAME}
+      - --platform=managed
+      - --image=${_IMAGE}:${COMMIT_SHA}
+      - --region=${_DEPLOY_REGION}
+      - --quiet
+
+images:
+  - ${_IMAGE}:${COMMIT_SHA}
+
+options:
+  logging: CLOUD_LOGGING_ONLY
