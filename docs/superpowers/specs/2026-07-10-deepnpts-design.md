@@ -127,8 +127,13 @@ state (`nnx.BatchStat`) that complicates the training scan, the train/predict
   - `batch_norm=True` path: shape + finiteness only (not strict numerics);
   - **strict parity** vs `neuralforecast.DeepNPTS` at **`batch_norm=False`**,
     `scaler_type="identity"`, `dropout=0.0` in eval, matched init and seed.
-- **`benchmarks/deepnpts_benchmark.py`** — Chronax vs NeuralForecast harness,
-  mirroring `benchmarks/bitcn_benchmark.py` (uses the `.venv-nf` reference env).
+- **Benchmark**: DeepNPTS is picked up automatically by the shared neural
+  harness (`benchmarks/neural/run.py --models DeepNPTS`), which auto-discovers
+  any `chronax.models` forecaster taking `h`/`input_size`/`random_seed`. A
+  per-model override in `benchmarks/neural/config.yaml` pins the NF side to
+  `scaler_type="identity"` + `batch_norm=False` so the comparison isolates the
+  engine, not the preprocessing. (No standalone benchmark script — the
+  auto-discovery harness superseded the per-model scripts.)
 
 ## Parity notes
 
