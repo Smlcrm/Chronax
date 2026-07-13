@@ -1,11 +1,15 @@
-"""Tests for chronax.models.BiTCN.
+"""Tests for chronax.models.DeepNPTS.
 
-Covers the four source modules of the bitcn subpackage in one file (losses,
+Covers the four source modules of the deepnpts subpackage in one file (losses,
 module, training, model), matching the flat ``test_<model>.py`` convention used
-elsewhere in ``tests/``.
+elsewhere in ``tests/``. The strict numerical parity test vs neuralforecast runs
+at ``batch_norm=False`` (see ``test_parity_vs_neuralforecast``).
 """
+import json
 import math
 import pickle
+import subprocess
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -14,7 +18,7 @@ import pytest
 from flax import nnx
 
 from chronax.models.base_forecaster import BaseForecaster
-from chronax.models.bitcn.bitcn_losses import (
+from chronax.models.deepnpts.deepnpts_losses import (
     LOSSES, huber, mae, mse, resolve,
 )
 
@@ -70,19 +74,12 @@ def test_resolve_unknown_raises():
         resolve("not_a_loss")
 
 
-from chronax.models.bitcn.bitcn_module import (
-    CustomConv1d, TCNCell, _TorchConvInit, _TorchLinearInit, _gelu,
-)
+from chronax.models.deepnpts.deepnpts_module import DeepNPTSNet, _TorchLinearInit
 
 
 # ============================================================================
-# Module: inits / conv / cell
+# Module: init / backbone
 # ============================================================================
-
-def test_gelu_is_exact():
-    z = jnp.array([0.7, -1.3, 2.0])
-    assert jnp.allclose(_gelu(z), jax.nn.gelu(z, approximate=False))
-
 
 def test_torch_linear_init_bounds():
     init = _TorchLinearInit(fan_in=16)
@@ -91,84 +88,52 @@ def test_torch_linear_init_bounds():
     assert jnp.all(jnp.abs(w) <= bound + 1e-6)
 
 
-def test_torch_conv_init_bounds():
-    init = _TorchConvInit(in_channels=8, kernel_size=2)
-    w = init(jax.random.PRNGKey(0), (4, 8, 2))
-    bound = math.sqrt(1.0 / (8 * 2))
-    assert jnp.all(jnp.abs(w) <= bound + 1e-6)
-
-
-def test_custom_conv_backward_preserves_length():
-    # padding=(k-1)*dilation keeps output length == input length (causal, left pad).
-    conv = CustomConv1d(3, 5, kernel_size=2, padding=1, dilation=1, mode="backward",
-                        rngs=nnx.Rngs(0))
-    x = jnp.ones((2, 3, 10))            # [B, C_in, L]
-    out = conv(x)
-    assert out.shape == (2, 5, 10)
-
-
-def test_custom_conv_backward_is_causal():
-    # Backward conv output at position t must not depend on inputs after t.
-    conv = CustomConv1d(1, 1, kernel_size=2, padding=3, dilation=3, mode="backward",
-                        rngs=nnx.Rngs(1))
-    x = jnp.asarray(np.random.RandomState(0).randn(1, 1, 12), dtype=jnp.float32)
-    base = conv(x)
-    x2 = x.at[:, :, -1].set(999.0)      # perturb only the last (future) step
-    pert = conv(x2)
-    assert jnp.allclose(base[:, :, :-1], pert[:, :, :-1], atol=1e-5)
-
-
-def test_custom_conv_forward_padding_side():
-    conv = CustomConv1d(2, 2, kernel_size=2, padding=1, dilation=1, mode="forward",
-                        rngs=nnx.Rngs(0))
-    assert conv.pad == (0, 1)
-
-
-def test_custom_conv_rejects_bad_mode():
-    with pytest.raises(ValueError):
-        CustomConv1d(1, 1, kernel_size=2, mode="sideways", rngs=nnx.Rngs(0))
-
-
-def test_tcn_cell_shapes_and_residual():
-    cell = TCNCell(4, 4, kernel_size=2, padding=1, dilation=1, mode="backward",
-                   dropout=0.0, rngs=nnx.Rngs(0))
-    h = jnp.ones((2, 4, 9))
-    out_acc = jnp.zeros_like(h)
-    h_next, out_next = cell(h, out_acc, deterministic=True)
-    assert h_next.shape == (2, 4, 9)     # residual keeps channel/length
-    assert out_next.shape == (2, 4, 9)   # skip accumulator matches
-
-
-from chronax.models.bitcn.bitcn_module import BiTCNNet
-
-
-# ============================================================================
-# Module: backbone
-# ============================================================================
-
 def test_net_forward_shape():
-    net = BiTCNNet(h=4, input_size=12, hidden_size=8, dropout=0.0, rngs=nnx.Rngs(0))
+    net = DeepNPTSNet(h=4, input_size=12, hidden_size=8, n_layers=2, dropout=0.0,
+                      batch_norm=False, rngs=nnx.Rngs(0))
     x = jnp.ones((3, 12, 1))
     out = net(x, deterministic=True)
     assert out.shape == (3, 4, 1)
 
 
-@pytest.mark.parametrize("input_size,expected", [(72, 7), (7, 3), (16, 4), (2, 1)])
-def test_net_n_layers_bwd_is_ceil_log2(input_size, expected):
-    net = BiTCNNet(h=4, input_size=input_size, hidden_size=8, dropout=0.0, rngs=nnx.Rngs(0))
-    assert net.n_layers_bwd == expected
-    assert expected == math.ceil(math.log2(input_size))
+def test_net_softmax_weights_keep_forecast_in_window_range():
+    # Each forecast value is a convex combination (softmax weights) of the window,
+    # so it must lie within [min(window), max(window)].
+    net = DeepNPTSNet(h=4, input_size=12, hidden_size=8, n_layers=2, dropout=0.0,
+                      batch_norm=False, rngs=nnx.Rngs(0))
+    x = jnp.asarray(np.random.RandomState(0).randn(5, 12, 1), dtype=jnp.float32)
+    out = net(x, deterministic=True)                # [5, 4, 1]
+    lo = jnp.min(x, axis=1)                          # [5, 1]
+    hi = jnp.max(x, axis=1)
+    assert bool(jnp.all(out[..., 0] >= lo - 1e-4))
+    assert bool(jnp.all(out[..., 0] <= hi + 1e-4))
+
+
+def test_net_batch_norm_path_shape_and_finite():
+    net = DeepNPTSNet(h=4, input_size=12, hidden_size=8, n_layers=2, dropout=0.1,
+                      batch_norm=True, rngs=nnx.Rngs(0))
+    x = jnp.asarray(np.random.RandomState(1).randn(6, 12, 1), dtype=jnp.float32)
+    out = net(x, deterministic=False)
+    assert out.shape == (6, 4, 1)
+    assert bool(jnp.all(jnp.isfinite(out)))
 
 
 def test_net_deterministic_is_repeatable():
-    net = BiTCNNet(h=4, input_size=12, hidden_size=8, dropout=0.5, rngs=nnx.Rngs(0))
+    net = DeepNPTSNet(h=4, input_size=12, hidden_size=8, n_layers=2, dropout=0.5,
+                      batch_norm=False, rngs=nnx.Rngs(0))
     x = jnp.asarray(np.random.RandomState(0).randn(2, 12, 1), dtype=jnp.float32)
     a = net(x, deterministic=True)
     b = net(x, deterministic=True)
     assert jnp.allclose(a, b)
 
 
-from chronax.models.bitcn.bitcn_training import (
+def test_net_rejects_zero_layers():
+    with pytest.raises(ValueError):
+        DeepNPTSNet(h=4, input_size=12, hidden_size=8, n_layers=0, dropout=0.0,
+                    batch_norm=False, rngs=nnx.Rngs(0))
+
+
+from chronax.models.deepnpts.deepnpts_training import (
     build_windows, forward_loss, predict_step, train,
 )
 
@@ -190,8 +155,9 @@ def test_build_windows_too_short_raises():
         build_windows(jnp.arange(3.0), input_size=4, h=2)
 
 
-def _tiny_net(h=4, input_size=12):
-    return BiTCNNet(h=h, input_size=input_size, hidden_size=8, dropout=0.0, rngs=nnx.Rngs(0))
+def _tiny_net(h=4, input_size=12, batch_norm=False):
+    return DeepNPTSNet(h=h, input_size=input_size, hidden_size=8, n_layers=2,
+                       dropout=0.0, batch_norm=batch_norm, rngs=nnx.Rngs(0))
 
 
 def test_forward_loss_scalar_finite():
@@ -203,10 +169,12 @@ def test_forward_loss_scalar_finite():
 
 
 def test_train_returns_losses_and_reduces():
+    # DeepNPTS's softmax-resample head converges more slowly than a direct-output
+    # head, so use enough steps for a clear reduction (40 is noisy on this series).
     net = _tiny_net()
-    losses = train(net, _make_y(120), h=4, input_size=12, max_steps=40,
+    losses = train(net, _make_y(120), h=4, input_size=12, max_steps=200,
                    windows_batch_size=16, lr=1e-3, seed=0)
-    assert losses.shape == (40,)
+    assert losses.shape == (200,)
     assert jnp.all(jnp.isfinite(losses))
     assert float(jnp.mean(losses[-5:])) < float(jnp.mean(losses[:5]))
 
@@ -220,6 +188,14 @@ def test_train_with_replacement_regime_runs():
     assert jnp.all(jnp.isfinite(losses))
 
 
+def test_train_batch_norm_path_runs():
+    net = _tiny_net(batch_norm=True)
+    losses = train(net, _make_y(120), h=4, input_size=12, max_steps=20,
+                   windows_batch_size=16, lr=1e-3, seed=0)
+    assert losses.shape == (20,)
+    assert jnp.all(jnp.isfinite(losses))
+
+
 def test_predict_step_shape():
     net = _tiny_net()
     out = predict_step(net, _make_y(60), h=4, input_size=12)
@@ -227,8 +203,8 @@ def test_predict_step_shape():
     assert jnp.all(jnp.isfinite(out))
 
 
-from chronax.models.bitcn.bitcn_model import (
-    BiTCN, _boxcox, _inv_boxcox, _select_boxcox_lambda,
+from chronax.models.deepnpts.deepnpts_model import (
+    DeepNPTS, _boxcox, _inv_boxcox, _select_boxcox_lambda,
 )
 from chronax.utils import ConformalIntervals
 
@@ -238,23 +214,31 @@ from chronax.utils import ConformalIntervals
 # ============================================================================
 
 def _fast_model(**kw):
-    base = dict(h=4, input_size=12, hidden_size=8, dropout=0.0, max_steps=40,
-                learning_rate=1e-3, windows_batch_size=16, random_seed=0)
+    base = dict(h=4, input_size=12, hidden_size=8, n_layers=2, dropout=0.0,
+                max_steps=40, learning_rate=1e-3, windows_batch_size=16, random_seed=0)
     base.update(kw)
-    return BiTCN(**base)
+    return DeepNPTS(**base)
 
 
 def test_is_base_forecaster():
-    assert issubclass(BiTCN, BaseForecaster)
+    assert issubclass(DeepNPTS, BaseForecaster)
 
 
 def test_uses_exog_false():
-    assert BiTCN.uses_exog is False
+    assert DeepNPTS.uses_exog is False
 
 
 def test_input_size_default_resolves_to_3h():
-    m = BiTCN(h=10)
+    m = DeepNPTS(h=10)
     assert m.input_size == 30
+
+
+def test_default_hyperparameters_match_nf():
+    m = DeepNPTS(h=4)
+    assert m.hidden_size == 32
+    assert m.n_layers == 2
+    assert m.dropout == 0.1
+    assert m.batch_norm is False   # documented override of NF default (True)
 
 
 def test_fit_predict_shape_and_finite():
@@ -312,6 +296,24 @@ def test_pickle_round_trip_preserves_predictions():
     assert jnp.allclose(before, after)
 
 
+def test_pickle_round_trip_with_batch_norm():
+    m = _fast_model(batch_norm=True, dropout=0.1)
+    m.fit(_make_y(120))
+    before = m.predict(h=4)["mean"]
+    m2 = pickle.loads(pickle.dumps(m))
+    after = m2.predict(h=4)["mean"]
+    assert jnp.allclose(before, after)
+
+
+def test_predict_in_window_range():
+    m = _fast_model()
+    m.fit(_make_y(120))
+    out = np.asarray(m.predict(h=4)["mean"])
+    ctx = np.asarray(m._context)
+    assert bool(np.all(out >= ctx.min() - 1e-4))
+    assert bool(np.all(out <= ctx.max() + 1e-4))
+
+
 def test_boxcox_round_trip_identity():
     y = jnp.asarray(np.linspace(1.0, 5.0, 50), dtype=jnp.float32)
     lam = _select_boxcox_lambda(y)
@@ -352,13 +354,71 @@ def test_predict_level_without_conformal_params_raises():
 def test_conformal_does_not_corrupt_fitted_model():
     # conformity_scores re-fits inside a vmap; it must run on a throwaway copy
     # (self.new()) so the tracer-valued refits don't overwrite self.model_.
-    # Without the fix the second predict returns different values or raises a
-    # tracer leak.
+    # Regression for the "cs = self.conformity_scores(...)" bug: without the fix
+    # the second predict below returns different values or raises a tracer leak.
     m = _fast_model()
     m.fit(_make_y(160))
     before = np.asarray(m.predict(h=4)["mean"])
     m.conformal_params = ConformalIntervals(n_windows=2, h=4)
-    _ = m.predict(h=4, level=[80])
-    after = np.asarray(m.predict(h=4)["mean"])
+    _ = m.predict(h=4, level=[80])                 # triggers conformity_scores
+    after = np.asarray(m.predict(h=4)["mean"])     # model_ must be untouched
     assert np.all(np.isfinite(after))
     assert np.allclose(before, after)
+
+
+# ============================================================================
+# Parity vs neuralforecast (batch_norm=False)
+# ============================================================================
+
+_NF_VENV_PY = Path(__file__).resolve().parents[1] / "benchmarks" / ".venv-nf" / "bin" / "python"
+
+
+@pytest.mark.skipif(not _NF_VENV_PY.exists(),
+                    reason="neuralforecast reference venv (benchmarks/.venv-nf) not present")
+def test_parity_vs_neuralforecast():
+    """Chronax DeepNPTS vs neuralforecast at identical hyperparameters.
+
+    Both sides: batch_norm=False, scaler_type='identity', dropout=0.0, same seed
+    and window sampling. Trained models will not be bit-identical (torch vs JAX
+    optimizers/PRNG differ), so this asserts the two engines land in the same
+    ballpark rather than exact equality — enough to catch a wrong forward pass
+    (e.g. softmax over the wrong axis) while tolerating optimizer noise.
+    """
+    h, input_size, max_steps = 8, 24, 300
+    y = np.asarray(100.0 + 20.0 * np.sin(np.arange(220) / 7.0), dtype=np.float32)
+    y_train = y[:-h]
+
+    m = DeepNPTS(h=h, input_size=input_size, hidden_size=32, n_layers=2,
+                 dropout=0.0, batch_norm=False, max_steps=max_steps,
+                 learning_rate=1e-3, windows_batch_size=64, random_seed=1)
+    m.fit(jnp.asarray(y_train))
+    chronax_pred = np.asarray(m.predict(h=h)["mean"])
+
+    code = f"""
+import json, numpy as np, pandas as pd
+from neuralforecast import NeuralForecast
+from neuralforecast.losses.pytorch import MAE
+from neuralforecast.models import DeepNPTS
+y = np.asarray({y_train.tolist()!r}, dtype=np.float32)
+df = pd.DataFrame({{'unique_id': 'p', 'ds': pd.date_range('2000-01-01', periods=len(y), freq='D'), 'y': y}})
+m = DeepNPTS(h={h}, input_size={input_size}, hidden_size=32, n_layers=2,
+             dropout=0.0, batch_norm=False, max_steps={max_steps},
+             learning_rate=1e-3, windows_batch_size=64, scaler_type='identity',
+             random_seed=1, loss=MAE(), accelerator='cpu', enable_progress_bar=False,
+             logger=False, enable_model_summary=False, enable_checkpointing=False)
+nf = NeuralForecast(models=[m], freq='D')
+nf.fit(df=df)
+print(json.dumps(nf.predict()['DeepNPTS'].to_numpy().tolist()))
+"""
+    out = subprocess.run([str(_NF_VENV_PY), "-c", code], capture_output=True, text=True)
+    assert out.returncode == 0, f"NF subprocess failed:\n{out.stderr}"
+    nf_pred = np.asarray(json.loads(out.stdout.strip().splitlines()[-1]), dtype=np.float32)
+
+    # Both must resample from the same window, so both lie in the series' range.
+    lo, hi = float(y_train[-input_size:].min()), float(y_train[-input_size:].max())
+    assert np.all(chronax_pred >= lo - 1.0) and np.all(chronax_pred <= hi + 1.0)
+    assert np.all(nf_pred >= lo - 1.0) and np.all(nf_pred <= hi + 1.0)
+    # Same ballpark: mean absolute deviation small relative to the series scale.
+    series_scale = float(y_train.std())
+    mad = float(np.mean(np.abs(chronax_pred - nf_pred)))
+    assert mad < 0.5 * series_scale, f"MAD {mad:.3f} vs scale {series_scale:.3f}"

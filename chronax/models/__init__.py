@@ -62,9 +62,21 @@ try:
 except ImportError:
     KAN = None
 
-from .itransformer import iTransformer
+# iTransformer / VanillaTransformer depend on flax NNX (flax 0.10.x). If flax's
+# nnx import fails (e.g. an incompatible resolved jax that dropped an API nnx
+# needs), guard like PatchTST/BiTCN so the model degrades to None instead of
+# crashing the import of the entire chronax.models package (which would block
+# every other model, including the non-flax ones the benchmark discovers).
+try:
+    from .itransformer import iTransformer
+except ImportError:
+    iTransformer = None
 
-from .vanillatransformer import VanillaTransformer
+try:
+    from .vanillatransformer import VanillaTransformer
+except ImportError:
+    VanillaTransformer = None
+
 from .tft import TFT
 from .informer import Informer
 
@@ -81,6 +93,13 @@ try:
     from .bitcn import BiTCN
 except ImportError:
     BiTCN = None
+
+# DeepNPTS hard-pins flax 0.10.x (raises ImportError otherwise); guard like BiTCN so a
+# version/availability mismatch degrades to DeepNPTS=None instead of breaking the namespace.
+try:
+    from .deepnpts import DeepNPTS
+except ImportError:
+    DeepNPTS = None
 
 from .batched_forecaster import BatchedForecaster
 
@@ -126,6 +145,7 @@ __all__ = [
     "KAN",
     "PatchTST",
     "BiTCN",
+    "DeepNPTS",
     "BatchedForecaster",
     "XLSTM",
 ]

@@ -567,6 +567,21 @@ def test_conformity_scores_returns_finite_2d_array():
     assert jnp.all(jnp.isfinite(cs))
 
 
+def test_conformal_does_not_corrupt_fitted_model():
+    # conformity_scores re-fits inside a vmap; predict(level=...) must run it on a
+    # throwaway copy (self.new()) so the tracer-valued refits don't overwrite
+    # self.model_. Without the fix the second predict differs or raises a tracer leak.
+    m = iTransformer(h=4, input_size=12, hidden_size=8, n_heads=2, e_layers=1,
+                     d_ff=16, max_steps=2, windows_batch_size=16, random_seed=0)
+    m.fit(_make_y(80))
+    before = np.asarray(m.predict(h=4)["mean"])
+    m.conformal_params = ConformalIntervals(h=4, n_windows=3)
+    _ = m.predict(h=4, level=[80])
+    after = np.asarray(m.predict(h=4)["mean"])
+    assert np.all(np.isfinite(after))
+    assert np.allclose(before, after)
+
+
 def test_input_size_default_resolves_to_three_h():
     m = iTransformer(h=10)
     assert m.input_size == 30

@@ -18,3 +18,11 @@ datasets:
 # multivariate models get n_series=1 automatically — so nothing is listed per model.
 # Add an optional `overrides:` mapping (model -> chronax_params / nf_params) only to
 # change a param for a specific model.
+
+overrides:
+  # Chronax DeepNPTS is identity-scaled and defaults batch_norm off (its running
+  # stats add state complexity); NF DeepNPTS defaults scaler_type='standard' +
+  # batch_norm=True. Pin NF to match so the comparison isolates the engine
+  # (JAX vs PyTorch-Lightning), not the preprocessing.
+  DeepNPTS:
+    nf_params: { scaler_type: identity, batch_norm: false }
