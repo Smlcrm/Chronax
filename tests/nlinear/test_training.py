@@ -101,6 +101,24 @@ def test_train_raises_on_nonfinite_loss():
               lr=1e-4, seed=0, scaler=IdentityScaler())
 
 
+def test_sample_batch_idx_regimes():
+    import jax
+    from chronax.models.nlinear.nlinear_training import _sample_batch_idx
+    keys = jax.random.split(jax.random.PRNGKey(0), 7)
+    # large-n regime: uniform k-subset — distinct, in-range, deterministic
+    idx = _sample_batch_idx(keys, n_windows=500, windows_batch_size=64)
+    assert idx.shape == (7, 64)
+    assert int(idx.min()) >= 0 and int(idx.max()) < 500
+    for row in np.asarray(idx):
+        assert len(set(row.tolist())) == 64          # no replacement in this regime
+    idx2 = _sample_batch_idx(keys, n_windows=500, windows_batch_size=64)
+    np.testing.assert_array_equal(np.asarray(idx), np.asarray(idx2))
+    # small-n regime: with replacement, in-range
+    idx3 = _sample_batch_idx(keys, n_windows=10, windows_batch_size=64)
+    assert idx3.shape == (7, 64)
+    assert int(idx3.min()) >= 0 and int(idx3.max()) < 10
+
+
 def test_predict_step_shape_idempotent():
     net = _net(); y = _y()
     train(net, y, h=12, input_size=36, max_steps=5, windows_batch_size=64, lr=1e-3,

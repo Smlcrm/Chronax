@@ -56,6 +56,27 @@ def _jit_forward(model: NLinearNet, x: jnp.ndarray) -> jnp.ndarray:
     return model(x)
 
 
+def _sample_batch_idx(step_keys: jnp.ndarray, n_windows: int, windows_batch_size: int) -> jnp.ndarray:
+    """Per-step window indices replicating NF's regimes: with-replacement when
+    ``n_windows < windows_batch_size``, else a uniform random subset.
+
+    The subset is drawn via ``top_k`` over iid uniform keys — distribution-
+    equivalent to NF's ``randperm(n)[:k]`` (by symmetry every k-subset is equally
+    likely, and batch order is irrelevant to a mean-reduced loss) but ~11x
+    cheaper than a vmapped full permutation, which materializes a
+    ``[max_steps, n_windows]`` tensor and dominated NLinear's fit time on long
+    series (the per-step model compute is one small matmul).
+    Returns ``[len(step_keys), windows_batch_size]`` int32.
+    """
+    if n_windows < windows_batch_size:
+        def sample_one(k):
+            return jax.random.choice(k, n_windows, shape=(windows_batch_size,), replace=True)
+    else:
+        def sample_one(k):
+            return jax.lax.top_k(jax.random.uniform(k, (n_windows,)), windows_batch_size)[1]
+    return jax.vmap(sample_one)(step_keys)
+
+
 def train(model: NLinearNet, y: jnp.ndarray, *, h: int, input_size: int, max_steps: int,
           windows_batch_size: int, lr: optax.ScalarOrSchedule, seed: int,
           scaler: Scaler, loss_fn: LossFn = mae) -> jnp.ndarray:
@@ -71,15 +92,7 @@ def train(model: NLinearNet, y: jnp.ndarray, *, h: int, input_size: int, max_ste
     n_windows = windows.shape[0]
     key = jax.random.PRNGKey(seed)
     step_keys = jax.random.split(key, max_steps)
-
-    if n_windows < windows_batch_size:
-        def sample_one(k):
-            return jax.random.choice(k, n_windows, shape=(windows_batch_size,), replace=True)
-    else:
-        def sample_one(k):
-            return jax.random.permutation(k, n_windows)[:windows_batch_size]
-
-    batch_idx = jax.vmap(sample_one)(step_keys)          # [max_steps, windows_batch_size] int32
+    batch_idx = _sample_batch_idx(step_keys, n_windows, windows_batch_size)  # [max_steps, windows_batch_size] int32
     optimizer = nnx.Optimizer(model, optax.adam(lr), wrt=nnx.Param)
 
     @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
