@@ -5,7 +5,7 @@ import pytest
 from flax import nnx
 
 from chronax.models.nlinear.nlinear_losses import mae as loss_mae, resolve as resolve_loss
-from chronax.models.nlinear.nlinear_scaler import IdentityScaler, RobustScaler, resolve_scaler
+from chronax.models.nlinear.nlinear_scaler import IdentityScaler, resolve_scaler
 
 
 def test_masked_mae_drops_masked_elements():
