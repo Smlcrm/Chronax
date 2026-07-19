@@ -71,7 +71,9 @@ def _sample_batch_idx(step_keys: jnp.ndarray, n_windows: int, windows_batch_size
     NLinear's per-step compute is one small matmul. Under a trace (e.g.
     ``BaseForecaster.conformity_scores``'s vmap, whose short CV windows normally
     hit the small-n branch anyway) it falls back to pure-JAX ``argpartition`` —
-    both paths select the same index sets from the same uniforms.
+    both paths select the same index sets from the same uniforms (up to float32
+    key ties at the cut, where either resolution is an equally valid uniform
+    subset).
     Returns ``[len(step_keys), windows_batch_size]`` int32.
     """
     if n_windows < windows_batch_size:

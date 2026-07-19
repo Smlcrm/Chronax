@@ -62,6 +62,11 @@ try:
 except ImportError:
     KAN = None
 
+# NLinear depends on flax NNX (pinned 0.10.x — see chronax/models/nlinear/__init__.py).
+# Guard like KAN/PatchTST so an incompatible flax degrades this model to None instead
+# of crashing the entire chronax.models namespace. Note the trade-off: the pin's
+# informative ImportError is swallowed here; importing chronax.models.nlinear
+# directly surfaces it.
 try:
     from .nlinear import NLinear
 except ImportError:
