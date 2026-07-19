@@ -53,3 +53,59 @@ def test_init_matches_torch_bounds():
     assert np.abs(w).max() <= bound and np.abs(b).max() <= bound
     assert w.std() > 0.2 * bound          # non-degenerate uniform, not zeros/normal
     assert np.abs(b).max() > 0.0          # torch uses uniform bias, NOT zeros
+
+
+from chronax.models.nlinear.nlinear_training import build_windows, predict_step, scaled_forward_loss, train
+
+
+def _y(n=200):
+    return jnp.asarray(np.sin(np.arange(n) / 10.0), dtype=jnp.float32)
+
+
+def _net(h=12, input_size=36):
+    return NLinearNet(h=h, input_size=input_size, rngs=nnx.Rngs(0))
+
+
+def test_build_windows_shape_and_padding():
+    w, m = build_windows(_y(60), input_size=36, h=12)     # NF: n_windows = 60-36
+    assert w.shape == (24, 48) and m.shape == (24, 48)
+    assert float(m[:, :36].min()) == 1.0                  # insample always real
+    assert float(m[-1, 36:].min()) == 0.0                 # last horizon tail padded
+
+
+def test_scaled_forward_loss_scalar():
+    w, m = build_windows(_y(), input_size=36, h=12)
+    loss = scaled_forward_loss(_net(), w[:8], m[:8], h=12, input_size=36, scaler=IdentityScaler())
+    assert loss.shape == () and jnp.isfinite(loss)
+
+
+def test_train_decreases_loss_and_is_deterministic():
+    l1 = train(_net(), _y(), h=12, input_size=36, max_steps=30, windows_batch_size=64,
+               lr=1e-2, seed=0, scaler=IdentityScaler())
+    l2 = train(_net(), _y(), h=12, input_size=36, max_steps=30, windows_batch_size=64,
+               lr=1e-2, seed=0, scaler=IdentityScaler())
+    assert l1.shape == (30,) and float(l1[-1]) < float(l1[0])
+    np.testing.assert_allclose(np.asarray(l1), np.asarray(l2), rtol=1e-5)
+
+
+def test_train_oversample_small_n():
+    losses = train(_net(), _y(60), h=12, input_size=36, max_steps=8, windows_batch_size=64,
+                   lr=1e-3, seed=0, scaler=IdentityScaler())
+    assert losses.shape == (8,) and jnp.all(jnp.isfinite(losses))
+
+
+def test_train_raises_on_nonfinite_loss():
+    y = _y().at[50].set(jnp.nan)                          # NaN input -> NaN loss at step 0
+    with pytest.raises(RuntimeError, match="Non-finite loss"):
+        train(_net(), y, h=12, input_size=36, max_steps=5, windows_batch_size=64,
+              lr=1e-4, seed=0, scaler=IdentityScaler())
+
+
+def test_predict_step_shape_idempotent():
+    net = _net(); y = _y()
+    train(net, y, h=12, input_size=36, max_steps=5, windows_batch_size=64, lr=1e-3,
+          seed=0, scaler=IdentityScaler())
+    p1 = predict_step(net, y[-36:], h=12, input_size=36, scaler=IdentityScaler())
+    p2 = predict_step(net, y[-36:], h=12, input_size=36, scaler=IdentityScaler())
+    assert p1.shape == (12,)
+    np.testing.assert_allclose(np.asarray(p1), np.asarray(p2), rtol=1e-6)
