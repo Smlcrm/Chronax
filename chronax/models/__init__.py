@@ -62,6 +62,11 @@ try:
 except ImportError:
     KAN = None
 
+try:
+    from .nlinear import NLinear
+except ImportError:
+    NLinear = None
+
 # iTransformer / VanillaTransformer depend on flax NNX (flax 0.10.x). If flax's
 # nnx import fails (e.g. an incompatible resolved jax that dropped an API nnx
 # needs), guard like PatchTST/BiTCN so the model degrades to None instead of
@@ -143,6 +148,7 @@ __all__ = [
     "TFT",
     "Informer",
     "KAN",
+    "NLinear",
     "PatchTST",
     "BiTCN",
     "DeepNPTS",
