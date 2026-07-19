@@ -165,6 +165,18 @@ def test_forecast_fitted_nan_head_finite_tail():
     assert fitted.shape == (200,) and np.all(np.isnan(fitted[:36])) and np.all(np.isfinite(fitted[36:]))
 
 
+def test_fitted_values_match_hand_computed():
+    y = _make_y(60)
+    m = _tiny().fit(y)
+    # zero weights + constant bias c: one-step-ahead fitted[36+i] = c + y[35+i]
+    # (forward adds back the insample window's last value).
+    m.model_.weight.value = jnp.zeros((12, 36), dtype=jnp.float32)
+    m.model_.bias.value = jnp.full((12,), 0.5, dtype=jnp.float32)
+    fitted = np.asarray(m._compute_fitted_values())
+    for i in (0, 5, 23):
+        np.testing.assert_allclose(fitted[36 + i], 0.5 + float(y[35 + i]), rtol=1e-5)
+
+
 def test_predict_with_level_returns_interval_keys():
     m = NLinear(h=4, input_size=12, max_steps=2, windows_batch_size=16, random_seed=0)
     m.fit(_make_y(80))

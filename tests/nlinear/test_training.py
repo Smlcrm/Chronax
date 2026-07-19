@@ -67,10 +67,18 @@ def _net(h=12, input_size=36):
 
 
 def test_build_windows_shape_and_padding():
-    w, m = build_windows(_y(60), input_size=36, h=12)     # NF: n_windows = 60-36
+    y = _y(60)
+    w, m = build_windows(y, input_size=36, h=12)          # NF: n_windows = 60-36
     assert w.shape == (24, 48) and m.shape == (24, 48)
     assert float(m[:, :36].min()) == 1.0                  # insample always real
-    assert float(m[-1, 36:].min()) == 0.0                 # last horizon tail padded
+    # Exact padding contract (guards off-by-one leaking padded zeros into the
+    # loss — the failure class behind KAN's original airline accuracy gap):
+    # last window covers y[23:59] + [y[59], 11 zero-pads].
+    np.testing.assert_array_equal(np.asarray(m[-1, 36:]), [1.0] + [0.0] * 11)
+    np.testing.assert_array_equal(np.asarray(w[-1, 37:]), np.zeros(11))
+    assert float(w[-1, 36]) == float(y[-1])
+    # closed-form real-point count: sum_i min(48, 60-i) for i in 0..23
+    assert float(m.sum()) == 1086.0
 
 
 def test_scaled_forward_loss_scalar():
@@ -117,6 +125,17 @@ def test_sample_batch_idx_regimes():
     idx3 = _sample_batch_idx(keys, n_windows=10, windows_batch_size=64)
     assert idx3.shape == (7, 64)
     assert int(idx3.min()) >= 0 and int(idx3.max()) < 10
+
+
+def test_sample_batch_idx_traced_matches_host():
+    import jax
+    from functools import partial
+    from chronax.models.nlinear.nlinear_training import _sample_batch_idx
+    keys = jax.random.split(jax.random.PRNGKey(3), 5)
+    host = _sample_batch_idx(keys, 500, 64)
+    traced = jax.jit(partial(_sample_batch_idx, n_windows=500, windows_batch_size=64))(keys)
+    for hr, tr in zip(np.asarray(host), np.asarray(traced)):
+        assert set(hr.tolist()) == set(tr.tolist())      # same uniform k-subset either path
 
 
 def test_predict_step_shape_idempotent():
