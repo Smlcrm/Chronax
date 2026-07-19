@@ -60,24 +60,31 @@ def _sample_batch_idx(step_keys: jnp.ndarray, n_windows: int, windows_batch_size
     """Per-step window indices replicating NF's regimes: with-replacement when
     ``n_windows < windows_batch_size``, else a uniform random subset.
 
-    The subset is the ``argpartition`` top block of iid uniform keys —
+    The subset is the top-``windows_batch_size`` block of iid uniform keys —
     distribution-equivalent to NF's ``randperm(n)[:k]`` (by symmetry every
     k-subset is equally likely, and batch order is irrelevant to a mean-reduced
-    loss). Chosen by measurement at RoomTemperature scale (n=6959, 5000 steps):
-    vmapped full permutation 9.6s (materializes ``[max_steps, n_windows]``),
-    ``top_k`` 4.6s, ``argpartition`` 2.3s — vs ~0.5s for the entire training
-    scan, since NLinear's per-step compute is one small matmul. Stays
-    vmap-traceable for ``BaseForecaster.conformity_scores``.
+    loss). Selection runs via ``np.argpartition`` on the host when the keys are
+    concrete: measured per fit at RoomTemperature scale (n≈7000, 5000 steps,
+    the benchmark's only large-n dataset), sampling cost is 9.6s for a vmapped
+    full permutation, 4.6s for ``lax.top_k``, 2.3s for jitted ``jnp.argpartition``
+    and 0.4s for this hybrid — against ~0.5s for the ENTIRE training scan, since
+    NLinear's per-step compute is one small matmul. Under a trace (e.g.
+    ``BaseForecaster.conformity_scores``'s vmap, whose short CV windows normally
+    hit the small-n branch anyway) it falls back to pure-JAX ``argpartition`` —
+    both paths select the same index sets from the same uniforms.
     Returns ``[len(step_keys), windows_batch_size]`` int32.
     """
     if n_windows < windows_batch_size:
         def sample_one(k):
             return jax.random.choice(k, n_windows, shape=(windows_batch_size,), replace=True)
-    else:
-        def sample_one(k):
-            u = jax.random.uniform(k, (n_windows,))
-            return jnp.argpartition(u, n_windows - windows_batch_size)[n_windows - windows_batch_size:]
-    return jax.vmap(sample_one)(step_keys)
+        return jax.vmap(sample_one)(step_keys)
+    u = jax.vmap(lambda k: jax.random.uniform(k, (n_windows,)))(step_keys)
+    cut = n_windows - windows_batch_size
+    try:
+        u_host = np.asarray(u)
+    except jax.errors.TracerArrayConversionError:
+        return jnp.argpartition(u, cut, axis=-1)[:, cut:]
+    return jnp.asarray(np.argpartition(u_host, cut, axis=-1)[:, cut:])
 
 
 def train(model: NLinearNet, y: jnp.ndarray, *, h: int, input_size: int, max_steps: int,
