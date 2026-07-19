@@ -26,10 +26,15 @@ class NLinear(BaseForecaster):
         interface, including conformal prediction intervals via
         ``predict(level=...)``, pickle round-trip, and ``forecast(fitted=True)``.
 
+    ``input_size=-1`` (default) expands to ``3*h`` — a Chronax convenience;
+    neuralforecast requires ``input_size`` explicitly.
+
     ``scaler``: ``"identity"`` (default, matches neuralforecast) or ``"robust"``.
     Note the model's own last-value normalization cancels any scaler *shift*
-    algebraically; a non-identity scaler only changes the scale. ``float32``
-    throughout.
+    algebraically, and the scale cancels on the linear term too — a non-identity
+    scaler affects only the bias contribution. ``float32`` throughout, matching
+    torch/neuralforecast defaults (forward parity gated by
+    ``benchmarks/nlinear_weight_parity.py``).
     """
 
     uses_exog = False
@@ -139,8 +144,9 @@ class NLinear(BaseForecaster):
         return jnp.concatenate([nan_head, first])
 
     def __getstate__(self) -> dict:
-        """Serialize NNX Param state only. The GraphDef holds unpicklable JAX
-        ufuncs, so it is rebuilt via _build_net()."""
+        """Serialize NNX Param state only and rebuild the GraphDef via
+        _build_net() on load — smaller payload and robust to flax-internal
+        GraphDef changes across versions (same convention as KAN)."""
         state = self.__dict__.copy()
         if state.get("model_") is not None:
             _, full_state = nnx.split(state["model_"])

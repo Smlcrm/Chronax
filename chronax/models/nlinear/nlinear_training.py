@@ -64,16 +64,17 @@ def _sample_batch_idx(step_keys: jnp.ndarray, n_windows: int, windows_batch_size
     distribution-equivalent to NF's ``randperm(n)[:k]`` (by symmetry every
     k-subset is equally likely, and batch order is irrelevant to a mean-reduced
     loss). Selection runs via ``np.argpartition`` on the host when the keys are
-    concrete: measured per fit at RoomTemperature scale (n≈7000, 5000 steps,
-    the benchmark's only large-n dataset), sampling cost is 9.6s for a vmapped
-    full permutation, 4.6s for ``lax.top_k``, 2.3s for jitted ``jnp.argpartition``
+    concrete: measured per fit at ~7k-window scale (5000 steps, the largest
+    benchmark dataset; CPU, 2026-07), sampling cost was 9.6s for a vmapped full
+    permutation, 4.6s for ``lax.top_k``, 2.3s for jitted ``jnp.argpartition``
     and 0.4s for this hybrid — against ~0.5s for the ENTIRE training scan, since
-    NLinear's per-step compute is one small matmul. Under a trace (e.g.
-    ``BaseForecaster.conformity_scores``'s vmap, whose short CV windows normally
-    hit the small-n branch anyway) it falls back to pure-JAX ``argpartition`` —
-    both paths select the same index sets from the same uniforms (up to float32
-    key ties at the cut, where either resolution is an equally valid uniform
-    subset).
+    NLinear's per-step compute is one small matmul. Under a trace of the keys
+    themselves (e.g. ``jax.jit`` over ``step_keys``, as in the equivalence test)
+    it falls back to pure-JAX ``argpartition``; note that
+    ``BaseForecaster.conformity_scores``' vmap does NOT trace the keys (the seed
+    is a static int), so conformal fits still take the host path. Both paths
+    select the same index sets from the same uniforms (up to float32 key ties at
+    the cut, where either resolution is an equally valid uniform subset).
     Returns ``[len(step_keys), windows_batch_size]`` int32.
     """
     if n_windows < windows_batch_size:

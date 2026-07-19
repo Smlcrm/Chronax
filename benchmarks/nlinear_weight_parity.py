@@ -41,7 +41,7 @@ print("DUMP_OK", len(sd))
 '''
 
 
-def main():
+def main() -> None:
     DUMP.parent.mkdir(parents=True, exist_ok=True)
     DUMP.unlink(missing_ok=True)
     out = subprocess.run([str(NF_VENV_PY), "-c", _TORCH], capture_output=True, text=True)
