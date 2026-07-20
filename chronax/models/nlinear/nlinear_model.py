@@ -33,8 +33,7 @@ class NLinear(BaseForecaster):
     Note the model's own last-value normalization cancels any scaler *shift*
     algebraically, and the scale cancels on the linear term too — a non-identity
     scaler affects only the bias contribution. ``float32`` throughout, matching
-    torch/neuralforecast defaults (forward parity gated by
-    ``benchmarks/nlinear_weight_parity.py``).
+    torch/neuralforecast defaults.
     """
 
     uses_exog = False
