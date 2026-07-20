@@ -91,6 +91,20 @@ try:
 except ImportError:
     BiTCN = None
 
+# TCN is guarded like BiTCN so an off-pin flax degrades to None instead of
+# breaking the namespace.
+try:
+    from .tcn import TCN
+except ImportError:
+    TCN = None
+
+# StemGNN is guarded like TCN so an off-pin flax degrades to None instead of
+# breaking the namespace.
+try:
+    from .stemgnn import StemGNN
+except ImportError:
+    StemGNN = None
+
 from .batched_forecaster import BatchedForecaster
 
 from .xlstm import XLSTM
@@ -135,6 +149,8 @@ __all__ = [
     "KAN",
     "PatchTST",
     "BiTCN",
+    "TCN",
+    "StemGNN",
     "BatchedForecaster",
     "XLSTM",
 ]

@@ -13,7 +13,7 @@ A high-performance, JAX-accelerated time-series forecasting library. `chronax` p
 ## Features
 
 - ⚡ **JAX-accelerated** — JIT-compiled model fitting and forecasting on CPU, GPU, or TPU
-- 📈 **35+ forecasting models** — classical (AutoARIMA, AutoETS, AutoTheta, TBATS, MFLES, GARCH, STL, and more) and neural (TFT, Informer, PatchTST, XLSTM, and more)
+- 📈 **35+ forecasting models** — classical (AutoARIMA, AutoETS, AutoTheta, TBATS, MFLES, GARCH, STL, and more) and neural (TFT, Informer, PatchTST, TCN, XLSTM, and more)
 - 🔁 **Unified API** — every model follows the same `fit()` → `predict()` pattern
 - 📊 **Prediction intervals** — built-in conformal and native interval support
 - ✅ **NumPy compatible** — accepts and returns standard array types
@@ -231,6 +231,8 @@ Neural forecasters implemented in JAX/Flax, ported from the Nixtla `neuralforeca
 | `PatchTST` | ✓ | ✓ | — | Conformal |
 | `KAN` | ✓ | ✓ | — | Conformal |
 | `BiTCN` | ✓ | ✓ | — | Conformal |
+| `TCN` | ✓ | ✓ | ✓ | Conformal |
+| `StemGNN` | ✓ | ✓ | — | Conformal |
 | `GRU` | ✓ | ✓ | — | Conformal |
 | `XLSTM` | ✓ | ✓ | — | Conformal |
 | `Autoformer` | ✓ | — | — | — |
