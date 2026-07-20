@@ -1,34 +1,37 @@
-"""Offline unit tests for benchmarks/neural/registry.py."""
+"""Offline unit tests for benchmarks/neural/registry.py auto-discovery."""
 import pytest
 
 from benchmarks.neural import registry
-from chronax.models import GRU, KAN, XLSTM, Informer, PatchTST, TFT, iTransformer
+from chronax.models import GRU, KAN, PatchTST, TFT, iTransformer
+
+_WIRED = {"GRU", "PatchTST", "KAN", "TFT", "iTransformer"}
 
 
-def test_list_models():
-    assert sorted(registry.list_models()) == [
-        "GRU", "Informer", "KAN", "PatchTST", "TFT", "XLSTM", "iTransformer"]
+def test_discovers_wired_neural_models():
+    assert _WIRED <= set(registry.list_models())
+
+
+def test_excludes_non_benchmarkable():
+    models = set(registry.list_models())
+    # statistical models (no input_size), XLSTM (ctx_len/horizon_train convention),
+    # Autoformer (not a BaseForecaster) must not be auto-discovered.
+    for name in ["ARIMA", "AutoETS", "Naive", "XLSTM", "Autoformer"]:
+        assert name not in models
 
 
 @pytest.mark.parametrize("name,cls", [("GRU", GRU), ("PatchTST", PatchTST), ("KAN", KAN),
-                                      ("TFT", TFT), ("iTransformer", iTransformer),
-                                      ("Informer", Informer), ("XLSTM", XLSTM)])
+                                      ("TFT", TFT), ("iTransformer", iTransformer)])
 def test_resolve_chronax(name, cls):
     assert registry.resolve_chronax(name) is cls
 
 
-@pytest.mark.parametrize("name", ["GRU", "PatchTST", "KAN", "TFT", "iTransformer", "Informer"])
+@pytest.mark.parametrize("name", sorted(_WIRED))
 def test_nf_model_name_identity(name):
     assert registry.nf_model_name(name) == name
 
 
-def test_nf_model_name_xlstm_casing():
-    # The one name that differs between libraries: Chronax XLSTM -> NF xLSTM.
-    assert registry.nf_model_name("XLSTM") == "xLSTM"
-
-
 def test_unknown_model_raises_keyerror():
-    with pytest.raises(KeyError, match="unknown model"):
-        registry.resolve_chronax("DeepAR")
-    with pytest.raises(KeyError, match="unknown model"):
-        registry.nf_model_name("DeepAR")
+    with pytest.raises(KeyError):
+        registry.resolve_chronax("NoSuchModel")
+    with pytest.raises(KeyError):
+        registry.nf_model_name("NoSuchModel")

@@ -211,8 +211,9 @@ class VanillaTransformer(BaseForecaster):
                 )
             if self._train_y is None:
                 raise RuntimeError("Call fit(y) before predict(h, level=...).")
-            # Run the walk-forward on a clone: conformity_scores re-fits under vmap,
-            # and those fit() writes would leave leaked tracers on this fitted estimator.
+            # Run on a throwaway copy: conformity_scores re-fits inside a vmap, and
+            # calling it on self would overwrite this instance's fitted nnx weights
+            # (self.model_) with tracers, breaking a later predict().
             cs = self.new().conformity_scores(self._train_y)
             method = self.conformal_params.method
             fcst = BaseForecaster.add_confidence_intervals(fcst, cs, level, method)

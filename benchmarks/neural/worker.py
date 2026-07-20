@@ -47,30 +47,35 @@ def build_thread_env(threads: int) -> dict[str, str]:
     }
 
 
-def _nf_kwargs_str(params: dict) -> str:
-    """Render NF constructor kwargs from config nf_params. loss -> MAE()."""
-    parts: list[str] = []
+def _nf_extra_dict(params: dict) -> str:
+    """Render non-loss nf_params as a Python dict literal for the subprocess.
+
+    Loss is fixed to MAE in the constructor template (only loss=MAE is supported).
+    n_series is injected at runtime for models that require it (see
+    nf_subprocess_code), so it never needs to appear here.
+    """
+    items = []
     for k, v in params.items():
         if k == "loss":
             if v != "MAE":
                 raise ValueError(f"only loss=MAE is supported for NF, got {v!r}")
-            parts.append("loss=MAE()")
-        elif isinstance(v, str):
-            parts.append(f"{k}={v!r}")
-        else:
-            parts.append(f"{k}={v}")
-    return ", ".join(parts)
+            continue
+        items.append(f"{k!r}: {v!r}")
+    return "{" + ", ".join(items) + "}"
 
 
 def nf_subprocess_code(nf_name: str, spec: dict[str, str], h: int, input_size: int, params: dict, seed: int, threads: int) -> str:
     """Build the `python -c` source run inside .venv-nf for one NF seed.
 
     torch.set_num_threads pins CPU threads; the neuralforecast import is BEFORE
-    t0 so the timer measures only fit+predict (fair timing, spec §1).
+    t0 so the timer measures only fit+predict (fair timing). Loss is MAE. Any model
+    that *requires* n_series (i.e. a multivariate model) is given n_series=1 — this
+    is a univariate benchmark — detected by inspecting the model, so no per-model
+    config is needed.
     """
-    kwargs = _nf_kwargs_str(params)
+    extra = _nf_extra_dict(params)
     return f'''
-import json, time, numpy as np, pandas as pd
+import json, time, inspect, numpy as np, pandas as pd
 import torch
 torch.set_num_threads({int(threads)})
 from neuralforecast import NeuralForecast
@@ -82,9 +87,13 @@ df['ds'] = pd.to_datetime(df['ds']); df['unique_id'] = {spec['name']!r}
 df = df[['unique_id','ds','y']].sort_values('ds').reset_index(drop=True)
 train, test = df.iloc[:-{h}], df.iloc[-{h}:]
 y_true = test['y'].to_numpy()
-m = {nf_name}(h={h}, input_size={input_size}, {kwargs},
-    random_seed={seed}, accelerator='cpu', enable_progress_bar=False,
-    logger=False, enable_model_summary=False, enable_checkpointing=False)
+kw = {extra}
+sig = inspect.signature({nf_name}).parameters
+if 'n_series' in sig and sig['n_series'].default is inspect.Parameter.empty:
+    kw.setdefault('n_series', 1)   # univariate benchmark
+m = {nf_name}(h={h}, input_size={input_size}, loss=MAE(), random_seed={seed},
+    accelerator='cpu', enable_progress_bar=False, logger=False,
+    enable_model_summary=False, enable_checkpointing=False, **kw)
 nf = NeuralForecast(models=[m], freq={spec['freq']!r})
 t0 = time.perf_counter(); nf.fit(df=train); fcst = nf.predict(); t = time.perf_counter() - t0
 y_hat = fcst[{nf_name!r}].to_numpy()
@@ -105,7 +114,7 @@ import numpy as np
 
 sys.path.insert(0, str(REPO))
 from benchmarks.neural import metrics, registry  # noqa: E402
-from benchmarks.neural.run import load_config  # noqa: E402
+from benchmarks.neural.run import load_config, model_params  # noqa: E402
 
 
 def _dataset_spec(cfg: dict, name: str) -> dict:
@@ -116,13 +125,6 @@ def _dataset_spec(cfg: dict, name: str) -> dict:
             spec["path"] = str(p if p.is_absolute() else (REPO / p).resolve())
             return spec
     raise KeyError(f"unknown dataset {name!r}")
-
-
-def _model_cfg(cfg: dict, name: str) -> dict:
-    for m in cfg["models"]:
-        if m["name"] == name:
-            return m
-    raise KeyError(f"unknown model {name!r}")
 
 
 def load_dataset_y(spec: dict) -> np.ndarray:
@@ -199,7 +201,7 @@ def main() -> None:
     seeds = args.seeds if args.seeds is not None else exp["seeds"]
     warmup, threads = exp["warmup_seeds"], exp["threads"]
     spec = _dataset_spec(cfg, args.dataset)
-    model_cfg = _model_cfg(cfg, args.model)
+    chronax_params, nf_params = model_params(cfg, args.model)
 
     # Pin threads BEFORE importing jax/chronax (see module docstring).
     os.environ.update(build_thread_env(threads))
@@ -210,13 +212,13 @@ def main() -> None:
         y_train, y_test = y[:-h], y[-h:]
         for i, seed in enumerate(seeds):
             row = run_chronax_seed(cls, y_train, y_test, h, input_size,
-                                   model_cfg["chronax_params"], seed)
+                                   chronax_params, seed)
             emit_row(args.library, args.dataset, args.model, seed, i, warmup, row)
     else:
         nf_name = registry.nf_model_name(args.model)
         for i, seed in enumerate(seeds):
             row = run_nixtla_seed(nf_name, spec, h, input_size,
-                                  model_cfg["nf_params"], seed, threads)
+                                  nf_params, seed, threads)
             emit_row(args.library, args.dataset, args.model, seed, i, warmup, row)
 
 

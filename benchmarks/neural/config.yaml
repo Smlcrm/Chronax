@@ -19,37 +19,65 @@ datasets:
   - { name: RoomTemperature,   path: "benchmarks/benchmark_datasets/room temperature data.csv",
       ds_col: Datetime, y_col: Hourly_Temp, freq: h }
 
-models:
-  - name: GRU
-    chronax_params: { max_steps: 1000, learning_rate: 0.001, loss: mae }   # scaler: RobustScaler is hardwired in the Chronax GRU (no knob)
-    nf_params:      { max_steps: 1000, learning_rate: 0.001, scaler_type: robust, loss: MAE }
-  - name: PatchTST
-    chronax_params: { max_steps: 5000, learning_rate: 0.0001, loss: mae }  # scaler: RevIN is internal (no scaler_type knob)
-    nf_params:      { max_steps: 5000, learning_rate: 0.0001, scaler_type: identity, loss: MAE }  # scaler_type=identity is NF's native PatchTST default made explicit (not a protocol change)
-  - name: KAN
-    chronax_params: { max_steps: 1000, learning_rate: 0.001, scaler: identity, loss: mae }
-    nf_params:      { max_steps: 1000, learning_rate: 0.001, scaler_type: identity, loss: MAE }
-  - name: TFT
-    # windows_batch_size=128 deviates from the NF default (1024) SYMMETRICALLY: with-replacement
-    # sampling pads every step to 1024 windows even on 25-window datasets (both libraries),
-    # putting chronax TFT/Informer at ~2 h PER SEED on CPU. 128 = NF's own RNN-family default.
-    chronax_params: { max_steps: 1000, learning_rate: 0.001, scaler_type: robust, loss: mae, windows_batch_size: 128 }
-    nf_params:      { max_steps: 1000, learning_rate: 0.001, scaler_type: robust, loss: MAE, windows_batch_size: 128 }
-  - name: iTransformer
-    chronax_params: { max_steps: 1000, learning_rate: 0.001, loss: mae }   # natively multivariate; Chronax exposes a univariate adaptation
-    nf_params:      { max_steps: 1000, learning_rate: 0.001, scaler_type: identity, loss: MAE, n_series: 1 }
-  - name: Informer
+# Models are auto-discovered from chronax.models (any BaseForecaster taking
+# h/input_size/random_seed); both libraries use MAE loss and multivariate models
+# get n_series=1 automatically. XLSTM is auto-EXCLUDED (its ctor uses
+# ctx_len/horizon_train, not the neural windowed signature) — the deliberate
+# paired-run exclusion (owner, 2026-07-06: Chronax XLSTM is xLSTMTime, not
+# architecture-1:1 with NF's xLSTM) is now STRUCTURAL, not a config omission.
+#
+# ⚠ The `overrides:` below are NOT optional cosmetics: dev's auto-discovery falls
+# back to each library's OWN class defaults when a model is unlisted, and those do
+# NOT match (e.g. NF Informer defaults to 5000 steps + identity scaler). Every
+# entry pins a MEASURED §8 deviation ("optimize both libraries to purely reflect
+# model performance") — dropping one silently mis-runs that model. Preserved
+# verbatim across the 2026-07-20 dev(auto-discovery) merge; per-model rationale in
+# the comments.
+overrides:
+  GRU:
+    # Chronax GRU hardwires RobustScaler (no knob); pin NF to robust to match.
+    chronax_params: { max_steps: 1000, learning_rate: 0.001 }
+    nf_params:      { max_steps: 1000, learning_rate: 0.001, scaler_type: robust }
+  PatchTST:
+    # PatchTST needs the longer 5000-step budget; NF scaler_type=identity is its
+    # native PatchTST default made explicit (chronax RevIN is internal, no knob).
+    chronax_params: { max_steps: 5000, learning_rate: 0.0001 }
+    nf_params:      { max_steps: 5000, learning_rate: 0.0001, scaler_type: identity }
+  KAN:
+    chronax_params: { max_steps: 1000, learning_rate: 0.001, scaler: identity }
+    nf_params:      { max_steps: 1000, learning_rate: 0.001, scaler_type: identity }
+  TFT:
+    # windows_batch_size=128 deviates from the NF default (1024) SYMMETRICALLY:
+    # with-replacement sampling pads every step to 1024 windows even on 25-window
+    # datasets (both libraries), ~2 h/seed on CPU. 128 = NF's own RNN-family default.
+    chronax_params: { max_steps: 1000, learning_rate: 0.001, scaler_type: robust, windows_batch_size: 128 }
+    nf_params:      { max_steps: 1000, learning_rate: 0.001, scaler_type: robust, windows_batch_size: 128 }
+  iTransformer:
+    # natively multivariate (n_series=1 auto-added NF-side); NF identity = native default.
+    chronax_params: { max_steps: 1000, learning_rate: 0.001 }
+    nf_params:      { max_steps: 1000, learning_rate: 0.001, scaler_type: identity }
+  Informer:
     # Two SYMMETRIC deviations from NF Informer defaults (5000 steps, identity scaler):
-    # steps=1000 — at 1 pinned CPU thread the NF side costs hours/seed at 5000; and
-    # scaler_type=robust — identity feeds raw-scale data and structurally underfits at
-    # 1000 steps x lr 1e-4 (chronax MAE 427 on airline, 2026-07-06; predicted-by-arithmetic
-    # for both libraries). Robust matches the TFT/GRU entries and chronax's tested operating point.
-    chronax_params: { max_steps: 1000, learning_rate: 0.0001, scaler_type: robust, loss: mae, windows_batch_size: 128 }
-    nf_params:      { max_steps: 1000, learning_rate: 0.0001, scaler_type: robust, loss: MAE, windows_batch_size: 128 }  # wbs=128: see TFT comment
-  # XLSTM excluded from paired runs (owner, 2026-07-06): Chronax XLSTM is xLSTMTime
-  # (Alharthi & Mahmood 2024) — NOT architecture-1:1 with NF's xLSTM, so the paired
-  # accept-gate comparison is not meaningful. The wrapper takes the NF-convention
-  # params below and remains registered for ad-hoc runs; uncomment to re-enable.
-  # - name: XLSTM
-  #   chronax_params: { max_steps: 1000, learning_rate: 0.001 }   # NF-alias params (map to horizon/ctx_len/seed/lr); built-in z-score scaling (no knob)
-  #   nf_params:      { max_steps: 1000, learning_rate: 0.001, scaler_type: robust, loss: MAE }  # NF xLSTM defaults (mLSTM backbone, robust scaler); needs xlstm+mlstm_kernels in .venv-nf
+    # steps=1000 (5000 costs hours/seed CPU-side) and scaler_type=robust (identity
+    # feeds raw-scale data and structurally underfits at 1000 steps x lr 1e-4 —
+    # chronax MAE 427 on airline, 2026-07-06). wbs=128: see TFT.
+    chronax_params: { max_steps: 1000, learning_rate: 0.0001, scaler_type: robust, windows_batch_size: 128 }
+    nf_params:      { max_steps: 1000, learning_rate: 0.0001, scaler_type: robust, windows_batch_size: 128 }
+  TCN:
+    # NF TCN defaults already equal the harness conventions; pinned explicitly so the
+    # auto-discovery default-fallback can't drift them. wbs=128 = NF's own TCN default.
+    chronax_params: { max_steps: 1000, learning_rate: 0.001, scaler_type: robust, windows_batch_size: 128 }
+    nf_params:      { max_steps: 1000, learning_rate: 0.001, scaler_type: robust, windows_batch_size: 128 }
+  StemGNN:
+    # wbs=32 = NF's OWN StemGNN default; n_series=1 auto-added NF-side. ⚠ At n_series=1
+    # StemGNN's forecast is input-independent in scaled space on BOTH sides (proven
+    # bit-exact on NF 3.1.7) — the pairing is honest but compares scaler-anchored
+    # constant predictors.
+    chronax_params: { max_steps: 1000, learning_rate: 0.001, scaler_type: robust, windows_batch_size: 32 }
+    nf_params:      { max_steps: 1000, learning_rate: 0.001, scaler_type: robust, windows_batch_size: 32 }
+  DeepNPTS:
+    # Chronax DeepNPTS is identity-scaled and defaults batch_norm off (its running
+    # stats add state complexity); NF DeepNPTS defaults scaler_type='standard' +
+    # batch_norm=True. Pin NF to match so the comparison isolates the engine
+    # (JAX vs PyTorch-Lightning), not the preprocessing.
+    nf_params: { scaler_type: identity, batch_norm: false }

@@ -209,6 +209,10 @@ Deep Learning
    :members:
    :undoc-members:
 
+.. autoclass:: chronax.models.DeepNPTS
+   :members:
+   :undoc-members:
+
 .. autoclass:: chronax.models.VanillaTransformer
    :members:
    :undoc-members:

@@ -1,6 +1,6 @@
-![Simulacrum Logo](https://github.com/Smlcrm/assets/blob/main/Asset%201@4x-8.png?raw=true "Simulacrum — Chronax")
+![Simulacrum Logo](https://github.com/Smlcrm/smlcrm-brand-assets/blob/main/Asset%201@4x-8.png?raw=true "Simulacrum — Chronax")
 
-# chronax
+# Chronax
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11](https://img.shields.io/badge/python-3.11-blue.svg)](https://www.python.org/downloads/)
