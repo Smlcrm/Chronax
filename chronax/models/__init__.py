@@ -111,6 +111,20 @@ try:
 except ImportError:
     DeepNPTS = None
 
+# TCN depends on flax NNX; guard like BiTCN so an incompatible flax degrades it to None
+# instead of breaking the namespace.
+try:
+    from .tcn import TCN
+except ImportError:
+    TCN = None
+
+# StemGNN depends on flax NNX; guard like TCN so an incompatible flax degrades it to None
+# instead of breaking the namespace.
+try:
+    from .stemgnn import StemGNN
+except ImportError:
+    StemGNN = None
+
 from .batched_forecaster import BatchedForecaster
 
 from .xlstm import XLSTM
@@ -157,6 +171,8 @@ __all__ = [
     "PatchTST",
     "BiTCN",
     "DeepNPTS",
+    "TCN",
+    "StemGNN",
     "BatchedForecaster",
     "XLSTM",
 ]
