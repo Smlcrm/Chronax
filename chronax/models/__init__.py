@@ -62,6 +62,16 @@ try:
 except ImportError:
     KAN = None
 
+# NLinear depends on flax NNX (pinned 0.10.x — see chronax/models/nlinear/__init__.py).
+# Guard like KAN/PatchTST so an incompatible flax degrades this model to None instead
+# of crashing the entire chronax.models namespace. Note the trade-off: the pin's
+# informative ImportError is swallowed here; importing chronax.models.nlinear
+# directly surfaces it.
+try:
+    from .nlinear import NLinear
+except ImportError:
+    NLinear = None
+
 # iTransformer / VanillaTransformer depend on flax NNX (flax 0.10.x). If flax's
 # nnx import fails (e.g. an incompatible resolved jax that dropped an API nnx
 # needs), guard like PatchTST/BiTCN so the model degrades to None instead of
@@ -143,6 +153,7 @@ __all__ = [
     "TFT",
     "Informer",
     "KAN",
+    "NLinear",
     "PatchTST",
     "BiTCN",
     "DeepNPTS",
