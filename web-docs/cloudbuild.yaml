@@ -11,8 +11,8 @@
 substitutions:
   _GEMINI_API_KEY: ""
   _DOCGEN_TOKEN: ""
-  _CACHE_BUCKET: gs://sml-web-doc-gen-dev-docgen-cache
-  _DOCGEN_REF: main
+  _CACHE_BUCKET: gs://sml-web-doc-gen-dev-docgen-cache/chronax
+  _DOCGEN_REF: prod
   _SERVICE_NAME: web-docs-chronax-dev
   _DEPLOY_REGION: us-central1
   _IMAGE: us-central1-docker.pkg.dev/sml-web-doc-gen-dev/cloud-run-source-deploy/chronax/web-docs-chronax-dev
@@ -37,7 +37,8 @@ steps:
 
         echo "Generating docs (cache hits skip Gemini) ..."
         GEMINI_API_KEY="${_GEMINI_API_KEY}" PYTHONPATH=/docgen \
-          /venv/bin/python -m docgen --repo /workspace --out /workspace/site
+          /venv/bin/python -m docgen --repo /workspace --out /workspace/site \
+          --config /workspace/web-docs/docgen.toml
         cp /docgen/serve.py /workspace/serve.py
 
         echo "Saving doc cache to ${_CACHE_BUCKET} ..."
@@ -45,7 +46,7 @@ steps:
 
   # 2. Build the serve-only image (copies the prebuilt ./site + ./serve.py).
   - name: gcr.io/cloud-builders/docker
-    args: [build, -t, "${_IMAGE}:${COMMIT_SHA}", ., -f, Dockerfile]
+    args: [build, -t, "${_IMAGE}:${COMMIT_SHA}", ., -f, web-docs/Dockerfile]
 
   # 3. Push, then 4. deploy.
   - name: gcr.io/cloud-builders/docker
