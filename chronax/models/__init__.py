@@ -111,6 +111,13 @@ try:
 except ImportError:
     DeepNPTS = None
 
+# SOFTS hard-pins flax 0.10.x (raises ImportError otherwise); guard like DeepNPTS so a
+# version/availability mismatch degrades to SOFTS=None instead of breaking the namespace.
+try:
+    from .softs import SOFTS
+except ImportError:
+    SOFTS = None
+
 # TCN depends on flax NNX; guard like BiTCN so an incompatible flax degrades it to None
 # instead of breaking the namespace.
 try:
@@ -171,6 +178,7 @@ __all__ = [
     "PatchTST",
     "BiTCN",
     "DeepNPTS",
+    "SOFTS",
     "TCN",
     "StemGNN",
     "BatchedForecaster",
