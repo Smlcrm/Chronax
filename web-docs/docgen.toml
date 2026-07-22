@@ -1,5 +1,5 @@
 # Documentation config for docgen (github.com/Smlcrm/web-doc-generator).
-# Auto-loaded when generating docs for this repo.
+# Passed explicitly via --config in web-docs/cloudbuild.yaml.
 
 [project]
 name = "Chronax"
