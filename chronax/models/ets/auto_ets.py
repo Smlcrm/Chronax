@@ -140,10 +140,41 @@ class AutoETS(BaseForecaster):
         self.alias = alias
         self.conformal_params = prediction_intervals
         self.optax_steps = self.max_iter
+        # Eagerly-selected winning (E,T,S,damped) spec, cached at fit so the
+        # vmapped conformity_scores CV path re-fits only that fixed spec per
+        # window (the AutoARIMA/AutoMFLES eager-select-once pattern). None until
+        # fit; None also means "fresh/direct forecast -> full ZZZ grid".
+        self._selected_spec: Optional[tuple] = None
+        self._cs: Optional[jnp.ndarray] = None
 
-    def _fit_stacked(self, y: jnp.ndarray) -> dict[str, Any]:
-        """Run the stacked candidate fit on *y* (shared by fit/forecast)."""
+    def _fit_stacked(
+        self, y: jnp.ndarray, spec: Optional[tuple] = None
+    ) -> dict[str, Any]:
+        """Run the candidate fit on *y* (shared by fit/forecast).
+
+        When *spec* is a concrete ``(etype, ttype, stype, damped)`` tuple (the
+        eagerly-selected winner cached at fit), only that single candidate is
+        fitted — a fully-traceable one-candidate ``ets_f`` (``n_cand == 1`` ->
+        static winner index). This is what the vmapped
+        ``conformity_scores`` CV path uses, so each window re-fits the SELECTED
+        spec's parameters instead of re-running the ~12-candidate ZZZ grid (the
+        O(candidates x n_windows) scalability wall). With
+        *spec=None* the full ``self.model`` grid is fitted (fresh/direct use).
+        """
         steps = self.max_iter if self.max_iter is not None else self._default_optax_steps(len(y))
+        if spec is not None:
+            etype, ttype, stype, dtype = spec
+            return ets_f(
+                y,
+                m=self.season_length,
+                model=f"{etype}{ttype}{stype}",
+                damped=bool(dtype),
+                phi=self.phi,
+                allow_multiplicative_trend=True,
+                optax_steps=steps,
+                optax_lr=self.optax_lr,
+                optax_clip=self.optax_clip,
+            )
         return ets_f(
             y,
             m=self.season_length,
@@ -179,14 +210,56 @@ class AutoETS(BaseForecaster):
         self.optax_steps = self.max_iter if self.max_iter is not None else self._default_optax_steps(len(y))
         self.model_ = self._fit_stacked(y)
         self.model_["actual_residuals"] = y - self.model_["fitted"]
+        # Cache the eagerly-selected winning spec so the vmapped CV path
+        # (conformity_scores -> forecast) re-fits ONLY this fixed spec per
+        # window instead of the full ~12-candidate ZZZ grid. Concretising the
+        # traced argmin index here is eager/host-side (fit is not traced); the
+        # winner index is static when only one candidate was generated.
+        cands = self.model_["candidates"]
+        best_idx = 0 if len(cands) == 1 else int(self.model_["best"])
+        self._selected_spec = tuple(cands[best_idx])
         # Cache conformity scores on the training series (sibling convention);
-        # forecast() below is write-free, so the vmapped CV re-fits inside
-        # conformity_scores cannot leak tracers onto this fitted estimator.
+        # forecast() below is write-free on the fitted fast path, so the vmapped
+        # CV re-fits inside conformity_scores cannot leak tracers onto self.
         if self.conformal_params is not None:
             self._cs = self.conformity_scores(y=y, X=X)
         else:
             self._cs = None
         return self
+
+    def conformity_scores(
+        self, y: jnp.ndarray, X: Optional[jnp.ndarray] = None
+    ) -> jnp.ndarray:
+        """Conformity scores with eager spec selection, vmapped per-window refit.
+
+        The base implementation vmaps ``self.forecast`` over CV windows. Full
+        ZZZ model selection (fitting ~12 candidates and argmin-ing their IC) is
+        far too expensive to repeat inside every window — the
+        O(candidates x n_windows x optax_steps x n) wall that made AutoETS
+        ``TIMEOUT`` on long series. So the winning
+        ``(E,T,S,damped)`` spec is selected ONCE, eagerly, on the full series
+        here (via ``fit``); the vmapped ``forecast`` then re-fits only that
+        fixed spec's parameters per window through the one-candidate ``ets_f``
+        fast path (``_fit_stacked(spec=...)``) — mirroring the AutoARIMA
+        (``auto_arima.py``) and AutoMFLES (``auto_mfles.py``) overrides.
+
+        Calibration caveat (shared with AutoARIMA and AutoMFLES): the SPEC is
+        chosen with sight of the full series, including the CV test
+        windows — mildly optimistic. Parameters are still honestly re-fit per
+        window, so scores vary across windows.
+
+        Side Effects:
+            First call on an unfitted estimator runs ``fit`` (caches the
+            selected spec + scores) — mirroring ``forecast``'s first-call
+            behaviour and the sibling Auto overrides.
+        """
+        if self._selected_spec is None:
+            self.fit(y, X)
+            # fit() just ran the CV on exactly this y and cached the scores;
+            # reuse them rather than paying the n_windows re-fits twice.
+            if self._cs is not None:
+                return self._cs
+        return super().conformity_scores(y, X)
 
     def predict(
         self, h: int, X: Optional[jnp.ndarray] = None, level: Optional[List[int]] = None
@@ -301,8 +374,7 @@ class AutoETS(BaseForecaster):
 
         Stateless by contract: the base class's ``conformity_scores`` vmaps
         this method over CV windows, so it never reads or writes ``model_``
-        (stored state would leak tracers and future information — the
-        pre-refactor AutoCES bug, CLAUDE.md §4 #2).
+        (stored state would leak tracers and future information).
 
         Args:
             y (numpy.array): Clean time series of shape (n, ).
@@ -319,7 +391,10 @@ class AutoETS(BaseForecaster):
         self._validate_h(h)
         self._validate_level(level)
         self._validate_series_length(y)
-        mod = self._fit_stacked(y)
+        # Fitted fast path: re-fit only the eagerly-selected spec (cheap, and
+        # writes NOTHING to self, so the base conformity_scores can vmap this).
+        # Fresh/direct use (_selected_spec is None): full ZZZ grid.
+        mod = self._fit_stacked(y, spec=self._selected_spec)
         return self._compose_output(mod, y, h, X, level, fitted)
 
     def forward(

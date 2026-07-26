@@ -18,7 +18,7 @@ This module wires together the following components into a single entry-point
   mean paths, while :func:`_compute_pred_intervals` adds analytical or
   simulation-based prediction intervals.
 
-vmap contract (CLAUDE.md §1 rule 2): ``ets_f`` and the point-forecast path
+vmap contract: ``ets_f`` and the point-forecast path
 (:func:`ets_point_forecast`, :func:`ets_forward_stacked`) are natively
 traceable under ``jax.vmap`` — candidate structure is *config/shape-static*
 (a Python loop over static specs), while the winner is a traced
@@ -38,8 +38,9 @@ __all__ = [
 ]
 
 import math
-from functools import partial
+from functools import lru_cache, partial
 from typing import Dict, Any, Optional
+import numpy as np
 import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
@@ -53,41 +54,61 @@ from chronax.utils import _calculate_intervals, results
 _smalno = jnp.finfo(float).eps
 _PHI_LOWER = 0.8
 _PHI_UPPER = 0.98
-_AICC_RATIO_THRESHOLD = 40.0
 EPS = 1e-3
+
+# Largest seasonal period chronax fits in the AUTO grid; above it, seasonal
+# candidates are pruned (non-seasonal fallback). This is a chronax CRASH-SAFETY,
+# NOT a faithfulness choice: chronax's seasonal initparam is inadmissible
+# (check_param raise) at ~m>=60 (universal across datasets; m<=58 fits fine). 52
+# (= weekly seasonality) sits safely below that, so every allowed seasonal
+# candidate is fittable, while very-large m (e.g. cgm's 288, ~5 cycles) is pruned
+# to avoid the inadmissible-init raise.
+# NB: StatsForecast's AutoETS does NOT prune the SELECTION grid at m>24 — it fits
+# genuine seasonal periods and lets AICc pick non-seasonal. Its `m>24 return` lives
+# in `etssimulate`, the interval SIMULATION path (hardcoded 24-length state), which
+# chronax's `_etssimulate_jit` guard below mirrors. Applying that interval-sim limit
+# to selection would over-prune genuine sub-annual periods into a degenerate
+# non-seasonal fallback, so this threshold is set by the fit limit instead.
+_MAX_SEASONAL_M = 52
 EPS_PURE = 2e-2
 
 
 def _aicc(aic: float, n: int, k: int) -> float:
-    """Small-sample corrected AIC (AICc) with extra penalty for tiny datasets.
+    """Small-sample corrected AIC (AICc), Hyndman/StatsForecast form.
+
+    Unconditional Hyndman AICc: ``AIC + 2k(k+1)/(n-k-1)``, ``inf`` when the
+    correction denominator ``n-k-1 <= 0``. Matches R ``forecast::ets``,
+    StatsForecast, :func:`chronax.utils.calculate_information_criteria`, and
+    AutoARIMA (``auto_arima.py``).
+
+    No gating on ``n/k`` and no ad-hoc tiny-dataset penalty: an extra term of the
+    form ``k*(150-n)/150`` has no literature basis and penalizes high-k SEASONAL
+    models on short series, biasing selection away from a correct seasonal winner.
+    The Hyndman correction already vanishes as ``n`` grows, so a gate on ``n/k``
+    would be redundant as well.
 
     Parameters
     ----------
     aic : float
         Uncorrected AIC value.
     n : int
-        Number of observations.
+        Number of observations (static).
     k : int
-        Number of free parameters (including σ²).
+        Number of free parameters including σ² (static).
 
     Returns
     -------
     float
         AICc value; ``inf`` when the correction denominator is non-positive.
     """
+    # n, k are shape/config-static ints -> all branches are on statics; the
+    # returned value stays traced through `aic` (vmap-safe, as before).
     if k <= 0:
         return aic
-    if (n / k) < _AICC_RATIO_THRESHOLD:
-        denom = n - k - 1
-        if denom <= 0:
-            return float(jnp.inf)
-        base_aicc = aic + 2.0 * k * (k + 1) / denom
-    else:
-        base_aicc = aic
-    if n < 150:
-        extra_penalty = k * (150 - n) / 150.0
-        base_aicc = base_aicc + extra_penalty
-    return base_aicc
+    denom = n - k - 1
+    if denom <= 0:
+        return float(jnp.inf)
+    return aic + 2.0 * k * (k + 1) / denom
 
 
 def _prepare_init_state(
@@ -134,10 +155,17 @@ def _compute_ic(lik: jnp.ndarray, n: int, k: int) -> tuple[jnp.ndarray, jnp.ndar
 
 
 def _inv_sigmoid_scaled(val: float, low: float, high: float) -> float:
-    """Inverse of the legacy scaled-sigmoid transform: constrained → unconstrained."""
-    z = (val - low) / (high - low)
-    z = jnp.clip(z, 1e-4, 1.0 - 1e-4)
-    return float(jnp.log(z / (1.0 - z)))
+    """Inverse of the legacy scaled-sigmoid transform: constrained → unconstrained.
+
+    Pure host math on concrete start values (session-2 lever 3a): the eager
+    x0 build runs once per candidate per fit, and each jnp op here was a
+    dispatch + device sync. The inputs are data-independent start values
+    (proven concrete even under the CV vmap — a tracer would crash the
+    ``float()``), so Python floats are exact and free.
+    """
+    z = (float(val) - low) / (high - low)
+    z = min(max(z, 1e-4), 1.0 - 1e-4)
+    return math.log(z / (1.0 - z))
 
 
 @partial(jax.jit, static_argnames=("m", "error", "trend", "season", "h"))
@@ -179,7 +207,7 @@ def _etssimulate_jit(
     This is a *stateful* helper used by interval simulation for Class 4/5
     models; it mirrors the kernel `_ets.update` and `_ets.forecast` behavior.
     """
-    if m > 24 and season != _ets.Component.Nothing:
+    if m > _MAX_SEASONAL_M and season != _ets.Component.Nothing:
         return jnp.zeros((h,), dtype=x.dtype)
     elif m < 1:
         m = 1
@@ -403,6 +431,65 @@ def initparam(
     m: int,
     bounds: str,
 ) -> tuple[dict[str, float], jnp.ndarray, jnp.ndarray]:
+    """Memoized front for :func:`_initparam_impl`.
+
+    Every input is pure config — no ``y`` anywhere — yet the eager impl pays
+    several ``.at[].set`` scatter dispatches plus ``float()`` device syncs
+    per call, and the auto grid calls it once per candidate per fit
+    (~0.3-0.5 ms/candidate, n-independent). Key the results on host floats
+    (NaN normalized to None — NaN != NaN would miss the cache forever) and
+    the bounds as tuples. Inputs are provably concrete here: the impl's own
+    ``float()`` casts would crash on a tracer, and the conformal CV vmap has
+    exercised this path since the S-wave, so caching on host values cannot
+    change traceability. The returned dict is copied per call so a caller
+    mutation cannot poison the cache; the jnp bounds arrays are immutable.
+    """
+    key_vals = []
+    for v in (alpha, beta, gamma, phi):
+        fv = float(v)
+        key_vals.append(None if math.isnan(fv) else fv)
+    d, lo, up = _initparam_cached(
+        key_vals[0], key_vals[1], key_vals[2], key_vals[3],
+        str(trendtype), str(seasontype), bool(damped),
+        tuple(float(v) for v in np.asarray(lower)),
+        tuple(float(v) for v in np.asarray(upper)),
+        int(m), str(bounds),
+    )
+    return dict(d), lo, up
+
+
+@lru_cache(maxsize=2048)
+def _initparam_cached(
+    alpha_k, beta_k, gamma_k, phi_k, trendtype, seasontype, damped,
+    lower_t, upper_t, m, bounds,
+):
+    """Config-keyed cache body for :func:`initparam` (raises pass through
+    uncached, so the boundary-consistency Exception reproduces every call)."""
+    return _initparam_impl(
+        math.nan if alpha_k is None else alpha_k,
+        math.nan if beta_k is None else beta_k,
+        math.nan if gamma_k is None else gamma_k,
+        math.nan if phi_k is None else phi_k,
+        trendtype, seasontype, damped,
+        jnp.asarray(lower_t, dtype=jnp.float64),
+        jnp.asarray(upper_t, dtype=jnp.float64),
+        m, bounds,
+    )
+
+
+def _initparam_impl(
+    alpha: float,
+    beta: float,
+    gamma: float,
+    phi: float,
+    trendtype: str,
+    seasontype: str,
+    damped: bool,
+    lower: jnp.ndarray,
+    upper: jnp.ndarray,
+    m: int,
+    bounds: str,
+) -> tuple[dict[str, float], jnp.ndarray, jnp.ndarray]:
     """
     Initialize (and lightly sanitize) smoothing parameters and bounds.
 
@@ -546,19 +633,31 @@ def admissible(alpha: float, beta: float, gamma: float, phi: float, m: int) -> b
             return False
         if beta < -(1 - phi) * (gamma / m + alpha):
             return False
-        # Characteristic-equation check via companion-matrix roots (JAX)
-        P = jnp.full(2 + m - 2 + 2, jnp.nan)
-        P = P.at[:2].set(jnp.array([phi * (1 - alpha - gamma), alpha + beta - alpha * phi + gamma - 1.0]))
-        mid_len = m - 2
-        if mid_len > 0:
-            P = P.at[2 : (m - 2 + 2)].set(jnp.repeat(alpha + beta - alpha * phi, mid_len))
-        P = P.at[(m - 2 + 2) :].set(jnp.array([alpha + beta - phi, 1.0]))
-        roots = _polyroots_power_basis(P)  # complex
-        mod = jnp.abs(roots)
-        max_mod = float(jnp.max(mod))
-        if max_mod > 1 + 1e-10:
+        # Characteristic-equation check via companion-matrix roots, routed
+        # through the jitted mirror behind a host memo: the eager build plus
+        # `_polyroots_power_basis` eigvals and a float() sync runs once per SEASONAL
+        # candidate per fit on purely config-derived inputs (start values + default
+        # bounds), so without the memo repeat fits re-pay an identical verdict.
+        # `_admissible_root_ok`
+        # builds the SAME monic polynomial and applies the SAME <= 1+1e-10
+        # boundary (complement-exact for non-NaN moduli; a NaN modulus — LAPACK
+        # non-convergence or NaN params, unreachable from finite start values —
+        # now maps to inadmissible, the safer direction, where the old `>` test
+        # mapped it admissible). The memo makes every fit after the first free
+        # (maxsize bounds growth if data-derived floats ever reach this path).
+        if not _admissible_root_cached(
+                float(alpha), float(beta), float(gamma), float(phi), int(m)):
             return False
     return True
+
+
+@lru_cache(maxsize=4096)
+def _admissible_root_cached(alpha: float, beta: float, gamma: float,
+                            phi: float, m: int) -> bool:
+    """Host memo over the jitted seasonal stability check (see admissible())."""
+    return bool(_admissible_root_ok(
+        jnp.float64(alpha), jnp.float64(beta), jnp.float64(gamma),
+        jnp.float64(phi), m=m))
 
 
 def check_param(
@@ -612,6 +711,7 @@ def check_param(
     return True
 
 
+@partial(jax.jit, static_argnames=("m",))
 def _admissible_root_ok(
     alpha: jnp.ndarray,
     beta: jnp.ndarray,
@@ -641,6 +741,7 @@ def _admissible_root_ok(
     return jnp.max(jnp.abs(roots)) <= 1.0 + 1e-10
 
 
+@partial(jax.jit, static_argnames=("bounds", "m", "damped", "has_beta", "has_gamma"))
 def _valid_params_jnp(
     alpha: jnp.ndarray,
     beta: jnp.ndarray,
@@ -662,6 +763,11 @@ def _valid_params_jnp(
     (``damped``/``has_beta``/``has_gamma``), so all Python branching is on
     config and the returned validity is a traced boolean scalar. NaN
     parameters fail every comparison, so a diverged fit is invalid for free.
+
+    Jitted with config-only statics: eagerly this costs ~50 op dispatches plus a
+    ``jnp.linalg.eigvals`` per seasonal candidate, once per fit. One jitted call per
+    static config removes that while inlining unchanged into the vmapped conformity
+    trace.
     """
     one = jnp.asarray(True)
     phi_e = phi if damped else jnp.asarray(1.0, dtype=jnp.float64)
@@ -920,25 +1026,28 @@ def pegelsresid_C(
     """
     Roll out ETS residuals, AMSE, and likelihood from an initialized state.
 
-    This is the high-level wrapper around `_ets.calc_full` that:
-    - prepares buffers,
+    This is the high-level wrapper around the lean no-history rollout that:
     - enforces structural simplifications (e.g., set beta/gamma/phi when absent),
-    - reshapes the packed state history,
     - returns `(amse, residuals, states, lik)`.
+
+    Routes through ``_ets._calc_roll_nohist`` (with
+    ``clip_multiplicative_errors=False``, whose static-False selects make it
+    expression-identical to ``_calc_roll``) rather than ``_ets.calc_full``. A full
+    (n+1, n_states) state history would be scattered per step, but every consumer —
+    forecast seeding, native intervals, the stacked CV refit, ``ets_f``'s
+    ``cand_last_state`` — reads only ``states[-1]``. ``states`` is therefore the
+    final snapshot only, shape ``(1, n_states)``, and all ``[-1]`` consumers are
+    indexing-identical. ``e``/``amse``/``lik`` are the same expressions in the same
+    order (in-carry likelihood accumulation).
 
     Returns
     -------
     (jnp.ndarray, jnp.ndarray, jnp.ndarray, float)
-        AMSE vector (length nmse), residuals (length n), state snapshots
-        ((n+1) x n_state), and the likelihood-style scalar.
+        AMSE vector (length nmse), residuals (length n), the final state
+        snapshot with shape (1, n_state), and the likelihood-style scalar.
     """
     y = jnp.asarray(y, dtype=jnp.float64)
-    p = int(init_state.shape[0])
     n = int(y.shape[0])
-
-    x = jnp.full((p * (n + 1),), jnp.nan)
-    x = x.at[:p].set(jnp.asarray(init_state, dtype=jnp.float64))
-    e = jnp.full_like(y, jnp.nan)
 
     if not damped:
         phi = 1.0
@@ -946,14 +1055,16 @@ def pegelsresid_C(
         beta = 0.0
     if seasontype == "N":
         gamma = 0.0
-    amse = jnp.full((nmse,), jnp.nan)
 
-    amse, e, x, lik = _ets.calc_full(
-        x,
-        e,
-        amse,
+    e0 = jnp.zeros_like(y)
+    amse0 = jnp.zeros((nmse,), dtype=jnp.float64)
+    e, amse, lik, last_state = _ets._calc_roll_nohist(
+        jnp.asarray(init_state, dtype=jnp.float64),
+        e0,
+        amse0,
         nmse,
         y,
+        jnp.asarray(n, dtype=jnp.int32),
         switch(errortype),
         switch(trendtype),
         switch(seasontype),
@@ -962,13 +1073,14 @@ def pegelsresid_C(
         jnp.asarray(gamma, dtype=jnp.float64),
         jnp.asarray(phi, dtype=jnp.float64),
         int(m),
+        clip_multiplicative_errors=False,
+        fcst_h=nmse,
     )
-    xs = x.reshape((n + 1, p))
     # Legacy NA sentinel (-99999) → NaN, branch-free: if lik is already NaN the
     # comparison is False and NaN propagates unchanged (same as the old
     # eager double-if, but traceable under vmap).
     lik = jnp.where(jnp.abs(lik + 99999.0) < _ets.TOL, jnp.nan, lik)
-    return amse, e, xs, lik
+    return amse, e, last_state[None, :], lik
 
 
 def optimize_ets_target_fn(
@@ -1158,6 +1270,119 @@ def optimize_ets_target_fn(
     )
 
 
+@lru_cache(maxsize=512)
+def _make_etsmodel_tail(
+    errortype: str,
+    trendtype: str,
+    seasontype: str,
+    damped: bool,
+    m: int,
+    nmse: int,
+    bounds: str,
+    opt_names: tuple,
+    pure_sigmoid: bool,
+    n_state_opt: int,
+    n: int,
+    k: int,
+):
+    """Config-keyed jitted post-optimizer tail for :func:`etsmodel`.
+
+    Everything after the optimizer would otherwise run as ~20 eager dispatches per
+    candidate (transform + validity + pegelsresid buffer builds + IC math +
+    par concat + fitted/sigma2), an n-independent ~1.3-2 ms/candidate floor
+    that dominated small-n AutoETS fits (ablation: 16 ms glue of 42.5 ms on
+    airline). One jitted call per static config fuses the lot; repeat fits
+    hit this lru_cache, so the S0 no-recompile contract holds. The values
+    are the same ops in the same f64 order — gated bit-identical end to end
+    (ICs included — a reassociated IC could flip a near-tied argmin) by
+    speed_probes/e3_gate.py across m in {1,4,11,12,52,288} x f32/f64.
+    """
+    opt_a = "alpha" in opt_names
+    opt_b = "beta" in opt_names
+    opt_g = "gamma" in opt_names
+    opt_p = "phi" in opt_names
+    np_ = len(opt_names)
+
+    @jax.jit
+    def _tail(y, init_state_full, fit_par, par4, lower, upper):
+        alpha, beta, gamma, phi = par4[0], par4[1], par4[2], par4[3]
+        init_state_fit = init_state_full
+        valid = jnp.asarray(True)
+        if np_ > 0:
+            if n_state_opt > 0:
+                fit_par_smooth = fit_par[:-n_state_opt]
+                init_state_fit = fit_par[-n_state_opt:]
+            else:
+                fit_par_smooth = fit_par
+            alpha, beta, gamma, phi = _ets._transform_smoothing_params(
+                fit_par_smooth, opt_a, opt_b, opt_g, opt_p,
+                alpha, beta, gamma, phi, lower, upper, pure_sigmoid,
+            )
+            valid = _valid_params_jnp(
+                jnp.asarray(alpha, dtype=jnp.float64),
+                jnp.asarray(beta, dtype=jnp.float64),
+                jnp.asarray(gamma, dtype=jnp.float64),
+                jnp.asarray(phi, dtype=jnp.float64),
+                lower, upper, bounds, m,
+                damped=damped,
+                has_beta=(trendtype != "N"),
+                has_gamma=(seasontype != "N"),
+            )
+        amse, e, states, lik = pegelsresid_C(
+            y=y,
+            m=m,
+            init_state=init_state_fit,
+            errortype=errortype,
+            trendtype=trendtype,
+            seasontype=seasontype,
+            damped=damped,
+            alpha=alpha,
+            beta=beta,
+            gamma=gamma,
+            phi=phi,
+            nmse=nmse,
+        )
+        aic, bic, aicc = _compute_ic(lik, n, k)
+        mse = amse[0]
+        amse_mean = jnp.mean(amse)
+        fit_par_full = jnp.concatenate([
+            jnp.stack([
+                jnp.asarray(alpha, dtype=jnp.float64),
+                jnp.asarray(beta, dtype=jnp.float64),
+                jnp.asarray(gamma, dtype=jnp.float64),
+                jnp.asarray(phi, dtype=jnp.float64),
+            ]),
+            init_state_fit,
+        ])
+        if errortype == "A":
+            fits_v = jnp.asarray(y) - e
+        else:
+            # protect e == -1
+            aux_e = jnp.where(e == -1.0, -1 + 1e-3, e)
+            fits_v = jnp.asarray(y) / (1.0 + aux_e)
+        sq_e = e * e
+        # Exclude infs from the sum but let NaN propagate (matches the old
+        # eager boolean-mask indexing, which cannot trace).
+        sigma2 = jnp.sum(jnp.where(jnp.isinf(sq_e), 0.0, sq_e)) / (n - k - 1)
+        return dict(
+            loglik=-0.5 * lik,
+            aic=aic,
+            bic=bic,
+            aicc=aicc,
+            mse=mse,
+            amse=amse_mean,
+            residuals=e,
+            states=states,
+            last_state=states[-1, :],
+            fitted=fits_v,
+            par=fit_par_full,
+            sigma2=sigma2,
+            valid=valid,
+        )
+
+    return _tail
+
+
 def etsmodel(
     y: jnp.ndarray,
     m: int,
@@ -1272,7 +1497,23 @@ def etsmodel(
                        jnp.asarray(lower, dtype=jnp.float64),
                        jnp.asarray(upper, dtype=jnp.float64),
                        bounds, m):
-        raise Exception("Parameters out of range")
+        # The AUTO grid never reaches here for the common trigger — seasonal
+        # candidates with m > _MAX_SEASONAL_M are pruned in ets_f, so one bad
+        # candidate cannot kill an auto fit. This
+        # raise is only hit by a *user-fixed* seasonal spec whose initial parameters
+        # are inadmissible at this m (e.g. ETS(A,A,A) at m=288 on some data). A
+        # vmap-safe silent degrade to non-seasonal is not possible (dropping the
+        # seasonal component changes the state shape, and forecast() re-fits under
+        # the CV vmap where shapes must be static), so — matching the plan's "keep
+        # genuine user-input raises" — we surface a clear, actionable error rather
+        # than crash opaquely or return NaNs.
+        raise ValueError(
+            f"ETS({errortype},{trendtype},{seasontype}) is inadmissible at "
+            f"season_length={m}: its initial smoothing parameters fall outside the "
+            f"stability region. Use season_length<={_MAX_SEASONAL_M}, a non-seasonal "
+            f"spec (seasontype='N'), or model='ZZZ' (auto — it prunes seasonal models "
+            f"for m>{_MAX_SEASONAL_M})."
+        )
 
     # initialize state (closed-form)
     if init_state_override is None:
@@ -1306,30 +1547,39 @@ def etsmodel(
             f"ETS({errortype},{trendtype},{seasontype}) specification."
         )
     if np_ > 0:
+        # Host-side x0 build (session-2 lever 3a): start values and bounds are
+        # concrete (a tracer would crash these float() casts — proven by the
+        # vmapped conformity path), so the former per-name jnp clip/log/minimum
+        # dispatches + device syncs are replaced by one bounds pull + Python
+        # math. Values match the old jnp ops to <=1 ULP (math.log vs XLA log).
+        lo_h = [float(v) for v in np.asarray(lower)]
+        up_h = [float(v) for v in np.asarray(upper)]
+
+        def _pure_sig_x0(v: float) -> float:
+            val = min(max(float(v), 1e-6), 1.0 - 1e-6)
+            return math.log(val / (1.0 - val))
+
         x0_unconstrained = []
         for name in opt_names:
             if name == "alpha":
                 if pure_sigmoid:
-                    val = float(jnp.clip(par_[name], 1e-6, 1.0 - 1e-6))
-                    x0_unconstrained.append(float(jnp.log(val / (1.0 - val))))
+                    x0_unconstrained.append(_pure_sig_x0(par_[name]))
                 else:
-                    x0_unconstrained.append(_inv_sigmoid_scaled(par_[name], float(lower[0]), float(upper[0])))
+                    x0_unconstrained.append(_inv_sigmoid_scaled(par_[name], lo_h[0], up_h[0]))
             elif name == "beta":
                 if pure_sigmoid:
-                    val = float(jnp.clip(par_[name], 1e-6, 1.0 - 1e-6))
-                    x0_unconstrained.append(float(jnp.log(val / (1.0 - val))))
+                    x0_unconstrained.append(_pure_sig_x0(par_[name]))
                 else:
-                    beta_cap = float(jnp.minimum(upper[1], par_["alpha"]))
-                    x0_unconstrained.append(_inv_sigmoid_scaled(par_[name], float(lower[1]), beta_cap))
+                    beta_cap = min(up_h[1], float(par_["alpha"]))
+                    x0_unconstrained.append(_inv_sigmoid_scaled(par_[name], lo_h[1], beta_cap))
             elif name == "gamma":
                 if pure_sigmoid:
-                    val = float(jnp.clip(par_[name], 1e-6, 1.0 - 1e-6))
-                    x0_unconstrained.append(float(jnp.log(val / (1.0 - val))))
+                    x0_unconstrained.append(_pure_sig_x0(par_[name]))
                 else:
-                    gamma_cap = float(jnp.minimum(upper[2], 1.0 - par_["alpha"]))
-                    x0_unconstrained.append(_inv_sigmoid_scaled(par_[name], float(lower[2]), gamma_cap))
+                    gamma_cap = min(up_h[2], 1.0 - float(par_["alpha"]))
+                    x0_unconstrained.append(_inv_sigmoid_scaled(par_[name], lo_h[2], gamma_cap))
             elif name == "phi":
-                x0_unconstrained.append(_inv_sigmoid_scaled(par_[name], float(lower[3]), float(upper[3])))
+                x0_unconstrained.append(_inv_sigmoid_scaled(par_[name], lo_h[3], up_h[3]))
         par_vec = jnp.asarray(x0_unconstrained, dtype=jnp.float64)
         fred = optimize_ets_target_fn(
             x0=par_vec,
@@ -1369,96 +1619,53 @@ def etsmodel(
         fred = results(x=jnp.asarray(par_vec), fn=jnp.nan, nit=0, simplex=jnp.empty((0,), dtype=jnp.float64))
         fit_par = jnp.asarray(par_vec)
 
-    init_state_fit = init_state_full
-    nstate = int(init_state_fit.shape[0])
-
-    valid = jnp.asarray(True)
-    if np_ > 0:
-        if opt_init_state and n_state_opt > 0:
-            fit_par_smooth = fit_par[:-n_state_opt]
-            init_state_fit = fit_par[-n_state_opt:]
-        else:
-            fit_par_smooth = fit_par
-        # Decode the (traced) optimizer output with the backend's jnp-native
-        # transform; the fitted params stay traced end-to-end.
-        alpha, beta, gamma, phi = _ets._transform_smoothing_params(
-            fit_par_smooth,
-            "alpha" in opt_names, "beta" in opt_names,
-            "gamma" in opt_names, "phi" in opt_names,
-            alpha, beta, gamma, phi, lower, upper, pure_sigmoid,
-        )
-        valid = _valid_params_jnp(
-            jnp.asarray(alpha, dtype=jnp.float64),
-            jnp.asarray(beta, dtype=jnp.float64),
-            jnp.asarray(gamma, dtype=jnp.float64),
-            jnp.asarray(phi, dtype=jnp.float64),
-            lower, upper, bounds, m,
-            damped=bool(damped),
-            has_beta=(trendtype != "N"),
-            has_gamma=(seasontype != "N"),
-        )
-
-    amse, e, states, lik = pegelsresid_C(
-        y=jnp.asarray(y, dtype=jnp.float64),
-        m=m,
-        init_state=init_state_fit,
-        errortype=errortype,
-        trendtype=trendtype,
-        seasontype=seasontype,
-        damped=damped,
-        alpha=alpha,
-        beta=beta,
-        gamma=gamma,
-        phi=phi,
-        nmse=nmse,
-    )
+    nstate = int(init_state_full.shape[0])
     k = np_ + n_state_opt + 1
-    ny = len(y)
-    aic, bic, aicc = _compute_ic(lik, ny, k)
 
-    mse = amse[0]
-    amse_mean = jnp.mean(amse)
-
-    fit_par_full = jnp.concatenate([
-        jnp.stack([
-            jnp.asarray(alpha, dtype=jnp.float64),
-            jnp.asarray(beta, dtype=jnp.float64),
-            jnp.asarray(gamma, dtype=jnp.float64),
-            jnp.asarray(phi, dtype=jnp.float64),
-        ]),
-        init_state_fit,
-    ])
-
-    if errortype == "A":
-        fits = jnp.asarray(y) - e
-    else:
-        # protect e == -1
-        aux_e = jnp.where(e == -1.0, -1 + 1e-3, e)
-        fits = jnp.asarray(y) / (1.0 + aux_e)
-
-    sq_e = e * e
-    # Exclude infs from the sum but let NaN propagate (matches the old eager
-    # boolean-mask indexing, which cannot trace: masked shapes are dynamic).
-    sigma2 = jnp.sum(jnp.where(jnp.isinf(sq_e), 0.0, sq_e)) / (ny - k - 1)
+    # The whole post-optimizer tail — transform + validity + pegelsresid rollout +
+    # IC math + par concat + fitted/sigma2 — runs as ONE config-keyed jitted call
+    # (see _make_etsmodel_tail), same ops in the same f64 order, which removes a
+    # per-candidate eager-dispatch floor.
+    # `opt_init_state and n_state_opt > 0` collapses to n_state_opt > 0
+    # inside the tail because n_state_opt is already 0 when opt_init_state is
+    # False (set above from the same flag).
+    tail = _make_etsmodel_tail(
+        errortype, trendtype, seasontype, bool(damped), int(m), int(nmse),
+        bounds, tuple(opt_names), bool(pure_sigmoid), int(n_state_opt),
+        int(len(y)), int(k),
+    )
+    par4 = jnp.asarray(
+        [float(alpha), float(beta), float(gamma), float(phi)],
+        dtype=jnp.float64,
+    )
+    out = tail(
+        jnp.asarray(y, dtype=jnp.float64),
+        init_state_full,
+        jnp.asarray(fit_par, dtype=jnp.float64),
+        par4,
+        lower_box,
+        upper_box,
+    )
 
     return dict(
-        loglik=-0.5 * lik,
-        aic=aic,
-        bic=bic,
-        aicc=aicc,
-        mse=mse,
-        amse=amse_mean,
+        loglik=out["loglik"],
+        aic=out["aic"],
+        bic=out["bic"],
+        aicc=out["aicc"],
+        mse=out["mse"],
+        amse=out["amse"],
         fit=fred,
-        residuals=e,
+        residuals=out["residuals"],
         components=f"{errortype}{trendtype}{seasontype}{'D' if damped else 'N'}",
         m=m,
         nstate=nstate,
-        fitted=fits,
-        states=states,
-        par=fit_par_full,
-        sigma2=sigma2,
+        fitted=out["fitted"],
+        states=out["states"],
+        last_state=out["last_state"],
+        par=out["par"],
+        sigma2=out["sigma2"],
         n_params=k,
-        valid=valid,
+        valid=out["valid"],
     )
 
 
@@ -1792,6 +1999,14 @@ def ets_f(
         if auto_model:
             # Shape-static pruning heuristics — auto grid only; a user-fixed
             # spec must never be silently dropped by a heuristic.
+            # Prune seasonal candidates only above chronax's real fit limit
+            # (_MAX_SEASONAL_M — crash-safety for the check_param inadmissible-init
+            # raise at large m; see the constant's NB — NOT SF mirroring, since SF's
+            # AutoETS fits m>24 seasonal). Allowing genuine sub-annual periods avoids
+            # a degenerate non-seasonal fallback; very-large m is still pruned to
+            # dodge the raise. m is config-static.
+            if m > _MAX_SEASONAL_M and stype != "N":
+                return
             if force_additive_error and etype == "M":
                 return
             if etype == "M" and cycles < 10:
@@ -1863,45 +2078,26 @@ def ets_f(
         )
         fits.append(fit)
 
-    data_positive = jnp.min(y) > 0
-    ic_rows = []
-    for spec, fit in zip(candidates, fits):
-        ok = fit["valid"]
-        if spec[0] == "M" or spec[2] == "M":
-            ok = ok & data_positive
-        ic_val = jnp.asarray(fit[ic], dtype=jnp.float64)
-        ic_rows.append(jnp.where(ok & jnp.isfinite(ic_val), ic_val, jnp.inf))
-    ic_vec = jnp.stack(ic_rows)
-    best = jnp.argmin(ic_vec)
-    # Raising on "no admissible model" is impossible under trace; expose a
-    # traced flag instead (argmin over all-inf picks index 0).
-    valid_any = jnp.isfinite(ic_vec).any()
-
     cand_nstate = tuple(int(f["nstate"]) for f in fits)
-    S = max(cand_nstate)
-
-    def _pad_state(v: jnp.ndarray) -> jnp.ndarray:
-        return jnp.pad(v, (0, S - v.shape[0]))
-
-    def _stack(key: str) -> jnp.ndarray:
-        return jnp.stack([jnp.asarray(f[key], dtype=jnp.float64) for f in fits])
-
-    def _take(stack: jnp.ndarray) -> jnp.ndarray:
-        return jnp.take(stack, best, axis=0)
-
-    cand_fitted = _stack("fitted")
-    cand_residuals = _stack("residuals")
-    cand_sigma2 = _stack("sigma2")
-    cand_loglik = _stack("loglik")
-    cand_aic = _stack("aic")
-    cand_bic = _stack("bic")
-    cand_aicc = _stack("aicc")
-    cand_mse = _stack("mse")
-    cand_amse = _stack("amse")
-    cand_k = jnp.asarray([f["n_params"] for f in fits])
-    cand_par = jnp.stack([f["par"][:4] for f in fits])
-    cand_init_state = jnp.stack([_pad_state(f["par"][4:]) for f in fits])
-    cand_last_state = jnp.stack([_pad_state(f["states"][-1, :]) for f in fits])
+    # Masked-IC selection + the 11 stacks + 11 winner takes would otherwise run as
+    # ~40-60 eager dispatches per fit (n-independent glue). One jitted call per
+    # static (specs, ic, nstates, ks) grid computes the identical values; the
+    # per-candidate inputs go in as a pytree of the exact arrays the tail produced.
+    sel = _make_ets_f_epilogue(
+        tuple(candidates), ic, cand_nstate,
+        tuple(int(f["n_params"]) for f in fits),
+    )(
+        y,
+        tuple(
+            dict(
+                fitted=f["fitted"], residuals=f["residuals"],
+                sigma2=f["sigma2"], loglik=f["loglik"], aic=f["aic"],
+                bic=f["bic"], aicc=f["aicc"], mse=f["mse"], amse=f["amse"],
+                valid=f["valid"], par=f["par"], last_state=f["last_state"],
+            )
+            for f in fits
+        ),
+    )
 
     return dict(
         # static metadata
@@ -1912,37 +2108,105 @@ def ets_f(
         cand_m=tuple(int(f["m"]) for f in fits),
         cand_nstate=cand_nstate,
         cand_k=tuple(int(f["n_params"]) for f in fits),
-        # per-candidate stacks
-        cand_par=cand_par,
-        cand_init_state=cand_init_state,
-        cand_last_state=cand_last_state,
-        cand_fitted=cand_fitted,
-        cand_residuals=cand_residuals,
-        cand_sigma2=cand_sigma2,
-        cand_loglik=cand_loglik,
-        cand_aic=cand_aic,
-        cand_bic=cand_bic,
-        cand_aicc=cand_aicc,
-        cand_mse=cand_mse,
-        cand_amse=cand_amse,
-        cand_valid=jnp.stack([f["valid"] for f in fits]),
-        ic=ic_vec,
-        # selection
-        best=best,
-        valid=valid_any,
-        # winner conveniences under the classic keys (traced take-selection)
-        fitted=_take(cand_fitted),
-        residuals=_take(cand_residuals),
-        sigma2=_take(cand_sigma2),
-        loglik=_take(cand_loglik),
-        aic=_take(cand_aic),
-        bic=_take(cand_bic),
-        aicc=_take(cand_aicc),
-        mse=_take(cand_mse),
-        amse=_take(cand_amse),
-        par=_take(cand_par),
-        n_params=_take(cand_k),
+        # per-candidate stacks + selection + winner conveniences (jitted)
+        **sel,
     )
+
+
+@lru_cache(maxsize=256)
+def _make_ets_f_epilogue(
+    specs: tuple, ic_name: str, nstates: tuple, ks: tuple
+):
+    """Config-keyed jitted selection epilogue for :func:`ets_f`.
+
+    Computes the masked IC vector, argmin winner, validity flag, the eleven
+    per-candidate stacks, and the eleven winner takes in one call — the same
+    values as the old eager block (gated bit-identical by e3_gate.py; a
+    reassociated IC would risk flipping a near-tied argmin, so ICs are bit-
+    compared, not toleranced). Statics: the candidate spec tuple (drives the
+    M-flavour data-positivity masks), the IC name, per-candidate state sizes
+    (drive the pad widths), and the per-candidate parameter counts.
+    """
+    K = len(specs)
+    S = max(nstates)
+    m_flavored = tuple((s[0] == "M" or s[2] == "M") for s in specs)
+    ks_arr_builder = tuple(ks)
+
+    @jax.jit
+    def _epilogue(y, cand):
+        data_positive = jnp.min(y) > 0
+        ic_rows = []
+        for i in range(K):
+            ok = cand[i]["valid"]
+            if m_flavored[i]:
+                ok = ok & data_positive
+            ic_val = jnp.asarray(cand[i][ic_name], dtype=jnp.float64)
+            ic_rows.append(jnp.where(ok & jnp.isfinite(ic_val), ic_val, jnp.inf))
+        ic_vec = jnp.stack(ic_rows)
+        best = jnp.argmin(ic_vec)
+        # Raising on "no admissible model" is impossible under trace; expose
+        # a traced flag instead (argmin over all-inf picks index 0).
+        valid_any = jnp.isfinite(ic_vec).any()
+
+        def _pad_state(v: jnp.ndarray) -> jnp.ndarray:
+            return jnp.pad(v, (0, S - v.shape[0]))
+
+        def _stack(key: str) -> jnp.ndarray:
+            return jnp.stack(
+                [jnp.asarray(cand[i][key], dtype=jnp.float64) for i in range(K)]
+            )
+
+        def _take(stack: jnp.ndarray) -> jnp.ndarray:
+            return jnp.take(stack, best, axis=0)
+
+        cand_fitted = _stack("fitted")
+        cand_residuals = _stack("residuals")
+        cand_sigma2 = _stack("sigma2")
+        cand_loglik = _stack("loglik")
+        cand_aic = _stack("aic")
+        cand_bic = _stack("bic")
+        cand_aicc = _stack("aicc")
+        cand_mse = _stack("mse")
+        cand_amse = _stack("amse")
+        cand_k = jnp.asarray(ks_arr_builder)
+        cand_par = jnp.stack([cand[i]["par"][:4] for i in range(K)])
+        cand_init_state = jnp.stack(
+            [_pad_state(cand[i]["par"][4:]) for i in range(K)]
+        )
+        cand_last_state = jnp.stack(
+            [_pad_state(cand[i]["last_state"]) for i in range(K)]
+        )
+        return dict(
+            cand_par=cand_par,
+            cand_init_state=cand_init_state,
+            cand_last_state=cand_last_state,
+            cand_fitted=cand_fitted,
+            cand_residuals=cand_residuals,
+            cand_sigma2=cand_sigma2,
+            cand_loglik=cand_loglik,
+            cand_aic=cand_aic,
+            cand_bic=cand_bic,
+            cand_aicc=cand_aicc,
+            cand_mse=cand_mse,
+            cand_amse=cand_amse,
+            cand_valid=jnp.stack([cand[i]["valid"] for i in range(K)]),
+            ic=ic_vec,
+            best=best,
+            valid=valid_any,
+            fitted=_take(cand_fitted),
+            residuals=_take(cand_residuals),
+            sigma2=_take(cand_sigma2),
+            loglik=_take(cand_loglik),
+            aic=_take(cand_aic),
+            bic=_take(cand_bic),
+            aicc=_take(cand_aicc),
+            mse=_take(cand_mse),
+            amse=_take(cand_amse),
+            par=_take(cand_par),
+            n_params=_take(cand_k),
+        )
+
+    return _epilogue
 
 
 def ets_point_forecast(mod: dict[str, Any], h: int) -> jnp.ndarray:
