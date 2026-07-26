@@ -11,7 +11,7 @@ Both classes wrap the low-level routines in :mod:`tbats_core` and inherit
 the common ``fit`` / ``predict`` / ``forecast`` interface from
 :class:`BaseForecaster`.
 
-vmap-native contract (CLAUDE.md §1 rule 2): :meth:`AutoTBATS.forecast` is
+vmap-native contract: :meth:`AutoTBATS.forecast` is
 fully stateless — it re-fits on the passed ``y`` and never reads or writes
 ``self`` — so ``BaseForecaster.conformity_scores`` can vmap it over CV
 windows, with every window getting its own honest fit.  Candidates in the
@@ -259,7 +259,7 @@ class AutoTBATS(BaseForecaster):
 
     def __init__(
         self,
-        season_length: Union[int, List[int]],
+        season_length: Union[int, List[int], str],
         use_boxcox: Optional[bool] = None,
         bc_lower_bound: float = -1.0,
         bc_upper_bound: float = 2.0,
@@ -269,10 +269,28 @@ class AutoTBATS(BaseForecaster):
         alias: str = "AutoTBATS",
         conformal_params: Optional[ConformalIntervals] = None,
     ) -> None:
-        """Initialize the AutoTBATS estimator configuration."""
-        if isinstance(season_length, int):
-            season_length = [season_length]
-        self.season_length: List[int] = list(season_length)
+        """Initialize the AutoTBATS estimator configuration.
+
+        ``season_length`` may be an int, a list of ints (multi-seasonal), or the
+        literal ``"auto"`` to infer a single dominant period from the training
+        series at fit (via ``detect_period``; resolved once and cached).
+        """
+        if isinstance(season_length, str):
+            # "auto": resolved once at fit via detect_period. A concrete int/list
+            # is used verbatim (statsforecast parity).
+            if season_length != "auto":
+                raise ValueError(
+                    f'season_length string must be "auto", got {season_length!r}'
+                )
+            self.season_length = "auto"
+        else:
+            if isinstance(season_length, int):
+                season_length = [season_length]
+            self.season_length = list(season_length)
+        # Resolved concrete period list cached at fit (season_length="auto" ->
+        # [detect_period(y)] once); the stateless/vmapped forecast reuses it so a
+        # traced CV window never re-detects. None until fit / a fresh forecast.
+        self._m_eff: Optional[List[int]] = None
         self.use_boxcox: Optional[bool] = use_boxcox
         self.bc_lower_bound: float = bc_lower_bound
         self.bc_upper_bound: float = bc_upper_bound
@@ -284,6 +302,20 @@ class AutoTBATS(BaseForecaster):
         self.conformal_params: Optional[ConformalIntervals] = conformal_params
         self.model_: Optional[Dict[str, Any]] = None
         self.only_conformal_intervals: bool = False
+
+    def _effective_periods(self, y: jnp.ndarray) -> List[int]:
+        """Resolve ``season_length`` to a concrete list of periods (eager).
+
+        Returns the fit-cached ``_m_eff`` when present (so the vmapped/stateless
+        forecast reuses the fit-time period and never re-detects on a traced CV
+        window); otherwise resolves ``"auto"`` → ``[detect_period(y)]`` on the
+        concrete series, or returns the explicit list verbatim.
+        """
+        if self._m_eff is not None:
+            return self._m_eff
+        if self.season_length == "auto":
+            return [self._resolve_season_length("auto", y)]
+        return self.season_length
 
     def fit(
         self,
@@ -319,14 +351,20 @@ class AutoTBATS(BaseForecaster):
         """
         y = _ensure_float(y)
 
+        # Resolve season_length="auto" fresh on this series (eager) and cache it
+        # so the stateless/vmapped forecast reuses the same period under CV.
+        periods = ([self._resolve_season_length("auto", y)]
+                   if self.season_length == "auto" else self.season_length)
+        self._m_eff = periods
+
         # Box–Cox forced on -> inputs must be strictly positive.
         if self.use_boxcox is True:
             y = _ensure_pos_strict(y)
 
         # Friendly heads-up (core will enforce this anyway):
         # when the sample is short relative to the largest season, damped trend and ARMA are curtailed.
-        if len(self.season_length) > 0:
-            mmax = int(max(self.season_length))
+        if len(periods) > 0:
+            mmax = int(max(periods))
             if y.shape[0] < 3 * mmax:
                 warnings.warn(
                     "Short sample vs. seasonality: damped trend and ARMA may be disabled for stability.",
@@ -340,7 +378,7 @@ class AutoTBATS(BaseForecaster):
         # Fit the full candidate grid with argmin selection
         self.model_ = _tbats_selection(
             y=y,
-            seasonal_periods=self.season_length,
+            seasonal_periods=periods,
             use_boxcox=self.use_boxcox,
             bc_lower=self.bc_lower_bound,
             bc_upper=self.bc_upper_bound,
@@ -349,6 +387,23 @@ class AutoTBATS(BaseForecaster):
             use_arma_errors=self.use_arma_errors,
         )
         return self
+
+    def conformity_scores(self, y: jnp.ndarray, X: Optional[jnp.ndarray] = None) -> jnp.ndarray:
+        """Resolve season_length="auto" eagerly, then delegate to the base CV path.
+
+        The base ``conformity_scores`` vmaps ``self.forecast`` over CV windows and
+        does NOT call ``fit`` (the invariant ``new().conformity_scores(y)`` is
+        fit-less; TBATS also never caches ``_cs`` at fit). With
+        ``season_length="auto"`` and no prior fit, the vmapped forecast's
+        ``_effective_periods`` fallback would re-run ``detect_period`` on a *traced*
+        window (ConcretizationError). Resolving ``_m_eff`` here on the concrete ``y``
+        (eager, before the vmap) makes every vmapped forecast reuse a concrete period
+        list — the eager-select-once pattern (AutoARIMA/AutoETS/AutoMFLES).
+        """
+        y = _ensure_float(y)
+        self._m_eff = ([self._resolve_season_length("auto", y)]
+                       if self.season_length == "auto" else self.season_length)
+        return super().conformity_scores(y=y, X=X)
 
     def _fitted_candidates(self) -> Tuple[List[Dict[str, Any]], jnp.ndarray]:
         """Return (candidates, best) from model_, with fit/version guards."""
@@ -452,7 +507,7 @@ class AutoTBATS(BaseForecaster):
         intervals).  Deliberately reads and writes NOTHING on ``self`` beyond
         configuration: the base class's ``conformity_scores`` vmaps this
         method over CV windows, so it must trace natively and every window
-        must get its own honest re-fit (CLAUDE.md §4 #2).  Use :meth:`fit` +
+        must get its own honest re-fit.  Use :meth:`fit` +
         :attr:`model_` when you need to inspect the fitted state.
 
         Because raising on data VALUES cannot trace, this method does not
@@ -493,7 +548,7 @@ class AutoTBATS(BaseForecaster):
 
         mod = _tbats_selection(
             y=y,
-            seasonal_periods=self.season_length,
+            seasonal_periods=self._effective_periods(y),
             use_boxcox=self.use_boxcox,
             bc_lower=self.bc_lower_bound,
             bc_upper=self.bc_upper_bound,
@@ -554,7 +609,7 @@ class TBATS(AutoTBATS):
 
     def __init__(
         self,
-        season_length: Union[int, List[int]],
+        season_length: Union[int, List[int], str],
         use_boxcox: Optional[bool] = True,
         bc_lower_bound: float = -1.0,
         bc_upper_bound: float = 2.0,
@@ -564,7 +619,7 @@ class TBATS(AutoTBATS):
         alias: str = "TBATS",
         conformal_params: Optional[ConformalIntervals] = None,
     ) -> None:
-        """Initialize a fixed-configuration TBATS estimator."""
+        """Initialize a fixed-configuration TBATS estimator (``season_length`` may be ``"auto"``)."""
         super().__init__(
             season_length=season_length,
             use_boxcox=use_boxcox,

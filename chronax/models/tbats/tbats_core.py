@@ -598,7 +598,21 @@ _calc_filter_core = _calc_filter_impl
 # L-BFGS Parameter Optimisation
 # ═══════════════════════════════════════════════════════════════════════
 
-_N_OPTIM_STEPS = 30
+# Convergence-gated L-BFGS: run at least _MIN_OPTIM_STEPS, then continue while the
+# per-observation best-loss improvement stays above _OPTIM_FTOL, stopping after
+# _OPTIM_PATIENCE consecutive stalled steps or at the _MAX_OPTIM_STEPS cap. The
+# A fixed-step scan leaves TBATS badly under-converged on trend-heavy and long
+# series, while the gate charges each cell only the steps it needs — fast-m cells
+# stop early, large-m cells run to the cap. The PATIENCE counter is load-bearing: a
+# bare "improvement < tol" test stops on a single L-BFGS line-search misfire
+# (best_loss flat for one step) and returns a barely-optimized result. The FTOL is
+# scaled
+# by n because the objective is n·log(sse). Under conformity_scores' vmap the loop
+# runs until every CV window stalls.
+_MIN_OPTIM_STEPS = 30
+_MAX_OPTIM_STEPS = 150
+_OPTIM_PATIENCE = 10
+_OPTIM_FTOL = 1e-6
 
 _TBATS_SOLVER = optax.lbfgs(
     memory_size=5,
@@ -686,10 +700,19 @@ def _run_lbfgs_optim(
 
     opt_state0 = _TBATS_SOLVER.init(u0)
     val_and_grad_fn = jax.value_and_grad(obj)
+    inf = jnp.asarray(jnp.inf, dtype=dtype)
+    n_obs = y_fit.shape[0]
 
-    def _optim_step(carry: tuple[jnp.ndarray, Any, jnp.ndarray, jnp.ndarray], _: jnp.ndarray) -> tuple[tuple[jnp.ndarray, Any, jnp.ndarray, jnp.ndarray], None]:
-        """Run one L-BFGS update while tracking the best iterate seen."""
-        u, opt_state, best_u, best_loss = carry
+    def _cond(carry: tuple) -> jnp.ndarray:
+        """Continue while under the cap AND (below the floor OR not yet stalled)."""
+        _, _, _, _, stall, it = carry
+        return (it < _MAX_OPTIM_STEPS) & (
+            (it < _MIN_OPTIM_STEPS) | (stall < _OPTIM_PATIENCE)
+        )
+
+    def _optim_step(carry: tuple) -> tuple:
+        """One L-BFGS update; track the best iterate + a consecutive-stall counter."""
+        u, opt_state, best_u, best_loss, stall, it = carry
         loss, grads = val_and_grad_fn(u)
         grads = jnp.where(jnp.isfinite(grads), grads, 0.0)
         updates, new_opt_state = _TBATS_SOLVER.update(
@@ -697,13 +720,19 @@ def _run_lbfgs_optim(
         )
         new_u = optax.apply_updates(u, updates)
         improved = jnp.isfinite(loss) & (loss < best_loss)
-        best_u = jnp.where(improved, u, best_u)
-        best_loss = jnp.where(improved, loss, best_loss)
-        return (new_u, new_opt_state, best_u, best_loss), None
+        new_best_u = jnp.where(improved, u, best_u)
+        new_best_loss = jnp.where(improved, loss, best_loss)
+        # A step improving best_loss by < _OPTIM_FTOL·n (per-obs LL) is a stall;
+        # PATIENCE consecutive stalls ⇒ converged. best_loss=inf on step 0 ⇒ the
+        # first real evaluation always counts as improvement (resets the counter).
+        improved_enough = (best_loss - new_best_loss) > (_OPTIM_FTOL * n_obs)
+        new_stall = jnp.where(improved_enough, jnp.int32(0), stall + jnp.int32(1))
+        return (new_u, new_opt_state, new_best_u, new_best_loss, new_stall, it + 1)
 
-    init_loss = obj(u0)
-    init_carry = (u0, opt_state0, u0, init_loss)
-    (_, _, best_u, _), _ = lax.scan(_optim_step, init_carry, jnp.arange(_N_OPTIM_STEPS))
+    it0 = jnp.asarray(0, dtype=jnp.int32)
+    stall0 = jnp.asarray(0, dtype=jnp.int32)
+    init_carry = (u0, opt_state0, u0, inf, stall0, it0)
+    _, _, best_u, _, _, _ = lax.while_loop(_cond, _optim_step, init_carry)
     return best_u
 
 
@@ -1072,7 +1101,7 @@ def tbats_selection(
 
     # Pre-build seasonal blocks once (shared across candidates), in the
     # generator's dtype — building them in y.dtype skewed the selection-path
-    # AIC against direct float64 fits (§4 #9's 0.11 AIC drift).
+    # AIC against direct float64 fits.
     seasonal_blocks = _build_seasonal_blocks(
         periods, jnp.asarray(kvmax, dtype=jnp.int32), jnp.float64
     )
