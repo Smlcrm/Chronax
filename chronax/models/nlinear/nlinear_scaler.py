@@ -1,4 +1,4 @@
-"""Per-window scalers for TCN: robust (the default) and identity.
+"""Per-window scalers for NLinear: identity (NF default) and robust (median/MAD).
 
 Self-contained (no cross-model import). Pure functions exposing
 (stats, transform, inverse) so the same shift/scale is reused for inverse.
@@ -7,21 +7,10 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-import jax
 import jax.numpy as jnp
 
 _MAD_TO_STD = 0.6744897501960817  # scipy.stats.norm.ppf(0.75)
 _EPS = 1e-6
-
-
-def _torch_median(x: jnp.ndarray, axis: int) -> jnp.ndarray:
-    """torch ``median``/``nanmedian`` convention: the LOWER of the two middle
-    order statistics on even-length axes (``jnp.median`` averages them — a
-    per-window shift difference on every even window; ``input_size = 3h`` is
-    even whenever h is). Axis length is static, so the index is compile-time.
-    """
-    n = x.shape[axis]
-    return jax.lax.index_in_dim(jnp.sort(x, axis=axis), (n - 1) // 2, axis, keepdims=True)
 
 
 @runtime_checkable
@@ -47,17 +36,11 @@ class IdentityScaler:
 
 
 class RobustScaler:
-    """Median + MAD scaler with a ``0.6745*std`` fallback when MAD is zero.
-
-    The shift is the window median and the scale is the median absolute
-    deviation ``median(|x - median|)``. Where MAD is zero the scale falls back
-    to ``0.6745*std``; exact zeros are then pinned to 1.0 and ``eps`` is added.
-    Mirrors neuralforecast's ``robust_statistics``.
-    """
+    """Median + MAD scaler with 0.6745*std fallback when MAD=0."""
 
     def stats(self, x: jnp.ndarray, axis: int = 1) -> tuple[jnp.ndarray, jnp.ndarray]:
-        median = _torch_median(x, axis)
-        mad = _torch_median(jnp.abs(x - median), axis)
+        median = jnp.median(x, axis=axis, keepdims=True)
+        mad = jnp.median(jnp.abs(x - median), axis=axis, keepdims=True)
         mean = jnp.mean(x, axis=axis, keepdims=True)
         std = jnp.sqrt(jnp.mean((x - mean) ** 2, axis=axis, keepdims=True))
         scale = jnp.where(mad == 0.0, std * _MAD_TO_STD, mad)

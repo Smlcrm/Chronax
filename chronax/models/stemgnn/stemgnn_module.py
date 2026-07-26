@@ -1,36 +1,35 @@
-"""Flax NNX modules for the StemGNN forecaster (port of neuralforecast.StemGNN).
+"""Flax NNX modules for the StemGNN forecaster (port of neuralforecast's StemGNN).
 
-Mirrors NF's ``models/stemgnn.py`` (itself adapted from microsoft/StemGNN): a
-latent correlation layer (GRU over the NODE axis + additive attention) learns a
-graph over series, a 4-term Chebyshev expansion of its normalized Laplacian is
-the "GFT", and each ``StockBlockLayer`` runs the Spe-Seq cell — a 4-point DFT
-over the CHEBYSHEV-ORDER axis (not time; NF quirk kept), GLU stacks on the
-real/imag parts, an ``irfft`` back — followed by a per-order graph-conv kernel
-and sigmoid-gated forecast/backcast heads over two residual stacks.
+A latent correlation layer (GRU over the NODE axis + additive attention) learns
+a graph over series; a 4-term Chebyshev expansion of its normalized Laplacian
+forms the graph Fourier transform ("GFT"); and each ``StockBlockLayer`` runs the
+Spe-Seq cell — a 4-point DFT over the CHEBYSHEV-ORDER axis (not time), GLU stacks
+on the real/imag parts, an ``irfft`` back — followed by a per-order graph-conv
+kernel and sigmoid-gated forecast/backcast heads over two residual stacks.
 
-The 4-point DFT/IDFT are implemented as CONSTANT-MATRIX GEMMs instead of
-``jnp.fft`` primitives: the forward twiddles for length 4 are exactly
+The 4-point DFT/IDFT are materialized as CONSTANT-MATRIX GEMMs rather than
+``jnp.fft`` primitives. For length 4 the forward twiddles are exactly
 ``{0, ±1}`` and the ``irfft(n=4)`` linear map is exact quarters, so the GEMMs
-equal the FFT to float rounding — and XLA-CPU pessimizes non-GEMM primitives
-inside ``lax.scan`` training bodies (~15x measured on TCN's convs, 2026-07-17
-trap). ``irfft(n=4)`` consumes only the first ``n//2+1 = 3`` complex bins and
-ignores the imaginary parts of bins 0 and 2 (DC/Nyquist) — the probed
-``_IRFFT4`` matrix reproduces pocketfft's semantics exactly, top-frequency bin
+equal the FFT to float rounding, and keeping the transform as a matmul stays on
+the XLA-CPU fast path inside the ``lax.scan`` training body (FFT primitives
+there are heavily pessimized). ``irfft(n=4)`` consumes only the first
+``n//2+1 = 3`` complex bins and ignores the imaginary parts of bins 0 and 2
+(DC/Nyquist); ``_IRFFT4`` reproduces that map exactly, top-frequency bin
 discarded, as in torch.
 
-⚠ n_series=1 degeneracy (proven on NF 3.1.7, bit-exact): softmax over a single
-node gives ``A=[[a]]``, so ``diag(degree)-A == 0`` REGARDLESS of ``a`` (dropout
-included), and NF hardcodes Chebyshev ``T0 = zeros`` (not identity) — hence
-``mul_L == 0``, every block's forecast head sees only layer biases, and the
-network output is an input-independent constant per horizon step (in scaled
-space). The input reaches only block 0's backcast shortcut, which dies in
-block 1's ``mul_L @ X``. ``chebyshev_first_term="identity"`` restores the
-paper's ``T0 = I`` (standard Chebyshev basis; at N=1 ``mul_L = [I, 0, -I, 0]``)
-— a deliberate, test-guarded deviation from NF. Related corner kept AS IN NF:
-if a training step's attention dropout zeroes the whole batch (p ~= 2^-wbs per
-step at N=1), ``degree == 0`` and the ``sqrt``'s infinite gradient NaNs the
-step; do NOT add an epsilon inside the sqrt — NF has the identical hazard and
-``_finite_or_raise`` surfaces it.
+At ``n_series=1`` the network is degenerate: softmax over a single node gives
+``A=[[a]]``, so ``diag(degree)-A == 0`` regardless of ``a`` (dropout included),
+and the Chebyshev expansion uses ``T0 = zeros`` (not identity), hence
+``mul_L == 0``. Every block's forecast head then sees only layer biases and the
+output is an input-independent constant per horizon step (in scaled space); the
+input reaches only block 0's backcast shortcut, which dies in block 1's
+``mul_L @ X``. ``chebyshev_first_term="identity"`` instead uses the paper's
+standard basis ``T0 = I`` (at N=1 ``mul_L = [I, 0, -I, 0]``), restoring a real
+data path so the univariate model genuinely forecasts. No epsilon is added
+inside the Laplacian ``sqrt``: if a training step's attention dropout zeroes the
+whole batch (probability ``~2^-wbs`` per step at N=1) then ``degree == 0`` and
+the sqrt's infinite gradient produces a non-finite step, which the training-time
+finite check surfaces.
 
 All shapes/branches are static ctor config, so everything traces under
 ``jax.vmap`` (``BaseForecaster.conformity_scores``). ``float32`` throughout.
@@ -55,10 +54,11 @@ _DFT4_IM = np.ascontiguousarray(_DFT4.imag, dtype=np.float32)   # entries exactl
 
 
 def _build_irfft4() -> np.ndarray:
-    """Probe ``np.fft.irfft(-, n=4)`` on the 6 real/imag basis vectors of the
-    3-bin half-spectrum. Columns ordered [Re0, Re1, Re2, Im0, Im1, Im2]; the
-    Im0/Im2 columns come out exactly zero (pocketfft ignores the imaginary
-    parts of the DC and Nyquist bins) and every entry is an exact quarter."""
+    """Build the constant ``irfft(n=4)`` matrix by evaluating ``np.fft.irfft(., n=4)``
+    on the 6 real/imag basis vectors of the 3-bin half-spectrum. Columns are
+    ordered [Re0, Re1, Re2, Im0, Im1, Im2]; the Im0/Im2 columns come out exactly
+    zero (the imaginary parts of the DC and Nyquist bins are ignored) and every
+    entry is an exact quarter."""
     cols = []
     for j in range(3):
         e = np.zeros(3, dtype=np.complex128)
@@ -84,8 +84,8 @@ def _dft4(x: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
 
 def _irfft4(re: jnp.ndarray, im: jnp.ndarray) -> jnp.ndarray:
     """``torch.fft.irfft(-, n=4, dim=1)`` on a 4-bin complex spectrum ``[B, 4, N, W]``:
-    crops to the first 3 Hermitian bins (top-frequency bin discarded) and maps back
-    to 4 real samples. Exact linear map probed from pocketfft."""
+    crops to the first 3 Hermitian bins (top-frequency bin discarded) and maps
+    back to 4 real samples via an exact constant linear map."""
     coeffs = jnp.concatenate([re[:, :3], im[:, :3]], axis=1)     # [B, 6, N, W]
     return jnp.einsum("tj,bjnw->btnw", _IRFFT4, coeffs)          # [B, 4, N, W]
 
@@ -161,13 +161,12 @@ def _dropout(x: jnp.ndarray, rate: float, key, deterministic: bool) -> jnp.ndarr
 # Layers
 # ---------------------------------------------------------------------------
 class GLU(nnx.Module):
-    """NF ``GLU``: ``linear_left(x) * sigmoid(linear_right(x))``.
+    """Gated linear unit: ``linear_left(x) * sigmoid(linear_right(x))``.
 
-    The two torch Linears are FUSED into one ``Linear(in, 2*out)`` whose output
-    is split — identical math (concatenated output columns), identical init law
-    (torch draws both layers from ``U(±1/sqrt(in))``), and half the GEMM
-    dispatches on the hot path. Guarded by ``test_glu_fused_equals_two_gemms``;
-    the weight-transplant script concatenates torch's left/right kernels.
+    The two linear maps are fused into one ``Linear(in, 2*out)`` whose output is
+    split — identical math (concatenated output columns), same init law (both
+    halves drawn from ``U(±1/sqrt(in))``), and half the GEMM dispatches on the
+    hot path.
     """
 
     def __init__(self, in_features: int, out_features: int, *, rngs: nnx.Rngs):
@@ -230,21 +229,20 @@ class TorchGRU(nnx.Module):
 
 
 class StockBlockLayer(nnx.Module):
-    """NF ``StockBlockLayer``: GFT -> Spe-Seq cell -> per-order graph-conv kernel
-    -> sigmoid-gated forecast head (+ backcast head on block 0 only).
+    """One StemGNN block: GFT -> Spe-Seq cell -> per-order graph-conv kernel ->
+    sigmoid-gated forecast head (+ backcast head on block 0 only).
 
-    ``stack_cnt`` is the BLOCK INDEX (0 or 1), as in NF. Block 1 has no
-    ``backcast`` Linear but DOES carry a dead ``backcast_short_cut`` — torch
-    builds it unconditionally, so it is kept for parameter-count and
-    weight-transplant parity (``test_block1_dead_shortcut_params`` proves it
-    never influences the forward).
+    ``stack_cnt`` is the block index (0 or 1). Block 1 has no ``backcast``
+    Linear but still carries a ``backcast_short_cut`` that never influences its
+    forward; it is built unconditionally to keep the parameter layout aligned
+    with the reference for weight transplant.
     """
 
     def __init__(self, time_step: int, unit: int, multi_layer: int, stack_cnt: int,
                  *, rngs: nnx.Rngs):
         L = time_step
         S = multi_layer * L                          # per-order feature width
-        O = 4 * multi_layer * L                      # GLU width (NF output_channel * L)
+        O = 4 * multi_layer * L                      # GLU width
         self.time_step = L
         self.multi = multi_layer
         self.stack_cnt = stack_cnt
@@ -253,16 +251,16 @@ class StockBlockLayer(nnx.Module):
             init = _TorchLinearInit(n_in)
             return nnx.Linear(n_in, n_out, kernel_init=init, bias_init=init, rngs=rngs)
 
-        # torch shape [1, 4, 1, S, S] stored squeezed as [4, S, S]; torch fans
-        # for the 5-D tensor: fan_in = size(1)*receptive = 4*S*S, fan_out = S*S.
+        # Weight is stored squeezed as [4, S, S]; the xavier fans follow the
+        # reference's 5-D [1, 4, 1, S, S] layout: fan_in = 4*S*S, fan_out = S*S.
         w_init = _XavierNormalInit(4 * S * S, S * S)
         self.weight = nnx.Param(w_init(rngs.params(), (4, S, S)))
         self.forecast = lin(S, S)
         self.forecast_result = lin(S, L)
         if stack_cnt == 0:
             self.backcast = lin(S, L)
-        self.backcast_short_cut = lin(L, L)          # dead on block 1 (torch parity)
-        # 6 GLUs in torch order [r0, i0, r1, i1, r2, i2]; stage 0 maps 4L -> O.
+        self.backcast_short_cut = lin(L, L)          # unused on block 1
+        # 6 GLUs ordered [r0, i0, r1, i1, r2, i2]; stage 0 maps 4L -> O, rest O -> O.
         self.glus = [GLU(4 * L, O, rngs=rngs), GLU(4 * L, O, rngs=rngs)] + [
             GLU(O, O, rngs=rngs) for _ in range(4)
         ]
@@ -283,9 +281,9 @@ class StockBlockLayer(nnx.Module):
 
     def __call__(self, x: jnp.ndarray, mul_L: jnp.ndarray):
         """x: ``[B, N, L]``; mul_L: ``[4, N, N]`` -> (forecast ``[B, N, L]``,
-        backcast ``[B, N, L]`` | None). torch's dummy channel dim is dropped
-        (in_channel == 1 always); the einsums are the squeezed equivalents of
-        its broadcast matmuls."""
+        backcast ``[B, N, L]`` | None). The single input channel is dropped
+        (in_channel == 1 always), so the einsums are the squeezed equivalents of
+        the reference's broadcast matmuls."""
         gfted = jnp.einsum("knm,bml->bknl", mul_L, x)            # [B, 4, N, L]
         g = self.spe_seq_cell(gfted)                             # [B, 4, N, S]
         igfted = jnp.einsum("bkns,kst->bnt", g, self.weight.value)   # sum over orders
@@ -298,12 +296,11 @@ class StockBlockLayer(nnx.Module):
 
 
 class StemGNNNet(nnx.Module):
-    """Full StemGNN network (NF ``StemGNN.forward`` minus the wrapper glue).
+    """Full StemGNN network forward.
 
     ``insample_z [B, L, N]`` (scaled) -> ``[B, h, outputsize_multiplier * N]``.
-    At N>1 the final reshape interleaves quantile heads and series exactly as
-    NF does (kept verbatim); the univariate wrapper always runs N=1 where it
-    collapses to ``[B, h, mult]``.
+    At N>1 the final reshape interleaves quantile heads and series; the
+    univariate wrapper always runs N=1, where it collapses to ``[B, h, mult]``.
     """
 
     def __init__(self, *, h: int, input_size: int, n_series: int = 1,
@@ -311,7 +308,6 @@ class StemGNNNet(nnx.Module):
                  leaky_rate: float = 0.2, outputsize_multiplier: int = 1,
                  chebyshev_first_term: str = "nf_zero", rngs: nnx.Rngs):
         if n_stacks != 2:
-            # NF raises bare Exception("StemGNN currently only supports n_stacks=2.")
             raise ValueError("StemGNN currently only supports n_stacks=2.")
         if chebyshev_first_term not in ("nf_zero", "identity"):
             raise ValueError(
@@ -344,11 +340,11 @@ class StemGNNNet(nnx.Module):
         self.fc2 = lin(input_size, h * outputsize_multiplier)
 
     def _latent_correlation(self, x: jnp.ndarray, dropout_key, deterministic: bool) -> jnp.ndarray:
-        """``[B, L, N]`` -> ``mul_L [4, N, N]``. Reproduces NF's axis dance
-        exactly: the GRU rolls over NODES with hidden = n_series, the additive
-        attention operates on the (hidden, node) axes of its full output
-        sequence, and one graph is formed by averaging attention over the
-        batch. ``degree`` uses PRE-symmetrization row sums (NF quirk)."""
+        """``[B, L, N]`` -> ``mul_L [4, N, N]``. The GRU rolls over NODES with
+        hidden size = n_series; the additive attention operates on the
+        (hidden, node) axes of its full output sequence; one graph is formed by
+        averaging attention over the batch. ``degree`` uses PRE-symmetrization
+        row sums."""
         gru_out = self.gru(jnp.transpose(x, (2, 0, 1)))          # [N, B, N]
         inp = jnp.transpose(gru_out, (1, 0, 2))                  # [B, N(seq), N(hid)]
         inp = jnp.transpose(inp, (0, 2, 1))                      # [B, N(hid), N(seq)]
@@ -365,9 +361,9 @@ class StemGNNNet(nnx.Module):
         lap = dinv[:, None] * (jnp.diag(degree) - A) * dinv[None, :]
         n = A.shape[0]
         if self.chebyshev_first_term == "nf_zero":
-            t0 = jnp.zeros((n, n), lap.dtype)                    # NF quirk: T0 = 0, not I
+            t0 = jnp.zeros((n, n), lap.dtype)                    # default: T0 = 0 (not the standard-basis I)
         else:
-            t0 = jnp.eye(n, dtype=lap.dtype)                     # paper mode (deliberate deviation)
+            t0 = jnp.eye(n, dtype=lap.dtype)                     # paper mode: standard Chebyshev basis T0 = I
         t1 = lap
         t2 = 2.0 * (lap @ t1) - t0
         t3 = 2.0 * (lap @ t2) - t1
@@ -377,8 +373,8 @@ class StemGNNNet(nnx.Module):
                  deterministic: bool = True) -> jnp.ndarray:
         """insample_z: ``[B, L, N]`` scaled -> ``[B, h, mult * N]`` scaled.
 
-        ``deterministic=True`` (inference/eval) needs no key — dropout is off,
-        as under torch ``model.eval()``. Training passes a per-step key.
+        ``deterministic=True`` (inference/eval) needs no key — dropout is off.
+        Training passes a per-step dropout key.
         """
         x = insample_z.astype(jnp.float32)
         if not deterministic and dropout_key is None:

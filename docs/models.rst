@@ -213,6 +213,14 @@ Deep Learning
    :members:
    :undoc-members:
 
+.. autoclass:: chronax.models.TCN
+   :members:
+   :undoc-members:
+
+.. autoclass:: chronax.models.StemGNN
+   :members:
+   :undoc-members:
+
 .. autoclass:: chronax.models.VanillaTransformer
    :members:
    :undoc-members:

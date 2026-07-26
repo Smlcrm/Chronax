@@ -40,8 +40,8 @@ class TCN(BaseForecaster):
     are supported (``uses_exog = True``): their history joins the encoder
     channels and their horizon slice is residual-concatenated before the
     decoder. Historical and static exog are not modeled. ``context_size`` is
-    accepted for NF API parity but unused (it is unused in NF's forward too).
-    Point or multi-quantile losses; conformal or native quantile intervals.
+    accepted for neuralforecast API parity but is unused. Point or
+    multi-quantile losses; conformal or native quantile intervals.
     ``float32`` throughout.
     """
 
@@ -64,7 +64,7 @@ class TCN(BaseForecaster):
         self.dilations = (1, 2, 4, 8, 16) if dilations is None else tuple(dilations)
         self.encoder_hidden_size = encoder_hidden_size
         self.encoder_activation = encoder_activation
-        self.context_size = context_size          # NF API parity; unused (as in NF)
+        self.context_size = context_size          # accepted for API parity; unused
         self.decoder_hidden_size = decoder_hidden_size
         self.decoder_layers = decoder_layers
         self.max_steps = max_steps
@@ -116,7 +116,7 @@ class TCN(BaseForecaster):
         if y.ndim != 1:
             raise ValueError(f"y must be 1-D; got shape {y.shape}.")
         if y.shape[0] <= self.input_size:
-            # NF trains from T >= input_size+1 (h-padded partial windows); match it.
+            # Need at least one window: T >= input_size + 1 (partial windows are h-padded).
             raise ValueError(
                 f"Series length {y.shape[0]} too short for input_size={self.input_size} "
                 f"(need at least input_size+1)."

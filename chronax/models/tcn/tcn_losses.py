@@ -3,8 +3,8 @@
 Point losses keep the shared signature ``(pred, target) -> scalar`` and
 reduce by mean. ``MultiQuantileLoss`` is the multi-quantile (pinball) loss.
 Every loss carries an ``outputsize_multiplier`` so the network's output
-head width is loss-driven (NF ``loss.outputsize_multiplier``). All are
-module-level / class-based so a fitted estimator pickles cleanly.
+head width is loss-driven. All are module-level / class-based so a fitted
+estimator pickles cleanly.
 """
 from __future__ import annotations
 

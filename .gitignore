@@ -46,8 +46,37 @@ coverage.xml
 .pytest_cache/
 cover/
 
-# Neural benchmark per-run outputs (statistical benchmark_results/*.csv stay tracked)
-benchmarks/benchmark_results/neural/
+# Benchmark per-run outputs. Sweep CSVs, parity dumps and analysis notes are
+# local artifacts; the files negated below predate this rule and stay tracked.
+benchmarks/benchmark_results/*
+!benchmarks/benchmark_results/benchmark_20260301_232919.csv
+!benchmarks/benchmark_results/benchmark_20260301_233315.csv
+!benchmarks/benchmark_results/benchmark_20260301_234756.csv
+!benchmarks/benchmark_results/benchmark_20260302_094930.csv
+!benchmarks/benchmark_results/benchmark_20260302_095000.csv
+!benchmarks/benchmark_results/benchmark_20260302_095055.csv
+!benchmarks/benchmark_results/benchmark_results.csv
+!benchmarks/benchmark_results/gru_20260507T041727Z.csv
+!benchmarks/benchmark_results/gru_20260507T041727Z_summary.csv
+
+# Expanded campaign platform (datasets, per-run configs, analysis scripts,
+# reference baselines). Lives in the private claude-md repo, not here; the
+# public suite is benchmarks/config.yaml + benchmarks/neural/config.yaml.
+benchmarks/benchmark_datasets/*
+!benchmarks/benchmark_datasets/airline-passengers.csv
+!benchmarks/benchmark_datasets/daily-total-female-births.csv
+!benchmarks/benchmark_datasets/room temperature data.csv
+benchmarks/config_*.yaml
+benchmarks/neural/config_*.yaml
+benchmarks/neural/campaign_analyze.py
+benchmarks/scripts/
+benchmarks/baselines/*
+!benchmarks/baselines/README.md
+
+# Session handoff notes and implementation plans (private repo)
+handoff-*/
+plans/
+scripts/
 
 # Translations
 *.mo

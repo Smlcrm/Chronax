@@ -3,11 +3,10 @@
 Windows are scaled per-window (scaler stats on the insample target; per-channel
 scaling on future-known exog), the loss is computed in scaled space, and the
 whole training loop is one ``nnx.scan`` so it stays ``vmap``-traceable for
-``BaseForecaster.conformity_scores`` (mirrors the Informer/TFT trainers). The
-TCN forward is fully deterministic (no dropout/batchnorm at NF defaults), so
-the only RNG stream is the batch-index sampling; inference needs no key at all
-and repeated predictions, pickled round-trips, and conformal windows are
-bit-identical by construction.
+``BaseForecaster.conformity_scores``. The TCN forward is fully deterministic
+(no dropout or batchnorm), so the only RNG stream is the batch-index sampling;
+inference needs no key at all, and repeated predictions, pickled round-trips,
+and conformal windows are bit-identical by construction.
 """
 from __future__ import annotations
 
@@ -22,19 +21,14 @@ from chronax.models.tcn.tcn_module import TCNNet
 
 
 def build_windows(y: jnp.ndarray, input_size: int, h: int) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """NF-parity rolling windows over ``y`` right-padded with ``h`` zeros.
+    """Rolling windows over ``y``, right-padded with ``h`` zeros.
 
-    NF's ``padder_train = ConstantPad1d((0, h), 0)`` (``_base_model.py:340``)
-    pads the training series before windowing, and the default availability
-    threshold (0.0) keeps every window with >=1 valid target point, masking the
-    padded tail out of the loss. The partial windows put insample contexts
-    ending at the very last observations into training — on trending series
-    this is where the forecast-relevant regime lives (dropping them cost
-    airline ~13 MAE vs NF, root-caused 2026-07-17 via lockstep replay).
-
-    Returns ``(windows [n, input_size+h], target_mask [n, h])`` with
-    ``n = len(y) - input_size``; mask is 1.0 where the target position is a
-    real observation and 0.0 in the zero-padded tail.
+    Padding keeps every window with at least one real target and lets the newest
+    observations appear as training contexts; the padded tail is masked out of
+    the loss (matters on trending series, where the most recent regime is the
+    forecast-relevant one). Returns ``(windows [n, input_size+h], target_mask
+    [n, h])`` with ``n = len(y) - input_size``; the mask is 1.0 at real target
+    positions and 0.0 in the zero-padded tail.
     """
     T = y.shape[0]
     n = T - input_size
@@ -48,9 +42,9 @@ def build_windows(y: jnp.ndarray, input_size: int, h: int) -> tuple[jnp.ndarray,
 
 
 def build_exog_windows(arr: jnp.ndarray, input_size: int, h: int, n_windows: int, span: str) -> jnp.ndarray:
-    """Rolling windows of an exog array ``[T, F]`` (right-padded with ``h`` zero
-    rows, mirroring `build_windows` — NF pads the whole temporal tensor, so late
-    windows see zeros in the padded region of exog channels too).
+    """Rolling windows of an exog array ``[T, F]``, right-padded with ``h`` zero
+    rows to match ``build_windows`` (late windows see zeros in the padded tail of
+    each exog channel).
 
     ``span="input"`` -> ``[n, input_size, F]`` (encoder window); ``span="full"`` ->
     ``[n, input_size+h, F]`` (future-known spanning input + horizon).
@@ -65,20 +59,19 @@ def _scale_exog(windows: jnp.ndarray, scaler, stats_len: int | None = None) -> j
     """Per-channel per-window robust scaling of ``[B, T, F]`` exog.
 
     ``stats_len`` restricts the STATISTICS to the first ``stats_len`` positions
-    (the insample span) while transforming the whole window — NF's
-    ``_normalization`` zeroes the horizon out of the scaler mask
-    (``_base_model.py:892``), so exog stats never see the horizon slice.
-    ``None`` keeps full-span stats (used only for insample-span windows).
+    (the insample span) while transforming the whole window, so exog stats never
+    see the horizon slice. ``None`` keeps full-span stats (used only for
+    insample-span windows).
     """
     stats_src = windows if stats_len is None else windows[:, :stats_len]
     shift, scale = scaler.stats(stats_src, axis=1)      # [B, 1, F]
     return scaler.transform(windows, shift, scale)
 
 
-# Elementwise forms of the registry point losses, for NF-parity masked reduction
-# (NF losses compute sum(loss*mask)/sum(mask) — `_weighted_mean`). Keyed by the
-# registry function OBJECTS so a user's custom callable that happens to share a
-# name falls through to the custom branch instead of being shadowed.
+# Elementwise forms of the registry point losses, for masked reduction
+# (sum(loss*mask)/sum(mask)). Keyed by the registry function OBJECTS so a user's
+# custom callable that happens to share a name falls through to the custom
+# branch instead of being shadowed.
 _ELEMENTWISE = {
     _losses.mae: lambda e: jnp.abs(e),
     _losses.mse: lambda e: e * e,
@@ -90,9 +83,8 @@ def forward_loss(net, y_windows, target_mask=None, *, h, input_size, scaler, los
                  futr_windows=None):
     """Scale, forward, and reduce a point/quantile loss in scaled space.
 
-    ``target_mask [B, h]`` marks real target positions (0 in the NF h-padded
-    tail); the loss is the masked mean over valid elements, matching NF's
-    ``_weighted_mean``. ``None`` means all-valid.
+    ``target_mask [B, h]`` marks real target positions (0 in the h-padded tail);
+    the loss is the masked mean over valid elements. ``None`` means all-valid.
     """
     insample = y_windows[:, :input_size]                # [B, L]
     target = y_windows[:, input_size:]                  # [B, h]
@@ -109,8 +101,8 @@ def forward_loss(net, y_windows, target_mask=None, *, h, input_size, scaler, los
         q = jnp.asarray(loss_fn.quantiles, dtype=pred.dtype)          # [Q]
         err = target_z[..., None] - pred                               # [B, h, Q]
         ql = jnp.maximum(q * err, (q - 1.0) * err)
-        # NF quirk kept: MQLoss's 1/len(quantiles) hits a [1,1,1,Q] tensor
-        # (len==1), so NF SUMS over quantiles and means over valid positions.
+        # Sum over quantiles and average over valid positions (mirrors
+        # neuralforecast's MQLoss, whose per-quantile 1/len normalization is a no-op).
         return jnp.sum(ql * target_mask[..., None]) / denom
     ew = _ELEMENTWISE.get(loss_fn)
     if ew is not None:
@@ -137,17 +129,16 @@ def train(net, y, *, h, input_size, max_steps, windows_batch_size, lr, seed, los
           futr_exog=None):
     """Train ``net`` in place via one ``nnx.scan``. Returns per-step losses.
 
-    Batch-index sampling follows NF's regime split: with replacement when the
-    dataset has fewer windows than ``windows_batch_size`` (``torch.randint``),
-    without replacement otherwise (``torch.randperm[:B]``).
+    Batch-index sampling splits on dataset size: with replacement when there are
+    fewer windows than ``windows_batch_size``, without replacement otherwise.
     """
     y_windows, target_mask = build_windows(y, input_size, h)
     n = y_windows.shape[0]
     futr_w = build_exog_windows(futr_exog, input_size, h, n, "full") if futr_exog is not None else None
     step_keys = jax.random.split(jax.random.PRNGKey(seed), max_steps)
-    if n < windows_batch_size:                          # NF: torch.randint -> with replacement
+    if n < windows_batch_size:                          # fewer windows than batch: with replacement
         sample = lambda k: jax.random.choice(k, n, shape=(windows_batch_size,), replace=True)
-    else:                                               # NF: torch.randperm[:B] -> without replacement
+    else:                                               # enough windows: without replacement
         sample = lambda k: jax.random.permutation(k, n)[:windows_batch_size]
     batch_idx = jax.vmap(sample)(step_keys)             # [max_steps, B]
     optimizer = nnx.Optimizer(net, optax.adam(lr), wrt=nnx.Param)

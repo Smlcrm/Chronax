@@ -62,6 +62,16 @@ try:
 except ImportError:
     KAN = None
 
+# NLinear depends on flax NNX (pinned 0.10.x — see chronax/models/nlinear/__init__.py).
+# Guard like KAN/PatchTST so an incompatible flax degrades this model to None instead
+# of crashing the entire chronax.models namespace. Note the trade-off: the pin's
+# informative ImportError is swallowed here; importing chronax.models.nlinear
+# directly surfaces it.
+try:
+    from .nlinear import NLinear
+except ImportError:
+    NLinear = None
+
 # iTransformer / VanillaTransformer depend on flax NNX (flax 0.10.x). If flax's
 # nnx import fails (e.g. an incompatible resolved jax that dropped an API nnx
 # needs), guard like PatchTST/BiTCN so the model degrades to None instead of
@@ -115,6 +125,27 @@ try:
 except ImportError:
     DeepNPTS = None
 
+# SOFTS hard-pins flax 0.10.x (raises ImportError otherwise); guard like DeepNPTS so a
+# version/availability mismatch degrades to SOFTS=None instead of breaking the namespace.
+try:
+    from .softs import SOFTS
+except ImportError:
+    SOFTS = None
+
+# TCN depends on flax NNX; guard like BiTCN so an incompatible flax degrades it to None
+# instead of breaking the namespace.
+try:
+    from .tcn import TCN
+except ImportError:
+    TCN = None
+
+# StemGNN depends on flax NNX; guard like TCN so an incompatible flax degrades it to None
+# instead of breaking the namespace.
+try:
+    from .stemgnn import StemGNN
+except ImportError:
+    StemGNN = None
+
 from .batched_forecaster import BatchedForecaster
 
 from .xlstm import XLSTM
@@ -157,11 +188,15 @@ __all__ = [
     "TFT",
     "Informer",
     "KAN",
+    "NLinear",
     "PatchTST",
     "BiTCN",
     "TCN",
     "StemGNN",
     "DeepNPTS",
+    "SOFTS",
+    "TCN",
+    "StemGNN",
     "BatchedForecaster",
     "XLSTM",
 ]

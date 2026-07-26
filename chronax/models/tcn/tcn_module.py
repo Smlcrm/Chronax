@@ -1,19 +1,15 @@
 """Flax NNX modules for the TCN forecaster (port of neuralforecast.TCN).
 
-Mirrors NF's ``common/_modules.py`` building blocks: ``CausalConv1d`` (dilated
-causal 1-D convolution), ``TemporalConvolutionEncoder`` (a plain sequential
-stack of causal convs with exponentially increasing dilations), the ``MLP``
-decoder, and the full ``TCNNet`` (encoder -> context adapter
-``Linear(input_size -> h)`` over the time axis -> optional future-exog residual
-concat -> per-timestep MLP decoder).
+The building blocks are ``CausalConv1d`` (dilated causal 1-D convolution),
+``TemporalConvolutionEncoder`` (a plain sequential stack of causal convs with
+exponentially increasing dilations), the ``MLP`` decoder, and the full
+``TCNNet`` (encoder -> context adapter ``Linear(input_size -> h)`` over the
+time axis -> optional future-exog residual concat -> per-timestep MLP decoder).
 
-Causality: torch's ``CausalConv1d`` pads BOTH sides by ``(k-1)*d`` then
-``Chomp1d`` trims the right pad — mathematically identical to the causal
-K-shifted-GEMM form used here (guarded by the NumPy-reference and causality
-tests in ``tests/test_tcn.py``; see ``CausalConv1d.__call__`` for why the conv
-primitive is avoided). All shift amounts are static ctor config, so everything
-traces under ``jax.vmap`` (``BaseForecaster.conformity_scores``). ``float32``
-throughout.
+Causality is realized as K left-shifted matmul taps (see ``CausalConv1d``),
+mathematically identical to a symmetric pad plus a right-trim. All shift
+amounts are static ctor config, so everything traces under ``jax.vmap`` as
+``BaseForecaster.conformity_scores`` requires. ``float32`` throughout.
 """
 from __future__ import annotations
 
@@ -58,17 +54,15 @@ class _TorchConvInit:
         return jax.random.uniform(key, shape, dtype, minval=-self.bound, maxval=self.bound)
 
 
-# NF's TCN docstring documents 'tanh' or 'relu' for encoder_activation; restrict
-# to that documented set (deliberate deviation from torch's open getattr(nn, name)).
+# Supported encoder activations.
 ACTIVATIONS = {"ReLU": jax.nn.relu, "Tanh": jnp.tanh}
 
 
 class CausalConv1d(nnx.Module):
-    """Causal dilated 1-D convolution + activation (NF ``CausalConv1d``).
+    """Causal dilated 1-D convolution followed by an activation.
 
-    Operates in torch's channel-first layout ``[B, C, L]``; causality (torch's
-    symmetric pad + right ``Chomp1d``) is realized as K left-shifted GEMM taps —
-    see ``__call__``. Weight shape is torch's
+    Operates in channel-first layout ``[B, C, L]``; causality is realized as K
+    left-shifted matmul taps (see ``__call__``). Weight shape is
     ``(out_channels, in_channels, kernel_size)``.
     """
 
@@ -97,13 +91,11 @@ class CausalConv1d(nnx.Module):
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         """x: [B, C_in, L] -> [B, C_out, L].
 
-        Computed as K shifted GEMMs (``out[t] = Σ_k W[:,:,k] · x[t-(K-1-k)·d]``)
-        rather than ``lax.conv_general_dilated``: XLA-CPU pessimizes conv
-        primitives inside ``lax.scan`` bodies (~15× per training step, measured
-        2026-07-17: 478→32 ms/step), while matmuls keep their fast path in both
-        contexts. Fixed-weight parity with the conv primitive: ≤1.5e-8 (f32).
-        K and the shift amounts are static (ctor config), so this traces
-        unchanged under jit/vmap.
+        Computed as K shifted matmuls (``out[t] = Σ_k W[:,:,k] · x[t-(K-1-k)·d]``)
+        rather than ``lax.conv_general_dilated``: the XLA CPU backend pessimizes
+        conv primitives inside the ``lax.scan`` training loop, while matmuls keep
+        their fast dot path there. K and the shift amounts are static ctor
+        config, so this traces unchanged under jit/vmap.
         """
         x = x.astype(self.weight.value.dtype)   # enforce float32 (x64-safe)
         w = self.weight.value                   # [C_out, C_in, K]
@@ -121,11 +113,12 @@ class CausalConv1d(nnx.Module):
 
 
 class TemporalConvolutionEncoder(nnx.Module):
-    """Sequential stack of causal dilated convs (NF ``TemporalConvolutionEncoder``).
+    """Sequential stack of causal dilated convs.
 
     Layer i uses ``padding = (kernel_size-1) * dilations[i]``; layer 0 maps
     ``in_channels -> out_channels``, the rest ``out_channels -> out_channels``.
-    Input/output are time-first ``[B, L, C]`` (transposed internally, as in NF).
+    Input/output are time-first ``[B, L, C]`` (transposed to channel-first
+    internally).
     """
 
     def __init__(
@@ -163,13 +156,11 @@ class TemporalConvolutionEncoder(nnx.Module):
 
 
 class MLP(nnx.Module):
-    """NF ``MLP`` decoder head: ``num_layers`` Linears total, ReLU between.
+    """MLP decoder head: ``num_layers`` Linears total, ReLU between.
 
     ``num_layers=1`` is a direct linear projection. For ``num_layers>=2``:
     input Linear, ``num_layers-2`` hidden Linears, output Linear — ReLU after
-    every layer but the last. NF's TCN instantiates this with ``dropout=0.0``,
-    so the dropout layers are omitted entirely (parity guarded by the
-    parameter-count test).
+    every layer but the last. Dropout is omitted (TCN runs it at ``0.0``).
     """
 
     def __init__(
@@ -206,7 +197,7 @@ class MLP(nnx.Module):
 class TCNNet(nnx.Module):
     """Full TCN: encoder -> context adapter -> futr residual concat -> MLP decoder.
 
-    Forward (mirrors NF ``TCN.forward``):
+    Forward:
       1. concat scaled insample_y with the historic slice of future-known exog
          -> encoder input ``[B, L, 1+F]``;
       2. ``TemporalConvolutionEncoder`` -> ``[B, L, C]``;
@@ -215,8 +206,8 @@ class TCNNet(nnx.Module):
       4. concat the horizon slice of futr exog as extra channels -> ``[B, C+F, h]``;
       5. transpose to ``[B, h, C+F]``, per-timestep MLP decoder -> ``[B, h, mult]``.
 
-    The forward is fully deterministic (no dropout/batchnorm at TCN's NF
-    defaults), so no RNG or train/eval mode flags are needed.
+    The forward is fully deterministic (no dropout or batchnorm), so no RNG or
+    train/eval mode flags are needed.
     """
 
     def __init__(

@@ -47,16 +47,14 @@ class IdentityScaler:
 
 
 class RobustScaler:
-    """Median + MAD scaler with 0.6745*std fallback when MAD=0 (NF parity).
+    """Median + median-absolute-deviation (MAD) scaler, mirroring
+    neuralforecast's ``robust_statistics``.
 
-    ⚠ Port from NF's CODE, not its docstring: ``robust_statistics``
-    (``common/_scalers.py``) *documents* the mean absolute deviation but
-    *computes* ``masked_median(|x - median|)`` — the MEDIAN absolute deviation —
-    then falls back to ``0.6745*std`` when MAD=0, pins exact zeros to 1.0, and
-    adds eps. This sequence mirrors that code path exactly. At n_series=1
-    StemGNN's forecast is a learned constant in scaled space (see
-    ``stemgnn_model``), so the scaler's median/MAD ARE the data-dependent part
-    of the forecast — scaler parity is accuracy parity here.
+    Shift is the median; scale is the MAD, with three guards applied in order:
+    fall back to ``0.6745 * std`` where MAD is 0, pin any remaining exact zeros
+    to 1.0, then add ``eps``. At ``n_series=1`` the network's forecast is a
+    learned constant in scaled space, so this median/MAD pair is the only
+    data-dependent part of the forecast.
     """
 
     def stats(self, x: jnp.ndarray, axis: int = 1) -> tuple[jnp.ndarray, jnp.ndarray]:

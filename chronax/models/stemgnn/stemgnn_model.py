@@ -2,20 +2,17 @@
 
 Univariate point and multi-quantile forecasting via the Spectral Temporal Graph
 Neural Network (Cao et al., 2020, https://arxiv.org/abs/2103.07719), a flax.nnx
-port of ``neuralforecast.models.StemGNN`` (which adapts microsoft/StemGNN).
-Intervals come from the conformal path (point loss) or natively from the
-quantile heads. No exogenous support (NF parity). ``float32`` throughout.
+port of ``neuralforecast.models.StemGNN``. Intervals come from the conformal
+path (point loss) or natively from the quantile heads. No exogenous support.
+``float32`` throughout.
 
-⚠ Univariate degeneracy (NF parity, proven bit-exact on NF 3.1.7): StemGNN is
-natively multivariate; this wrapper runs it at ``n_series=1`` (the iTransformer
-precedent). At N=1 the learned single-node graph Laplacian is exactly 0 and
-NF's Chebyshev expansion hardcodes ``T0 = zeros`` (not identity), so the
-forecast head sees only layer biases — the network output is a learned
-CONSTANT per horizon step in per-window-scaled space, and the data-dependent
-part of the forecast is exactly the robust scaler's inverse
-(~ window median + c * window MAD). This mirrors NF's behavior at
-``n_series=1`` exactly. ``chebyshev_first_term="identity"`` opts into the
-paper's ``T0 = I`` (a deliberate, test-guarded deviation from NF), restoring a
+StemGNN is natively multivariate; this wrapper runs it at ``n_series=1``, where
+it is degenerate: the single-node graph Laplacian is exactly 0 and the Chebyshev
+expansion uses ``T0 = zeros`` (not identity), so the forecast head sees only
+layer biases. The network output is then a learned CONSTANT per horizon step in
+per-window-scaled space, and the only data-dependent part of the forecast is the
+robust scaler's inverse (~ window median + c * window MAD).
+``chebyshev_first_term="identity"`` opts into the paper's ``T0 = I``, restoring a
 real data path so the univariate model genuinely forecasts.
 """
 from __future__ import annotations
@@ -41,7 +38,7 @@ def _nearest_q_index(quantiles, target: float) -> int:
 
 class StemGNN(BaseForecaster):
     """StemGNN: Spectral Temporal Graph Neural Network
-    (flax.nnx port of neuralforecast.StemGNN).
+    (flax.nnx port of neuralforecast's StemGNN).
 
     Cao et al., 2020 -- https://arxiv.org/abs/2103.07719. A latent correlation
     layer (GRU over the series axis + additive attention) learns a graph over
@@ -49,12 +46,11 @@ class StemGNN(BaseForecaster):
     "GFT" of its normalized Laplacian, a 4-point DFT over the Chebyshev-order
     axis with GLU filtering (the Spe-Seq cell), a per-order graph-conv kernel,
     and sigmoid-gated forecast/backcast heads; a final MLP maps to the horizon.
-    Trained with NF's default StepLR schedule (``num_lr_decays``). This wrapper
-    is univariate (``n_series = 1`` internally — see the module docstring for
-    the proven N=1 degeneracy this inherits from NF, and the
-    ``chebyshev_first_term`` escape hatch). No exogenous support (NF parity).
-    Point or multi-quantile losses; conformal or native quantile intervals.
-    ``float32`` throughout.
+    Trained with a StepLR schedule (``num_lr_decays``). This wrapper is
+    univariate (``n_series = 1`` internally — see the module docstring for the
+    N=1 degeneracy and the ``chebyshev_first_term`` escape hatch). No exogenous
+    support. Point or multi-quantile losses; conformal or native quantile
+    intervals. ``float32`` throughout.
     """
 
     uses_exog = False
@@ -67,7 +63,6 @@ class StemGNN(BaseForecaster):
         if input_size < 1:
             input_size = 3 * h
         if n_stacks != 2:
-            # NF raises bare Exception with this exact message; typed here.
             raise ValueError("StemGNN currently only supports n_stacks=2.")
         if chebyshev_first_term not in ("nf_zero", "identity"):
             raise ValueError(
@@ -122,7 +117,7 @@ class StemGNN(BaseForecaster):
         if y.ndim != 1:
             raise ValueError(f"y must be 1-D; got shape {y.shape}.")
         if y.shape[0] <= self.input_size:
-            # NF trains from T >= input_size+1 (h-padded partial windows); match it.
+            # Partial (h-padded) windows need only T >= input_size + 1.
             raise ValueError(
                 f"Series length {y.shape[0]} too short for input_size={self.input_size} "
                 f"(need at least input_size+1)."
@@ -194,7 +189,7 @@ class StemGNN(BaseForecaster):
 
     # ---- forecast ------------------------------------------------------------
     def forecast(self, y, h, X=None, X_future=None, level=None, fitted=False) -> dict:
-        """Stateless fit-then-predict. Exogenous inputs are unsupported (NF parity)."""
+        """Stateless fit-then-predict. Exogenous inputs are unsupported."""
         if X_future is not None:
             raise NotImplementedError("Exogenous variables are not supported.")
         self.fit(y, X=X)

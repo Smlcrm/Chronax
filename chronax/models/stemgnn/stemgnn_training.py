@@ -1,18 +1,15 @@
-"""Window construction and JIT/scan training for StemGNN.
+"""Window construction and scan-based training for StemGNN.
 
 Windows are scaled per-window (scaler stats on the insample target), the loss
 is computed in scaled space, and the whole training loop is one ``nnx.scan`` so
-it stays ``vmap``-traceable for ``BaseForecaster.conformity_scores`` (mirrors
-the TCN/Informer trainers). Two RNG streams split off ``seed``: batch-index
-keys (NF's regime-dependent window sampling) and per-step dropout keys for the
-attention dropout (Informer's two-stream pattern) — shuffling batches never
+it stays ``vmap``-traceable for ``BaseForecaster.conformity_scores``. Two RNG
+streams split off ``seed``: batch-index keys (regime-dependent window sampling)
+and per-step dropout keys for the attention dropout — shuffling batches never
 perturbs which attention entries drop on a given step.
 
-Unlike the older wrappers, StemGNN also mirrors NF's DEFAULT learning-rate
-schedule: ``num_lr_decays=3`` -> torch ``StepLR(step_size=max_steps//3,
-gamma=0.5)`` stepped per optimizer step (``_base_model.py`` default). The other
-chronax neural ports silently train at constant LR against an NF that decays —
-a filed template gap; StemGNN is the first port to close it.
+Optimization follows neuralforecast's default learning-rate schedule:
+``num_lr_decays`` maps to a torch-style ``StepLR(step_size=max_steps //
+num_lr_decays, gamma=0.5)`` stepped once per optimizer step.
 """
 from __future__ import annotations
 
@@ -26,19 +23,16 @@ from chronax.models.stemgnn.stemgnn_losses import MultiQuantileLoss
 
 
 def build_windows(y: jnp.ndarray, input_size: int, h: int) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """NF-parity rolling windows over ``y`` right-padded with ``h`` zeros.
+    """Rolling windows over ``y`` right-padded with ``h`` zeros.
 
-    NF's ``padder_train = ConstantPad1d((0, h), 0)`` pads the training series
-    before windowing, and the default availability threshold (0.0) keeps every
-    window with >=1 valid target point, masking the padded tail out of the
-    loss (the multivariate path verified identical to the univariate one at
-    n_series=1). The partial windows put insample contexts ending at the very
-    last observations into training — on trending series this is where the
-    forecast-relevant regime lives (dropping them cost TCN/airline ~13 MAE,
-    root-caused 2026-07-17 via lockstep replay).
+    The series is padded with ``h`` trailing zeros before windowing, so every
+    window with at least one valid target point is kept and the padded tail is
+    masked out of the loss. These partial windows put insample contexts ending
+    at the very last observations into training — on trending series that is
+    where the forecast-relevant regime lives.
 
     Returns ``(windows [n, input_size+h], target_mask [n, h])`` with
-    ``n = len(y) - input_size``; mask is 1.0 where the target position is a
+    ``n = len(y) - input_size``; the mask is 1.0 where the target position is a
     real observation and 0.0 in the zero-padded tail.
     """
     T = y.shape[0]
@@ -52,10 +46,10 @@ def build_windows(y: jnp.ndarray, input_size: int, h: int) -> tuple[jnp.ndarray,
     return y_pad[idx], target_mask
 
 
-# Elementwise forms of the registry point losses, for NF-parity masked reduction
-# (NF losses compute sum(loss*mask)/sum(mask) — `_weighted_mean`). Keyed by the
-# registry function OBJECTS so a user's custom callable that happens to share a
-# name falls through to the custom branch instead of being shadowed.
+# Elementwise forms of the registry point losses, used for the masked-mean
+# reduction sum(loss*mask)/sum(mask). Keyed by the registry function OBJECTS so
+# a user's custom callable that happens to share a name falls through to the
+# custom branch instead of being shadowed.
 _ELEMENTWISE = {
     _losses.mae: lambda e: jnp.abs(e),
     _losses.mse: lambda e: e * e,
@@ -64,16 +58,16 @@ _ELEMENTWISE = {
 
 
 def _lr_schedule(lr: float, max_steps: int, num_lr_decays: int):
-    """NF's default scheduler: torch ``StepLR(step_size=max(max_steps//num_lr_decays,
-    1), gamma=0.5)`` stepped once per optimizer step.
+    """Torch-style ``StepLR(step_size=max(max_steps // num_lr_decays, 1),
+    gamma=0.5)`` stepped once per optimizer step.
 
-    optax's update ``t`` (1-indexed) reads ``schedule(t-1)`` (the count
+    optax's update ``t`` (1-indexed) reads ``schedule(t-1)`` (the count is read
     pre-increment), and torch applies gamma when ``last_epoch`` reaches a
-    multiple of ``step_size`` — so torch update ``t`` and optax count ``t-1``
+    multiple of ``step_size``, so torch update ``t`` and optax count ``t-1``
     align at boundaries ``k*step_size``. For ``max_steps=1000, num_lr_decays=3``:
     updates 1-333 at ``lr``, 334-666 at ``lr/2``, 667-999 at ``lr/4``, update
     1000 at ``lr/8`` (boundaries {333, 666, 999}). ``num_lr_decays <= 0``
-    disables the schedule (NF sets ``lr_decay_steps=10e7``).
+    disables the schedule.
     """
     if num_lr_decays is None or num_lr_decays <= 0:
         return lr
@@ -88,9 +82,8 @@ def forward_loss(net, y_windows, target_mask=None, *, h, input_size, scaler, los
                  dropout_key=None, deterministic=True):
     """Scale, forward, and reduce a point/quantile loss in scaled space.
 
-    ``target_mask [B, h]`` marks real target positions (0 in the NF h-padded
-    tail); the loss is the masked mean over valid elements, matching NF's
-    ``_weighted_mean``. ``None`` means all-valid.
+    ``target_mask [B, h]`` marks real target positions (0 in the padded tail);
+    the loss is the masked mean over valid elements. ``None`` means all-valid.
     """
     insample = y_windows[:, :input_size]                # [B, L]
     target = y_windows[:, input_size:]                  # [B, h]
@@ -105,8 +98,7 @@ def forward_loss(net, y_windows, target_mask=None, *, h, input_size, scaler, los
         q = jnp.asarray(loss_fn.quantiles, dtype=pred.dtype)          # [Q]
         err = target_z[..., None] - pred                               # [B, h, Q]
         ql = jnp.maximum(q * err, (q - 1.0) * err)
-        # NF quirk kept: MQLoss's 1/len(quantiles) hits a [1,1,1,Q] tensor
-        # (len==1), so NF SUMS over quantiles and means over valid positions.
+        # Sum over quantiles (not mean), then mean over valid target positions.
         return jnp.sum(ql * target_mask[..., None]) / denom
     ew = _ELEMENTWISE.get(loss_fn)
     if ew is not None:
@@ -133,18 +125,17 @@ def train(net, y, *, h, input_size, max_steps, windows_batch_size, lr, num_lr_de
           seed, loss_fn, scaler):
     """Train ``net`` in place via one ``nnx.scan``. Returns per-step losses.
 
-    Batch-index sampling follows NF's regime split: with replacement when the
-    dataset has fewer windows than ``windows_batch_size`` (``torch.randint``),
-    without replacement otherwise (``torch.randperm[:B]``). Adam runs on the
-    NF-default StepLR schedule (``_lr_schedule``).
+    Batch-index sampling splits by regime: with replacement when the dataset
+    has fewer windows than ``windows_batch_size``, without replacement
+    otherwise. Adam runs on the StepLR schedule from ``_lr_schedule``.
     """
     y_windows, target_mask = build_windows(y, input_size, h)
     n = y_windows.shape[0]
     batch_key, drop_key = jax.random.split(jax.random.PRNGKey(seed))
     step_keys = jax.random.split(batch_key, max_steps)
-    if n < windows_batch_size:                          # NF: torch.randint -> with replacement
+    if n < windows_batch_size:                          # fewer windows than batch: with replacement
         sample = lambda k: jax.random.choice(k, n, shape=(windows_batch_size,), replace=True)
-    else:                                               # NF: torch.randperm[:B] -> without replacement
+    else:                                               # enough windows: without replacement
         sample = lambda k: jax.random.permutation(k, n)[:windows_batch_size]
     batch_idx = jax.vmap(sample)(step_keys)             # [max_steps, B]
     drop_keys = jax.random.split(drop_key, max_steps)   # [max_steps, 2]
@@ -171,7 +162,7 @@ def train(net, y, *, h, input_size, max_steps, windows_batch_size, lr, num_lr_de
 
 @nnx.jit
 def _forward_det(net, insample_z):
-    """Inference forward: deterministic (dropout off, as under torch ``model.eval()``)."""
+    """Inference forward: deterministic (dropout off)."""
     return net(insample_z)
 
 
