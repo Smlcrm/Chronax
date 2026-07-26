@@ -142,15 +142,28 @@ class SimpleExponentialSmoothing(BaseForecaster):
             h (int): Forecast horizon (number of steps ahead).
             X (jnp.ndarray | None): In-sample exogenous variables (unused; included for API compatibility). Default is None.
             X_future (jnp.ndarray | None): Future exogenous variables (unused; included for API compatibility). Default is None.
-            level (list[int | float] | None): Confidence levels (unused; included for BaseForecaster compliance). Default is None.
+            level (list[int | float] | None): Confidence levels (0--100) for conformal prediction intervals, e.g. ``[80, 95]``. Requires ``conformal_params``. Default is None.
             fitted (bool): Whether to return fitted values (unused; included for BaseForecaster compliance). Default is False.
 
         Returns:
-            dict: Dictionary containing ``"mean"``, point forecasts of shape (h,), all equal to the final smoothed level.
+            dict: ``"mean"`` (shape (h,), all equal to the final smoothed level), plus ``lo-{level}``/``hi-{level}`` when ``level`` is given.
         """
         y = utils.ensure_float(y)
         mod = _ses(y=y, alpha=self.alpha, h=h, fitted=False)
-        return {"mean": mod["mean"]}
+        res = {"mean": mod["mean"]}
+        if level is None:
+            # The conformity_scores CV path lands here (it never passes `level`),
+            # so this stays vmap-native.
+            return res
+        # `level` must be honoured here, not silently dropped: the CV path never
+        # passes it, so a stateless path that ignores it returns point forecasts
+        # with neither intervals nor an error.
+        if self.conformal_params is None:
+            raise Exception("You must pass `conformal_params` to compute them.")
+        cs = self.conformity_scores(y=y, X=None)
+        return self.add_confidence_intervals(
+            res, cs, sorted(level), self.conformal_params.method
+        )
     
     def predict(
         self,

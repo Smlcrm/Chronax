@@ -40,7 +40,9 @@ Methods:
 6. forward(y, h, X=None, X_future=None, level=None, fitted=False) - Apply fitted model to new data
 
 Implementation Notes:
-- Sigmoid reparameterization for admissibility-constrained smoothing parameters
+- Sigmoid reparameterization bounds each smoothing parameter to (0, 1)
+  INDEPENDENTLY (a per-parameter box, NOT a joint ETS admissibility/invertibility
+  constraint — the fit can reach the box corners, e.g. gamma->1)
 - States initialized via classical decomposition with trend estimation
 - Supports 8 model variants: AAA, AAM, MAA, MAM (+ damped versions)
 - Analytical interval formulas from Hyndman et al. (2008) and Taylor (2003)
@@ -575,6 +577,27 @@ class HoltWinters(BaseForecaster):
         self.phi = phi
         self.alias = alias
         self.conformal_params = conformal_params
+
+    def conformity_scores(self, y: jnp.ndarray, X: jnp.ndarray | None = None):
+        """Walk-forward conformity scores, regime-routed by window length.
+
+        HW's fit is a fixed 150-step Adam+L-BFGS whose zoom linesearch makes the CV
+        vmap an anti-optimization on short windows (batched carries + both-branch
+        selects), so those run several times faster sequentially. On long/big-m
+        windows the vmap amortizes the optimizer scan and wins instead. The routing
+        bound of 512 is an EMPIRICAL crossover measured between the two regimes, not
+        a mechanism bound — re-probe before moving it.
+
+        HW's optimizer is trajectory-sensitive: the two regimes reach equally valid
+        fit endpoints whose scores differ materially, so the equivalence that matters
+        here is interval CALIBRATION, not bits. Aggregate coverage and median
+        interval width are unchanged across regimes.
+        """
+        if self.conformal_params is not None:
+            window_n = jnp.asarray(y).size - self.conformal_params.h
+            if window_n <= 512:
+                return self._conformity_scores_sequential(y=y, X=X)
+        return super().conformity_scores(y=y, X=X)
 
     def fit(self, y: jnp.ndarray, X: jnp.ndarray | None = None) -> 'HoltWinters':
         r"""Fit the Holt-Winters model.
