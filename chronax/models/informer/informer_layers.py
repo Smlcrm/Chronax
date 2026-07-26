@@ -37,6 +37,16 @@ class _TorchLinearInit:
         bound = 1.0 / math.sqrt(self.fan_in)
         return jax.random.uniform(key, shape, dtype, minval=-bound, maxval=bound)
 
+    def __eq__(self, other):
+        # Value equality. Initializer instances are static graphdef leaves, so an
+        # identity-based __eq__ makes same-config graphdefs UNEQUAL and the
+        # module-level @nnx.jit _forward_det cache can never hit across nets built by
+        # a later fit — costing a full recompile on every refit->predict.
+        return type(other) is type(self) and other.fan_in == self.fan_in
+
+    def __hash__(self):
+        return hash((type(self), self.fan_in))
+
 
 def _torch_linear(in_features: int, out_features: int, *, use_bias: bool = True, rngs: nnx.Rngs):
     init = _TorchLinearInit(in_features)
@@ -64,6 +74,12 @@ class _KaimingNormalConvInit:
 
     def __call__(self, key, shape, dtype=jnp.float32):
         return jax.random.normal(key, shape, dtype) * math.sqrt(2.0 / self.fan_in)
+
+    def __eq__(self, other):  # I2 value equality — see _TorchLinearInit above
+        return type(other) is type(self) and other.fan_in == self.fan_in
+
+    def __hash__(self):
+        return hash((type(self), self.fan_in))
 
 
 def _resolve_activation(name: str):
@@ -263,8 +279,8 @@ class ConvLayer(nnx.Module):
     ``Conv1d(kernel_size=3, padding=2, padding_mode='circular')`` — the paper
     repo's padding is torch-version-conditional and the NF benchmark twin uses
     padding=2, which EXPANDS the sequence to ``L + 2`` before the pool (the
-    length-preserving padding=1 variant used here until 2026-07-07 was a parity
-    bug, not a decision). Torch circular padding draws the left pad from the
+    length-preserving padding=1 variant is NOT equivalent). Torch circular padding
+    draws the left pad from the
     sequence tail and the right pad from its head, so we pre-pad explicitly and
     run a VALID conv. Init matches torch ``Conv1d`` default — same
     ``U(-1/sqrt(fan_in), 1/sqrt(fan_in))`` bound as ``_torch_linear``, with
@@ -290,7 +306,17 @@ class ConvLayer(nnx.Module):
     def __call__(self, x: jnp.ndarray, *, use_running_average: bool) -> jnp.ndarray:
         """x: ``[B, L, C]`` -> ``[B, (L+1)//2 + 1, C]``."""
         x = jnp.concatenate([x[:, -2:], x, x[:, :2]], axis=1)  # torch circular padding=2
-        x = self.conv(x)  # VALID k=3 on L+4 -> L+2
+        # k=3 VALID conv on L+4 -> L+2, expressed as 3 shifted GEMMs: XLA-CPU lowers
+        # `convolution` at these shapes to its naive elemental emitter inside the
+        # training scan (no Eigen custom-call), which dominates the fit wall, while
+        # the GEMM form keeps the fast dot path. `self.conv` stays the parameter
+        # holder so init/pickle/weight-transplant maps are unchanged; equivalence
+        # <=1e-4 is guarded by test_conv_layer_gemm_matches_conv_primitive.
+        w = self.conv.kernel.value                              # [3, C, C]
+        b = self.conv.bias.value
+        out_len = x.shape[1] - 2
+        x = (x[:, 0:out_len] @ w[0] + x[:, 1:out_len + 1] @ w[1]
+             + x[:, 2:out_len + 2] @ w[2] + b)
         x = self.norm(x, use_running_average=use_running_average)
         x = jax.nn.elu(x)
         return nnx.max_pool(x, window_shape=(3,), strides=(2,), padding=((1, 1),))

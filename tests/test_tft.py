@@ -209,6 +209,30 @@ def test_continuous_embedding_zero_features():
     assert out.shape == (2, 5, 0, 8)
 
 
+def test_continuous_embedding_xavier_init_nf_parity():
+    # NF initializes embedding vectors with torch.nn.init.xavier_normal_ —
+    # std = sqrt(2/(num_features+hidden)). A fixed small std starts the input
+    # coupling far weaker. Guard the distribution, not exact values.
+    emb = ContinuousEmbedding(num_features=1, hidden_size=512, rngs=nnx.Rngs(0))
+    std = float(np.asarray(emb.vectors.value).std())
+    expected = (2.0 / (1 + 512)) ** 0.5
+    assert abs(std - expected) / expected < 0.15
+    np.testing.assert_array_equal(np.asarray(emb.bias.value), 0.0)
+
+
+def test_vsn_selection_weights_ignore_dropout_nf_parity():
+    # NF builds the VSN joint/selection GRN WITHOUT dropout — only the
+    # per-variable GRNs take it. Selection weights must
+    # be deterministic across training-mode calls while the variable transforms
+    # stay stochastic.
+    vsn = VariableSelectionNetwork(hidden_size=8, num_inputs=2, dropout=0.5, rngs=nnx.Rngs(0))
+    x = jnp.asarray(np.random.RandomState(0).randn(4, 2, 8), jnp.float32)
+    out_a, w_a = vsn(x, deterministic=False)
+    out_b, w_b = vsn(x, deterministic=False)
+    np.testing.assert_array_equal(np.asarray(w_a), np.asarray(w_b))
+    assert not bool(jnp.allclose(out_a, out_b)), "var_grns dropout inactive in training mode"
+
+
 def test_imha_shapes_and_divisibility():
     attn = InterpretableMultiHeadAttention(n_head=4, hidden_size=16, rngs=nnx.Rngs(0))
     out, w = attn(jnp.ones((2, 7, 16)), deterministic=True)
@@ -236,7 +260,7 @@ def test_imha_rows_sum_to_one():
 
 def test_imha_out_dropout_applied_in_training_mode():
     """NF parity: InterpretableMultiHeadAttention applies out_dropout (rate =
-    `dropout`, NOT attn_dropout) after the output projection (NF tft.py:229,267).
+    `dropout`, NOT attn_dropout) after the output projection.
     Training-mode forwards must be stochastic when dropout > 0; deterministic
     forwards must be reproducible and match the eval path."""
     attn = InterpretableMultiHeadAttention(
@@ -324,7 +348,31 @@ def test_fusion_decoder_slices_to_horizon():
     ce = jnp.zeros((B, hidden))
     out, attn = dec(temporal, ce, input_size=L, deterministic=True)
     assert out.shape == (B, h, hidden)
-    assert attn.shape == (B, 2, L + h, L + h)
+    # TFT-S1: only the surviving h query rows are computed (query_start=L).
+    assert attn.shape == (B, 2, h, L + h)
+
+
+def test_imha_query_slice_matches_compute_then_slice():
+    # TFT-S1 deviation guard: NF computes all T query rows and discards all but
+    # the last h; chronax computes only the last h. Per-row math is identical;
+    # outputs match compute-then-slice to floating-point reassociation (~1 ULP
+    # — the sliced einsum tiles differently; measured 1.6e-8 at these dims).
+    imha = InterpretableMultiHeadAttention(n_head=2, hidden_size=16, attn_dropout=0.0,
+                                           dropout=0.5, rngs=nnx.Rngs(0))
+    x = jnp.asarray(np.random.RandomState(0).randn(3, 10, 16), jnp.float32)
+    full, attn_full = imha(x, deterministic=True)
+    sliced, attn_sliced = imha(x, deterministic=True, query_start=6)
+    np.testing.assert_allclose(np.asarray(full[:, 6:]), np.asarray(sliced), rtol=0, atol=1e-6)
+    np.testing.assert_allclose(np.asarray(attn_full[:, :, 6:]), np.asarray(attn_sliced), rtol=0, atol=1e-6)
+
+
+def test_same_config_nets_share_graphdef():
+    # Value-__eq__ on the picklable initializers makes same-config graphdefs
+    # EQUAL, so the module-level @nnx.jit _forward_det cache hits across nets
+    # built by a later fit instead of recompiling per instance.
+    gd_a, _ = nnx.split(_tnet())
+    gd_b, _ = nnx.split(_tnet())
+    assert gd_a == gd_b
 
 
 def _net(**kw):
@@ -392,7 +440,22 @@ def _tnet(mult=1, **kw):
 
 
 def test_build_windows_shape():
-    assert build_windows(_make_y(60), 36, 12).shape == (60 - 48 + 1, 48)
+    w, m = build_windows(_make_y(60), 36, 12)
+    assert w.shape == (60 - 36, 48) and m.shape == (60 - 36, 12)
+
+
+def test_build_windows_nf_padding_semantics():
+    # NF parity (NEU-A1): series right-padded with h zeros; n = T - input_size
+    # windows; every window with >=1 real target point is kept, padded tail
+    # masked out of the loss.
+    y = jnp.arange(1.0, 11.0)                # T=10, values 1..10 (no zeros)
+    w, m = build_windows(y, input_size=3, h=2)
+    assert w.shape == (7, 5) and m.shape == (7, 2)
+    np.testing.assert_array_equal(np.asarray(w[0]), [1, 2, 3, 4, 5])
+    np.testing.assert_array_equal(np.asarray(m[0]), [1, 1])
+    np.testing.assert_array_equal(np.asarray(w[6]), [7, 8, 9, 10, 0])   # padded tail
+    np.testing.assert_array_equal(np.asarray(m[6]), [1, 0])             # masked out
+    assert float(m.sum()) == 13.0
 
 
 def test_build_windows_too_short_raises():
@@ -402,14 +465,41 @@ def test_build_windows_too_short_raises():
 
 def test_build_exog_windows_spans():
     arr = jnp.asarray(np.random.RandomState(0).randn(60, 2), jnp.float32)
-    n = 60 - 48 + 1
+    n = 60 - 36
     assert build_exog_windows(arr, 36, 12, n, "input").shape == (n, 36, 2)
     assert build_exog_windows(arr, 36, 12, n, "full").shape == (n, 48, 2)
 
 
+def test_exog_scaling_stats_use_insample_span_only():
+    # NF's _normalization masks the horizon out of the scaler stats: exog
+    # statistics come from the insample span only; the horizon slice is
+    # transformed with those stats but never feeds them.
+    from chronax.models.tft.tft_training import _scale_exog
+    rng = np.random.RandomState(0)
+    L, h, F = 8, 4, 2
+    w = jnp.asarray(rng.randn(3, L + h, F), jnp.float32)
+    a = _scale_exog(w, RobustScaler(), stats_len=L)
+    w2 = w.at[:, L:, :].add(1e4)         # perturb horizon slice massively
+    b = _scale_exog(w2, RobustScaler(), stats_len=L)
+    np.testing.assert_array_equal(np.asarray(a[:, :L]), np.asarray(b[:, :L]))
+
+
+def test_masked_loss_ignores_padded_tail():
+    # A window whose padded target cell is masked must contribute only its
+    # real points to the loss (NF `_weighted_mean` semantics).
+    net = _tnet()
+    y = jnp.asarray(np.arange(1.0, 61.0), jnp.float32)   # T=60
+    w, m = build_windows(y, 36, 12)
+    kw = dict(h=12, input_size=36, scaler=RobustScaler(), loss_fn=mae, deterministic=True)
+    full = forward_loss(net, w, m, **kw)
+    w_poison = w.at[-1, -1].set(1e6)     # last target cell of the last window is padded
+    poisoned = forward_loss(net, w_poison, m, **kw)
+    np.testing.assert_allclose(float(full), float(poisoned), rtol=0, atol=1e-6)
+
+
 def test_forward_loss_scalar_finite():
     net = _tnet()
-    w = build_windows(_make_y(), 36, 12)
+    w, _ = build_windows(_make_y(), 36, 12)
     loss = forward_loss(net, w[:8], h=12, input_size=36, scaler=RobustScaler(),
                         loss_fn=mae, deterministic=True)
     assert loss.shape == () and bool(jnp.isfinite(loss))

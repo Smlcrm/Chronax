@@ -26,6 +26,12 @@ class _TorchLinearInit:
         bound = 1.0 / math.sqrt(self.fan_in)
         return jax.random.uniform(key, shape, dtype, minval=-bound, maxval=bound)
 
+    def __eq__(self, other):  # I2 value equality — see informer_layers._TorchLinearInit
+        return type(other) is type(self) and other.fan_in == self.fan_in
+
+    def __hash__(self):
+        return hash((type(self), self.fan_in))
+
 
 _GRN_ACTIVATIONS = {
     "ELU": jax.nn.elu,
@@ -139,9 +145,12 @@ class VariableSelectionNetwork(nnx.Module):
         rngs: nnx.Rngs,
     ):
         self.num_inputs = num_inputs
+        # NF parity: the joint/selection GRN takes NO dropout — only the per-variable
+        # GRNs do. Regularizing the selection logits under-commits the target channel
+        # on seasonal series, leaving weight on constant inputs.
         self.joint_grn = GRN(
             hidden_size * num_inputs, hidden_size, output_size=num_inputs,
-            context_size=context_size, dropout=dropout, activation=activation, rngs=rngs,
+            context_size=context_size, dropout=0.0, activation=activation, rngs=rngs,
         )
         self.var_grns = [
             GRN(hidden_size, hidden_size, dropout=dropout, activation=activation, rngs=rngs)
@@ -173,7 +182,12 @@ class ContinuousEmbedding(nnx.Module):
         self.hidden_size = hidden_size
         if num_features > 0:
             k = rngs.params()
-            vec = jax.random.normal(k, (num_features, hidden_size), dtype=jnp.float32) * 0.02
+            # NF parity: torch.nn.init.xavier_normal_ on the [num_features, hidden]
+            # vectors, std = sqrt(2/(num_features+hidden)). A fixed small std (e.g.
+            # normal*0.02) starts the input coupling far weaker and costs accuracy on
+            # seasonal data within a fixed step budget.
+            std = (2.0 / (num_features + hidden_size)) ** 0.5
+            vec = jax.random.normal(k, (num_features, hidden_size), dtype=jnp.float32) * std
             self.vectors = nnx.Param(vec.astype(jnp.float32))
             self.bias = nnx.Param(jnp.zeros((num_features, hidden_size), dtype=jnp.float32))
         else:
@@ -213,22 +227,34 @@ class InterpretableMultiHeadAttention(nnx.Module):
         )
         self.attn_dropout = nnx.Dropout(rate=attn_dropout, rngs=rngs)
         # NF parity: a second dropout at rate `dropout` (not attn_dropout) after
-        # the output projection (NF tft.py:229,267) — missing until 2026-07-07.
+        # the output projection.
         self.out_dropout = nnx.Dropout(rate=dropout, rngs=rngs)
 
-    def __call__(self, x: jnp.ndarray, deterministic: bool = True):
+    def __call__(self, x: jnp.ndarray, deterministic: bool = True, query_start: int = 0):
+        """Compute attention only for query rows ``>= query_start``.
+
+        A deliberate schedule deviation from NF, which computes all T query rows and
+        discards all but the last h in the decoder — most of that work is wasted at
+        long input lengths. Per-row math is identical (row-wise softmax/dot); the
+        deterministic path matches compute-then-slice to ~1 ULP of f32 reassociation
+        (guarded by test_imha_query_slice_matches_compute_then_slice). Training
+        differs only through the out_dropout mask SHAPE ([B,h,·] vs [B,T,·]).
+        ``query_start=0`` is the identity schedule. Returned ``attn`` is
+        ``[B, n_head, T-query_start, T]``.
+        """
         B, T, _ = x.shape
-        qkv = self.qkv(x)
+        qkv = self.qkv(x)                    # k/v need all rows; q's unused rows are dropped below
         nh = self.n_head * self.d_head
         q, k, v = jnp.split(qkv, [nh, 2 * nh], axis=-1)
-        q = q.reshape(B, T, self.n_head, self.d_head)
+        Tq = T - query_start
+        q = q[:, query_start:].reshape(B, Tq, self.n_head, self.d_head)
         k = k.reshape(B, T, self.n_head, self.d_head)
         # v stays [B, T, d_head] -- shared across heads
-        scores = jnp.einsum("bqhd,bkhd->bhqk", q, k) * self.scale            # [B, n_head, T, T]
-        causal = jnp.tril(jnp.ones((T, T), dtype=bool))
+        scores = jnp.einsum("bqhd,bkhd->bhqk", q, k) * self.scale            # [B, n_head, Tq, T]
+        causal = jnp.tril(jnp.ones((T, T), dtype=bool))[query_start:]        # [Tq, T]
         scores = jnp.where(causal[None, None], scores, -1e9)
         attn = jax.nn.softmax(scores, axis=-1)
         attn = self.attn_dropout(attn, deterministic=deterministic)
         ctx = jnp.einsum("bhqk,bkd->bhqd", attn, v)                          # v broadcast over heads
-        ctx = jnp.mean(ctx, axis=1)                                          # average heads -> [B, T, d_head]
+        ctx = jnp.mean(ctx, axis=1)                                          # average heads -> [B, Tq, d_head]
         return self.out_dropout(self.out_proj(ctx), deterministic=deterministic), attn

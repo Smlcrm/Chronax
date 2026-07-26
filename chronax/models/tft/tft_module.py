@@ -164,8 +164,12 @@ class TemporalFusionDecoder(nnx.Module):
 
     def __call__(self, temporal, ce, input_size, deterministic=True):
         enriched = self.enrichment_grn(temporal, ce, deterministic=deterministic)
-        attn_out, attn_w = self.attention(enriched, deterministic=deterministic)
-        x = attn_out[:, input_size:, :]
+        # TFT-S1: only the last h query rows survive the slice below, so only
+        # they are computed (query_start; see the IMHA docstring for the
+        # deviation record). attn_w is [B, n_head, h, T].
+        attn_out, attn_w = self.attention(enriched, deterministic=deterministic,
+                                          query_start=input_size)
+        x = attn_out
         enriched = enriched[:, input_size:, :]
         temporal = temporal[:, input_size:, :]
         x = self.attention_ln(self.attention_gate(x) + enriched)

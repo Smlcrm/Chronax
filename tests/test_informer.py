@@ -315,6 +315,25 @@ def test_conv_layer_halves_length():
         assert bool(jnp.all(jnp.isfinite(out)))
 
 
+def test_conv_layer_gemm_matches_conv_primitive():
+    # The distil conv is expressed as 3 shifted GEMMs, because XLA-CPU lowers
+    # `convolution` at these shapes to its naive emitter inside the training scan.
+    # This pins the GEMM form to the conv primitive on the same padded input
+    # and parameters.
+    c_in = 16
+    layer = ConvLayer(c_in, rngs=nnx.Rngs(0))
+    x = jax.random.normal(jax.random.PRNGKey(1), (4, 30, c_in), dtype=jnp.float32)
+    out = layer(x, use_running_average=True)
+    xp = jnp.concatenate([x[:, -2:], x, x[:, :2]], axis=1)
+    ref = jax.lax.conv_general_dilated(
+        xp, layer.conv.kernel.value, window_strides=(1,), padding="VALID",
+        dimension_numbers=("NHC", "HIO", "NHC")) + layer.conv.bias.value
+    ref = layer.norm(ref, use_running_average=True)
+    ref = jax.nn.elu(ref)
+    ref = nnx.max_pool(ref, window_shape=(3,), strides=(2,), padding=((1, 1),))
+    np.testing.assert_allclose(np.asarray(out), np.asarray(ref), atol=1e-4)
+
+
 def test_conv_layer_batchstat_updates():
     c_in = 4
     layer = ConvLayer(c_in, rngs=nnx.Rngs(0))
@@ -499,7 +518,22 @@ def _make_y(n=200):
 
 
 def test_build_windows_shape():
-    assert build_windows(_make_y(60), 36, 12).shape == (60 - 48 + 1, 48)
+    w, m = build_windows(_make_y(60), 36, 12)
+    assert w.shape == (60 - 36, 48) and m.shape == (60 - 36, 12)
+
+
+def test_build_windows_nf_padding_semantics():
+    # NF parity (NEU-A1): series right-padded with h zeros; n = T - input_size
+    # windows; every window with >=1 real target point is kept, padded tail
+    # masked out of the loss.
+    y = jnp.arange(1.0, 11.0)                # T=10, values 1..10 (no zeros)
+    w, m = build_windows(y, input_size=3, h=2)
+    assert w.shape == (7, 5) and m.shape == (7, 2)
+    np.testing.assert_array_equal(np.asarray(w[0]), [1, 2, 3, 4, 5])
+    np.testing.assert_array_equal(np.asarray(m[0]), [1, 1])
+    np.testing.assert_array_equal(np.asarray(w[6]), [7, 8, 9, 10, 0])   # padded tail
+    np.testing.assert_array_equal(np.asarray(m[6]), [1, 0])             # masked out
+    assert float(m.sum()) == 13.0
 
 
 def test_build_windows_too_short_raises():
@@ -508,17 +542,54 @@ def test_build_windows_too_short_raises():
 
 
 def test_build_exog_windows_full_span_shape():
-    n = 60 - 48 + 1
+    n = 60 - 36
     arr = jnp.asarray(np.random.RandomState(0).randn(60, 2), jnp.float32)
     assert build_exog_windows(arr, 36, 12, n, "full").shape == (n, 48, 2)
 
 
+def test_exog_scaling_stats_use_insample_span_only():
+    # NF's _normalization masks the horizon out of the scaler stats: exog
+    # statistics come from the insample span only; the horizon slice is
+    # transformed with those stats but never feeds them.
+    from chronax.models.informer.informer_training import _scale_exog
+    rng = np.random.RandomState(0)
+    L, h, F = 8, 4, 2
+    w = jnp.asarray(rng.randn(3, L + h, F), jnp.float32)
+    a = _scale_exog(w, RobustScaler(), stats_len=L)
+    w2 = w.at[:, L:, :].add(1e4)         # perturb horizon slice massively
+    b = _scale_exog(w2, RobustScaler(), stats_len=L)
+    np.testing.assert_array_equal(np.asarray(a[:, :L]), np.asarray(b[:, :L]))
+
+
+def test_masked_loss_ignores_padded_tail():
+    # A window whose padded target cell is masked must contribute only its
+    # real points to the loss (NF `_weighted_mean` semantics).
+    net = _net()
+    y = jnp.asarray(np.arange(1.0, 61.0), jnp.float32)   # T=60
+    w, m = build_windows(y, 36, 12)
+    kw = dict(h=12, input_size=36, scaler=RobustScaler(), loss_fn=mae,
+              sample_key=jax.random.PRNGKey(0), deterministic=True)
+    full = forward_loss(net, w, m, **kw)
+    w_poison = w.at[-1, -1].set(1e6)     # last target cell of the last window is padded
+    poisoned = forward_loss(net, w_poison, m, **kw)
+    np.testing.assert_allclose(float(full), float(poisoned), rtol=0, atol=1e-6)
+
+
 def test_forward_loss_scalar_finite():
     net = _net()
-    w = build_windows(_make_y(), 36, 12)
+    w, _ = build_windows(_make_y(), 36, 12)
     loss = forward_loss(net, w[:8], h=12, input_size=36, scaler=RobustScaler(),
                         loss_fn=mae, sample_key=jax.random.PRNGKey(0), deterministic=True)
     assert loss.shape == () and bool(jnp.isfinite(loss))
+
+
+def test_same_config_nets_share_graphdef():
+    # Value-__eq__ on the picklable initializers makes same-config graphdefs
+    # EQUAL, so the module-level @nnx.jit _forward_det cache hits across nets
+    # built by a later fit instead of recompiling per instance.
+    gd_a, _ = nnx.split(_net())
+    gd_b, _ = nnx.split(_net())
+    assert gd_a == gd_b
 
 
 def test_train_decreases_loss():
@@ -780,7 +851,7 @@ def test_fitted_with_exog_not_implemented():
 
 
 def test_vmap_forecast_matches_python_loop():
-    # conformity_scores vmaps forecast over windows (xlstm pattern, test_xlstmtime.py:174)
+    # conformity_scores vmaps forecast over windows
     B, T, h = 4, 120, 6
     y_batch = jnp.stack([_make_y(T) * (i + 1) for i in range(B)])
     m = Informer(h=h, input_size=18, hidden_size=8, n_head=2, conv_hidden_size=8,
