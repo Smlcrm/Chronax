@@ -84,7 +84,10 @@ def stl_decompose(
     n = y.shape[0]
     seasonal = int(seasonal) | 1
     trend = int(trend) | 1
-    low_pass = 0 if low_pass is None else int(low_pass) | 1
+    # Low-pass window defaults to the trend window. STL's seasonal step is
+    # C - lowpass(C); the low-pass must be wide enough to capture the trend that
+    # leaked into the cycle-subseries smoothing (see the seasonal step below).
+    low_pass = (int(trend) | 1) if low_pass is None else int(low_pass) | 1
     seasonal_jump = max(1, int(seasonal_jump))
     trend_jump = max(1, int(trend_jump))
 
@@ -107,45 +110,42 @@ def stl_decompose(
         # Each row now contains one subseries (fixed size)
         subseries_matrix = detrend_padded.reshape(max_sub_len, period).T
         
-        # Now vmap can work on fixed-size rows
-        def smooth_phase(subseries_row):
+        # Cycle-subseries smoothing WITH canonical STL boundary extension: smooth
+        # each subseries and extrapolate one point beyond each end, so each
+        # length-`max_sub_len` row becomes length `max_sub_len + 2`. Stitching
+        # gives an extended `C` of length `(max_sub_len + 2) * period`, in which
+        # the ORIGINAL series boundary (index n-1) sits a full period from the
+        # ends — i.e. in the INTERIOR — so the low-pass below is not edge-biased
+        # and the boundary seasonal is correct. (Without the extension the last
+        # cycle's seasonal is damped -> the trend undershoots at the boundary and
+        # MSTL/STL forecasts lag.) The linear
+        # extrapolation `2*s[0]-s[1]` of the smoothed endpoints stands in for the
+        # deg-1 LOESS extension R/statsmodels use (loess_window_jump's deg is
+        # inert at boundaries under edge padding). Out-of-range indices clamp in
+        # JAX, so a degenerate max_sub_len==1 falls back to a flat extension.
+        def smooth_phase_ext(subseries_row):
             # subseries_row has shape (max_sub_len,) - FIXED SIZE!
-            return loess_window_jump(subseries_row, seasonal, deg=seasonal_deg, robust_outer=0, jump=seasonal_jump)
-        
+            s = loess_window_jump(subseries_row, seasonal, deg=seasonal_deg, robust_outer=0, jump=seasonal_jump)
+            left = 2.0 * s[0] - s[1]
+            right = 2.0 * s[-1] - s[-2]
+            return jnp.concatenate([left[None], s, right[None]])  # (max_sub_len + 2,)
+
         # vmap over the first dimension (period subseries)
-        shats = jax.vmap(smooth_phase)(subseries_matrix)  # Shape: (period, max_sub_len)
-        
-        # Stitch seasonal back to full length
-        # Transpose back and flatten, then trim to original length
-        seas_new_padded = shats.T.reshape(-1)  # Shape: (padded_len,)
-        seas_new = seas_new_padded[:n]  # Trim back to original length
+        shats_ext = jax.vmap(smooth_phase_ext)(subseries_matrix)  # (period, max_sub_len + 2)
+        cycle_ext = shats_ext.T.reshape(-1)  # ((max_sub_len + 2) * period,)
 
-        # Center seasonal by phase means (sum-to-zero over each phase)
-        def add_t(carry2, t):
-            sums, counts = carry2
-            r = t % period
-            return (sums.at[r].add(seas_new[t]), counts.at[r].add(1)), None
-
-        (phase_sums, phase_counts), _ = lax.scan(add_t, (jnp.zeros(period), jnp.zeros(period)), jnp.arange(n))
-        phase_means = phase_sums / jnp.maximum(phase_counts, 1.0)
-
-        def center_t(ti, s):
-            r = ti % period
-            return s.at[ti].add(-phase_means[r])
-
-        seas_new = lax.fori_loop(0, n, center_t, seas_new)
-
-        # Optional low-pass smoothing of seasonal to stabilize
-        seas_sm = lax.cond(
-            low_pass > 0,
-            lambda _: loess_window_jump(seas_new, low_pass, deg=trend_deg, robust_outer=0, jump=1),
-            lambda _: seas_new,
-            operand=None,
-        )
+        # Canonical STL seasonal = C - lowpass(C), computed on the EXTENDED C and
+        # trimmed back to the original-series window [period : period + n]. The
+        # low-pass isolates the trend/low-frequency content that leaked into the
+        # cycle-subseries smoothing; subtracting yields a pure, mean-zero-ish
+        # seasonal. (Centering C by phase means with the low-pass off instead lets
+        # the seasonal absorb the trend, several times too large in amplitude.)
+        low = loess_window_jump(cycle_ext, low_pass, deg=trend_deg, robust_outer=0, jump=1)
+        seas_new = lax.dynamic_slice(cycle_ext - low, (period,), (n,))
 
         # 2) Trend smoothing on deseasonalized data
-        trend_new = loess_window_jump(y - seas_sm, trend, deg=trend_deg, robust_outer=0, jump=trend_jump)
-        return trend_new, seas_sm
+        trend_new = loess_window_jump(y - seas_new, trend, deg=trend_deg, robust_outer=0, jump=trend_jump)
+        return trend_new, seas_new
 
     trend_est, seas_est = lax.fori_loop(0, int(inner), inner_body, (trend_est, seas_est))
     remainder = y - trend_est - seas_est

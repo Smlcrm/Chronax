@@ -106,6 +106,17 @@ class IMAPA(BaseForecaster):
         self._cs: Optional[jnp.ndarray] = None
         self.model_: Optional[Dict[str, jnp.ndarray]] = None
 
+    def conformity_scores(self, y, X=None):
+        """Sequential-window CV, overriding the base vmapped path.
+
+        IMAPA's fit is golden-section/while-loop heavy: under the base CV vmap the
+        traced-bound aggregation ``fori_loop`` batches its whole carry and the
+        f32/f64 and step ``lax.cond``s lower to select, executing BOTH complete
+        searches per level per window. Windows, masking, and values are identical;
+        only the execution regime changes (base `_conformity_scores_sequential`).
+        """
+        return self._conformity_scores_sequential(y=y, X=X)
+
     def fit(
         self,
         y: jnp.ndarray,

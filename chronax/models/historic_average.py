@@ -115,6 +115,11 @@ class HistoricAverage(BaseForecaster):
             "sigma": utils.calculate_sigma(residuals, len(y) - 1),
             "n": len(y),
         }
+        # Cache conformity scores on the REAL series at fit. Scoring the fitted
+        # values instead would score a CONSTANT series — they are all equal to the
+        # historical mean — whose CV residuals are ~0, giving zero-width intervals.
+        if self.conformal_params is not None:
+            self._cs = self.conformity_scores(y)
         return self
 
     def predict(self, h: int, X: jnp.ndarray | None = None, level: list[int] | None = None) -> dict:
@@ -145,7 +150,7 @@ class HistoricAverage(BaseForecaster):
             
             if self.conformal_params is not None:
                 res = self.add_confidence_intervals(
-                    res, self.conformity_scores(self.model_["fitted"], X=None), level, "conformal_distribution"
+                    res, self._cs, level, "conformal_distribution"
                 )
             else:
                 # res = {**res, **utils._calculate_intervals(mean, sigmah, level)}

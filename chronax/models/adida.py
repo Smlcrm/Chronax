@@ -4,7 +4,7 @@
 import jax
 import jax.numpy as jnp
 from jax import jit, lax
-from functools import lru_cache
+from functools import lru_cache, partial
 from chronax.utils import (
     ensure_float,
     calculate_sigma,
@@ -260,6 +260,7 @@ def _masked_optimized_ses_forecast(
     return _masked_ses_forecast(alpha, x, n_valid)
 
 
+@partial(jit, static_argnames=["h"])
 def _adida_point(
     y: jnp.ndarray,  # time series
     h: int,  # forecasting horizon
@@ -269,6 +270,14 @@ def _adida_point(
     The aggregation level is data-dependent, so all shapes stay static:
     positions map to chunk ids, sums land in a fixed length-n buffer via
     segment_sum, and SES runs over the masked ``n_chunks`` prefix.
+
+    Jitted at module level: the masked-SES helpers below define their
+    ``fori_loop``/``cond`` bodies *inside* the function, so eager dispatch would
+    rebuild four fresh closures per call and pjit — which keys on callable identity —
+    would recompile an identical jaxpr every time. One stable jitted callable also
+    fuses the eager segment_sum chain. ``h`` is the
+    only static; the aggregation level stays traced (shapes are kept static by
+    ``segment_sum(num_segments=n)`` + masking).
     """
     n = y.shape[0]
     mean_interval = _interval_mean(y)

@@ -437,7 +437,11 @@ def _jit_optimize_theta(y: jnp.ndarray, model_type: int, x0: jnp.ndarray,
         updates, new_state = adam_opt.update(grads, state, p)
         new_p = optax.apply_updates(p, updates)
         improved = jnp.isfinite(loss) & (loss < best_loss)
-        best_p = jnp.where(improved, new_p, best_p)
+        # Track the EVALUATED point p (where `loss` was measured), not the
+        # post-update new_p — best_loss corresponds to p, so storing new_p
+        # mismatches the pair and seeds L-BFGS from the wrong iterate. Matches
+        # the L-BFGS phase below and the ETS backend's convention.
+        best_p = jnp.where(improved, p, best_p)
         best_loss = jnp.where(improved, loss, best_loss)
         return (new_p, new_state, best_p, best_loss), None
 
