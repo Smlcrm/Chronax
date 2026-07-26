@@ -16,7 +16,7 @@ import concurrent.futures
 import threading  # Added for thread-safe tracking
 
 # Assumes mfles.py is in the same directory
-from .mfles import MFLES
+from .mfles import MFLES, _ROBUST_AUTODETECT_MAX_N
 from chronax.models.base_forecaster import BaseForecaster
 
 # =============================================================================
@@ -677,15 +677,25 @@ class AutoMFLES(BaseForecaster):
     def conformity_scores(
         self, y: jnp.ndarray, X: Optional[jnp.ndarray] = None
     ) -> jnp.ndarray:
-        """Conformity scores with eager selection, vmapped per-window re-fit.
+        """Conformity scores with eager selection, per-window re-fit.
 
         The base implementation vmaps ``self.forecast`` over CV windows. The
         grid search (threaded Python loop, ``.item()``/``np.argmin`` scoring)
-        cannot trace, so it runs ONCE, eagerly, here; the vmapped ``forecast``
-        then re-fits the SELECTED config independently per window via MFLES's
-        traceable config-replay path.
+        cannot trace, so it runs ONCE, eagerly, here; the per-window
+        ``forecast`` then re-fits the SELECTED config independently per window
+        via MFLES's traceable config-replay path.
 
-        Calibration caveat (AutoARIMA/xLSTM class, CLAUDE.md §3.1): the CONFIG
+        Execution regime: the replayed config never pins ``robust`` (a ctor field,
+        not a fit kwarg), so window fits below the ``_ROBUST_AUTODETECT_MAX_N``
+        guardrail live-auto-detect it as a traced scalar — under the CV vmap the
+        trend ``lax.cond`` lowers to ``select`` and Siegel executes every round of
+        every window. Those cells run the windows sequentially instead, at
+        bit-identical values. At or above the bound fit() pins robust=False
+        statically and the vmap amortizes fine. The window fit
+        length is ``n - h`` exactly (base padding: ``base_train_end +
+        (n_windows-1)*h`` with the ``n_windows`` terms cancelling).
+
+        Calibration caveat (shared with AutoARIMA and AutoETS): the CONFIG
         is selected with sight of the full series; per-window parameters are
         still honestly re-fit, so scores vary across windows.
         """
@@ -696,4 +706,8 @@ class AutoMFLES(BaseForecaster):
             inner_cs = getattr(self.model_["model"], "_cs", None)
             if inner_cs is not None:
                 return inner_cs
+        if self.conformal_params is not None:
+            window_n = jnp.asarray(y).size - self.conformal_params.h
+            if window_n < _ROBUST_AUTODETECT_MAX_N:
+                return self._conformity_scores_sequential(y=y, X=X)
         return super().conformity_scores(y, X)
