@@ -10,11 +10,15 @@ Features:
 - GARCH(p,q) and pure ARCH(p) models
 - Primary: jaxopt.LBFGSB with box-constrained direct parameterization
 - Fallback: Optax ADAM + L-BFGS with softplus reparameterization (lax.cond)
-- Multi-start optimization: every candidate (ACF-based, uniform,
-  high/low-persistence) is fit via a vmapped LBFGSB run, winner by jnp.argmin
+- Multi-start: candidates fit via jax.lax.map (NOT jax.vmap — batching jaxopt's
+  while-loop is a ~90x CPU penalty), winner by jnp.argmin. GARCH(1,1) trims the set to
+  {acf, lo}; higher orders keep the full 4-start set
+- Optimizer objective in FLOAT64 (``_optimizer_nll_f64``) — kills the f32 line-search
+  thrash; fitted params cast to f32 for the byte-stable forecast pipeline
 - vmap-native fit/forecast: no host casts or Python control flow on traced
   values, so conformity_scores' vmapped CV path traces end-to-end
-- O(log n) parallel variance recursion for q<=1 via associative scan
+- O(log n) parallel variance recursion for q<=1 via associative scan (FORECAST path;
+  the optimizer uses a faster sequential scan)
 - Deterministic and stochastic (Monte Carlo) forecasting
 - Native and conformal prediction intervals
 - Padded-input support for GPU JIT reuse in cross-validation
@@ -55,6 +59,7 @@ Implementation Notes:
 import jax
 import jax.numpy as jnp
 import optax
+from functools import lru_cache
 from jax import lax
 
 import jaxopt
@@ -76,16 +81,20 @@ _LOG_2PI = jnp.float32(jnp.log(2 * jnp.pi))
 _LBFGS_STEPS = 40
 _LBFGS_MEMORY = 15
 _LBFGS_LS_STEPS = 20
+# 50 is a flat-ridge refinement budget, not correctness-load-bearing: the f64
+# objective below reaches the MLE well inside it. Any change here must be judged at
+# the USER dtype (f64, the default for numpy input under the global x64 flip), not
+# at the harness f32 — persistence and vol-spike band widths diverge under f32
+# long before the NLL or the unconditional variance does.
 _LBFGSB_MAXITER = 50
 _LBFGSB_HISTORY = 15
 _LBFGSB_TOL = 1e-5
 _LBFGSB_MAXLS = 30
 
 # Optax-fallback iteration budgets (static, config-derived — a data-dependent
-# count cannot feed a jit static arg; CLAUDE.md §10). The former adaptive
-# heuristic mapped data complexity into 20–80 (120 extended); both scan phases
-# track best-params monotonically, so running the full budget converges
-# equal-or-better than any adaptive cutoff.
+# count cannot feed a jit static arg). Both scan phases track best-params
+# monotonically, so running the full budget converges equal-or-better than any
+# data-adaptive cutoff would.
 _MAX_ITER = 80
 _MAX_ITER_EXTENDED = 120
 
@@ -329,6 +338,62 @@ def _log_likelihood_direct(params: jnp.ndarray, y: jnp.ndarray, p: int,
 _log_likelihood_direct = jax.jit(_log_likelihood_direct, static_argnums=(2, 3))
 
 
+_LOG_2PI_F64 = jnp.float64(jnp.log(2 * jnp.pi))
+_EPS64 = jnp.float64(1e-12)
+
+
+def _optimizer_nll_f64(params, y, p, q, init_var, actual_len):
+    """FLOAT64 NLL for the LBFGSB optimizer ONLY.
+
+    The same masked-mean objective as :func:`_log_likelihood_direct`
+    (``start_idx=max(p,q)``, direct params, no penalty), computed in f64 via a
+    SEQUENTIAL scan. Two reasons for the separate f64 path: the Wolfe line-search
+    tests are otherwise evaluated on ~1e-7 f32 rounding noise, which under-converges
+    the fit on the flat boundary-MLE ridges of no-ARCH series; and the sequential
+    scan is faster per-eval on CPU than the associative q=1 path.
+
+    Only the FITTED PARAMS are affected — the forecast/filter keeps the byte-stable
+    f32 associative :func:`_compute_sigma2_series`. The q>=2 scan carries the
+    log-smoothing bound (gradient armor; inert at q=1)."""
+    y = y.astype(jnp.float64)
+    omega = jnp.maximum(params[0].astype(jnp.float64), _EPS64)
+    alpha = jnp.maximum(params[1:1 + p].astype(jnp.float64), _EPS64)
+    beta = (jnp.maximum(params[1 + p:1 + p + q].astype(jnp.float64), _EPS64)
+            if q > 0 else jnp.zeros(0, jnp.float64))
+    iv = jnp.float64(init_var)
+    n = y.shape[0]
+    y2 = y ** 2
+    y2p = jnp.concatenate([jnp.full(p, iv, jnp.float64), y2])
+    lags = p - 1 - jnp.arange(p)
+    arch = omega + jnp.dot(alpha, y2p[lags[:, None] + jnp.arange(n)])  # (n,)
+    if q == 0:
+        sigma2 = jnp.maximum(arch, _EPS64)
+    else:
+        buf0 = jnp.full(max(q, 1), iv, jnp.float64)
+        sigma2_max = iv * jnp.float64(1e6)  # matches the f32 q>1 path's log-smoothed bound
+
+        def step(buf, a_t):
+            s = jnp.maximum(a_t + jnp.dot(beta, jnp.flip(buf[:q])), _EPS64)
+            # Log-smoothed upper bound = GRADIENT ARMOR: inert at q=1 on real data (sigma2 <<
+            # iv*1e6, so it matches the unbounded associative q=1 path bitwise there), but at
+            # q>=2 the beta SUM is unconstrained (each beta boxed at 0.9999) so (sum beta)^t
+            # can overflow in-box — the bound caps it to a finite gradient. The f32 q>1
+            # path carries the same bound; both must keep it.
+            s = jnp.where(s > sigma2_max, sigma2_max + jnp.log(s / sigma2_max), s)
+            return jnp.roll(buf, -1).at[-1].set(s), s
+
+        _, sigma2 = lax.scan(step, buf0, arch)
+    ll = _LOG_2PI_F64 + jnp.log(sigma2) + y2 / sigma2
+    eff = jnp.where(actual_len < 0, n, actual_len)
+    start = max(p, q)
+    mask = ((jnp.arange(n) >= start) & (jnp.arange(n) < eff)).astype(jnp.float64)
+    count = jnp.maximum(jnp.sum(mask), 1.0)
+    nll = 0.5 * jnp.sum(ll * mask) / count
+    return jnp.where(jnp.isfinite(nll), nll, jnp.float64(1e10))
+
+_optimizer_nll_f64 = jax.jit(_optimizer_nll_f64, static_argnums=(2, 3))
+
+
 def _run_lbfgsb_optimization(y: jnp.ndarray, init_var: float,
                               init_params_direct: jnp.ndarray,
                               p: int, q: int,
@@ -356,7 +421,7 @@ def _run_lbfgsb_optimization(y: jnp.ndarray, init_var: float,
         (best_params, best_loss) — optimized params and final NLL.
     """
     def loss_fn(params):
-        return _log_likelihood_direct(params, y, p, q, init_var, actual_len)
+        return _optimizer_nll_f64(params, y, p, q, init_var, actual_len)  # R2: f64 objective
 
     n_params = 1 + p + q
     # Bounds follow the candidate dtype: mixed f32 params / f64 bounds would
@@ -596,6 +661,194 @@ def _forecast_sigma2_stochastic_impl(
 _forecast_sigma2_stochastic_impl = jax.jit(_forecast_sigma2_stochastic_impl, static_argnums=(6, 7, 8))
 
 
+def _inverse_softplus_core(x: jnp.ndarray) -> jnp.ndarray:
+    """Return y such that softplus(y) + _EPSILON = x, elementwise.
+
+    Traceable: both branches evaluate under jnp.where; for target > 20 softplus is
+    identity to float precision, and the inner clamp keeps the untaken expm1 branch
+    finite (no inf/NaN leaking through the select).
+    """
+    target = jnp.maximum(jnp.asarray(x) - 1e-8, 1e-8)
+    return jnp.where(
+        target > 20.0,
+        target,
+        jnp.log(jnp.maximum(jnp.expm1(jnp.minimum(target, 20.0)), 1e-8)),
+    )
+
+
+def _init_params_core(y: jnp.ndarray, p: int, q: int) -> jnp.ndarray:
+    """Starting parameters in softplus space, adaptive to the (config-static) order."""
+    sample_var = jnp.maximum(jnp.var(y), 1e-8)
+
+    if q == 0:
+        alpha_sum, beta_sum = 0.05, 0.0
+        omega_target = jnp.maximum(sample_var * 0.95, 1e-8)
+    else:
+        alpha_sum, beta_sum = 0.05, 0.90
+        omega_target = jnp.maximum(sample_var * 0.05, 1e-8)
+
+    init_omega = _inverse_softplus_core(omega_target)
+
+    if p > 1:
+        e2 = y ** 2
+        e2_centered = e2 - jnp.mean(e2)
+        var_e2 = jnp.var(e2)
+        acf = jnp.stack([
+            jnp.mean(e2_centered[k:] * e2_centered[:-k]) for k in range(1, p + 1)
+        ]) / jnp.maximum(var_e2, 1e-8)
+        acf = jnp.maximum(acf, 0.01 / p)
+        acf_targets = alpha_sum * acf / jnp.sum(acf)
+        uniform_targets = jnp.full(p, alpha_sum / p)
+        alpha_targets = jnp.where(var_e2 > 1e-8, acf_targets, uniform_targets)
+        init_alphas = _inverse_softplus_core(alpha_targets)
+    else:
+        init_alphas = jnp.full(p, _inverse_softplus_core(alpha_sum / p))
+
+    init_beta = _inverse_softplus_core(beta_sum / q) if q > 0 else jnp.asarray(0.0)
+
+    return jnp.concatenate([
+        jnp.reshape(init_omega, (1,)),
+        init_alphas,
+        jnp.full(q, init_beta) if q > 0 else jnp.zeros(0),
+    ])
+
+
+@lru_cache(maxsize=256)  # n_eff is in the key; sized like ets_backend's runner cache
+def _get_garch_fit_runner(p: int, q: int, n_iters: int, n_eff: int, padded: bool):
+    """Build (and cache) the jitted GARCH parameter fit for one static config.
+
+    Every argument is config- or shape-derived (never value-derived),
+    so the returned jitted callable keeps a stable identity across calls and XLA
+    compiles once per (order, budget, length). Without the cache the ``lax.cond``
+    below is dispatched with two *fresh* branch closures on every fit; pjit's cache
+    keys on callable identity, so it recompiles an identical jaxpr each call — and
+    because ``cond`` stages BOTH branches, that compile includes the entire optax
+    Adam+L-BFGS fallback (~670 ms measured) even though the fallback almost never
+    fires. Mirrors ``ets_backend._get_optimizer_runner``.
+    """
+    def _run(y: jnp.ndarray) -> dict:
+        y_actual = y[:n_eff] if padded else y
+
+        # Rescale data to normalize the loss landscape (arch library technique)
+        scale = jnp.maximum(jnp.std(y_actual), 1e-6)
+        y_scaled = y / scale
+        y_scaled_actual = y_scaled[:n_eff] if padded else y_scaled
+
+        init_var = _compute_backcast(y_scaled_actual)
+        init_params = _init_params_core(y_scaled_actual, p, q)
+
+        actual_len_jax = jnp.int32(n_eff if padded else -1)
+        sample_var_val = jnp.maximum(jnp.var(y_scaled_actual), 1e-8)
+
+        # Build candidates in DIRECT (constrained, positive) param space.
+        acf_direct = jax.nn.softplus(init_params).at[0].add(_EPSILON)
+        sf_direct = jnp.full(1 + p + q, 0.1)
+
+        if q > 0:
+            hi_direct = jnp.concatenate([
+                jnp.reshape(0.05 * sample_var_val, (1,)),
+                jnp.full(p, 0.05 / p),
+                jnp.full(q, 0.90 / q),
+            ])
+            lo_direct = jnp.concatenate([
+                jnp.reshape(0.20 * sample_var_val, (1,)),
+                jnp.full(p, 0.15 / p),
+                jnp.full(q, 0.70 / q),
+            ])
+            # At GARCH(1,1) the NLL is effectively unimodal, so {acf, lo} reproduces the
+            # 4-start winner (acf == hi to 1e-8 — a softplus round-trip of
+            # `_init_params_core`'s target [0.05*var, 0.05, 0.90], and sf0.1 never uniquely
+            # wins here); what matters is the y/std rescaling, not multistart breadth. Higher
+            # orders keep the FULL 4-start set — sf0.1 does uniquely win some overspecified
+            # p+q>=4 fits, so the trim is valid only at (1,1).
+            candidates = ([acf_direct, lo_direct] if (p == 1 and q == 1)
+                          else [acf_direct, sf_direct, hi_direct, lo_direct])
+        else:
+            hi_direct = jnp.concatenate([
+                jnp.reshape(0.10 * sample_var_val, (1,)),
+                jnp.full(p, 0.20 / p),
+            ])
+            candidates = [acf_direct, sf_direct, hi_direct]
+
+        # Multi-start: optimize EVERY candidate (count config-static) via lax.map, winner by
+        # NLL. ⚠ lax.map (SEQUENTIAL), NOT jax.vmap: batching jaxopt's nested while-loop
+        # with jax.vmap costs a ~90x per-iteration execution penalty on CPU at identical trip
+        # counts, and dominates the whole fit. The optimizer space is FLOAT64
+        # (`_optimizer_nll_f64`); the winner is cast to f32 for storage so the
+        # forecast/filter pipeline stays f32 and byte-stable.
+        cand_stack = jnp.stack(candidates).astype(jnp.float64)
+
+        def _run_one(cand):
+            return _run_lbfgsb_optimization(y_scaled, init_var, cand, p, q, actual_len_jax)
+
+        params_stack, losses = jax.lax.map(_run_one, cand_stack)
+        losses = jnp.where(jnp.isfinite(losses), losses, jnp.inf)
+        best_params = jnp.take(params_stack, jnp.argmin(losses), axis=0)
+        lbfgsb_ok = jnp.isfinite(losses).any()
+
+        # Variance targeting only for p+q >= 4 (biases low-order MLE); config-static.
+        sv = sample_var_val.astype(jnp.float32) if p + q >= 4 else jnp.float32(-1.0)
+        init_params_f32 = init_params.astype(jnp.float32)
+        empty_beta = jnp.zeros(0, dtype=jnp.float32)
+
+        # Fallback to ADAM+L-BFGS only when every LBFGSB start produced a
+        # non-finite NLL. lax.cond keeps the fallback off the eager/jit fast
+        # path (under vmap batching both branches run — the cost of a fallback
+        # that stays traceable; a host `if best is None` cannot).
+        def _lbfgsb_branch(_):
+            # best_params is f64 (the optimizer space); cast to f32 for storage and to match
+            # the f32 optax-fallback branch (lax.cond requires matching output dtypes).
+            bp = best_params.astype(jnp.float32)
+            omega = jnp.maximum(bp[0], _EPSILON)
+            alpha = jnp.maximum(bp[1:1 + p], _EPSILON)
+            beta = jnp.maximum(bp[1 + p:1 + p + q], _EPSILON) if q > 0 else empty_beta
+            return omega, alpha, beta
+
+        def _optax_branch(_):
+            final_params = _run_optax_optimization(
+                y_scaled, init_var, init_params_f32, p, q, n_iters, actual_len_jax, sv)
+            omega = jax.nn.softplus(final_params[0]) + _EPSILON
+            alpha = jax.nn.softplus(final_params[1:1 + p])
+            beta = jax.nn.softplus(final_params[1 + p:1 + p + q]) if q > 0 else empty_beta
+            return omega, alpha, beta
+
+        omega, alpha, beta = lax.cond(lbfgsb_ok, _lbfgsb_branch, _optax_branch, None)
+
+        persistence = jnp.sum(alpha) + jnp.sum(beta)
+
+        # Post-fit stationarity clamping: scale alpha+beta to 0.999 if needed.
+        # 0.999 (not 0.98) lets high-persistence financial data retain accurate MLE
+        # parameters while still preventing near-IGARCH instability. The clamp caps
+        # persistence at 0.999, so the old `persistence >= 1.0` raise was unreachable.
+        clamped = persistence > 0.999
+        scale_factor = jnp.where(clamped, 0.999 / jnp.maximum(persistence, 1e-8), 1.0)
+        alpha = alpha * scale_factor
+        beta = beta * scale_factor
+        # Recompute omega so unconditional variance matches sample variance.
+        # astype keeps omega on the cond-branch dtype (f32) — sample_var_val follows
+        # y and would silently promote the select under x64.
+        omega = jnp.where(clamped, sample_var_val.astype(omega.dtype) * (1.0 - 0.999), omega)
+
+        # Compute sigma2 in scaled space, then un-scale
+        sigma2_scaled = _compute_sigma2_series(y_scaled, omega, alpha, beta, p, q, init_var)
+        sigma2_full = sigma2_scaled * (scale ** 2)
+        sigma2 = sigma2_full[:n_eff] if padded else sigma2_full
+
+        return {
+            'omega': omega * (scale ** 2),
+            'alpha': alpha,
+            'beta': beta,
+            'sigma2': sigma2,
+            'fitted': jnp.zeros(n_eff),
+            'y_mean': jnp.mean(y_actual),
+            'y_last': y_actual[-p:],
+            'sigma2_last': sigma2[-q:] if q > 0 else jnp.array([]),
+            'init_var': init_var * (scale ** 2),
+        }
+
+    return jax.jit(_run)
+
+
 # =============================================================================
 # GARCH Class
 # =============================================================================
@@ -620,10 +873,9 @@ class GARCH(BaseForecaster):
         Whether to use the extended optax-fallback iteration budget
         (120 instead of 80).
     iteration_scaling : str, default 'cubic'
-        Deprecated/inert. Formerly scaled a data-adaptive iteration count,
-        which cannot feed a jit static argument (CLAUDE.md §10); the budget
-        is now fixed by allow_extended_iterations alone. The value is still
-        validated for API compatibility.
+        Deprecated/inert: a data-adaptive iteration count cannot feed a jit
+        static argument, so the budget is fixed by allow_extended_iterations
+        alone. The value is still validated for API compatibility.
     """
     uses_exog = False
 
@@ -658,71 +910,14 @@ class GARCH(BaseForecaster):
         if not isinstance(h, int) or h <= 0:
             raise ValueError(f"Forecast horizon h must be a positive integer, got {h}")
 
-    @staticmethod
-    def _inverse_softplus(x: jnp.ndarray) -> jnp.ndarray:
-        """Return y such that softplus(y) + _EPSILON = x, elementwise.
-
-        Traceable: both branches evaluate under jnp.where; for target > 20
-        softplus is identity to float precision, and the inner clamp keeps the
-        untaken expm1 branch finite (no inf/NaN leaking through the select).
-        """
-        target = jnp.maximum(jnp.asarray(x) - 1e-8, 1e-8)
-        return jnp.where(
-            target > 20.0,
-            target,
-            jnp.log(jnp.maximum(jnp.expm1(jnp.minimum(target, 20.0)), 1e-8)),
-        )
+    _inverse_softplus = staticmethod(_inverse_softplus_core)
 
     def _get_init_params(self, y: jnp.ndarray, init_var: jnp.ndarray) -> jnp.ndarray:
-        """Compute starting parameters, adaptive to model order.
-
-        Uses ACF of squared observations for per-lag alpha proportions
-        when p > 1, giving better initialization for higher-order models.
-
-        Fully traceable: every value derived from ``y`` stays a jnp scalar,
-        the degenerate-variance guard is a ``jnp.where`` select, and the lag
-        loop runs over the *config-static* order p.
-        """
-        sample_var = jnp.maximum(jnp.var(y), 1e-8)
-
-        if self.q == 0:
-            alpha_sum = 0.05
-            beta_sum = 0.0
-            omega_target = jnp.maximum(sample_var * 0.95, 1e-8)
-        else:
-            alpha_sum = 0.05
-            beta_sum = 0.90
-            omega_target = jnp.maximum(sample_var * 0.05, 1e-8)
-
-        init_omega = self._inverse_softplus(omega_target)
-
-        # ACF-based per-lag alpha proportions for p > 1
-        if self.p > 1:
-            e2 = y ** 2
-            e2_centered = e2 - jnp.mean(e2)
-            var_e2 = jnp.var(e2)
-            acf = jnp.stack([
-                jnp.mean(e2_centered[k:] * e2_centered[:-k])
-                for k in range(1, self.p + 1)
-            ]) / jnp.maximum(var_e2, 1e-8)
-            acf = jnp.maximum(acf, 0.01 / self.p)
-            acf_targets = alpha_sum * acf / jnp.sum(acf)
-            uniform_targets = jnp.full(self.p, alpha_sum / self.p)
-            alpha_targets = jnp.where(var_e2 > 1e-8, acf_targets, uniform_targets)
-            init_alphas = self._inverse_softplus(alpha_targets)
-        else:
-            init_alphas = jnp.full(self.p, self._inverse_softplus(alpha_sum / self.p))
-
-        init_beta = (
-            self._inverse_softplus(beta_sum / self.q) if self.q > 0
-            else jnp.asarray(0.0)
-        )
-
-        return jnp.concatenate([
-            jnp.reshape(init_omega, (1,)),
-            init_alphas,
-            jnp.full(self.q, init_beta) if self.q > 0 else jnp.zeros(0),
-        ])
+        """Starting parameters in softplus space, adaptive to the order (see
+        :func:`_init_params_core`). ``init_var`` is accepted for API compatibility
+        and unused. Kept as a thin delegate so the jitted fit runner can call the
+        module-level core without capturing ``self``."""
+        return _init_params_core(y, self.p, self.q)
 
     def _fit_parameters_optax(
         self, y: jnp.ndarray, init_var: float, init_params: jnp.ndarray,
@@ -789,146 +984,13 @@ class GARCH(BaseForecaster):
                 f"Need at least {min_obs} observations for GARCH({self.p},{self.q}), got {n_eff}"
             )
 
-        y_actual = y[:n_eff] if actual_len is not None else y
-
-        # Rescale data to normalize the loss landscape (arch library technique)
-        scale = jnp.maximum(jnp.std(y_actual), 1e-6)
-        y_scaled = y / scale
-
-        y_scaled_actual = y_scaled[:n_eff] if actual_len is not None else y_scaled
-        init_var = _compute_backcast(y_scaled_actual)
-        init_params = self._get_init_params(y_scaled_actual, init_var)
-
-        actual_len_jax = jnp.int32(-1 if actual_len is None else actual_len)
-        sample_var_val = jnp.maximum(jnp.var(y_scaled_actual), 1e-8)
-
-        # Build candidates in DIRECT (constrained, positive) param space
-        # Candidate 1: ACF-based (transform from softplus space)
-        acf_direct = jax.nn.softplus(init_params)
-        acf_direct = acf_direct.at[0].add(_EPSILON)
-
-        # Candidate 2: SF-style uniform 0.1
-        sf_direct = jnp.full(1 + self.p + self.q, 0.1)
-
-        if self.q > 0:
-            # Candidate 3: High-persistence (alpha=0.05, beta=0.90)
-            hi_direct = jnp.concatenate([
-                jnp.reshape(0.05 * sample_var_val, (1,)),
-                jnp.full(self.p, 0.05 / self.p),
-                jnp.full(self.q, 0.90 / self.q)
-            ])
-            # Candidate 4: Low-persistence (alpha=0.15, beta=0.70)
-            lo_direct = jnp.concatenate([
-                jnp.reshape(0.20 * sample_var_val, (1,)),
-                jnp.full(self.p, 0.15 / self.p),
-                jnp.full(self.q, 0.70 / self.q)
-            ])
-            candidates = [acf_direct, sf_direct, hi_direct, lo_direct]
-        else:
-            # Pure ARCH: third candidate with higher alpha
-            hi_direct = jnp.concatenate([
-                jnp.reshape(0.10 * sample_var_val, (1,)),
-                jnp.full(self.p, 0.20 / self.p)
-            ])
-            candidates = [acf_direct, sf_direct, hi_direct]
-
-        # Multi-start: optimize EVERY candidate (count is config-static) with a
-        # vmapped LBFGSB run and pick the winner by NLL — replaces the former
-        # init-loss prescreen + Python sorted/try-except selection, which
-        # concretized traced values (ces.py's stacked-fits + argmin pattern).
-        # Optimizer space is pinned to float32: the NLL kernels compute in
-        # float32 regardless, so wider candidate dtypes buy cost, not precision.
-        cand_stack = jnp.stack(candidates).astype(jnp.float32)
-
-        def _run_one(cand):
-            return _run_lbfgsb_optimization(
-                y_scaled, init_var, cand, self.p, self.q, actual_len_jax)
-
-        params_stack, losses = jax.vmap(_run_one)(cand_stack)
-        losses = jnp.where(jnp.isfinite(losses), losses, jnp.inf)
-        best_params = jnp.take(params_stack, jnp.argmin(losses), axis=0)
-        lbfgsb_ok = jnp.isfinite(losses).any()
-
-        # Variance targeting only for p+q >= 4 (biases low-order MLE);
-        # config-static choice.
-        sv = (
-            sample_var_val.astype(jnp.float32)
-            if self.p + self.q >= 4 else jnp.float32(-1.0)
-        )
         if n_iters is None:
             n_iters = _MAX_ITER_EXTENDED if self.allow_extended_iterations else _MAX_ITER
-        init_params_f32 = init_params.astype(jnp.float32)
-        empty_beta = jnp.zeros(0, dtype=jnp.float32)
 
-        # Fallback to ADAM+L-BFGS only when every LBFGSB start produced a
-        # non-finite NLL. lax.cond keeps the fallback off the eager/jit fast
-        # path (under vmap batching both branches run — the cost of a fallback
-        # that stays traceable; a host `if best is None` cannot).
-        def _lbfgsb_branch(_):
-            omega = jnp.maximum(best_params[0], _EPSILON)
-            alpha = jnp.maximum(best_params[1:1 + self.p], _EPSILON)
-            beta = (
-                jnp.maximum(best_params[1 + self.p:1 + self.p + self.q], _EPSILON)
-                if self.q > 0 else empty_beta
-            )
-            return omega, alpha, beta
-
-        def _optax_branch(_):
-            final_params = _run_optax_optimization(
-                y_scaled, init_var, init_params_f32, self.p, self.q, n_iters,
-                actual_len_jax, sv)
-            omega = jax.nn.softplus(final_params[0]) + _EPSILON
-            alpha = jax.nn.softplus(final_params[1:1 + self.p])
-            beta = (
-                jax.nn.softplus(final_params[1 + self.p:1 + self.p + self.q])
-                if self.q > 0 else empty_beta
-            )
-            return omega, alpha, beta
-
-        omega, alpha, beta = lax.cond(lbfgsb_ok, _lbfgsb_branch, _optax_branch, None)
-
-        persistence = jnp.sum(alpha) + jnp.sum(beta)
-
-        # Post-fit stationarity clamping: scale alpha+beta to 0.999 if needed.
-        # Use 0.999 (not 0.98) to allow high-persistence financial data (e.g.
-        # S&P 500) to retain accurate MLE parameters while still preventing
-        # near-IGARCH instability. The clamp caps persistence at 0.999, so the
-        # old `persistence >= 1.0` raise was unreachable (NaN comparisons fall
-        # through it too) — removed rather than kept as untraceable dead code.
-        clamped = persistence > 0.999
-        scale_factor = jnp.where(clamped, 0.999 / jnp.maximum(persistence, 1e-8), 1.0)
-        alpha = alpha * scale_factor
-        beta = beta * scale_factor
-        # Recompute omega so unconditional variance matches sample variance.
-        # Without this, clamping collapses the unconditional variance
-        # (omega/(1-persistence) becomes much smaller than sample_var).
-        # astype keeps omega on the cond-branch dtype (f32) — sample_var_val
-        # follows y and would silently promote the select under x64 (§10).
-        omega = jnp.where(
-            clamped, sample_var_val.astype(omega.dtype) * (1.0 - 0.999), omega
+        runner = _get_garch_fit_runner(
+            self.p, self.q, int(n_iters), int(n_eff), actual_len is not None
         )
-
-        # Compute sigma2 in scaled space, then un-scale
-        sigma2_scaled = _compute_sigma2_series(
-            y_scaled, omega, alpha, beta, self.p, self.q, init_var)
-        sigma2_full = sigma2_scaled * (scale ** 2)
-        sigma2 = sigma2_full[:n_eff] if actual_len is not None else sigma2_full
-
-        # Un-scale variance parameters
-        omega_unscaled = omega * (scale ** 2)
-        init_var_unscaled = init_var * (scale ** 2)
-
-        return {
-            'omega': omega_unscaled,
-            'alpha': alpha,
-            'beta': beta,
-            'sigma2': sigma2,
-            'fitted': jnp.zeros(n_eff),
-            'y_mean': jnp.mean(y_actual),
-            'y_last': y_actual[-self.p:],
-            'sigma2_last': sigma2[-self.q:] if self.q > 0 else jnp.array([]),
-            'init_var': init_var_unscaled,
-        }
+        return runner(y)
 
     def _forecast_sigma2(self, omega: float, alpha: jnp.ndarray,
                          beta: jnp.ndarray, y_last: jnp.ndarray,
@@ -939,6 +1001,19 @@ class GARCH(BaseForecaster):
         return _forecast_sigma2_impl(
             omega, alpha, beta, y_last, sigma2_last, sigma2_max, h, self.p, self.q
         )
+
+    def conformity_scores(self, y, X=None):
+        """Sequential-window CV, overriding the base vmapped path.
+
+        Under vmap the CV windows re-import the vmap-of-jaxopt-while penalty that
+        ``lax.map`` avoids in the multistart (batched LBFGSB line-search loops), and
+        the optax fallback's ``lax.cond`` gains a batched runtime predicate — it
+        lowers to a select and EXECUTES the full Adam+L-BFGS fallback for every
+        window. Running the windows sequentially avoids both. Windows, masking, and
+        values are identical; only the execution regime changes (base
+        ``_conformity_scores_sequential``).
+        """
+        return self._conformity_scores_sequential(y=y, X=X)
 
     def fit(self, y: jnp.ndarray, X: jnp.ndarray | None = None,
             n_iters: int | None = None,
@@ -967,7 +1042,7 @@ class GARCH(BaseForecaster):
         y_actual = y[:n_eff] if actual_len is not None else y
 
         # No data-dependent validation raises here: booleans on traced values
-        # cannot branch under vmap (CLAUDE.md §1 rule 2). NaN input propagates
+        # cannot branch under vmap. NaN input propagates
         # NaN outputs; near-constant input degenerates gracefully (the internal
         # scale is clamped at 1e-6, so forecasts collapse to the series mean).
         y_mean = jnp.mean(y_actual)
@@ -1190,7 +1265,7 @@ class GARCH(BaseForecaster):
         if simulate:
             # Fit a clone: forecast() is contractually stateless, and fit()
             # attribute writes under a caller's vmap would leak tracers onto
-            # this estimator (the §5.1 clone pattern).
+            # this estimator.
             m = self.new()
             m.fit(y, X, n_iters=n_iters, actual_len=actual_len)
             res = m.predict(h, X_future, level, simulate=True,
