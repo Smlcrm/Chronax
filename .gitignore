@@ -73,6 +73,18 @@ benchmarks/scripts/
 benchmarks/baselines/*
 !benchmarks/baselines/README.md
 
+# Parity/benchmark scripts that need the neuralforecast+torch env in
+# benchmarks/.venv-nf. They are manual gates, not part of the pytest suite, and
+# the env is not a declared dependency. kan/patchtst below are self-contained
+# and stay tracked.
+benchmarks/*_weight_parity.py
+!benchmarks/kan_weight_parity.py
+!benchmarks/patchtst_weight_parity.py
+benchmarks/informer_sparse_attention_parity.py
+benchmarks/tft_benchmark.py
+benchmarks/xlstm_benchmark.py
+benchmarks/torch_xlstm.py
+
 # Session handoff notes and implementation plans (private repo)
 handoff-*/
 plans/
