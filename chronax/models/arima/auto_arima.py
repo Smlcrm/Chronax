@@ -54,8 +54,6 @@ Side Effects:
 
 Author:
     Auto-documented
-Date:
-    2026-02-21
 """
 
 from __future__ import annotations
@@ -1145,11 +1143,55 @@ def _compute_metrics(loglik: Array, sigma2: Array, n_obs: Array, n_params: int) 
     # Return JAX arrays (do not cast to float)
     return {
         "aic": aic, 
-        "aicc": aicc, 
+        "aicc": aicc,
         "bic": bic,
-        "loglik": loglik, 
+        "loglik": loglik,
         "sigma2": sigma2
     }
+
+
+# Generosity factors for the intercept/drift box constraint. Wide
+# enough to never bind on a legitimate fit, narrow relative to the runaway
+# magnitudes the unconstrained LBFGS produces (drift ~ -3e5 on scale-100 data).
+_DRIFT_BOUND_FACTOR = 25.0
+_MEAN_BOUND_FACTOR = 3.0
+
+
+def _intercept_bounds(
+    y: Array, d: int, D: int, ns: int
+) -> Tuple[Array, Array]:
+    """Data-physical box constraint for the mean/drift coefficient.
+
+    The mean/drift is an unconstrained parameter jointly optimized with the
+    ARMA coefficients; a poorly-conditioned LBFGS step can drive it to a
+    non-physical value (observed: drift = -2.96e5 on a scale-~100 d=1 series),
+    which the ``_reconstruct_forecast`` integrator then compounds over the
+    horizon into a ~1e8 forecast. This returns a generous but finite ``(lo, hi)``
+    the coefficient is clipped to, both inside the objective (via
+    :func:`_unpack_and_adjust`, so the optimizer converges to the true small
+    value rather than wandering off) and post-fit on the raw parameter vector
+    the forecast kernel reads.
+
+    For a **drift** (``d + D >= 1``) the coefficient is a constant on the
+    ``(d, D)``-differenced series and must stay near that series' mean (a drift
+    integrates over the horizon, so it has to be tight); for a **stationary
+    mean** (``d + D == 0``) it must lie within a few ranges of the observed
+    level. ``d``, ``D``, ``ns`` are static config ints so the differencing loops
+    are static and the whole function is vmap-native.
+    """
+    yd = y
+    for _ in range(int(d)):
+        yd = yd[1:] - yd[:-1]
+    for _ in range(int(D)):
+        yd = yd[int(ns):] - yd[: -int(ns)]
+    if (int(d) + int(D)) >= 1:
+        center = jnp.nanmean(yd)
+        scale = jnp.nanstd(yd) + jnp.abs(center) + 1e-8
+        width = _DRIFT_BOUND_FACTOR * scale
+        return center - width, center + width
+    rng = jnp.nanmax(y) - jnp.nanmin(y) + 1e-8
+    return jnp.nanmin(y) - _MEAN_BOUND_FACTOR * rng, jnp.nanmax(y) + _MEAN_BOUND_FACTOR * rng
+
 
 def _unpack_and_adjust(
     params: Array,
@@ -1259,10 +1301,17 @@ def _unpack_and_adjust(
     # Because we padded safe_coefs, indexing at n_exog is ALWAYS valid.
     # If n_exog=0 and include_mean=False, it picks the dummy 0.0 we added.
     intercept_val = jax.lax.dynamic_index_in_dim(safe_coefs, n_exog, keepdims=False)
-    
+
+    # Box-constrain the mean/drift inside the objective so the
+    # optimizer converges to the true (small) value instead of a runaway (which
+    # the d>0 forecast integrator amplifies to ~1e8). No-op for well-behaved
+    # fits — the true optimum sits well inside the bound.
+    _lo, _hi = _intercept_bounds(y, d, D, ns)
+    intercept_val = jnp.clip(intercept_val, _lo, _hi)
+
     # Final adjustment only if include_mean is truly active
     y_adj = y_adj - jnp.where(include_mean, intercept_val, 0.0)
-            
+
     return y_adj, phi, theta
 
 def _objective_css(
@@ -1478,6 +1527,12 @@ def _fit_model_bfgs(
 # Fast-path (forecast) optimizer budget — config-static scan lengths.
 _FAST_LBFGS_MEMORY = 10
 _FAST_LBFGS_LS_STEPS = 20
+# Early-exit rule for the fast-path while_loop: stop after _FAST_LBFGS_PATIENCE
+# consecutive iterations whose EVALUATED loss fails to improve the running best
+# by a relative _FAST_LBFGS_FTOL (scipy L-BFGS-B factr=1e7 equivalent). maxiter
+# stays the hard cap, so no run does more work than the old fixed budget.
+_FAST_LBFGS_FTOL = 2.22e-9
+_FAST_LBFGS_PATIENCE = 2
 
 
 @partial(jax.jit, static_argnames=['loss_fn', 'arma', 'maxiter'])
@@ -1502,10 +1557,28 @@ def _fit_model_scan(
         line search fails (nit=1/status=3 on seasonal-MA specs like
         (1,1,1)(0,1,1)[12]), so the fast path — the code conformity_scores
         vmaps — uses this pure-lax optimizer instead (optax.lbfgs + zoom
-        linesearch inside a fixed-length lax.scan with best-iterate
-        tracking): eager and vmapped runs are identical by construction and
-        a failed search can never return a worse-than-init point. Same
-        pattern as the GARCH optax fallback.
+        linesearch with best-iterate tracking): a failed search can never
+        return a worse-than-init point. Same pattern as the GARCH optax
+        fallback.
+
+        The loop is a convergence-gated lax.while_loop rather than a fixed-length
+        lax.scan, which would pay every one of `maxiter` O(n) CSS steps even when the
+        fit converges in a fraction of them — costly on long series. Exit fires after
+        _FAST_LBFGS_PATIENCE consecutive evaluated losses that fail to
+        improve the best by a relative _FAST_LBFGS_FTOL; `maxiter` remains
+        the hard cap, so cost is never above the old fixed budget. Per-lane
+        SEMANTICS are identical between eager and vmapped runs: `done`
+        latches on the PREVIOUS trip (the latching trip's own update still
+        lands) and converged lanes ride along frozen while other vmap lanes
+        finish; numerics agree to vmap-lowering noise (measured 4.5e-11 —
+        batched reductions associate differently, the pre-existing class).
+        ⚠ Because the exit test thresholds a lowering-sensitive loss, a ~ULP
+        eager-vs-vmap loss difference near ftol can in principle flip one exit and
+        bifurcate a trajectory — accepted repo-wide for convergence-gated
+        optimizers, so endpoints are compared on accuracy, not bits.
+        Non-finite losses count as
+        non-improving, so a diverging run exits after PATIENCE trips and
+        returns the tracked best (or init) exactly as before.
 
         Best-iterate tracking stores the point the loss was EVALUATED at
         (not the post-update point), and the final iterate is evaluated once
@@ -1552,27 +1625,78 @@ def _fit_model_scan(
         ),
     )
 
-    def _lbfgs_step(carry, _):
-        params, state, best_params, best_loss = carry
+    # ftol floored at 8*eps(dtype): a relative tolerance below the dtype's
+    # resolution is unreachable and would disable the exit (the AutoCES f32
+    # tolerance lesson). init_params.dtype is concrete at trace time.
+    ftol = max(_FAST_LBFGS_FTOL, 8.0 * float(jnp.finfo(init_params.dtype).eps))
+
+    def _lbfgs_cond(carry):
+        _, _, _, _, it, _, done = carry
+        return (it < maxiter) & jnp.logical_not(done)
+
+    def _lbfgs_body(carry):
+        params, state, best_params, best_loss, it, stall, done = carry
         loss, grads = value_and_grad_fn(params)
         grads = jnp.where(jnp.isfinite(grads), grads, 0.0)
         updates, new_state = solver.update(
             grads, state, params, value=loss, grad=grads, value_fn=objective)
         new_params = optax.apply_updates(params, updates)
         improved = jnp.isfinite(loss) & (loss < best_loss)
-        best_params = jnp.where(improved, params, best_params)
-        best_loss = jnp.where(improved, loss, best_loss)
-        return (new_params, new_state, best_params, best_loss), None
+        # "meaningful" = improves the best by more than ftol relative. A first
+        # finite loss against best_loss=inf always counts; NaN/inf losses never
+        # do (so divergence accumulates stall instead of resetting it).
+        denom = jnp.maximum(jnp.maximum(jnp.abs(best_loss), jnp.abs(loss)), 1.0)
+        meaningful = improved & jnp.where(
+            jnp.isfinite(best_loss), (best_loss - loss) / denom > ftol, True)
+        new_stall = jnp.where(meaningful, 0, stall + 1)
+        new_done = done | (new_stall >= _FAST_LBFGS_PATIENCE)
+        new_best_params = jnp.where(improved, params, best_params)
+        new_best_loss = jnp.where(improved, loss, best_loss)
+        # Freeze on the PREVIOUS trip's latch: the trip that trips `done` still
+        # commits its own update (eager exit happens after it), and under vmap a
+        # converged lane rides along as a no-op. For a lane that instead runs out
+        # of `maxiter` without latching, per-lane parity is carried by JAX's
+        # batched-while lowering itself (the entire carry is re-selected on the
+        # entry predicate per lane) — the freeze alone does not cover that case.
+        frz = done
+        return (jnp.where(frz, params, new_params),
+                jax.tree_util.tree_map(
+                    lambda o, n: jnp.where(frz, o, n), state, new_state),
+                jnp.where(frz, best_params, new_best_params),
+                jnp.where(frz, best_loss, new_best_loss),
+                jnp.where(frz, it, it + 1),
+                jnp.where(frz, stall, new_stall),
+                new_done)
 
     init_loss = objective(init_params)
     safe_init_loss = jnp.where(jnp.isfinite(init_loss), init_loss, jnp.inf)
-    carry0 = (init_params, solver.init(init_params), init_params, safe_init_loss)
-    (final_params, _, best_params, best_loss), _ = lax.scan(
-        _lbfgs_step, carry0, None, length=maxiter)
+    carry0 = (init_params, solver.init(init_params), init_params, safe_init_loss,
+              jnp.asarray(0, jnp.int32), jnp.asarray(0, jnp.int32),
+              jnp.asarray(False))
+    final_params, _, best_params, best_loss, _, _, _ = lax.while_loop(
+        _lbfgs_cond, _lbfgs_body, carry0)
 
     final_loss = objective(final_params)
     take_final = jnp.isfinite(final_loss) & (final_loss < best_loss)
     return jnp.where(take_final, final_params, best_params)
+
+
+# Jitted aliases for the EAGER post-processing call sites only.
+# Both raw functions build their `lax.cond` / `lax.scan` bodies as fresh closures,
+# so an eager call recompiles an identical jaxpr every time — 16 of the 17 compiles
+# a fresh-instance `AutoARIMA.forecast` pays (one cond + one scan per candidate of
+# the stepwise search), plus two per eager `ARIMA.fit()`.
+#
+# The RAW functions must stay in place: `_unpack_and_adjust` is also called from
+# inside `_objective_css`/`_objective_ml`, which pass `ncxreg`/`n_exog`/`include_mean`
+# as *traced* ints — `static_argnames` on the shared symbol raises "Non-hashable
+# static arguments ... DynamicJaxprTracer". Jitting only the eager sites also leaves
+# every existing compiled kernel's jaxpr byte-identical — no nested pjit inside the
+# programs that contain `arima_css`, which must keep its current fusion.
+_unpack_and_adjust_jit = partial(
+    jax.jit, static_argnames=['arma', 'ncxreg', 'n_exog', 'include_mean']
+)(_unpack_and_adjust)
+_kalman_filter_core_jit = jax.jit(_kalman_filter_core)
 
 
 def arima_fit(
@@ -1682,7 +1806,6 @@ def arima_fit(
     current_params = init_params
     
     # Helper to call the JIT kernel
-    # Note: We use _fit_model_lbfgs because optax.lbfgs IS the BFGS implementation
     def run_bfgs(
         start_params: Array,
         loss_func: Callable[..., float],
@@ -1699,14 +1822,34 @@ def arima_fit(
         css_iter = maxiter // 2 if method == "CSS-ML" else maxiter
         current_params = run_bfgs(current_params, _objective_css, css_iter)
         
-    if "ML" in method: 
+    if "ML" in method:
         ml_iter = maxiter // 2 if method == "CSS-ML" else maxiter
         current_params = run_bfgs(current_params, _objective_ml, ml_iter)
 
-    # 4. POST-PROCESSING
-    y_adj, phi, theta = _unpack_and_adjust(current_params, x, xreg, arma, ncxreg, n_exog, include_mean)
+    # The mean/drift coefficient is estimated unreliably by the ARMA optimizer — a
+    # poorly-conditioned BFGS step can drive it to a wrong-sign runaway that the d>0
+    # forecast integrator then amplifies by orders of magnitude. Replace it with its
+    # closed form, which is well-conditioned and what R's joint estimate converges
+    # to anyway:
+    #   * drift (d+D==1): mean of the (seasonally-)differenced series;
+    #   * stationary mean (d+D==0): the sample mean, clipped to the data range.
+    # For well-behaved fits the optimizer already sits at this value, so it is a
+    # no-op; it only rescues the degenerate runaways. Applied BEFORE the loglik /
+    # IC computation below so order selection scores the corrected model.
+    if include_mean:
+        _mi = narma + n_exog
+        if use_drift:
+            _dx = (x[period:] - x[:-period]) if (D == 1 and period > 1) else (x[1:] - x[:-1])
+            current_params = current_params.at[_mi].set(jnp.nanmean(_dx))
+        else:
+            _ilo, _ihi = _intercept_bounds(x, d, D, period)
+            current_params = current_params.at[_mi].set(
+                jnp.clip(current_params[_mi], _ilo, _ihi))
+
+    # 4. POST-PROCESSING (eager: use the jitted aliases — see their definition)
+    y_adj, phi, theta = _unpack_and_adjust_jit(current_params, x, xreg, arma, ncxreg, n_exog, include_mean)
     mod = make_arima(phi, theta, delta, arma)
-    (_, _, ssq, sumlog, nu), resid, innovations = _kalman_filter_core(y_adj, mod)
+    (_, _, ssq, sumlog, nu), resid, innovations = _kalman_filter_core_jit(y_adj, mod)
     
     sigma2 = jnp.where(nu > 0, ssq / nu, jnp.inf)
     
@@ -1786,8 +1929,16 @@ def _predict_core(
         Role: Shared prediction math for single and batched ARIMA models.
     """
     # 1. Kalman Forecast (Stochastic Part)
+    # The forecast VARIANCE is a structural forecast from a known state: zero
+    # the initial covariance so Z P_h Z' accumulates the pure MA(inf) psi-weight
+    # variance (sigma2 * sum_{j<h} psi_j^2) — the correct ARIMA forecast SE.
+    # make_arima's P0 carries the diffuse FILTER prior (kappa on the integration
+    # states) needed for the likelihood; reusing it here contaminated the SE by
+    # ~sqrt(kappa)=1000x for integrated (d+D>0) models. The mean forecast (Z@a)
+    # evolves via T from a0 independently of P0, so point forecasts are unchanged.
+    mod = mod._replace(P0=jnp.zeros_like(mod.P0))
     forecast_component, cov_component = kalman_forecast(n_ahead, mod)
-    
+
     # 2. Exogenous/Mean (Deterministic Part)
     xm = jnp.zeros(n_ahead, dtype=jnp.float64)
     
@@ -1825,6 +1976,7 @@ _predict_batch_kernel = jax.vmap(
 # SHARED RECONSTRUCTION: Undo differencing using the delta polynomial
 # =============================================================================
 
+@partial(jax.jit, static_argnames=['arma', 'h'])
 def _reconstruct_forecast(
     raw_pred: Array,
     y_train: Array,
@@ -3086,9 +3238,9 @@ def auto_arima_f(
     # Re-derive constant based on bestfit results or logic
     # (Simplified: assume allowdrift/allowmean logic holds for best model)
     use_constant = (allowdrift and d_val + D_val == 1) or (allowmean and d_val + D_val == 0)
-    
+
     final_model = arima_fit(
-        x, 
+        x,
         order=(final_p, d_val, final_q),
         seasonal={'order': (final_P, D_val, final_Q), 'period': m},
         xreg=xreg,
@@ -3396,8 +3548,8 @@ class AutoARIMA(BaseForecaster):
             *parameters* of that fixed order independently per window via the
             traceable CSS fast path.
 
-            Calibration caveat (same class as xLSTM's fast path, CLAUDE.md
-            §3.1): the ORDER is selected with sight of the full series,
+            Calibration caveat (shared with the other Auto models): the ORDER is
+            selected with sight of the full series,
             including CV test windows — mildly optimistic. Parameters are
             still honestly re-fit per window, so scores vary across windows.
 
@@ -3587,14 +3739,13 @@ class AutoARIMA(BaseForecaster):
         fc_norm = _reconstruct_forecast(mean_pred, self.y_train_, self.model_["arma"], h)
         mean_orig = _aa_denormalize(fc_norm, self._y_mean, self._y_std)
 
-        # Standard Errors
+        # Standard Errors. The state-space (make_arima) already bakes the
+        # differencing into T/Z, so kalman_forecast returns the integrated-series
+        # forecast SE directly; the old sqrt(cumsum(se^2)) here integrated a
+        # SECOND time (double count). se_pred is already the correct per-horizon
+        # SE — just rescale to the original units.
         if se_pred is not None:
-            p, q, P, Q, m, d, D = self.model_["arma"]
-            if d + D > 0:
-                se_scaled = jnp.sqrt(jnp.cumsum(se_pred**2))
-            else:
-                se_scaled = se_pred
-            se_orig = se_scaled * self._y_std
+            se_orig = se_pred * self._y_std
         else:
             se_orig = None
 

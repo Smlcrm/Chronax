@@ -50,8 +50,6 @@ Side Effects:
 
 Author:
     Auto-documented
-Date:
-    2026-02-21
 """
 
 from __future__ import annotations
@@ -238,8 +236,8 @@ class ARIMA(BaseForecaster):
             Forecast reconstruction assumes the same differencing specification
             that was used during fitting.
         """
-        # No host round-trip: np.array(y) here concretized traced inputs and
-        # broke conformity_scores' vmapped forecast->fit path (CLAUDE.md §2).
+        # No host round-trip: np.array(y) here would concretize traced inputs and
+        # break conformity_scores' vmapped forecast->fit path.
         y_jax = jnp.asarray(y, dtype=jnp.float64)
         if X is not None:
             X = jnp.asarray(X, dtype=jnp.float64)
@@ -449,12 +447,10 @@ class ARIMA(BaseForecaster):
             mean_orig = fc_norm
 
         if se_pred is not None:
-            p, q, P, Q, m, d, D = self.model_["arma"]
-            if d + D > 0:
-                se_scaled = jnp.sqrt(jnp.cumsum(se_pred**2))
-            else:
-                se_scaled = se_pred
-            se_orig = se_scaled * (self._y_std if self.standardize else 1.0)
+            # se_pred is already the integrated-series forecast SE (the state-
+            # space bakes differencing into T/Z); the old sqrt(cumsum(se^2))
+            # double-integrated. See _predict_core's P0=0 note in auto_arima.py.
+            se_orig = se_pred * (self._y_std if self.standardize else 1.0)
         else:
             se_orig = None
 
