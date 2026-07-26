@@ -1,16 +1,23 @@
 """xLSTM / xLSTMTime numerics — pure-functional JAX.
 
-Implements the matrix-LSTM cell (mLSTM) and scalar-LSTM cell (sLSTM)
-from Beck et al. 2024 with the log-space stabilizer trick for numerical
-safety on exponential gates. Adds the xLSTMTime extensions of
-Alharthi & Mahmood 2024: reversible instance normalization (RevIN),
-learnable moving-average series decomposition, and a direct linear
-forecast head as an alternative to autoregressive decoding.
+Implements mLSTM/sLSTM cells FOLLOWING Beck et al. 2024 (log-space
+stabilizer trick), with documented deviations from the NX-AI reference
+kept on purpose: ``max(|n|,1)`` normalizer floor (reference divides by n
+raw), ``±gate_clip`` on i/f pre-activations (reference has none), exp forget
+default (reference v1.x sLSTM code is sigmoid-only), glorot/flat-bias inits
+(reference: zeros-R + powerlaw/linspace forget bias). Adds xLSTMTime-
+INSPIRED extensions (Alharthi & Mahmood 2024, adapted to time-axis
+recurrence — see the model docstring): reversible instance normalization
+(RevIN), learnable moving-average series decomposition, and a direct
+linear forecast head as an alternative to autoregressive decoding.
 
-Master params are held in float32; forward/backward compute runs in
-bfloat16. The stabilizer state m_t and the rescaled gate scalars
-i_stab, f_stab are kept in float32 to bound numerical drift on long
-sequences.
+Master params are held in float32. Compute dtype is config-static
+(``XLSTMConfig.compute_dtype``), DEFAULT ``"float32"``: bf16 is several times
+SLOWER on XLA-CPU for a prediction drift around 0.1% of scale, so
+``"bfloat16"`` is opt-in for GPU work, where it mirrors the canonical CUDA
+kernel's dtype policy. The stabilizer
+state m_t and the rescaled gate scalars i_stab, f_stab are kept in float32
+in either mode to bound numerical drift on long sequences.
 
 All public functions are pure (no class state). They are intended to be
 wrapped by lru_cache'd jit builders in :mod:`xlstm_functions`.
@@ -60,10 +67,15 @@ class XLSTMConfig:
     horizon: int = 8          # static; required when decode_mode == "direct"
     use_conv1d_in_slstm: bool = False
     conv1d_kernel: int = 4
-    # sLSTM cell semantics. Defaults reproduce the original behavior; the
-    # paper-faithful FlashRNN/xLSTM sLSTM is opt-in (Eq. 13-15, arXiv 2412.07752).
+    # sLSTM cell semantics. Defaults reproduce the original Chronax behavior;
+    # "sigmoid"/"per_cell" match the FlashRNN/xLSTM equations (Eq. 13-15,
+    # arXiv 2412.07752) for the GATE and STABILIZER only — the max(|n|,1)
+    # floor and gate_clip remain deliberate deviations (module docstring).
     slstm_forget_gate: str = "exp"      # "exp" (current) | "sigmoid" (log-sigmoid forget)
     slstm_stabilizer: str = "per_head"  # "per_head" (current) | "per_cell" (per Eq.15)
+    # Compute dtype for forward/backward (params master copy stays float32).
+    # "float32" default — bf16 is several times slower on XLA-CPU.
+    compute_dtype: str = "float32"      # "float32" | "bfloat16"
 
     def __post_init__(self):
         if len(self.block_types) != self.num_layers:
@@ -85,6 +97,20 @@ class XLSTMConfig:
             raise ValueError(
                 f"slstm_stabilizer must be 'per_head' or 'per_cell', got {self.slstm_stabilizer!r}"
             )
+        if self.compute_dtype not in ("float32", "bfloat16"):
+            raise ValueError(
+                f"compute_dtype must be 'float32' or 'bfloat16', got {self.compute_dtype!r}"
+            )
+
+
+def _compute_dtype(cfg: "XLSTMConfig"):
+    # getattr: configs pickled before compute_dtype existed restore without the
+    # field — decode them at f32 instead of crashing.
+    return (
+        jnp.bfloat16
+        if getattr(cfg, "compute_dtype", "float32") == "bfloat16"
+        else jnp.float32
+    )
 
 
 # =============================================================================
@@ -94,9 +120,9 @@ class XLSTMConfig:
 class BlockState(NamedTuple):
     """Per-block mLSTM state.
 
-    - ``C``: covariance matrix per head, shape (H, Dh, Dh). bf16 in compute.
-    - ``n``: normalizer vector per head, shape (H, Dh). bf16.
-    - ``m``: log-space stabilizer per head, shape (H,). float32.
+    - ``C``: covariance matrix per head, shape (H, Dh, Dh). Compute dtype.
+    - ``n``: normalizer vector per head, shape (H, Dh). Compute dtype.
+    - ``m``: log-space stabilizer per head, shape (H,). Always float32.
     """
     C: jnp.ndarray
     n: jnp.ndarray
@@ -106,9 +132,9 @@ class BlockState(NamedTuple):
 class SLSTMBlockState(NamedTuple):
     """Per-block sLSTM state.
 
-    - ``h``: hidden state per head (needed for memory mixing via R), shape (H, Dh). bf16.
-    - ``c``: scalar cell per unit, shape (H, Dh). bf16.
-    - ``n``: normalizer, shape (H, Dh). bf16.
+    - ``h``: hidden state per head (needed for memory mixing via R), shape (H, Dh). Compute dtype.
+    - ``c``: scalar cell per unit, shape (H, Dh). Compute dtype.
+    - ``n``: normalizer, shape (H, Dh). Compute dtype.
     - ``m``: log-space stabilizer, float32. Shape (H,) for ``slstm_stabilizer="per_head"``
       (default) or (H, Dh) for ``"per_cell"`` (paper Eq.15).
     """
@@ -292,19 +318,29 @@ def revin_normalize(x: jnp.ndarray, p: dict, eps: float = 1e-5):
 
     Returns (x_norm, stats) where stats = {"mu": (1,) or (1, D_in), "sigma": same}.
     If ``p`` is a non-empty dict, applies learnable affine ``gamma * x_norm + beta``.
+
+    The stats are stop-gradiented (canonical RevIN ``.detach()``s them). This
+    is provably accuracy-invariant here — mu/sigma are functions of the input
+    data only, never of params, so no gradient w.r.t. params flows through
+    them — and pruning the dead gradient subgraph speeds up training.
     """
-    mu = jnp.mean(x, axis=0, keepdims=True)
-    sigma = jnp.sqrt(jnp.var(x, axis=0, keepdims=True) + eps)
+    mu = lax.stop_gradient(jnp.mean(x, axis=0, keepdims=True))
+    sigma = lax.stop_gradient(jnp.sqrt(jnp.var(x, axis=0, keepdims=True) + eps))
     x_n = (x - mu) / sigma
     if p:
         x_n = x_n * p["gamma"] + p["beta"]
     return x_n, {"mu": mu, "sigma": sigma}
 
 
-def revin_denormalize(y: jnp.ndarray, p: dict, stats: dict):
-    """Inverse of :func:`revin_normalize`. y: (H,) or (H, D_in)."""
+def revin_denormalize(y: jnp.ndarray, p: dict, stats: dict, eps: float = 1e-5):
+    """Inverse of :func:`revin_normalize`. y: (H,) or (H, D_in).
+
+    Divides by ``gamma + eps**2`` (canonical RevIN form) — guards a
+    trained-to-zero gamma. At gamma ~ 1 the 1e-10 shift is below f32
+    resolution, so predictions are bit-identical to the unguarded form.
+    """
     if p:
-        y = (y - p["beta"]) / p["gamma"]
+        y = (y - p["beta"]) / (p["gamma"] + eps * eps)
     return y * stats["sigma"] + stats["mu"]
 
 
@@ -431,7 +467,7 @@ def mlstm_block_forward(block_params, x_seq, init_state: BlockState, cfg: XLSTMC
     Input-side ops (pre-LN, up-projection, qkv + gate projections) are computed for
     the whole sequence up front; only the C/n/m memory recurrence runs in the scan,
     and the block tail is vectorized over T. Numerically equivalent to scanning
-    ``mlstm_block_step`` (the AR-decode path), up to bf16 reassociation.
+    ``mlstm_block_step`` (the AR-decode path), up to compute-dtype reassociation.
 
     Perf: hoisting the input GEMMs out of the (irreducibly sequential) time loop is
     faster on CPU/XLA at the context lengths this model uses (ctx_len <= ~128; default
@@ -533,23 +569,19 @@ def _causal_conv1d(x_seq, conv_W, conv_b, kernel: int):
 
     conv_W: (D, kernel). Pads `kernel-1` on the left with zeros so no future
     leakage. Returns shape (T, D), same dtype as x_seq.
+
+    Computed as `kernel` STATIC shifted elementwise multiply-adds, NOT
+    `lax.conv_general_dilated`: XLA-CPU pessimizes conv primitives inside a
+    `lax.scan` body, and the shifted form keeps the fast elementwise path.
+    out[t, d] = sum_k xp[t+k, d] * W[d, k] + b[d]. Do not "simplify" back to
+    the conv primitive.
     """
     T, D = x_seq.shape
     pad = kernel - 1
     xp = jnp.concatenate([jnp.zeros((pad, D), dtype=x_seq.dtype), x_seq], axis=0)  # (T+pad, D)
-    # Depthwise causal cross-correlation as a single fused conv (FlashRNN-style: keep the
-    # input-side op as one batched kernel rather than T dynamic-slices). conv_W is laid out
-    # (D, kernel) -> OIW (D, 1, kernel) with feature_group_count=D so each channel convolves
-    # only with its own filter. VALID padding over the left-zero-padded signal == causal.
-    dn = lax.conv_dimension_numbers((1, T + pad, D), (D, 1, kernel), ("NWC", "OIW", "NWC"))
-    out = lax.conv_general_dilated(
-        xp[None],                    # (1, T+pad, D)
-        conv_W[:, None, :],          # (D, 1, kernel)
-        window_strides=(1,),
-        padding="VALID",
-        dimension_numbers=dn,
-        feature_group_count=D,
-    )[0]                             # (T, D)
+    out = xp[0:T, :] * conv_W[:, 0]
+    for k in range(1, kernel):  # static, kernel is config (default 4)
+        out = out + xp[k:k + T, :] * conv_W[:, k]
     return out + conv_b
 
 
@@ -676,7 +708,8 @@ def xlstm_forward(params, x_seq, cfg: XLSTMConfig):
         Direct mode: preds shape (cfg.horizon,) float32 — direct multi-step forecast.
         final_states: tuple of per-block carry states (only meaningful in AR mode).
     """
-    params_bf = _cast_pytree(params, jnp.bfloat16)
+    cdt = _compute_dtype(cfg)
+    params_bf = _cast_pytree(params, cdt)
     x_f32 = x_seq.astype(jnp.float32)
 
     # RevIN (operates on f32 series for numerical stability)
@@ -690,12 +723,12 @@ def xlstm_forward(params, x_seq, cfg: XLSTMConfig):
     if cfg.use_decomposition:
         decomp_p = params["decomp"]
         trend, seasonal = series_decompose(x_norm, decomp_p, cfg.decomp_kernel)
-        h_trend, st_trend = _embed_and_stack_forward(trend.astype(jnp.bfloat16), params_bf, cfg)
-        h_seas, _ = _embed_and_stack_forward(seasonal.astype(jnp.bfloat16), params_bf, cfg)
+        h_trend, st_trend = _embed_and_stack_forward(trend.astype(cdt), params_bf, cfg)
+        h_seas, _ = _embed_and_stack_forward(seasonal.astype(cdt), params_bf, cfg)
         h_seq = h_trend + h_seas
         final_states = st_trend
     else:
-        h_seq, final_states = _embed_and_stack_forward(x_norm.astype(jnp.bfloat16), params_bf, cfg)
+        h_seq, final_states = _embed_and_stack_forward(x_norm.astype(cdt), params_bf, cfg)
 
     # Head
     if cfg.decode_mode == "direct":
@@ -735,6 +768,10 @@ def decode(params, z_tail, h_steps: int, cfg: XLSTMConfig):
     -------
     preds : (h_steps,) float32 — normalized scale when RevIN is off (caller
         denormalizes with its z-score stats), original scale when RevIN is on.
+
+    ⚠ ``use_decomposition`` + AR decode is incoherent: the rollout continues
+    from the trend branch's states only and never re-decomposes new steps.
+    Decomposition is designed for ``decode_mode='direct'``.
     """
     assert cfg.decode_mode == "ar", "decode() is AR-only; use decode_direct for direct mode."
     _, final_states = xlstm_forward(params, z_tail, cfg)
@@ -749,7 +786,8 @@ def decode(params, z_tail, h_steps: int, cfg: XLSTMConfig):
     else:
         revin_p, revin_stats = None, None
         last = z_tail[-1].astype(jnp.float32)
-    params_bf = _cast_pytree(params, jnp.bfloat16)
+    cdt = _compute_dtype(cfg)
+    params_bf = _cast_pytree(params, cdt)
 
     W_in = params_bf["input_embed"]["W"]
     b_in = params_bf["input_embed"]["b"]
@@ -760,7 +798,7 @@ def decode(params, z_tail, h_steps: int, cfg: XLSTMConfig):
 
     def ar_step(carry, _):
         last_val, states = carry
-        last_bf = jnp.asarray(last_val, dtype=jnp.bfloat16)
+        last_bf = jnp.asarray(last_val, dtype=cdt)
         x = last_bf * W_in.squeeze(0) + b_in  # (D,)
         new_states = []
         for i, block_p in enumerate(params_bf["blocks"]):

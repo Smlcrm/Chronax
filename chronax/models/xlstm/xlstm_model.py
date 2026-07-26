@@ -5,8 +5,13 @@ model contract: extend :class:`BaseForecaster`, expose ``fit``/``predict``
 /``forecast``, integrate with the conformal-intervals framework.
 
 The constructor exposes both the vanilla mLSTM recipe (current defaults)
-and the full xLSTMTime framework (Alharthi & Mahmood 2024) behind opt-in
-kwargs:
+and an xLSTMTime-INSPIRED profile (Alharthi & Mahmood 2024) behind opt-in
+kwargs. ⚠ This is a deliberate TIME-AXIS adaptation, not a port: canonical
+xLSTMTime runs its recurrence over the CHANNEL axis (a univariate series
+would degenerate to a single recurrent step) and its released training
+pipeline is unsound (test-split checkpoint selection), so parity with it is a
+non-goal. The validation instrument is instead an NF-paired empirical gate,
+which the sLSTM+RevIN+decomposition+direct profile passes. Opt-in kwargs:
 
   - ``block_types`` — per-layer ``"mlstm"`` or ``"slstm"``.
   - ``use_revin`` — reversible instance normalization (per-series stats).
@@ -86,11 +91,20 @@ class XLSTM(BaseForecaster):
         Causal-Conv1D kernel size.
     slstm_forget_gate : {"exp", "sigmoid"}
         sLSTM forget-gate form. ``"exp"`` (default) preserves the original
-        behavior; ``"sigmoid"`` uses the log-sigmoid forget gate of the xLSTM
-        paper (Eq. 13-15, arXiv 2412.07752). sLSTM blocks only.
+        Chronax behavior; ``"sigmoid"`` matches the log-sigmoid forget gate of
+        the FlashRNN/xLSTM equations (Eq. 13-15, arXiv 2412.07752) — the GATE
+        only: the ``max(|n|,1)`` normalizer floor and ``gate_clip`` remain
+        deliberate deviations from the NX-AI reference (see the backend module
+        docstring). sLSTM blocks only.
     slstm_stabilizer : {"per_head", "per_cell"}
-        sLSTM log-space stabilizer granularity. ``"per_head"`` (default) keeps the
-        original collapsed stabilizer; ``"per_cell"`` matches the paper (Eq. 15).
+        sLSTM log-space stabilizer granularity. ``"per_head"`` (default) keeps
+        the original collapsed stabilizer; ``"per_cell"`` matches the paper
+        (Eq. 15) for the STABILIZER only (floor/clip deviations remain).
+    compute_dtype : {"float32", "bfloat16"}
+        Forward/backward compute dtype (master params stay float32).
+        ``"float32"`` default — bfloat16 is several times SLOWER on XLA-CPU for
+        a prediction drift around 0.1% of scale; keep ``"bfloat16"`` for GPU
+        work only.
 
     NF-convention aliases
     ---------------------
@@ -137,6 +151,7 @@ class XLSTM(BaseForecaster):
         conv1d_kernel: int = 4,
         slstm_forget_gate: str = "exp",
         slstm_stabilizer: str = "per_head",
+        compute_dtype: str = "float32",
         # ── NF-convention aliases (see docstring) ─────────────────────────────
         h: Optional[int] = None,
         input_size: Optional[int] = None,
@@ -199,6 +214,10 @@ class XLSTM(BaseForecaster):
             raise ValueError(
                 f"slstm_stabilizer must be 'per_head' or 'per_cell', got {slstm_stabilizer!r}"
             )
+        if compute_dtype not in ("float32", "bfloat16"):
+            raise ValueError(
+                f"compute_dtype must be 'float32' or 'bfloat16', got {compute_dtype!r}"
+            )
 
         self.ctx_len = int(ctx_len)
         self.horizon_train = int(horizon_train)
@@ -226,6 +245,7 @@ class XLSTM(BaseForecaster):
         self.conv1d_kernel = int(conv1d_kernel)
         self.slstm_forget_gate = slstm_forget_gate
         self.slstm_stabilizer = slstm_stabilizer
+        self.compute_dtype = compute_dtype
 
         self.model_ = {}
 
@@ -267,6 +287,7 @@ class XLSTM(BaseForecaster):
             conv1d_kernel=self.conv1d_kernel,
             slstm_forget_gate=self.slstm_forget_gate,
             slstm_stabilizer=self.slstm_stabilizer,
+            compute_dtype=self.compute_dtype,
         )
 
     def fit(self, y: jnp.ndarray, X: jnp.ndarray | None = None) -> "XLSTM":
@@ -311,6 +332,72 @@ class XLSTM(BaseForecaster):
             cs = self.conformity_scores(y=y_f, X=X)
             self.model_["_cs"] = cs
         return self
+
+    def conformity_scores(self, y: jnp.ndarray, X: jnp.ndarray | None = None) -> jnp.ndarray:
+        """Walk-forward conformity scores.
+
+        Fitted fast path: the base implementation hands ``forecast`` a
+        fixed-size edge-masked series, so window i's context tail ends in
+        ``(n_windows-1-i)*h`` CONSTANT values, which badly inflates scores on
+        trending data. Here we slice each window's TRUE tail
+        ``y[train_end-ctx : train_end]`` (left-edge-padded when
+        ``train_end < ctx`` — in that short-series regime the padded
+        fixed-length tail deliberately differs from what
+        ``forecast(y[:train_end])`` would decode from its shorter unpadded
+        tail) and vmap the cached decoder over the window axis. No CONTEXT
+        value at index >= train_end enters a window's forecast; the fitted
+        params and (non-RevIN) mu/std remain full-series artifacts, which is a
+        documented params-reuse trade (mildly optimistic calibration). Unfitted
+        instances fall back to the base implementation (stateless fit-per-window
+        under vmap), preserving the contract-suite invariants.
+        """
+        if not self.model_:
+            return super().conformity_scores(y, X=X)
+        if self.conformal_params is None:
+            raise ValueError(
+                "The instance attribute conformal_params must be initialized as a conformal_intervals object."
+            )
+        cfg: XLSTMConfig = self.model_["cfg"]
+        h = self.conformal_params.h
+        if cfg.decode_mode == "direct" and h != cfg.horizon:
+            raise ValueError(
+                f"Direct-mode conformal requires conformal_params.h ({h}) == cfg.horizon ({cfg.horizon})."
+            )
+        y_f = utils.ensure_float(y)
+        n = int(y_f.shape[0])
+        n_windows = min(self.conformal_params.n_windows, (n - 1) // h)
+        if n_windows < 2:
+            raise ValueError(
+                f"Conformal prediction requires at least {2 * h + 1:,} samples per window; series has {n:,}."
+            )
+        ctx = cfg.ctx_len
+        base_train_end = n - n_windows * h
+
+        tails, tests = [], []
+        for i in range(n_windows):  # static Python ints — vmap/jit-safe
+            train_end = base_train_end + i * h
+            start = max(0, train_end - ctx)
+            tail = y_f[start:train_end]
+            pad = ctx - (train_end - start)
+            if pad > 0:  # static per-window amount (short-series edge)
+                tail = jnp.concatenate([jnp.repeat(y_f[:1], pad), tail])
+            tails.append(tail)
+            tests.append(y_f[train_end:train_end + h])
+        tails_arr = jnp.stack(tails)   # (n_windows, ctx)
+        tests_arr = jnp.stack(tests)   # (n_windows, h)
+
+        mu, std = self.model_["mu"], self.model_["std"]
+        dec = _get_decoder(cfg, int(h))
+        params = self.model_["params"]
+
+        def one_window(tail):
+            if cfg.use_revin:
+                return dec(params, tail.astype(jnp.float32))  # decoder normalizes internally
+            z_tail = (tail - mu) / std
+            return dec(params, z_tail) * std + mu
+
+        fcst = jax.vmap(one_window)(tails_arr)  # (n_windows, h)
+        return tests_arr - fcst.astype("float32")
 
     def _decode_from_y(self, y: jnp.ndarray, h: int) -> jnp.ndarray:
         """Take the last ctx_len of y, decode h steps, denormalise if needed."""
@@ -373,8 +460,17 @@ class XLSTM(BaseForecaster):
         walk-forward), reuses trained params + decodes from the last
         ``ctx_len`` of ``y``. Slow path (no prior fit): fits a temporary
         model on ``y`` then predicts.
+
+        ``level`` on the fitted fast path uses the conformity scores cached
+        at fit (params-reuse calibration). ``fitted=True`` raises —
+        XLSTM has no in-sample fitted-values path.
         """
         y_f = utils.ensure_float(y)
+        if fitted:
+            raise NotImplementedError(
+                "fitted=True (in-sample fitted values) is not supported by XLSTM. "
+                "Call predict()/forecast() without `fitted`."
+            )
         if self.model_:
             cfg: XLSTMConfig = self.model_["cfg"]
             if cfg.decode_mode == "direct" and int(h) != cfg.horizon:
@@ -382,7 +478,21 @@ class XLSTM(BaseForecaster):
                     f"Direct-mode forecast requires h == cfg.horizon ({cfg.horizon}); got {h}."
                 )
             mean = self._decode_from_y(y_f, int(h))
-            return {"mean": mean}
+            result = {"mean": mean}
+            if level is not None:
+                if self.conformal_params is None:
+                    raise ValueError(
+                        "level requested but conformal_params is None; pass conformal_params at construction."
+                    )
+                cs = self.model_.get("_cs")
+                if cs is None:
+                    raise ValueError(
+                        "Conformity scores not cached. Refit with conformal_params set."
+                    )
+                result = self.add_confidence_intervals(
+                    result, cs, level, self.conformal_params.method
+                )
+            return result
         tmp = self.new()
         tmp.model_ = {}
         tmp.fit(y_f)
