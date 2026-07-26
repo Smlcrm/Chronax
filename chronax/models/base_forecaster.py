@@ -94,6 +94,58 @@ class BaseForecaster(ABC):
         """Return the model's alias as its string representation."""
         return self.alias
 
+    @staticmethod
+    def _resolve_season_length(
+        season_length: "int | float | str",
+        y: jnp.ndarray,
+        *,
+        strict: bool = True,
+    ) -> int:
+        """Resolve a model's ``season_length`` to a concrete Python int.
+
+        The single canonical entry point any model references to support
+        ``season_length="auto"``. An explicit int is used **verbatim**
+        (statsforecast parity — a deliberate period is domain knowledge,
+        never overridden). ``"auto"`` delegates to the canonical vmap-safe
+        :func:`chronax.utils.detect_period` (``strict=True`` =
+        periodogram + ≥5-cycle + folded-strength + divisor-defundamental).
+
+        Eager-only contract: this materialises a Python int (period sizes
+        static seasonal-state shapes → must be static for jit). Call it
+        once at ``fit()`` on concrete ``y`` and cache the result
+        (``self._m_eff``); never invoke it inside a jit/vmap trace. The
+        cached int is what flows to jitted kernels and the vmap forecast
+        path (the AutoETS pattern).
+
+        Parameters
+        ----------
+        season_length : int | float | "auto"
+            Configured period, or the literal ``"auto"`` to infer.
+        y : jnp.ndarray
+            Training series (concrete; used only when ``"auto"``).
+        strict : bool, default True
+            Passed to :func:`detect_period`. Canonical "auto" uses strict.
+
+        Returns
+        -------
+        int
+            Period ≥ 1 (1 = non-seasonal).
+        """
+        if isinstance(season_length, str):
+            if season_length != "auto":
+                raise ValueError(
+                    f'season_length string must be "auto", got {season_length!r}'
+                )
+            from chronax.utils import detect_period
+
+            m = int(detect_period(jnp.asarray(y, dtype=jnp.float64), strict=strict))
+            return m if m >= 1 else 1
+        if not isinstance(season_length, (int, float)) or int(season_length) < 1:
+            raise ValueError(
+                f'season_length must be an int >= 1 or "auto", got {season_length!r}'
+            )
+        return int(season_length)
+
     @abstractmethod
     def fit(self, y: jnp.ndarray, X: jnp.ndarray | None = None) -> "BaseForecaster":
         """
@@ -227,6 +279,67 @@ class BaseForecaster(ABC):
         cs = vmap(compute_window_scores)(jnp.arange(n_windows))
         # self._cs = cs
         return cs
+
+    def _conformity_scores_sequential(self, y, X=None):
+        """Sequential-window variant of :meth:`conformity_scores` — identical
+        windows, masking, and per-window computation; only the execution
+        regime differs (a Python loop with concrete indices instead of the
+        CV ``vmap``).
+
+        For models whose ``fit`` contains while-loops or data-dependent
+        ``lax.cond``s with scalar-ish bodies (golden-section searches,
+        jaxopt/optax line searches), the CV vmap is an ANTI-optimization
+        batched predicates batch the whole carry, conds lower to ``select``
+        executing BOTH branches per window, and tight loops degrade to
+        gather/select code — an order of magnitude slower than the same windows
+        run sequentially. Models opt in by overriding
+        ``conformity_scores`` to delegate here; pure-scan fits (ETS class)
+        amortize the vmap fine and should NOT.
+
+        The body deliberately mirrors :meth:`conformity_scores` line for
+        line (kept byte-identical there — it serves 20+ models) rather than
+        sharing a refactored core; keep the two in sync when editing either.
+        """
+        if self.conformal_params is None:
+            raise ValueError(
+                "The instance attribute conformal_params must be initialized as a conformal_intervals object."
+            )
+        n_windows = self.conformal_params.n_windows
+        h = self.conformal_params.h
+        y = utils.ensure_float(y)
+        n_samples = y.size
+        n_windows = min(n_windows, (n_samples - 1) // h)
+        if n_windows < 2:
+            raise ValueError(
+                f"Conformal prediction requires at least {2 * h + 1:,} samples per window; series has {n_samples:,}."
+            )
+        test_size = n_windows * h
+        base_train_end = n_samples - test_size
+        max_train_size = base_train_end + (n_windows - 1) * h
+
+        y_padded = jnp.pad(y, (0, max(0, max_train_size - n_samples)), mode='edge')
+        if X is not None:
+            X_padded = jnp.pad(X, ((0, max(0, max_train_size - n_samples)), (0, 0)), mode='edge')
+        else:
+            X_padded = None
+
+        scores = []
+        for i_window in range(n_windows):
+            train_end = base_train_end + i_window * h
+            y_train = lax.dynamic_slice(y_padded, (0,), (max_train_size,))
+            mask = jnp.arange(max_train_size) < train_end
+            y_train = jnp.where(mask, y_train, y_train[train_end - 1])
+            y_test = lax.dynamic_slice(y_padded, (train_end,), (h,))
+            if X_padded is not None:
+                X_train = lax.dynamic_slice(X_padded, (0, 0), (max_train_size, X_padded.shape[1]))
+                X_train = jnp.where(mask[:, None], X_train, X_train[train_end - 1])
+                X_test = lax.dynamic_slice(X_padded, (train_end, 0), (h, X_padded.shape[1]))
+            else:
+                X_train = None
+                X_test = None
+            fcst_window = self.forecast(h=h, y=y_train, X=X_train, X_future=X_test)  # type: ignore[attr-defined]
+            scores.append(y_test - fcst_window['mean'].astype('float32'))
+        return jnp.stack(scores)
 
 
     @staticmethod
