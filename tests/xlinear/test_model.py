@@ -217,7 +217,9 @@ def test_fitted_values_closed_form_use_norm():
     for p in (m.model_.w_proj, m.model_.w_tg1, m.model_.w_tg2, m.model_.w_cg1,
               m.model_.w_cg2, m.model_.w_head):
         p.value = jnp.zeros_like(p.value)
-    m.model_.b_head.value = jnp.full((12,), 0.5, dtype=jnp.float32)
+    # non-constant bias pins ONE-STEP-AHEAD selection: pred_z[:, 0] uses
+    # b_head[0]=0.5; a pred_z[:, -1] mutation would use b_head[11]=1.6.
+    m.model_.b_head.value = 0.5 + jnp.arange(12, dtype=jnp.float32) / 10.0
     fitted = np.asarray(m._compute_fitted_values())
     idx = np.arange(36)[None, :] + np.arange(24)[:, None]
     _, mean, stdev = _revin(jnp.asarray(np.asarray(y)[idx]))
@@ -237,3 +239,20 @@ def test_xlinear_auto_discovered_by_benchmark_harness():
     from benchmarks.neural import registry
     assert "XLinear" in registry.list_models()
     assert registry.resolve_chronax("XLinear") is XLinear
+
+
+def test_predict_smaller_h_is_prefix_of_full():
+    # mutation-probe gap: full[-h:] instead of full[:h] passed every value test
+    m = _tiny().fit(_make_y())
+    full = np.asarray(m.predict(h=12)["mean"])
+    np.testing.assert_allclose(np.asarray(m.predict(h=5)["mean"]), full[:5], rtol=1e-6)
+
+
+def test_predict_conditions_on_series_end():
+    # mutation-probe gap: a y[:input_size] context still beat naive on sine.
+    # On a strong trend, RevIN de-normalization anchors predictions near the
+    # END-window level (~100); a start-window context would anchor near ~5.
+    y = jnp.asarray(np.linspace(0.0, 100.0, 200), dtype=jnp.float32)
+    m = _tiny().fit(y)
+    pred = np.asarray(m.predict(h=12)["mean"])
+    assert np.all(pred > 50.0), pred

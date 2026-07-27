@@ -236,3 +236,17 @@ def test_predict_step_shift_equivariant_under_robust():
     base = np.asarray(predict_step(net, ctx, h=12, input_size=36, scaler=RobustScaler()))
     shifted = np.asarray(predict_step(net, ctx + 50.0, h=12, input_size=36, scaler=RobustScaler()))
     np.testing.assert_allclose(shifted, base + 50.0, rtol=1e-3, atol=1e-2)
+
+
+def test_train_updates_all_params_including_glob_token():
+    # mutation-probe gap: a param dropped from the optimizer pytree (e.g. the
+    # glob_token demoted from nnx.Param) freezes silently while every other
+    # test stays green. Snapshot all 13 trainable leaves; all must move.
+    net = _net(); y = _y()
+    names = ["w_proj", "b_proj", "glob_token", "w_tg1", "b_tg1", "w_tg2", "b_tg2",
+             "w_cg1", "b_cg1", "w_cg2", "b_cg2", "w_head", "b_head"]
+    before = {n: np.asarray(getattr(net, n).value).copy() for n in names}
+    train(net, y, h=12, input_size=36, max_steps=10, windows_batch_size=32, lr=1e-2,
+          seed=0, scaler=IdentityScaler())
+    for n in names:
+        assert not np.allclose(before[n], np.asarray(getattr(net, n).value)), f"{n} did not train"

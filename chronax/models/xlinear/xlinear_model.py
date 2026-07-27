@@ -38,7 +38,8 @@ class XLinear(BaseForecaster):
     ``scaler`` knob ("identity" default, matching NF; "robust" also available).
     NF trains this model through its multivariate dataset path — at n_series=1 it
     degenerates to the univariate protocol used here, but batching semantics are
-    not bit-verified (same accepted caveat as iTransformer). ``float32``
+    not bit-verified: an accepted limitation shared by Chronax's other univariate
+    ports of NF multivariate models (e.g. iTransformer). ``float32``
     throughout, matching torch/neuralforecast defaults.
     """
 

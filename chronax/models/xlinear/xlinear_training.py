@@ -69,7 +69,8 @@ def _sample_batch_idx(step_keys: jnp.ndarray, n_windows: int, windows_batch_size
     permutation, 4.6s for ``lax.top_k``, 2.3s for jitted ``jnp.argpartition``
     and 0.4s for this hybrid — against ~0.5s for the ENTIRE training scan, as
     measured on NLinear (one small matmul per step; sampling cost is
-    model-independent). Under a trace of the keys
+    model-independent — XLinear's heavier per-step compute only shrinks the
+    sampling share of total fit time). Under a trace of the keys
     themselves (e.g. ``jax.jit`` over ``step_keys``, as in the equivalence test)
     it falls back to pure-JAX ``argpartition``; note that
     ``BaseForecaster.conformity_scores``' vmap does NOT trace the keys (the seed
