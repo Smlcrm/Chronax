@@ -88,6 +88,33 @@ def test_moving_avg_window_one_fits_and_predicts():
     assert jnp.all(jnp.isfinite(m.predict(h=12)["mean"]))
 
 
+def test_even_zero_moving_avg_window_routes_to_odd_message():
+    # pins guard ORDER: even non-positives are NF parity ("odd"), not "positive"
+    with pytest.raises(ValueError, match="odd"):
+        DLinear(h=12, input_size=36, moving_avg_window=0)
+
+
+def test_moving_avg_window_threads_to_predictions():
+    # mutation-probe gap: constructor k must actually reach the net's decomposition
+    y = _make_y()
+    p1 = np.asarray(DLinear(h=12, input_size=36, moving_avg_window=1, max_steps=20,
+                            windows_batch_size=64, random_seed=0).fit(y).predict(h=12)["mean"])
+    p25 = np.asarray(DLinear(h=12, input_size=36, moving_avg_window=25, max_steps=20,
+                             windows_batch_size=64, random_seed=0).fit(y).predict(h=12)["mean"])
+    assert not np.allclose(p1, p25)
+
+
+def test_pickle_round_trip_nondefault_kernel():
+    # __setstate__ rebuilds via _build_net(); shapes are k-independent, so only a
+    # behavioral check catches a rebuild that drops the kernel
+    m = DLinear(h=12, input_size=36, moving_avg_window=7, max_steps=20,
+                windows_batch_size=64, random_seed=0).fit(_make_y())
+    before = np.asarray(m.predict(h=12)["mean"])
+    m2 = pickle.loads(pickle.dumps(m))
+    assert m2.model_.moving_avg_window == 7
+    np.testing.assert_allclose(np.asarray(m2.predict(h=12)["mean"]), before, rtol=1e-5, atol=1e-5)
+
+
 def test_predict_deterministic_same_seed():
     y = _make_y()
     np.testing.assert_allclose(np.asarray(_tiny().fit(y).predict(h=12)["mean"]),
@@ -191,6 +218,24 @@ def test_fitted_values_match_hand_computed():
     m.model_.b_season.value = jnp.full((12,), 0.2, dtype=jnp.float32)
     fitted = np.asarray(m._compute_fitted_values())
     np.testing.assert_allclose(fitted[36:], np.full(24, 0.5), rtol=1e-5)
+
+
+def test_fitted_values_robust_scaler_closed_form():
+    # mutation-probe gap: under identity the shift/scale plumbing is invisible;
+    # robust makes it load-bearing — pred_z=0.5 => fitted = 0.5*scale + shift.
+    from chronax.models.dlinear.dlinear_scaler import RobustScaler
+    y = _make_y(60)
+    m = _tiny(scaler="robust").fit(y)
+    m.model_.w_trend.value = jnp.zeros((12, 36), dtype=jnp.float32)
+    m.model_.w_season.value = jnp.zeros((12, 36), dtype=jnp.float32)
+    m.model_.b_trend.value = jnp.full((12,), 0.3, dtype=jnp.float32)
+    m.model_.b_season.value = jnp.full((12,), 0.2, dtype=jnp.float32)
+    fitted = np.asarray(m._compute_fitted_values())
+    idx = np.arange(36)[None, :] + np.arange(60 - 36)[:, None]
+    win = jnp.asarray(np.asarray(y)[idx])
+    shift, scale = RobustScaler().stats(win, axis=1)
+    expected = 0.5 * np.asarray(scale)[:, 0] + np.asarray(shift)[:, 0]
+    np.testing.assert_allclose(fitted[36:], expected, rtol=1e-4)
 
 
 def test_predict_with_level_returns_interval_keys():

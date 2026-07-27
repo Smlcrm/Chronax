@@ -55,6 +55,17 @@ def test_series_decomp_kernel_larger_than_length():
     np.testing.assert_allclose(np.asarray(trend), np.ones((2, 12)), rtol=1e-6)
 
 
+def test_series_decomp_kernel_larger_than_length_hand_values():
+    # non-constant series pins edge-padding VALUES on the k>L path (the default
+    # regime whenever 3*h < 25), not just shapes
+    y = np.array([[1.0, 2.0, 4.0, 8.0]], dtype=np.float32)
+    trend, _ = _series_decomp(jnp.asarray(y), 25)
+    pad = 12
+    padded = np.concatenate([np.full(pad, 1.0), y[0], np.full(pad, 8.0)])
+    expected = np.array([padded[i:i + 25].mean() for i in range(4)])
+    np.testing.assert_allclose(np.asarray(trend[0]), expected, rtol=1e-6)
+
+
 def test_forward_matches_hand_computed_and_detects_swap():
     net = DLinearNet(h=2, input_size=4, moving_avg_window=3, rngs=nnx.Rngs(0))
     # Wt != Ws (swap-detecting: biases cancel under a swap, weights must differ)
@@ -169,3 +180,17 @@ def test_predict_step_shape_idempotent():
     p2 = predict_step(net, y[-36:], h=12, input_size=36, scaler=IdentityScaler())
     assert p1.shape == (12,)
     np.testing.assert_allclose(np.asarray(p1), np.asarray(p2), rtol=1e-6)
+
+
+def test_predict_step_shift_equivariant_under_robust():
+    # mutation-probe gap: identity ignores shift/scale args, so the inverse-scaling
+    # call-site is invisible under it. Under robust, shifting the context by c
+    # shifts the median by c (MAD unchanged) => prediction must shift by exactly c.
+    from chronax.models.dlinear.dlinear_scaler import RobustScaler
+    net = _net(); y = _y()
+    train(net, y, h=12, input_size=36, max_steps=5, windows_batch_size=64, lr=1e-3,
+          seed=0, scaler=RobustScaler())
+    ctx = y[-36:]
+    base = np.asarray(predict_step(net, ctx, h=12, input_size=36, scaler=RobustScaler()))
+    shifted = np.asarray(predict_step(net, ctx + 50.0, h=12, input_size=36, scaler=RobustScaler()))
+    np.testing.assert_allclose(shifted, base + 50.0, rtol=1e-4, atol=1e-3)
