@@ -8,8 +8,17 @@ The `neuralforecast` side runs in an isolated venv (its PyTorch/Lightning stack
 conflicts with the JAX env):
 
 ```bash
+# Unix / Git Bash / WSL
 bash benchmarks/setup_nf_venv.sh
 ```
+
+```powershell
+# Windows PowerShell
+python -m venv benchmarks\.venv-nf
+.\benchmarks\.venv-nf\Scripts\pip.exe install -r benchmarks\requirements-nf.txt
+```
+
+The harness auto-detects `Scripts\python.exe` (Windows) or `bin/python` (Unix).
 
 ## Run
 

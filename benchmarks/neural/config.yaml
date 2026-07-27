@@ -14,10 +14,9 @@ datasets:
       ds_col: Datetime, y_col: Hourly_Temp, freq: h }
 
 # Models are auto-discovered from chronax.models (any BaseForecaster taking
-# h/input_size/random_seed). Both libraries use matching defaults + MAE loss, and
-# multivariate models get n_series=1 automatically — so nothing is listed per model.
-# Add an optional `overrides:` mapping (model -> chronax_params / nf_params) only to
-# change a param for a specific model.
+# h/input_size/random_seed). MAE loss is forced on both sides; multivariate models
+# get n_series=1 automatically. Use `overrides:` when Chronax and NF defaults
+# diverge (transformers, DeepNPTS, etc.).
 
 overrides:
   # Chronax DeepNPTS is identity-scaled and defaults batch_norm off (its running
@@ -26,3 +25,39 @@ overrides:
   # (JAX vs PyTorch-Lightning), not the preprocessing.
   DeepNPTS:
     nf_params: { scaler_type: identity, batch_norm: false }
+
+  # Autoformer/FEDformer: pin NF to the Chronax port protocol (not NF shipped
+  # defaults of max_steps=5000 / windows_batch_size=1024 / identity scaler).
+  Autoformer:
+    chronax_params:
+      max_steps: 1000
+      batch_size: 32
+      num_lr_decays: 3
+      val_fraction: 0.0
+      val_check_steps: 100
+      early_stop_patience_steps: -1
+      grad_clip: 0.0
+    nf_params:
+      max_steps: 1000
+      windows_batch_size: 32
+      num_lr_decays: 3
+      scaler_type: robust
+      val_check_steps: 100
+      early_stop_patience_steps: -1
+
+  FEDformer:
+    chronax_params:
+      max_steps: 1000
+      batch_size: 32
+      num_lr_decays: 3
+      val_fraction: 0.0
+      val_check_steps: 100
+      early_stop_patience_steps: -1
+      grad_clip: 0.0
+    nf_params:
+      max_steps: 1000
+      windows_batch_size: 32
+      num_lr_decays: 3
+      scaler_type: robust
+      val_check_steps: 100
+      early_stop_patience_steps: -1

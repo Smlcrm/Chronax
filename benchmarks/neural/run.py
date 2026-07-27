@@ -255,7 +255,6 @@ def accept_gate_report(df: pd.DataFrame, models: Sequence[str], datasets: Sequen
 
 WORKER_PY = REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKER_PY = REPO_ROOT / "benchmarks" / "neural" / "worker.py"
-NF_VENV_PY = REPO_ROOT / "benchmarks" / ".venv-nf" / "bin" / "python"
 RESULTS_DIR = REPO_ROOT / "benchmarks" / "benchmark_results" / "neural"
 BASELINES_DIR = REPO_ROOT / "benchmarks" / "baselines"
 
@@ -267,12 +266,32 @@ if str(REPO_ROOT) not in sys.path:
 from benchmarks.neural import registry  # noqa: E402  (after sys.path fixup)
 
 
+def _resolve_nf_venv_py(repo_root: Path) -> Path:
+    """Windows: Scripts/python.exe; Unix: bin/python."""
+    base = Path(repo_root) / "benchmarks" / ".venv-nf"
+    candidates = (
+        base / "Scripts" / "python.exe",
+        base / "bin" / "python",
+        base / "bin" / "python3",
+    )
+    for path in candidates:
+        if path.exists():
+            return path
+    return candidates[0] if sys.platform.startswith("win") else candidates[1]
+
+
+NF_VENV_PY = _resolve_nf_venv_py(REPO_ROOT)
+
+
 def check_nf_venv(libs, venv_py=NF_VENV_PY) -> None:
     """Fail fast up front if NF is requested but .venv-nf is absent (spec §10)."""
     if "nixtla" in libs and not Path(venv_py).exists():
         raise NeuralBenchError(
-            f"{venv_py} not found — run `benchmarks/setup_nf_venv.sh` first "
-            "to create the isolated neuralforecast venv.")
+            f"{venv_py} not found — create the isolated neuralforecast venv first:\n"
+            "  Unix:  bash benchmarks/setup_nf_venv.sh\n"
+            "  Windows:\n"
+            "    python -m venv benchmarks\\.venv-nf\n"
+            "    benchmarks\\.venv-nf\\Scripts\\pip.exe install -r benchmarks\\requirements-nf.txt")
 
 
 def stream_worker_to_csv(model, dataset, library, config_path, csv_path, done, seeds) -> None:

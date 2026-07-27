@@ -10,10 +10,29 @@ pinned via env vars that must be set BEFORE JAX initializes (see main()).
 """
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
-NF_VENV_PY = REPO / "benchmarks" / ".venv-nf" / "bin" / "python"
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+
+
+def _resolve_nf_venv_py(repo_root: Path) -> Path:
+    """Windows: Scripts/python.exe; Unix: bin/python."""
+    base = Path(repo_root) / "benchmarks" / ".venv-nf"
+    candidates = (
+        base / "Scripts" / "python.exe",
+        base / "bin" / "python",
+        base / "bin" / "python3",
+    )
+    for path in candidates:
+        if path.exists():
+            return path
+    return candidates[0] if sys.platform.startswith("win") else candidates[1]
+
+
+NF_VENV_PY = _resolve_nf_venv_py(REPO)
 
 
 def build_thread_env(threads: int) -> dict[str, str]:
