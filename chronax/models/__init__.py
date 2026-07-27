@@ -132,6 +132,20 @@ try:
 except ImportError:
     StemGNN = None
 
+# MLP depends on flax NNX; guard like TCN so an incompatible flax degrades it to None
+# instead of breaking the namespace. GMM (the distribution loss MLP/HINT train with)
+# is importable from chronax.models.mlp.
+try:
+    from .mlp import MLP
+except ImportError:
+    MLP = None
+
+# HINT wraps an MLP base model (flax NNX); guard like MLP.
+try:
+    from .hint import HINT
+except ImportError:
+    HINT = None
+
 from .batched_forecaster import BatchedForecaster
 
 from .xlstm import XLSTM
@@ -181,6 +195,8 @@ __all__ = [
     "SOFTS",
     "TCN",
     "StemGNN",
+    "MLP",
+    "HINT",
     "BatchedForecaster",
     "XLSTM",
 ]

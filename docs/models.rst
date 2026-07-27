@@ -212,3 +212,11 @@ Deep Learning
 .. autoclass:: chronax.models.VanillaTransformer
    :members:
    :undoc-members:
+
+.. autoclass:: chronax.models.MLP
+   :members:
+   :undoc-members:
+
+.. autoclass:: chronax.models.HINT
+   :members:
+   :undoc-members:
