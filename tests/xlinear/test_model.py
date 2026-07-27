@@ -223,3 +223,17 @@ def test_fitted_values_closed_form_use_norm():
     _, mean, stdev = _revin(jnp.asarray(np.asarray(y)[idx]))
     expected = 0.5 * np.asarray(stdev)[:, 0] + np.asarray(mean)[:, 0]
     np.testing.assert_allclose(fitted[36:], expected, rtol=1e-4)
+
+
+def test_xlinear_importable_from_models_namespace():
+    from chronax.models import XLinear as X
+    assert X is XLinear
+
+
+def test_xlinear_auto_discovered_by_benchmark_harness():
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from benchmarks.neural import registry
+    assert "XLinear" in registry.list_models()
+    assert registry.resolve_chronax("XLinear") is XLinear
