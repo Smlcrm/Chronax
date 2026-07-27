@@ -256,3 +256,8 @@ def test_predict_conditions_on_series_end():
     m = _tiny().fit(y)
     pred = np.asarray(m.predict(h=12)["mean"])
     assert np.all(pred > 50.0), pred
+
+
+def test_forecast_raises_on_exog():
+    with pytest.raises(NotImplementedError):
+        _tiny().forecast(_make_y(), h=12, X=jnp.ones((200, 1)))
