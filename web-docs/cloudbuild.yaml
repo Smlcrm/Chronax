@@ -62,6 +62,9 @@ steps:
       - --platform=managed
       - --image=${_IMAGE}:${COMMIT_SHA}
       - --region=${_DEPLOY_REGION}
+      # The serve container reads GEMINI_API_KEY at runtime to power the
+      # "Ask AI" chat endpoint; without it the site is served fully static.
+      - --update-env-vars=GEMINI_API_KEY=${_GEMINI_API_KEY}
       - --quiet
 
 images:
