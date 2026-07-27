@@ -31,7 +31,7 @@ class DLinear(BaseForecaster):
     constraint — which also rejects even non-positives — surfaced here as
     ValueError) and positive (Chronax addition: neuralforecast accepts odd
     negative values and fails only at forward).
-    ``input_size=-1`` (default) expands to ``3*h`` — a Chronax convenience;
+    ``input_size=-1`` (default; any value < 1) expands to ``3*h`` — a Chronax convenience;
     neuralforecast requires ``input_size`` explicitly.
 
     ``scaler``: ``"identity"`` (default, matches neuralforecast) or ``"robust"``.

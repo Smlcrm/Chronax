@@ -18,7 +18,11 @@ from flax import nnx
 
 
 def _series_decomp(y: jnp.ndarray, kernel_size: int) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """NF SeriesDecomp: (trend, seasonal) for ``y: [B, L]`` -> each ``[B, L]``."""
+    """NF SeriesDecomp math; returns ``(trend, seasonal)`` for ``y: [B, L]``.
+
+    Note NF's own ``SeriesDecomp.forward`` returns ``(res, moving_mean)`` — the
+    REVERSE order; values are identical, only the tuple order differs here.
+    """
     pad = (kernel_size - 1) // 2
     y_pad = jnp.pad(y, ((0, 0), (pad, pad)), mode="edge")
     trend = jax.lax.reduce_window(
