@@ -72,6 +72,15 @@ try:
 except ImportError:
     NLinear = None
 
+# XLinear depends on flax NNX (pinned 0.10.x — see chronax/models/xlinear/__init__.py).
+# Guard like NLinear so an incompatible flax degrades this model to None instead of
+# crashing the entire chronax.models namespace; the pin's informative ImportError is
+# swallowed here, but importing chronax.models.xlinear directly surfaces it.
+# (Distinct from XLSTM below — different model family.)
+try:
+    from .xlinear import XLinear
+except ImportError:
+    XLinear = None
 # DLinear depends on flax NNX (pinned 0.10.x — see chronax/models/dlinear/__init__.py).
 # Guard like NLinear so an incompatible flax degrades this model to None instead of
 # crashing the entire chronax.models namespace; the pin's informative ImportError is
@@ -198,6 +207,7 @@ __all__ = [
     "Informer",
     "KAN",
     "NLinear",
+    "XLinear",
     "DLinear",
     "PatchTST",
     "BiTCN",
