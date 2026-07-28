@@ -81,6 +81,14 @@ try:
     from .xlinear import XLinear
 except ImportError:
     XLinear = None
+# DLinear depends on flax NNX (pinned 0.10.x — see chronax/models/dlinear/__init__.py).
+# Guard like NLinear so an incompatible flax degrades this model to None instead of
+# crashing the entire chronax.models namespace; the pin's informative ImportError is
+# swallowed here, but importing chronax.models.dlinear directly surfaces it.
+try:
+    from .dlinear import DLinear
+except ImportError:
+    DLinear = None
 
 # iTransformer / VanillaTransformer depend on flax NNX (flax 0.10.x). If flax's
 # nnx import fails (e.g. an incompatible resolved jax that dropped an API nnx
@@ -142,6 +150,20 @@ try:
 except ImportError:
     StemGNN = None
 
+# MLP depends on flax NNX; guard like TCN so an incompatible flax degrades it to None
+# instead of breaking the namespace. GMM (the distribution loss MLP/HINT train with)
+# is importable from chronax.models.mlp.
+try:
+    from .mlp import MLP
+except ImportError:
+    MLP = None
+
+# HINT wraps an MLP base model (flax NNX); guard like MLP.
+try:
+    from .hint import HINT
+except ImportError:
+    HINT = None
+
 from .batched_forecaster import BatchedForecaster
 
 from .xlstm import XLSTM
@@ -186,12 +208,15 @@ __all__ = [
     "KAN",
     "NLinear",
     "XLinear",
+    "DLinear",
     "PatchTST",
     "BiTCN",
     "DeepNPTS",
     "SOFTS",
     "TCN",
     "StemGNN",
+    "MLP",
+    "HINT",
     "BatchedForecaster",
     "XLSTM",
 ]
