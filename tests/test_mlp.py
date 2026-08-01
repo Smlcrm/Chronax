@@ -295,7 +295,7 @@ class TestMLPNet:
 from chronax.models.mlp.mlp_scaler import IdentityScaler, RobustScaler  # noqa: E402
 from chronax.models.mlp.mlp_losses import mae  # noqa: E402
 from chronax.models.mlp.mlp_training import (  # noqa: E402
-    build_windows, forward_loss, predict_params, train, train_on_windows,
+    build_windows, forward_loss, predict_params, predict_step, train, train_on_windows,
 )
 
 
@@ -380,6 +380,16 @@ class TestMLPTraining:
         assert bool(jnp.all(jnp.isfinite(losses)))
         assert not np.allclose(before, np.asarray(net.out.kernel.value))
 
+    def test_predict_step_batched_matches_single(self):
+        net = MLPNet(h=4, input_size=12, num_layers=2, hidden_size=8,
+                     outputsize_multiplier=1, rngs=nnx.Rngs(0))
+        y = _make_y()
+        ctx = jnp.stack([y[-12:], y[-13:-1]])
+        single = predict_step(net, y[-12:], h=4, input_size=12, scaler=RobustScaler())
+        batched = predict_step(net, ctx, h=4, input_size=12, scaler=RobustScaler())
+        assert batched.shape == (2, 4, 1)
+        np.testing.assert_array_equal(np.asarray(batched[0]), np.asarray(single))
+
     def test_predict_params_batched_matches_single(self):
         from chronax.models.mlp.mlp_losses import GMM
         g = GMM(n_components=2)
@@ -453,13 +463,13 @@ class TestMLPModel:
         g = GMM(n_components=3, num_samples=4000)
         m = _tiny(loss=g).fit(_make_y())
         out = m.predict(h=4, level=[80])
-        args = predict_params(m.model_, m._context, input_size=12,
+        args = predict_params(m.model_, m._contexts, input_size=12,
                               scaler=m._scaler, loss_fn=m._loss_fn)
         np.testing.assert_allclose(np.asarray(out["mean"]),
-                                   np.asarray(g.analytic_mean(args)), rtol=1e-6)
+                                   np.asarray(g.analytic_mean(args)[0]), rtol=1e-6)
         samples = g.sample(args, key=jax.random.PRNGKey(m.random_seed))
-        mc = np.asarray(samples.mean(axis=-1))
-        sd = np.asarray(samples.std(axis=-1))
+        mc = np.asarray(samples.mean(axis=-1))[0]
+        sd = np.asarray(samples.std(axis=-1))[0]
         assert np.all(np.abs(mc - np.asarray(out["mean"])) < 4 * sd / np.sqrt(4000))
 
     def test_predict_level_twice_then_pickle_then_predict_conformal(self):
@@ -525,9 +535,9 @@ class TestMLPModel:
         with pytest.raises(ValueError, match="futr_exog"):
             m.predict(h=4)
 
-    def test_rejects_2d_y(self):
-        with pytest.raises(ValueError, match="1-D"):
-            _tiny().fit(jnp.ones((30, 2)))
+    def test_rejects_3d_y(self):
+        with pytest.raises(ValueError, match="1-D or 2-D"):
+            _tiny().fit(jnp.ones((30, 2, 2)))
 
     def test_short_series_raises(self):
         with pytest.raises(ValueError, match="too short"):
@@ -543,3 +553,134 @@ class TestMLPModel:
         assert (m.input_size, m.num_layers, m.hidden_size) == (12, 2, 1024)
         assert (m.max_steps, m.learning_rate, m.windows_batch_size) == (1000, 1e-3, 1024)
         assert (m.scaler_type, m.loss, m.random_seed) == ("identity", "mae", 1)
+
+
+# =============================================================================
+# Multivariate (cross-learned N-series) surface
+# =============================================================================
+
+def _panel(T=72, seed=0):
+    """Three independent series as columns — a plain panel, no hierarchy."""
+    rng = np.random.RandomState(seed)
+    t = np.arange(T)
+    cols = [10 + 0.2 * t + 2 * np.sin(t / 3.0) + 0.3 * rng.randn(T),
+            30 + 0.1 * t + 3 * np.cos(t / 5.0) + 0.3 * rng.randn(T),
+            5 + 0.05 * t + np.sin(t / 2.0) + 0.2 * rng.randn(T)]
+    return jnp.asarray(np.stack(cols, axis=1), jnp.float32)
+
+
+class TestMLPMultivariate:
+    def test_2d_fit_predict_shapes_gmm(self):
+        from chronax.models.mlp.mlp_losses import GMM
+        m = _tiny(loss=GMM(n_components=2, num_samples=256)).fit(_panel())
+        out = m.predict(h=4, level=[80, 95])
+        assert set(out) == {"mean", "lo-80", "hi-80", "lo-95", "hi-95"}
+        for v in out.values():
+            assert v.shape == (4, 3)
+        assert bool(jnp.all(out["lo-95"] <= out["lo-80"]))
+        assert bool(jnp.all(out["hi-80"] <= out["hi-95"]))
+
+    def test_2d_point_path(self):
+        m = _tiny().fit(_panel())
+        out = m.predict(h=4)
+        assert set(out) == {"mean"} and out["mean"].shape == (4, 3)
+
+    def test_2d_mq_native_path(self):
+        from chronax.models.mlp.mlp_losses import MultiQuantileLoss
+        m = _tiny(loss=MultiQuantileLoss((0.1, 0.5, 0.9))).fit(_panel())
+        out = m.predict(h=4, level=[80])       # 0.10/0.90 are trained quantiles
+        assert out["mean"].shape == (4, 3)
+        assert out["lo-80"].shape == (4, 3)
+        assert bool(jnp.all(out["lo-80"] <= out["hi-80"]))
+        with pytest.raises(ValueError, match="not trained"):
+            m.predict(h=4, level=[95])
+
+    def test_rank_rule(self):
+        y = _make_y()
+        m1 = _tiny().fit(y)
+        assert m1.predict(h=4)["mean"].shape == (4,)
+        m2 = _tiny().fit(y[:, None])
+        assert m2.predict(h=4)["mean"].shape == (4, 1)
+
+    def test_2d_single_column_matches_1d(self):
+        y = _make_y()
+        p1 = _tiny().fit(y).predict(h=4)["mean"]
+        p2 = _tiny().fit(y[:, None]).predict(h=4)["mean"]
+        np.testing.assert_array_equal(np.asarray(p1), np.asarray(p2[:, 0]))
+
+    def test_2d_columns_not_scrambled(self):
+        # Disjoint value ranges per column: the robust per-window scaler anchors
+        # each forecast to its own context median, so a scrambled column order
+        # would land forecasts in the wrong range by construction.
+        rng = np.random.RandomState(0)
+        t = np.arange(60)
+        panel = np.stack([1000.0 + np.sin(t / 3.0) + 0.1 * rng.randn(60),
+                          5000.0 + np.cos(t / 4.0) + 0.1 * rng.randn(60),
+                          9000.0 + np.sin(t / 5.0) + 0.1 * rng.randn(60)], axis=1)
+        m = _tiny(scaler_type="robust", max_steps=5).fit(jnp.asarray(panel, jnp.float32))
+        mean = np.asarray(m.predict(h=4)["mean"])
+        for j, center in enumerate([1000.0, 5000.0, 9000.0]):
+            assert np.all(np.abs(mean[:, j] - center) < 500.0)
+
+    def test_2d_point_level_raises(self):
+        m = _tiny().fit(_panel())
+        m.conformal_params = ConformalIntervals(h=4, n_windows=2)
+        with pytest.raises(ValueError, match="native"):
+            m.predict(h=4, level=[80])
+
+    def test_2d_conformity_scores_raises(self):
+        m = _tiny()
+        m.conformal_params = ConformalIntervals(h=4, n_windows=2)
+        m.fit(_panel())
+        with pytest.raises(ValueError, match="native"):
+            m.conformity_scores(_panel())
+
+    def test_2d_fitted_raises(self):
+        with pytest.raises(NotImplementedError, match="fitted"):
+            _tiny().forecast(_panel(), h=4, fitted=True)
+
+    def test_2d_shared_futr_exog(self):
+        rng = np.random.RandomState(0)
+        T, F = 72, 2
+        x = jnp.asarray(rng.randn(T, F), jnp.float32)
+        m = _tiny().fit(_panel(T), futr_exog=x)
+        out = m.predict(h=4, futr_exog=jnp.asarray(rng.randn(4, F), jnp.float32))
+        assert out["mean"].shape == (4, 3)
+        with pytest.raises(ValueError, match="futr_exog"):
+            m.predict(h=4)
+
+    def test_2d_gmm_shared_futr_exog(self):
+        # Distribution head + 2-D fit + shared exog: predict_params must
+        # broadcast the shared exog window across the batch of contexts.
+        from chronax.models.mlp.mlp_losses import GMM
+        rng = np.random.RandomState(0)
+        T, F = 72, 2
+        x = jnp.asarray(rng.randn(T, F), jnp.float32)
+        m = _tiny(loss=GMM(n_components=2, num_samples=128)).fit(_panel(T), futr_exog=x)
+        out = m.predict(h=4, level=[80],
+                        futr_exog=jnp.asarray(rng.randn(4, F), jnp.float32))
+        assert out["mean"].shape == (4, 3)
+        assert bool(jnp.all(out["lo-80"] <= out["hi-80"]))
+
+    def test_2d_fit_is_vmap_traceable(self):
+        from chronax.models.mlp.mlp_losses import GMM
+        def run(panel):
+            m = MLP(h=4, input_size=12, hidden_size=8, max_steps=3,
+                    windows_batch_size=16, random_seed=0,
+                    loss=GMM(n_components=2, num_samples=64))
+            m.fit(panel)
+            return m.predict(h=4)["mean"]
+        panels = jnp.stack([_panel(seed=0), _panel(seed=1)])
+        out = jax.vmap(run)(panels)
+        assert out.shape == (2, 4, 3) and bool(jnp.all(jnp.isfinite(out)))
+
+    def test_2d_pickle_roundtrip_and_twice(self):
+        from chronax.models.mlp.mlp_losses import GMM
+        m = _tiny(loss=GMM(n_components=2, num_samples=128)).fit(_panel())
+        o1 = m.predict(h=4, level=[90])
+        o2 = m.predict(h=4, level=[90])
+        np.testing.assert_array_equal(np.asarray(o1["hi-90"]), np.asarray(o2["hi-90"]))
+        m2 = pickle.loads(pickle.dumps(m))
+        o3 = m2.predict(h=4, level=[90])
+        for k in o1:
+            np.testing.assert_array_equal(np.asarray(o1[k]), np.asarray(o3[k]))

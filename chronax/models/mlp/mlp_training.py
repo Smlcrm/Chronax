@@ -195,36 +195,44 @@ def _forward_det(net, insample_z, futr_z):
 
 
 def predict_step(net, y_context, *, h, input_size, scaler, futr_full=None):
-    """Forecast next ``h`` steps from the final ``input_size`` of the series.
+    """Forecast next ``h`` steps from per-series contexts, in the **original**
+    scale (point/quantile heads only — distribution heads go through
+    ``predict_params``).
 
-    Returns ``[h, multiplier]`` in the **original** scale (point/quantile heads
-    only — distribution heads go through ``predict_params``). ``futr_full`` is
-    the ``[input_size+h, F]`` future-known window (history + horizon).
+    ``y_context`` is ``[L]`` (one series) or ``[B, L]`` (a batch of series
+    tails); returns ``[h, multiplier]`` / ``[B, h, multiplier]`` accordingly.
+    ``futr_full`` (``[input_size+h, F]``, history + horizon) is shared across a
+    batch of contexts.
     """
-    insample = y_context[None, :]                       # [1, L]
-    shift, scale = scaler.stats(insample, axis=1)
-    insample_z = scaler.transform(insample, shift, scale)[..., None]   # [1, L, 1]
-    futr_z = (_scale_exog(futr_full[None], scaler, stats_len=input_size)
-              if futr_full is not None else None)
-    pred_z = _forward_det(net, insample_z, futr_z)[0]  # [h, mult]
-    return scaler.inverse(pred_z, shift[0, 0], scale[0, 0])
+    single = y_context.ndim == 1
+    ctx = y_context[None, :] if single else y_context   # [B, L]
+    shift, scale = scaler.stats(ctx, axis=1)            # [B, 1]
+    insample_z = scaler.transform(ctx, shift, scale)[..., None]        # [B, L, 1]
+    futr_z = None
+    if futr_full is not None:
+        futr_z = _scale_exog(futr_full[None], scaler, stats_len=input_size)
+        futr_z = jnp.broadcast_to(futr_z, (ctx.shape[0],) + futr_z.shape[1:])
+    pred_z = _forward_det(net, insample_z, futr_z)      # [B, h, mult]
+    out = scaler.inverse(pred_z, shift[..., None], scale[..., None])
+    return out[0] if single else out
 
 
 def predict_params(net, y_context, *, input_size, scaler, loss_fn, futr_full=None):
     """Distribution parameters for the next ``h`` steps, in the ORIGINAL scale.
 
     ``y_context`` is ``[L]`` (one series) or ``[B, L]`` (a batch of contexts —
-    the hierarchical caller's per-series tails); returns the loss's decoupled
-    parameter tuple with arrays ``[h, K]`` / ``[B, h, K]`` accordingly.
-    ``futr_full`` (``[input_size+h, F]``) is supported for the single-context
-    form only.
+    per-series tails); returns the loss's decoupled parameter tuple with arrays
+    ``[h, K]`` / ``[B, h, K]`` accordingly. ``futr_full`` (``[input_size+h, F]``,
+    history + horizon) is shared across a batch of contexts.
     """
     single = y_context.ndim == 1
     ctx = y_context[None, :] if single else y_context   # [B, L]
     shift, scale = scaler.stats(ctx, axis=1)            # [B, 1]
     insample_z = scaler.transform(ctx, shift, scale)[..., None]
-    futr_z = (_scale_exog(futr_full[None], scaler, stats_len=input_size)
-              if futr_full is not None else None)
+    futr_z = None
+    if futr_full is not None:
+        futr_z = _scale_exog(futr_full[None], scaler, stats_len=input_size)
+        futr_z = jnp.broadcast_to(futr_z, (ctx.shape[0],) + futr_z.shape[1:])
     raw = _forward_det(net, insample_z, futr_z)         # [B, h, mult]
     distr_args = loss_fn.domain_map(raw)
     distr_args = loss_fn.scale_decouple(distr_args, loc=shift[..., None],
