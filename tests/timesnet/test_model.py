@@ -287,3 +287,17 @@ def test_conformity_scores_finite_2d_and_reuses_parent_periods():
     cs = m.conformity_scores(_make_y(80))
     assert cs.ndim == 2 and cs.shape[1] == 4 and jnp.all(jnp.isfinite(cs))
     assert m.periods_ == periods_before      # traced re-fits reuse, never clobber
+
+
+def test_timesnet_importable_from_models_namespace():
+    from chronax.models import TimesNet as T
+    assert T is TimesNet
+
+
+def test_timesnet_auto_discovered_by_benchmark_harness():
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from benchmarks.neural import registry
+    assert "TimesNet" in registry.list_models()
+    assert registry.resolve_chronax("TimesNet") is TimesNet

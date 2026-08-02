@@ -72,6 +72,13 @@ try:
 except ImportError:
     NLinear = None
 
+# TimesNet depends on flax NNX (pinned 0.10.x — see chronax/models/timesnet/__init__.py);
+# same guard and trade-off as NLinear above.
+try:
+    from .timesnet import TimesNet
+except ImportError:
+    TimesNet = None
+
 # iTransformer / VanillaTransformer depend on flax NNX (flax 0.10.x). If flax's
 # nnx import fails (e.g. an incompatible resolved jax that dropped an API nnx
 # needs), guard like PatchTST/BiTCN so the model degrades to None instead of
@@ -175,6 +182,7 @@ __all__ = [
     "Informer",
     "KAN",
     "NLinear",
+    "TimesNet",
     "PatchTST",
     "BiTCN",
     "DeepNPTS",
