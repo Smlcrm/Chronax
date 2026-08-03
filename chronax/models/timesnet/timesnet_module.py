@@ -67,18 +67,25 @@ class TimesNetNet(nnx.Module):
 
     def __init__(self, h: int, input_size: int, hidden_size: int, conv_hidden_size: int,
                  top_k: int, num_kernels: int, encoder_layers: int, dropout: float,
-                 periods: tuple, freqs: tuple, *, rngs: nnx.Rngs):
+                 periods: tuple[int, ...], freqs: tuple[int, ...], *, rngs: nnx.Rngs):
+        T = input_size + h
+        # periods/freqs are parallel (period = T // freq); each freq must index a
+        # nonzero rfft bin, else the in-graph `amp[:, freqs]` gather silently
+        # clamps to a wrong index instead of erroring. The wrapper's _compute_periods
+        # guarantees this; validate so a hand-built net fails loudly, not numerically.
+        if len(periods) != len(freqs) or len(freqs) != top_k:
+            raise ValueError(f"periods/freqs must be parallel tuples of length top_k={top_k}; "
+                             f"got len(periods)={len(periods)}, len(freqs)={len(freqs)}.")
+        if any(not (1 <= int(f) <= T // 2) for f in freqs):
+            raise ValueError(f"every freq must be in [1, {T // 2}] (nonzero rfft bins of a "
+                             f"length-{T} window); got freqs={tuple(int(f) for f in freqs)}.")
         self.h = h
         self.input_size = input_size
         self.hidden_size = hidden_size
-        self.conv_hidden_size = conv_hidden_size
-        self.top_k = top_k
-        self.num_kernels = num_kernels
         self.encoder_layers = encoder_layers
         self.dropout = dropout
         self.periods = tuple(int(p) for p in periods)
         self.freqs = tuple(int(f) for f in freqs)
-        T = input_size + h
         n_lin = 2                                   # predict_linear + projection
         # keys: 1 token conv + 2 per linear + 1 per conv2d (bias is zero-init, no draw)
         keys = jax.random.split(rngs.params(), 1 + 2 * n_lin + 2 * encoder_layers * num_kernels)

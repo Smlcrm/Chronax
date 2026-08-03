@@ -226,3 +226,27 @@ def test_predict_step_shift_equivariant_standard_scaler():
     p = predict_step(net, y[-8:], h=4, input_size=8, scaler=StandardScaler())
     p_shift = predict_step(net, y[-8:] + 100.0, h=4, input_size=8, scaler=StandardScaler())
     np.testing.assert_allclose(np.asarray(p_shift), np.asarray(p) + 100.0, rtol=1e-4)
+
+
+def test_net_rejects_mismatched_periods_freqs():
+    with pytest.raises(ValueError, match="parallel tuples"):
+        TimesNetNet(h=4, input_size=8, hidden_size=8, conv_hidden_size=8, top_k=2,
+                    num_kernels=2, encoder_layers=1, dropout=0.1, periods=(4,), freqs=(3,),
+                    rngs=nnx.Rngs(0))
+
+
+def test_net_rejects_out_of_range_freq():
+    # T=12 -> nonzero rfft bins are [1, 6]; freq 99 would silently clamp the gather
+    with pytest.raises(ValueError, match="every freq"):
+        TimesNetNet(h=4, input_size=8, hidden_size=8, conv_hidden_size=8, top_k=2,
+                    num_kernels=2, encoder_layers=1, dropout=0.1, periods=(4, 3), freqs=(3, 99),
+                    rngs=nnx.Rngs(0))
+
+
+def test_single_shared_layernorm_leaf_pair():
+    # Lock the shared-LayerNorm design: exactly one (scale, bias) pair regardless
+    # of encoder_layers — a per-layer-list implementation would show 2*L leaves.
+    net = _net(encoder_layers=3)
+    _, state = nnx.split(net)
+    ln_leaves = [tuple(p) for p, _ in nnx.to_flat_state(state) if any("ln_" in str(x) for x in p)]
+    assert len(ln_leaves) == 2, ln_leaves

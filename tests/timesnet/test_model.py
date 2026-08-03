@@ -138,7 +138,8 @@ def test_periods_set_after_fit_and_data_dependent():
         assert len(m.periods_) == 1 and len(m.freqs_) == 1
         assert m.periods_[0] == T // m.freqs_[0] and 1 <= m.freqs_[0] <= T // 2
     # period-8 tone -> freq bin 2 of a length-16 window; period-25 tone -> bin 1
-    assert m1.periods_ != m2.periods_
+    assert m1.freqs_ == (2,) and m1.periods_ == (8,)
+    assert m2.freqs_ == (1,) and m2.periods_ == (16,)
 
 
 def test_model_beats_naive_on_easy_signal():
@@ -301,3 +302,21 @@ def test_timesnet_auto_discovered_by_benchmark_harness():
     from benchmarks.neural import registry
     assert "TimesNet" in registry.list_models()
     assert registry.resolve_chronax("TimesNet") is TimesNet
+
+
+def test_h_below_one_raises_at_construction():
+    with pytest.raises(ValueError, match="positive"):
+        TimesNet(h=0, input_size=12, hidden_size=8, conv_hidden_size=8, top_k=2,
+                 num_kernels=2, encoder_layers=1)
+
+
+def test_fit_raises_on_non_finite_series():
+    y = _make_y().at[50].set(jnp.nan)
+    with pytest.raises(ValueError, match="non-finite"):
+        _tiny().fit(y)
+
+
+def test_default_input_size_expands_to_3h():
+    # Guard-order lock: input_size=-1 must expand to 3*h BEFORE the top_k guard,
+    # so a default-input_size construction succeeds (a swapped guard would raise).
+    assert TimesNet(h=4).input_size == 12

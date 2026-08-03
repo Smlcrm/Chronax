@@ -16,7 +16,7 @@ from chronax.models.timesnet.timesnet_training import predict_step, train
 
 
 def _compute_periods(y: np.ndarray, input_size: int, h: int, top_k: int,
-                     scaler: Scaler) -> tuple[tuple, tuple]:
+                     scaler: Scaler) -> tuple[tuple[int, ...], tuple[int, ...]]:
     """Static per-fit periods from the CONFIGURED-scaler-scaled training windows.
 
     DISCLOSED DIVERGENCE from neuralforecast: NF re-selects top-k per batch from
@@ -68,10 +68,10 @@ class TimesNet(BaseForecaster):
     sequence — at init that operand's spectrum is dominated by positional-
     encoding and random-init artifacts rather than the data (observed dev-time:
     zero overlap with the raw-data top-k on the airline series), so the data
-    spectrum is also the more principled selector. Consequences are adjudicated
-    by the committed accuracy benchmark, not assumed. ``conformity_scores``'
-    vmapped re-fits see traced data and REUSE the parent fit's periods
-    (``periods_``/``freqs_``, also pickled).
+    spectrum is arguably the more principled selector. Consequences are
+    adjudicated by the committed accuracy benchmark, not assumed. Any ``fit``
+    under a JAX trace (``conformity_scores``' vmapped re-fits) reuses the parent
+    fit's periods (``periods_``/``freqs_``, also pickled) rather than recomputing.
 
     Maintenance Status:
         Active univariate forecaster. Integrates with the ``BaseForecaster``
@@ -84,8 +84,10 @@ class TimesNet(BaseForecaster):
     ``scaler``: ``"standard"`` (default, matches neuralforecast's
     ``scaler_type='standard'``), ``"identity"``, or ``"robust"``. Constructor
     guards (``top_k`` within the window's nonzero rfft bins, ``num_kernels``/
-    ``encoder_layers`` >= 1) are Chronax additions — neuralforecast fails later
-    and more obscurely on the same inputs. ``float32`` throughout, matching
+    ``encoder_layers`` >= 1, ``h`` >= 1) are Chronax additions — on the same
+    inputs neuralforecast fails later and more obscurely (``top_k``,
+    ``num_kernels``) or silently trains a degenerate model (``encoder_layers=0``
+    builds an empty block list). ``float32`` throughout, matching
     torch/neuralforecast defaults.
     """
 
@@ -98,6 +100,8 @@ class TimesNet(BaseForecaster):
                  windows_batch_size: int = 64, loss: Union[str, LossFn] = "mae",
                  scaler: Union[str, Scaler] = "standard", random_seed: int = 1,
                  alias: str = "TimesNet"):
+        if h < 1:
+            raise ValueError(f"h must be a positive integer; got h={h}.")
         if input_size < 1:
             input_size = 3 * h
         if top_k < 1:
@@ -127,8 +131,8 @@ class TimesNet(BaseForecaster):
         self.alias = alias
         self.conformal_params = None
         self.model_: TimesNetNet | None = None
-        self.periods_: tuple | None = None
-        self.freqs_: tuple | None = None
+        self.periods_: tuple[int, ...] | None = None
+        self.freqs_: tuple[int, ...] | None = None
         self._context: jnp.ndarray | None = None
         self._train_y: jnp.ndarray | None = None
 
@@ -174,6 +178,9 @@ class TimesNet(BaseForecaster):
                     "concrete fit: static periods are computed from concrete data and reused "
                     "for traced re-fits.") from None
         else:
+            if not np.isfinite(y_host).all():
+                raise ValueError("y contains non-finite values (NaN/inf); its spectrum would "
+                                 "yield meaningless periods and a diverged fit.")
             self.periods_, self.freqs_ = _compute_periods(
                 y_host, self.input_size, self.h, self.top_k, scaler)
         net = self._build_net()
