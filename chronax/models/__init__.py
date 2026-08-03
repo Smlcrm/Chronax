@@ -136,6 +136,14 @@ try:
 except ImportError:
     SOFTS = None
 
+# SOFTSSharp (SOFTS#) hard-pins flax 0.10.x (raises ImportError otherwise); guard like
+# SOFTS so a version/availability mismatch degrades to SOFTSSharp=None instead of
+# breaking the namespace.
+try:
+    from .softssharp import SOFTSSharp
+except ImportError:
+    SOFTSSharp = None
+
 # TCN depends on flax NNX; guard like BiTCN so an incompatible flax degrades it to None
 # instead of breaking the namespace.
 try:
@@ -213,6 +221,7 @@ __all__ = [
     "BiTCN",
     "DeepNPTS",
     "SOFTS",
+    "SOFTSSharp",
     "TCN",
     "StemGNN",
     "MLP",
