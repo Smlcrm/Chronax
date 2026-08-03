@@ -249,7 +249,25 @@ class TransEncoderLayer(nnx.Module):
 
 
 class TransEncoder(nnx.Module):
-    """Stack of ``e_layers`` encoder layers plus a final LayerNorm (NF ``norm_layer``)."""
+    """Stack of ``e_layers`` encoder layers. NO final LayerNorm — see below.
+
+    NF's ``common._modules.TransEncoder`` takes an OPTIONAL ``norm_layer`` and
+    applies it only ``if self.norm is not None``. SOFTS builds the encoder
+    positionally::
+
+        TransEncoder([TransEncoderLayer(STAD(...), ...) for l in range(e_layers)])
+
+    with no ``norm_layer`` argument, so the reference has no final normalization
+    and the encoder output feeds ``projection`` directly — NF's ``state_dict``
+    has no ``encoder.norm.*`` entry at all.
+
+    The difference is subtler than it looks, and worth stating precisely: every
+    layer already ENDS in ``norm2``, so an extra final LayerNorm is near-identity
+    at initialization (re-normalizing an already-normalized vector). What it is
+    not is free — its scale and bias are learnable, so it would hand the port
+    ``2 * hidden_size`` trainable parameters the reference does not have, and a
+    learned per-feature affine applied immediately before the projector.
+    """
 
     def __init__(self, *, e_layers, hidden_size, d_core, d_ff, dropout,
                  activation="gelu", rngs: nnx.Rngs):
@@ -260,12 +278,11 @@ class TransEncoder(nnx.Module):
             )
             for _ in range(e_layers)
         ]
-        self.norm = nnx.LayerNorm(hidden_size, epsilon=1e-5, rngs=rngs)
 
     def __call__(self, x, deterministic: bool):
         for layer in self.layers:
             x = layer(x, deterministic=deterministic)
-        return self.norm(x)
+        return x
 
 
 class SOFTSNet(nnx.Module):

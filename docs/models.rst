@@ -201,6 +201,10 @@ Deep Learning
    :members:
    :undoc-members:
 
+.. autoclass:: chronax.models.SOFTSSharp
+   :members:
+   :undoc-members:
+
 .. autoclass:: chronax.models.TCN
    :members:
    :undoc-members:
