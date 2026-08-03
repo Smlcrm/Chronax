@@ -6,12 +6,60 @@ experiment:
   threads: 1                    # equal CPU thread budget pinned for BOTH libraries
 
 datasets:
-  - { name: AirlinePassengers, path: benchmarks/benchmark_datasets/airline-passengers.csv,
+  # --- univariate (legacy) ---
+  - { name: AirlinePassengers, kind: univariate, path: benchmarks/benchmark_datasets/airline-passengers.csv,
       ds_col: Month,    y_col: Passengers,  freq: MS }
-  - { name: DailyFemaleBirths, path: benchmarks/benchmark_datasets/daily-total-female-births.csv,
+  - { name: DailyFemaleBirths, kind: univariate, path: benchmarks/benchmark_datasets/daily-total-female-births.csv,
       ds_col: Date,     y_col: Births,      freq: D }
-  - { name: RoomTemperature,   path: "benchmarks/benchmark_datasets/room temperature data.csv",
+  - { name: RoomTemperature, kind: univariate, path: "benchmarks/benchmark_datasets/room temperature data.csv",
       ds_col: Datetime, y_col: Hourly_Temp, freq: h }
+
+  # --- multivariate (TempusBench, non-Kaggle, <=4 features) ---
+  - name: GA4EcommerceKPI
+    kind: multivariate
+    path: benchmarks/benchmark_datasets/ga4-ecommerce-kpi.csv
+    ds_col: Datetime
+    y_cols: [daily_pageviews, daily_active_users, daily_purchase_events, daily_revenue_usd]
+    freq: D
+    h: 7
+    input_size: 35
+  - name: WeeklyCushingUS
+    kind: multivariate
+    path: benchmarks/benchmark_datasets/weekly-cushing-us.csv
+    ds_col: Datetime
+    y_cols: [cushing_crude_oil_stocks, refinery_utilization, loaded_tanker_transits_us_gulf_lag4w]
+    freq: W-WED
+  - name: SplitSmartACEnergy
+    kind: multivariate
+    path: benchmarks/benchmark_datasets/splitsmart-ac-energy.csv
+    ds_col: Datetime
+    y_cols: [electrical_current, voltage, power_factor, room_temperature]
+    freq: 2min
+
+  # --- covariate (TempusBench, non-Kaggle, <=4 features) ---
+  - name: GA4RevenueTraffic
+    kind: covariate
+    path: benchmarks/benchmark_datasets/ga4-revenue-traffic.csv
+    ds_col: Datetime
+    y_col: daily_revenue_usd
+    hist_exog_cols: [percent_mobile_traffic, percent_paid_traffic]
+    freq: D
+    h: 7
+    input_size: 35
+  - name: GEFCom2014PV
+    kind: covariate
+    path: benchmarks/benchmark_datasets/gefcom2014-pv.csv
+    ds_col: Datetime
+    y_col: normalized_solar_power_output
+    hist_exog_cols: [global_horizontal_irradiance, air_temperature_at_2_meters, total_cloud_cover]
+    freq: h
+  - name: CapitalBikeshare
+    kind: covariate
+    path: benchmarks/benchmark_datasets/capital-bikeshare.csv
+    ds_col: Datetime
+    y_col: bike_trips
+    hist_exog_cols: [temp, hum, windspeed]
+    freq: D
 
 # Models are auto-discovered from chronax.models (any BaseForecaster taking
 # h/input_size/random_seed). MAE loss is forced on both sides; multivariate models

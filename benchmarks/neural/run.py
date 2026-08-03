@@ -28,6 +28,49 @@ class ConfigError(NeuralBenchError):
 
 
 _REQUIRED_EXP = {"h", "input_size", "seeds", "warmup_seeds", "threads"}
+_DATASET_KINDS = {"univariate", "multivariate", "covariate"}
+_MAX_FEATURES = 4
+
+
+def _validate_dataset_entry(d: dict, idx: int) -> None:
+    """Validate one datasets[] entry (kind, columns, optional h/input_size)."""
+    if not isinstance(d, dict):
+        raise ConfigError(f"datasets[{idx}] must be a mapping")
+    name = d.get("name")
+    label = repr(name) if name else f"datasets[{idx}]"
+    for key in ("name", "path", "ds_col", "freq"):
+        if not d.get(key):
+            raise ConfigError(f"{label} missing required key {key!r}")
+    kind = d.get("kind", "univariate")
+    if kind not in _DATASET_KINDS:
+        raise ConfigError(f"{label} kind must be one of {sorted(_DATASET_KINDS)}, got {kind!r}")
+    for opt in ("h", "input_size"):
+        if opt in d and (not isinstance(d[opt], int) or d[opt] < 1):
+            raise ConfigError(f"{label} {opt} must be a positive int")
+    if kind == "univariate":
+        if not d.get("y_col"):
+            raise ConfigError(f"{label} univariate dataset requires y_col")
+        n_feat = 1
+    elif kind == "multivariate":
+        y_cols = d.get("y_cols")
+        if not isinstance(y_cols, list) or not (2 <= len(y_cols) <= _MAX_FEATURES):
+            raise ConfigError(
+                f"{label} multivariate y_cols must be a list of length 2..{_MAX_FEATURES}")
+        if any(not isinstance(c, str) or not c for c in y_cols):
+            raise ConfigError(f"{label} multivariate y_cols must be non-empty strings")
+        n_feat = len(y_cols)
+    else:  # covariate
+        if not d.get("y_col"):
+            raise ConfigError(f"{label} covariate dataset requires y_col")
+        exog = d.get("hist_exog_cols")
+        if not isinstance(exog, list) or not exog:
+            raise ConfigError(f"{label} covariate dataset requires non-empty hist_exog_cols")
+        if any(not isinstance(c, str) or not c for c in exog):
+            raise ConfigError(f"{label} hist_exog_cols must be non-empty strings")
+        n_feat = 1 + len(exog)
+    if n_feat > _MAX_FEATURES:
+        raise ConfigError(
+            f"{label} has {n_feat} features; max allowed is {_MAX_FEATURES}")
 
 
 def validate_config(cfg: dict) -> None:
@@ -42,6 +85,8 @@ def validate_config(cfg: dict) -> None:
         raise ConfigError(f"experiment missing keys: {sorted(missing)}")
     if not cfg.get("datasets"):
         raise ConfigError("no datasets defined")
+    for i, d in enumerate(cfg["datasets"]):
+        _validate_dataset_entry(d, i)
     overrides = cfg.get("overrides")
     if overrides is not None:
         if not isinstance(overrides, dict):
@@ -255,6 +300,13 @@ def accept_gate_report(df: pd.DataFrame, models: Sequence[str], datasets: Sequen
 
 WORKER_PY = REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKER_PY = REPO_ROOT / "benchmarks" / "neural" / "worker.py"
+_NF_ROOT = REPO_ROOT / "benchmarks" / ".venv-nf"
+# Windows venvs use Scripts/python.exe; Unix uses bin/python.
+NF_VENV_PY = (
+    _NF_ROOT / "Scripts" / "python.exe"
+    if (_NF_ROOT / "Scripts" / "python.exe").exists()
+    else _NF_ROOT / "bin" / "python"
+)
 RESULTS_DIR = REPO_ROOT / "benchmarks" / "benchmark_results" / "neural"
 BASELINES_DIR = REPO_ROOT / "benchmarks" / "baselines"
 
