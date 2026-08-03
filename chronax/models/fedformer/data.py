@@ -32,21 +32,6 @@ _MAD_TO_STD = 0.6744897501960817
 _EPS = 1e-6
 
 
-def _torch_median(x: jnp.ndarray, axis: int = 1, keepdims: bool = True) -> jnp.ndarray:
-    """Median matching ``torch.median`` / ``nanmedian`` (lower middle on even n).
-
-    ``jnp.median`` averages the two central elements for even lengths; PyTorch
-    takes index ``(n-1)//2`` after sorting. RobustScaler windows use even
-    ``input_size`` (72), so this matters for NF parity.
-    """
-    x_sorted = jnp.sort(x, axis=axis)
-    idx = (x.shape[axis] - 1) // 2
-    med = jnp.take(x_sorted, idx, axis=axis)
-    if keepdims:
-        med = jnp.expand_dims(med, axis=axis)
-    return med
-
-
 class RobustScaler:
     """Median + MAD scaler with a std-based fallback when MAD == 0.
 
@@ -71,8 +56,8 @@ class RobustScaler:
         std-derived value when the MAD is zero (e.g. a near-constant window),
         and finally to 1 to avoid division by zero.
         """
-        median = _torch_median(x, axis=axis, keepdims=True)
-        mad = _torch_median(jnp.abs(x - median), axis=axis, keepdims=True)
+        median = jnp.median(x, axis=axis, keepdims=True)
+        mad = jnp.median(jnp.abs(x - median), axis=axis, keepdims=True)
         mean = jnp.mean(x, axis=axis, keepdims=True)
         std = jnp.sqrt(jnp.mean((x - mean) ** 2, axis=axis, keepdims=True))
         fallback = std * _MAD_TO_STD
@@ -98,59 +83,49 @@ class RobustScaler:
 # ---------------------------------------------------------------------------
 
 
-def build_windows(
-    y: np.ndarray, input_size: int, h: int
-) -> Tuple[np.ndarray, np.ndarray]:
-    """NF-style rolling windows with right-padding (``ConstantPad1d((0, h))``).
+def build_windows(y: np.ndarray, input_size: int, h: int) -> np.ndarray:
+    """Return ``[n_windows, input_size + h]`` sliding windows (stride 1).
 
-    Right-pads ``y`` with ``h`` zeros before unfolding, yielding
-    ``len(y) - input_size`` windows of length ``input_size + h`` — including
-    partial-horizon windows whose context reaches the end of the series.
-    Returns ``(windows, mask)`` where ``mask`` is 1 on real points and 0 on the
-    padded tail so the loss can drop padded horizon steps.
+    Each row is a contiguous ``[history | horizon]`` slice; the training loop
+    later splits it at ``input_size``.
+
+    Args:
+        y: 1-D series of length ``T``.
+        input_size: History window length ``L``.
+        h: Forecast horizon.
 
     Raises:
-        ValueError: When ``T < input_size + 1`` (no window with a real outsample).
+        ValueError: When ``T < input_size + h`` (no complete window fits).
     """
     y = np.asarray(y, dtype=np.float32).ravel()
-    n_real = len(y)
-    n = n_real - input_size  # NF keeps windows with >=1 valid outsample
-    if n < 1:
-        raise ValueError(
-            f"Series length {n_real} is too short for "
-            f"input_size={input_size}, h={h} (need at least {input_size + 1})."
-        )
     window_size = input_size + h
-    y_pad = np.concatenate([y, np.zeros(h, dtype=np.float32)])
-    avail = np.concatenate([np.ones(n_real, dtype=np.float32), np.zeros(h, dtype=np.float32)])
+    n = len(y) - window_size + 1
+    if n <= 0:
+        raise ValueError(
+            f"Series length {len(y)} is too short for "
+            f"input_size={input_size}, h={h} (need at least {window_size})."
+        )
+    # Vectorised index matrix: row i = [i, i+1, ..., i+window_size-1].
     idx = np.arange(window_size)[None, :] + np.arange(n)[:, None]
-    return y_pad[idx], avail[idx]
+    return y[idx]
 
 
 def split_train_val_windows(
-    windows: np.ndarray,
-    masks: np.ndarray,
-    *,
-    val_fraction: float = 0.1,
-) -> Tuple[Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]]:
+    windows: np.ndarray, *, val_fraction: float = 0.1
+) -> Tuple[np.ndarray, np.ndarray]:
     """Chronological split: earliest windows train, latest validate.
 
     A time-ordered split (no shuffling) avoids leaking future information into
     the training set. When ``val_fraction <= 0`` all windows train (empty val).
-    Returns ``((train_windows, train_masks), (val_windows, val_masks))``.
     """
     n = len(windows)
     if n < 1:
         raise ValueError("windows must be non-empty.")
     if val_fraction <= 0.0 or n < 2:
-        empty_w, empty_m = windows[:0], masks[:0]
-        return (windows, masks), (empty_w, empty_m)
+        return windows, windows[:0]
     n_val = max(1, int(n * val_fraction))
     n_train = max(1, n - n_val)
-    return (
-        (windows[:n_train], masks[:n_train]),
-        (windows[n_train:], masks[n_train:]),
-    )
+    return windows[:n_train], windows[n_train:]
 
 
 # ---------------------------------------------------------------------------

@@ -1,19 +1,9 @@
 """Chronax FEDformer -- JAX/Flax/Optax univariate forecaster.
 
-Public entry point is :class:`FEDformer` (exported from ``chronax.models``).
-The lower-level Flax modules and math primitives are re-exported for advanced
-use and testing. ``FEDformerForecaster`` remains as a deprecated config-based alias.
+Public entry point is :class:`FEDformerForecaster` (exported under the registry
+name ``FEDformer`` from ``chronax.models``). The lower-level Flax modules and
+math primitives are re-exported for advanced use and testing.
 """
-import flax
-
-# Pinned to flax 0.10.x — linen TrainState / Module APIs have churned across
-# minor versions. Loud failure here beats silent miscompilation on a newer flax.
-if not flax.__version__.startswith("0.10"):
-    raise ImportError(
-        f"chronax.models.FEDformer is pinned to flax==0.10.x; got flax {flax.__version__}. "
-        f"The linen training loop and TrainState wiring will likely need updates "
-        f"on a newer flax."
-    )
 
 from chronax.models.fedformer.data import (
     RobustScaler,
@@ -23,7 +13,7 @@ from chronax.models.fedformer.data import (
     pad_sequence,
     split_train_val_windows,
 )
-from chronax.models.fedformer.forecaster import FEDformer, FEDformerForecaster
+from chronax.models.fedformer.forecaster import FEDformerForecaster
 from chronax.models.fedformer.loss import (
     LOSSES,
     LossFn,
@@ -56,14 +46,15 @@ from chronax.models.fedformer.train import (
     eval_step,
     eval_window_step,
     make_lr_schedule,
-    predict_step,
     sample_batch_indices,
     should_stop_early,
-    train,
     train_loop,
     train_step,
     train_window_step,
 )
+
+# Public registry alias: ``from chronax.models import FEDformer``.
+FEDformer = FEDformerForecaster
 
 __all__ = [
     # Config + model
@@ -83,8 +74,8 @@ __all__ = [
     "series_decomp",
     "get_frequency_modes",
     # High-level forecaster
+    "FEDformerForecaster",
     "FEDformer",
-    "FEDformerForecaster",  # deprecated alias
     # Data utilities
     "RobustScaler",
     "build_windows",
@@ -109,8 +100,6 @@ __all__ = [
     "train_window_step",
     "eval_window_step",
     "train_loop",
-    "train",
-    "predict_step",
     "make_lr_schedule",
     "sample_batch_indices",
     "should_stop_early",

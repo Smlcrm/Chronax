@@ -2,9 +2,9 @@
 import pytest
 
 from benchmarks.neural import registry
-from chronax.models import Autoformer, FEDformer, GRU, KAN, PatchTST, TFT, iTransformer
+from chronax.models import GRU, KAN, PatchTST, TFT, iTransformer
 
-_WIRED = {"GRU", "PatchTST", "KAN", "TFT", "iTransformer", "Autoformer", "FEDformer"}
+_WIRED = {"GRU", "PatchTST", "KAN", "TFT", "iTransformer"}
 
 
 def test_discovers_wired_neural_models():
@@ -13,24 +13,14 @@ def test_discovers_wired_neural_models():
 
 def test_excludes_non_benchmarkable():
     models = set(registry.list_models())
-    # statistical models (no input_size), XLSTM (ctx_len/horizon_train convention)
-    # must not be auto-discovered.
-    for name in ["ARIMA", "AutoETS", "Naive", "XLSTM"]:
+    # statistical models (no input_size), XLSTM (ctx_len/horizon_train convention),
+    # Autoformer (not a BaseForecaster) must not be auto-discovered.
+    for name in ["ARIMA", "AutoETS", "Naive", "XLSTM", "Autoformer"]:
         assert name not in models
 
 
-@pytest.mark.parametrize(
-    "name,cls",
-    [
-        ("GRU", GRU),
-        ("PatchTST", PatchTST),
-        ("KAN", KAN),
-        ("TFT", TFT),
-        ("iTransformer", iTransformer),
-        ("Autoformer", Autoformer),
-        ("FEDformer", FEDformer),
-    ],
-)
+@pytest.mark.parametrize("name,cls", [("GRU", GRU), ("PatchTST", PatchTST), ("KAN", KAN),
+                                      ("TFT", TFT), ("iTransformer", iTransformer)])
 def test_resolve_chronax(name, cls):
     assert registry.resolve_chronax(name) is cls
 

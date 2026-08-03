@@ -1,222 +1,109 @@
-"""Autoformer forecaster: BaseForecaster wrapper around the Flax Linen backbone.
+"""High-level fit/forecast adapter around the Chronax Autoformer.
 
-Univariate direct-decoding Autoformer matching neuralforecast.Autoformer for the
-no-exogenous case. Training uses rolling windows with per-window RobustScaler;
-``model_`` holds a Flax ``TrainState`` after fit.
+Mirrors the ``neuralforecast.NeuralForecast(models=[Autoformer(...)]).fit(df).predict()``
+flow with a familiar ``fit(y) -> self`` / ``forecast(y) -> ndarray`` interface.
+
+Training follows neuralforecast's Autoformer convention:
+  - Build all rolling windows from the input series.
+  - Apply per-window ``RobustScaler`` (median / MAD) before every forward pass.
+  - Checkpoint the best-validation weights; restore them before returning.
+
+Both univariate (a single 1-D array) and panel (a list of 1-D arrays) modes
+are supported. Panel mode trains a *single shared model* over all series,
+exactly like the upstream NeuralForecast implementation.
 """
 from __future__ import annotations
 
-import warnings
-from typing import Callable, Union
+from dataclasses import asdict, replace
+from typing import List, Optional, Sequence, Tuple, Union
 
+import jax
 import jax.numpy as jnp
+import numpy as np
 
-from chronax.models.autoformer.data import RobustScaler
-from chronax.models.autoformer.loss import LossFn, resolve as _resolve_loss
-from chronax.models.autoformer.model import AutoformerConfig
-from chronax.models.autoformer.train import TrainState, predict_step, train
-from chronax.models.base_forecaster import BaseForecaster
-from chronax.utils import ConformalIntervals
+from chronax.models.autoformer.data import (
+    RobustScaler,
+    build_windows,
+    split_train_val_windows,
+)
+from chronax.models.autoformer.loss import LossFn, mae, resolve
+from chronax.models.autoformer.model import AutoformerConfig, AutoformerModel
+from chronax.models.autoformer.train import (
+    TrainState,
+    _get_model,
+    create_train_state,
+    eval_window_step,
+    make_lr_schedule,
+    should_stop_early,
+    train_window_step,
+)
 
 
-class Autoformer(BaseForecaster):
-    """Univariate Autoformer forecaster (JAX/Flax Linen port of neuralforecast.Autoformer).
+SeriesLike = Union[np.ndarray, Sequence[np.ndarray]]
 
-    Maintenance Status:
-        Active univariate forecaster. Integrates with the ``BaseForecaster``
-        interface, including conformal prediction intervals via
-        ``predict(level=...)``. Defaults match neuralforecast.Autoformer.
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _as_series_list(y: SeriesLike) -> List[np.ndarray]:
+    """Normalise ``y`` to a list of 1-D float32 arrays."""
+    if isinstance(y, np.ndarray):
+        return [y.astype(np.float32, copy=False).ravel()]
+    return [np.asarray(s, dtype=np.float32).ravel() for s in y]
+
+
+def _concat_windows(
+    y_list: List[np.ndarray], input_size: int, h: int
+) -> np.ndarray:
+    """Concatenate rolling windows from all series into ``[N, input_size+h]``."""
+    parts: List[np.ndarray] = []
+    for y in y_list:
+        if len(y) < input_size + h:
+            continue
+        parts.append(build_windows(y, input_size, h))
+    if not parts:
+        raise ValueError(
+            f"No series is long enough to extract windows "
+            f"(input_size={input_size}, h={h})."
+        )
+    return np.concatenate(parts, axis=0)
+
+
+def _snapshot(state: TrainState) -> dict:
+    """Deep-copy params for best-checkpoint restore."""
+    return jax.tree.map(jnp.asarray, state.params)
+
+
+def _restore(state: TrainState, saved_params: dict) -> TrainState:
+    return state.replace(params=saved_params)
+
+
+# ---------------------------------------------------------------------------
+# Forecaster
+# ---------------------------------------------------------------------------
+
+
+class AutoformerForecaster:
+    """High-level fit/forecast wrapper around :class:`~chronax.models.autoformer.model.AutoformerModel`.
+
+    Args:
+        config: Model architecture config (must include ``h`` and ``input_size``).
+        max_steps: Total optimiser steps.
+        learning_rate: Adam peak learning rate.
+        batch_size: Windows sampled per training step.
+        num_lr_decays: StepLR decays (gamma=0.5 each); -1 = constant LR.
+        val_fraction: Fraction of windows held out for validation (0 = none).
+        val_check_steps: Evaluate validation loss every this many steps.
+        early_stop_patience_steps: Stop if val loss does not improve for this
+            many consecutive checks; -1 = no early stopping.
+        grad_clip: Global gradient-norm clip (0 = disabled).
+        weight_decay: AdamW weight decay (0 = plain Adam).
+        loss: Window-level loss; string key or callable
+            (``"mae"`` / ``"mse"`` / ``"huber"`` or any ``(pred, target) -> scalar``).
+        seed: PRNG seed for parameter init and window sampling.
     """
-
-    uses_exog = False
-
-    def __init__(
-        self,
-        h: int,
-        input_size: int = -1,
-        hidden_size: int = 128,
-        n_heads: int = 4,
-        factor: int = 3,
-        moving_avg_window: int = 25,
-        encoder_layers: int = 2,
-        decoder_layers: int = 1,
-        conv_hidden_size: int = 32,
-        decoder_input_size_multiplier: float = 0.5,
-        dropout: float = 0.05,
-        activation: str = "gelu",
-        max_steps: int = 1000,
-        learning_rate: float = 1e-4,
-        batch_size: int = 32,
-        num_lr_decays: int = 3,
-        val_fraction: float = 0.1,
-        val_check_steps: int = 100,
-        early_stop_patience_steps: int = -1,
-        grad_clip: float = 1.0,
-        weight_decay: float = 0.0,
-        random_seed: int = 1,
-        alias: str = "Autoformer",
-        loss: Union[str, LossFn] = "mae",
-    ):
-        if input_size < 1:
-            input_size = 3 * h
-        self.h = h
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-        self.n_heads = n_heads
-        self.factor = factor
-        self.moving_avg_window = moving_avg_window
-        self.encoder_layers = encoder_layers
-        self.decoder_layers = decoder_layers
-        self.conv_hidden_size = conv_hidden_size
-        self.decoder_input_size_multiplier = decoder_input_size_multiplier
-        self.dropout = dropout
-        self.activation = activation
-        self.max_steps = max_steps
-        self.learning_rate = learning_rate
-        self.batch_size = batch_size
-        self.num_lr_decays = num_lr_decays
-        self.val_fraction = val_fraction
-        self.val_check_steps = val_check_steps
-        self.early_stop_patience_steps = early_stop_patience_steps
-        self.grad_clip = grad_clip
-        self.weight_decay = weight_decay
-        self.random_seed = random_seed
-        self.alias = alias
-        self.loss = loss
-        self.conformal_params: ConformalIntervals | None = None
-        self.model_: TrainState | None = None
-        self._context: jnp.ndarray | None = None
-        self._train_y: jnp.ndarray | None = None
-        self._scaler = RobustScaler()
-
-    @property
-    def _loss_fn(self) -> LossFn:
-        return _resolve_loss(self.loss)
-
-    def _build_config(self) -> AutoformerConfig:
-        return AutoformerConfig(
-            h=self.h,
-            input_size=self.input_size,
-            hidden_size=self.hidden_size,
-            n_heads=self.n_heads,
-            factor=self.factor,
-            moving_avg_window=self.moving_avg_window,
-            encoder_layers=self.encoder_layers,
-            decoder_layers=self.decoder_layers,
-            conv_hidden_size=self.conv_hidden_size,
-            decoder_input_size_multiplier=self.decoder_input_size_multiplier,
-            dropout=self.dropout,
-            activation=self.activation,
-        )
-
-    def fit(self, y: jnp.ndarray, X: jnp.ndarray | None = None) -> "Autoformer":
-        """Fit on a univariate 1-D series."""
-        if X is not None:
-            raise NotImplementedError("Exogenous variables are not supported.")
-        y = jnp.asarray(y, dtype=jnp.float32)
-        if y.ndim != 1:
-            raise ValueError(f"y must be 1-D; got shape {y.shape}.")
-        if y.shape[0] < self.input_size + self.h:
-            raise ValueError(
-                f"Series length {y.shape[0]} too short for "
-                f"input_size={self.input_size} + h={self.h}."
-            )
-        self.model_ = train(
-            y,
-            config=self._build_config(),
-            max_steps=self.max_steps,
-            learning_rate=self.learning_rate,
-            batch_size=self.batch_size,
-            num_lr_decays=self.num_lr_decays,
-            val_fraction=self.val_fraction,
-            val_check_steps=self.val_check_steps,
-            early_stop_patience_steps=self.early_stop_patience_steps,
-            grad_clip=self.grad_clip,
-            weight_decay=self.weight_decay,
-            loss_fn=self._loss_fn,
-            random_seed=self.random_seed,
-        )
-        self._context = y[-self.input_size :]
-        self._train_y = y
-        return self
-
-    def predict(
-        self,
-        h: int,
-        X: jnp.ndarray | None = None,
-        level: list[int | float] | None = None,
-    ) -> dict:
-        """Forecast ``h`` steps from the fitted context."""
-        if self.model_ is None or self._context is None:
-            raise RuntimeError("Call fit(y) before predict(h).")
-        if h < 1:
-            raise ValueError(f"h must be a positive integer; got h={h}.")
-        if h > self.h:
-            raise ValueError(
-                f"Autoformer was trained for h={self.h}; predict(h={h}) is not supported. "
-                f"Pass h <= {self.h} or re-fit with a larger h."
-            )
-        full = predict_step(
-            self.model_,
-            self._context,
-            h=self.h,
-            input_size=self.input_size,
-            scaler=self._scaler,
-        )
-        fcst = {"mean": full[:h]}
-        if level is not None:
-            if self.conformal_params is None:
-                raise ValueError(
-                    "predict(h, level=...) requires `model.conformal_params` to be set. "
-                    "Note: conformity_scores re-fits the model per CV window."
-                )
-            if self._train_y is None:
-                raise RuntimeError("Call fit(y) before predict(h, level=...).")
-            cs = self.new().conformity_scores(self._train_y)
-            fcst = BaseForecaster.add_confidence_intervals(
-                fcst, cs, level, self.conformal_params.method
-            )
-        return fcst
-
-    def forecast(
-        self,
-        y: jnp.ndarray,
-        h: int,
-        X: jnp.ndarray | None = None,
-        X_future: jnp.ndarray | None = None,
-        level: list[int | float] | None = None,
-        fitted: bool = False,
-    ) -> dict:
-        """Stateless fit-then-predict on ``y``."""
-        if X is not None or X_future is not None:
-            raise NotImplementedError("Exogenous variables are not supported.")
-        self.fit(y)
-        result = self.predict(h=h, level=level)
-        if fitted:
-            result["fitted"] = self._compute_fitted_values()
-        return result
-
-    def _compute_fitted_values(self) -> jnp.ndarray:
-        """One-step-ahead fitted values; first ``input_size`` entries are NaN."""
-        if self._train_y is None or self.model_ is None:
-            raise RuntimeError("Call fit(y) before computing fitted values.")
-        y = self._train_y
-        n_windows = y.shape[0] - self.input_size
-        if n_windows <= 0:
-            return jnp.full((y.shape[0],), jnp.nan, dtype=jnp.float32)
-        idx = jnp.arange(self.input_size)[None, :] + jnp.arange(n_windows)[:, None]
-        in_windows = y[idx]
-        shift, scale = self._scaler.stats(in_windows, axis=1)
-        x_z = self._scaler.transform(in_windows, shift, scale)[..., None]
-        pred_z = self.model_.apply_fn(self.model_.params, x_z, deterministic=True)
-        first_step_z = pred_z[:, 0, 0:1]
-        finite_part = self._scaler.inverse(first_step_z, shift, scale)[:, 0]
-        nan_head = jnp.full((self.input_size,), jnp.nan, dtype=jnp.float32)
-        return jnp.concatenate([nan_head, finite_part])
-
-
-class AutoformerForecaster(Autoformer):
-    """Deprecated config-based constructor; prefer :class:`Autoformer`."""
 
     def __init__(
         self,
@@ -231,41 +118,221 @@ class AutoformerForecaster(Autoformer):
         early_stop_patience_steps: int = -1,
         grad_clip: float = 1.0,
         weight_decay: float = 0.0,
-        loss: Union[str, LossFn, Callable] = "mae",
+        loss: "str | LossFn" = "mae",
         seed: int = 1,
     ):
-        warnings.warn(
-            "AutoformerForecaster(config=...) is deprecated; "
-            "use Autoformer(h=..., input_size=..., random_seed=...) instead.",
-            DeprecationWarning,
-            stacklevel=2,
+        self.config = config
+        self.max_steps = max_steps
+        self.learning_rate = learning_rate
+        self.batch_size = batch_size
+        self.num_lr_decays = num_lr_decays
+        self.val_fraction = val_fraction
+        self.val_check_steps = val_check_steps
+        self.early_stop_patience_steps = early_stop_patience_steps
+        self.grad_clip = grad_clip
+        self.weight_decay = weight_decay
+        self.loss = resolve(loss)
+        self.seed = seed
+
+        self._state: Optional[TrainState] = None
+        self._scaler: RobustScaler = RobustScaler()
+
+    # ------------------------------------------------------------------ properties
+
+    @property
+    def state(self) -> TrainState:
+        if self._state is None:
+            raise RuntimeError("AutoformerForecaster has not been fit yet.")
+        return self._state
+
+    @property
+    def fitted(self) -> bool:
+        return self._state is not None
+
+    # ------------------------------------------------------------------ fit
+
+    def fit(
+        self,
+        y: SeriesLike,
+        *,
+        verbose: bool = False,
+    ) -> "AutoformerForecaster":
+        """Train the model in-place on ``y``.
+
+        Args:
+            y: A single 1-D series or a list of 1-D series (panel mode).
+            verbose: Print training/validation loss periodically.
+
+        Returns:
+            ``self`` (for chaining).
+        """
+        y_list = _as_series_list(y)
+        cfg = self.config
+
+        # Build all rolling windows from every series
+        all_windows = _concat_windows(y_list, cfg.input_size, cfg.h)  # [N, L+h] numpy
+
+        # Chronological train/val split
+        train_windows_np, val_windows_np = split_train_val_windows(
+            all_windows, val_fraction=self.val_fraction
         )
-        super().__init__(
-            h=config.h,
-            input_size=config.input_size,
-            hidden_size=config.hidden_size,
-            n_heads=config.n_heads,
-            factor=config.factor,
-            moving_avg_window=config.moving_avg_window,
-            encoder_layers=config.encoder_layers,
-            decoder_layers=config.decoder_layers,
-            conv_hidden_size=config.conv_hidden_size,
-            decoder_input_size_multiplier=config.decoder_input_size_multiplier,
-            dropout=config.dropout,
-            activation=config.activation,
-            max_steps=max_steps,
-            learning_rate=learning_rate,
-            batch_size=batch_size,
-            num_lr_decays=num_lr_decays,
-            val_fraction=val_fraction,
-            val_check_steps=val_check_steps,
-            early_stop_patience_steps=early_stop_patience_steps,
-            grad_clip=grad_clip,
-            weight_decay=weight_decay,
-            random_seed=seed,
-            alias="Autoformer",
-            loss=loss if not callable(loss) or isinstance(loss, str) else loss,
+        n_train = len(train_windows_np)
+        has_val = len(val_windows_np) > 0
+
+        # Upload to device once (one-time host→device transfer)
+        train_windows_dev = jax.device_put(jnp.asarray(train_windows_np))
+        val_windows_dev = (
+            jax.device_put(jnp.asarray(val_windows_np)) if has_val else None
         )
-        # Allow callables that are already resolved LossFn
-        if callable(loss) and not isinstance(loss, str):
-            self.loss = loss
+
+        # Initialise train state
+        rng = jax.random.PRNGKey(self.seed)
+        init_rng, rng = jax.random.split(rng)
+        self._state = create_train_state(
+            init_rng,
+            cfg,
+            learning_rate=self.learning_rate,
+            weight_decay=self.weight_decay,
+            grad_clip=self.grad_clip,
+            num_lr_decays=self.num_lr_decays,
+            max_steps=self.max_steps,
+        )
+
+        np_rng = np.random.RandomState(self.seed)
+        best_params = _snapshot(self._state)
+        best_val_loss = float("inf")
+        checks_without_improvement = 0
+        log_every = max(1, self.max_steps // 10)
+
+        for step in range(self.max_steps):
+            rng, step_rng = jax.random.split(rng)
+            win_idx = np_rng.choice(n_train, size=self.batch_size, replace=True)
+            windows_batch = train_windows_dev[win_idx]
+
+            self._state, loss, _ = train_window_step(
+                self._state, windows_batch, step_rng,
+                input_size=cfg.input_size, loss_fn=self.loss,
+            )
+
+            if verbose and (step % log_every == 0 or step == self.max_steps - 1):
+                msg = f"  step {step:>5}: train_loss={float(loss):.5f}"
+                if has_val:
+                    val_loss_val, _ = eval_window_step(
+                        self._state, val_windows_dev,
+                        input_size=cfg.input_size, loss_fn=self.loss,
+                    )
+                    msg += f"  val_loss={float(val_loss_val):.5f}"
+                print(msg)
+
+            # Validation check + early stopping
+            if has_val and (step + 1) % self.val_check_steps == 0:
+                val_loss_val, _ = eval_window_step(
+                    self._state, val_windows_dev,
+                    input_size=cfg.input_size, loss_fn=self.loss,
+                )
+                val_scalar = float(val_loss_val)
+                if val_scalar < best_val_loss:
+                    best_val_loss = val_scalar
+                    best_params = _snapshot(self._state)
+                    checks_without_improvement = 0
+                else:
+                    checks_without_improvement += 1
+
+                if should_stop_early(
+                    early_stop_patience_steps=self.early_stop_patience_steps,
+                    checks_without_improvement=checks_without_improvement,
+                ):
+                    if verbose:
+                        print(f"  Early stopping at step {step + 1}.")
+                    break
+
+        # Restore best-validation checkpoint
+        if has_val:
+            self._state = _restore(self._state, best_params)
+
+        return self
+
+    # ------------------------------------------------------------------ forecast
+
+    def forecast(
+        self,
+        y: Optional[SeriesLike] = None,
+        h: Optional[int] = None,
+    ) -> np.ndarray:
+        """Produce horizon predictions from the last ``input_size`` of each series.
+
+        Args:
+            y: Series to forecast for (required; training data is not retained).
+            h: Horizon override — must match ``config.h`` if provided.
+
+        Returns:
+            ``np.ndarray`` of shape ``[h]`` for univariate input or
+            ``[n_series, h]`` for panel input.
+        """
+        if not self.fitted:
+            raise RuntimeError("Call .fit() before .forecast().")
+        if y is None:
+            raise ValueError(
+                "y must be provided to forecast (training data is not retained)."
+            )
+        if h is not None and h != self.config.h:
+            raise ValueError(
+                f"This forecaster was configured with h={self.config.h}; "
+                f"got h={h}. Construct a new forecaster for a different horizon."
+            )
+
+        y_list = _as_series_list(y)
+        squeeze = isinstance(y, np.ndarray)
+        cfg = self.config
+        model = _get_model(cfg)
+        preds_list: List[np.ndarray] = []
+
+        for series in y_list:
+            # Take the last input_size points as the encoder input
+            insample = jnp.asarray(series[-cfg.input_size:], dtype=jnp.float32)[None, :]
+            # Per-window robust scaling
+            shift, scale = self._scaler.stats(insample, axis=1)  # [1, 1]
+            insample_z = self._scaler.transform(insample, shift, scale)[..., None]  # [1, L, 1]
+            # Forward pass (deterministic, no dropout)
+            pred_z = model.apply(
+                self._state.params, insample_z, deterministic=True
+            )  # [1, h, 1]
+            # Inverse-transform to original scale
+            pred = self._scaler.inverse(pred_z[0, :, 0], shift[0, 0], scale[0, 0])
+            preds_list.append(np.asarray(pred))
+
+        preds = np.stack(preds_list, axis=0)  # [N, h]
+        return preds[0] if squeeze else preds
+
+    # ------------------------------------------------------------------ convenience
+
+    def fit_predict(self, y: SeriesLike, **kwargs) -> np.ndarray:
+        """Fit on ``y`` and immediately forecast for the same series."""
+        fit_kwargs = {k: v for k, v in kwargs.items() if k == "verbose"}
+        self.fit(y, **fit_kwargs)
+        return self.forecast(y=y)
+
+    def with_config(self, **overrides) -> "AutoformerForecaster":
+        """Return a fresh (unfitted) forecaster with overridden config fields."""
+        new_cfg = replace(self.config, **overrides)
+        return AutoformerForecaster(
+            new_cfg,
+            max_steps=self.max_steps,
+            learning_rate=self.learning_rate,
+            batch_size=self.batch_size,
+            num_lr_decays=self.num_lr_decays,
+            val_fraction=self.val_fraction,
+            val_check_steps=self.val_check_steps,
+            early_stop_patience_steps=self.early_stop_patience_steps,
+            grad_clip=self.grad_clip,
+            weight_decay=self.weight_decay,
+            loss=self.loss,
+            seed=self.seed,
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"AutoformerForecaster(config={asdict(self.config)}, "
+            f"max_steps={self.max_steps}, learning_rate={self.learning_rate}, "
+            f"batch_size={self.batch_size}, fitted={self.fitted})"
+        )

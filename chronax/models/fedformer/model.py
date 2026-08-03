@@ -53,57 +53,10 @@ import numpy as np  # host-side only: deterministic Fourier-mode index selection
 # Small shared helpers
 # ===========================================================================
 
-# Torch-matching initializers (parity with neuralforecast / PyTorch defaults).
-# TokenEmbedding uses kaiming-normal (NF override); Linear/other Conv1d use
-# torch's default uniform U(-1/sqrt(fan_in), 1/sqrt(fan_in)).
-
-
-class _TorchUniformInit:
-    """``U(-1/sqrt(fan_in), 1/sqrt(fan_in))`` — torch ``nn.Linear`` / ``nn.Conv1d`` default."""
-
-    def __init__(self, fan_in: int) -> None:
-        self.fan_in = fan_in
-
-    def __call__(self, key, shape, dtype=jnp.float32):
-        bound = 1.0 / math.sqrt(self.fan_in)
-        return jax.random.uniform(key, shape, dtype, minval=-bound, maxval=bound)
-
-
-class _KaimingNormalConvInit:
-    """TokenEmbedding: torch ``kaiming_normal_(fan_in, leaky_relu)``."""
-
-    def __init__(self, fan_in: int) -> None:
-        self.fan_in = fan_in
-
-    def __call__(self, key, shape, dtype=jnp.float32):
-        gain = math.sqrt(2.0 / (1.0 + 0.01 ** 2))
-        return (gain / math.sqrt(self.fan_in)) * jax.random.normal(key, shape, dtype)
-
-
-def _torch_dense(features: int, fan_in: int, *, name: str):
-    init = _TorchUniformInit(fan_in)
-    return fnn.Dense(features, kernel_init=init, bias_init=init, name=name)
-
-
-def _torch_conv(
-    features: int,
-    fan_in: int,
-    *,
-    kernel_size: tuple,
-    name: str,
-    padding: str = "SAME",
-    token_embed: bool = False,
-):
-    init = _KaimingNormalConvInit(fan_in) if token_embed else _TorchUniformInit(fan_in)
-    return fnn.Conv(
-        features=features,
-        kernel_size=kernel_size,
-        padding=padding,
-        use_bias=False,
-        kernel_init=init,
-        name=name,
-    )
-
+# He / Kaiming-normal initializer. The token-embedding and trend-projection
+# convolutions in the Autoformer/FEDformer family are initialised this way in
+# the upstream code; we reuse it so weight scales match.
+_HE_NORMAL = fnn.initializers.he_normal()
 
 # FEDformer hard-codes the multi-head count to 8 inside its learnable spectral
 # weight tensor (its leading dimension is literally 8). We expose the same
@@ -522,17 +475,16 @@ class MultiHeadProjection(fnn.Module):
         H = self.n_heads
 
         # Project then split into heads: [B, L, hidden] -> [B, L, H, hidden//H].
-        fan = self.hidden_size
-        q = _torch_dense(self.hidden_size, fan, name="q_proj")(queries).reshape(B, L, H, -1)
-        k = _torch_dense(self.hidden_size, fan, name="k_proj")(keys).reshape(B, S, H, -1)
-        v = _torch_dense(self.hidden_size, fan, name="v_proj")(values).reshape(B, S, H, -1)
+        q = fnn.Dense(self.hidden_size, name="q_proj")(queries).reshape(B, L, H, -1)
+        k = fnn.Dense(self.hidden_size, name="k_proj")(keys).reshape(B, S, H, -1)
+        v = fnn.Dense(self.hidden_size, name="v_proj")(values).reshape(B, S, H, -1)
 
         # Spectral mixing (self- or cross-).
         out = self.inner(q, k, v, deterministic)  # [B, L, H, E_out]
 
         # Merge heads and project out.
         out = out.reshape(B, L, -1)
-        return _torch_dense(self.hidden_size, fan, name="out_proj")(out)
+        return fnn.Dense(self.hidden_size, name="out_proj")(out)
 
 
 # ===========================================================================
@@ -555,7 +507,7 @@ class SeasonalLayerNorm(fnn.Module):
 
     @fnn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        x_hat = fnn.LayerNorm(epsilon=1e-5, name="ln")(x)
+        x_hat = fnn.LayerNorm(name="ln")(x)
         return x_hat - jnp.mean(x_hat, axis=1, keepdims=True)
 
 
@@ -570,7 +522,7 @@ class SeasonalLayerNorm(fnn.Module):
 #       better starting representation than a pointwise linear map. Circular
 #       padding avoids edge artifacts on periodic-ish series. This matches the
 #       embedding used throughout the Autoformer/Informer/FEDformer family.
-# HOW:  Conv1D(in=1 -> out=hidden, k=3, circular, no bias, kaiming-normal) + Dropout.
+# HOW:  Conv1D(in=1 -> out=hidden, k=3, circular, no bias, He-normal) + Dropout.
 
 
 class TokenEmbedding(fnn.Module):
@@ -581,12 +533,13 @@ class TokenEmbedding(fnn.Module):
 
     @fnn.compact
     def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
-        # fan_in = kernel_size * in_channels; univariate c_in=1 -> 3.
-        c_in = x.shape[-1]
-        y = _torch_conv(
-            self.hidden_size, 3 * c_in,
-            kernel_size=(3,), padding="CIRCULAR", name="token_conv",
-            token_embed=True,
+        y = fnn.Conv(
+            features=self.hidden_size,
+            kernel_size=(3,),
+            padding="CIRCULAR",
+            use_bias=False,
+            kernel_init=_HE_NORMAL,
+            name="token_conv",
         )(x)
         return fnn.Dropout(rate=self.dropout_rate, name="emb_drop")(
             y, deterministic=deterministic
@@ -646,15 +599,21 @@ class EncoderLayer(fnn.Module):
         x, _ = series_decomp(x, self.moving_avg_window)
 
         # --- Position-wise feed-forward (two width-1 convolutions) ---
-        y = _torch_conv(
-            self.conv_hidden_size, self.hidden_size,
-            kernel_size=(1,), name="conv1",
+        y = fnn.Conv(
+            features=self.conv_hidden_size,
+            kernel_size=(1,),
+            use_bias=False,
+            kernel_init=_HE_NORMAL,
+            name="conv1",
         )(x)
         y = _activation(self.activation, y)
         y = fnn.Dropout(rate=self.dropout_rate, name="drop2")(y, deterministic=deterministic)
-        y = _torch_conv(
-            self.hidden_size, self.conv_hidden_size,
-            kernel_size=(1,), name="conv2",
+        y = fnn.Conv(
+            features=self.hidden_size,
+            kernel_size=(1,),
+            use_bias=False,
+            kernel_init=_HE_NORMAL,
+            name="conv2",
         )(y)
         y = fnn.Dropout(rate=self.dropout_rate, name="drop3")(y, deterministic=deterministic)
 
@@ -793,24 +752,34 @@ class DecoderLayer(fnn.Module):
         x, trend2 = series_decomp(x, self.moving_avg_window)
 
         # --- (c) Position-wise feed-forward (+residual) -> decomp ---
-        y = _torch_conv(
-            self.conv_hidden_size, self.hidden_size,
-            kernel_size=(1,), name="conv1",
+        y = fnn.Conv(
+            features=self.conv_hidden_size,
+            kernel_size=(1,),
+            use_bias=False,
+            kernel_init=_HE_NORMAL,
+            name="conv1",
         )(x)
         y = _activation(self.activation, y)
         y = fnn.Dropout(rate=self.dropout_rate, name="drop3")(y, deterministic=deterministic)
-        y = _torch_conv(
-            self.hidden_size, self.conv_hidden_size,
-            kernel_size=(1,), name="conv2",
+        y = fnn.Conv(
+            features=self.hidden_size,
+            kernel_size=(1,),
+            use_bias=False,
+            kernel_init=_HE_NORMAL,
+            name="conv2",
         )(y)
         y = fnn.Dropout(rate=self.dropout_rate, name="drop4")(y, deterministic=deterministic)
         x, trend3 = series_decomp(x + y, self.moving_avg_window)
 
         # --- Trend pathway: sum the three trend pieces and project to c_out ---
         residual_trend = trend1 + trend2 + trend3
-        residual_trend = _torch_conv(
-            self.c_out, 3 * self.hidden_size,
-            kernel_size=(3,), padding="CIRCULAR", name="trend_proj",
+        residual_trend = fnn.Conv(
+            features=self.c_out,
+            kernel_size=(3,),
+            padding="CIRCULAR",
+            use_bias=False,
+            kernel_init=_HE_NORMAL,
+            name="trend_proj",
         )(residual_trend)
         return x, residual_trend
 
@@ -876,7 +845,7 @@ class Decoder(fnn.Module):
             trend = trend + residual_trend
 
         x = SeasonalLayerNorm(self.hidden_size, name="norm")(x)
-        x = _torch_dense(self.c_out, self.hidden_size, name="projection")(x)
+        x = fnn.Dense(self.c_out, name="projection")(x)
         return x, trend
 
 

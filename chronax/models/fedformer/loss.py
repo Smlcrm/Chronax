@@ -25,45 +25,33 @@ from typing import Callable, Mapping, Optional
 import jax.numpy as jnp
 
 
-# Type alias for window-loss callables (optional mask for NF-style padding).
-LossFn = Callable[..., jnp.ndarray]
+# Type alias for the simple window-loss signature.
+LossFn = Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray]
 
 
 # ---------------------------------------------------------------------------
-# Window losses (element-wise; optional outsample mask for NF-style padding)
+# Window losses (element-wise, no masking)
 # ---------------------------------------------------------------------------
 
 
-def _reduce(e: jnp.ndarray, mask: Optional[jnp.ndarray] = None) -> jnp.ndarray:
-    if mask is None:
-        return jnp.mean(e)
-    return (e * mask).sum() / jnp.clip(mask.sum(), 1.0)
+def mae(pred: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
+    """Mean Absolute Error: ``mean(|pred - target|)``.
+
+    Robust to outliers (linear penalty) and the FEDformer/Autoformer default.
+    """
+    return jnp.mean(jnp.abs(pred - target))
 
 
-def mae(
-    pred: jnp.ndarray,
-    target: jnp.ndarray,
-    mask: Optional[jnp.ndarray] = None,
-) -> jnp.ndarray:
-    """Mean Absolute Error; masked mean when ``mask`` is given (NF padder)."""
-    return _reduce(jnp.abs(pred - target), mask)
+def mse(pred: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
+    """Mean Squared Error: ``mean((pred - target)**2)``.
+
+    Penalises large errors quadratically; sensitive to outliers.
+    """
+    return jnp.mean((pred - target) ** 2)
 
 
-def mse(
-    pred: jnp.ndarray,
-    target: jnp.ndarray,
-    mask: Optional[jnp.ndarray] = None,
-) -> jnp.ndarray:
-    """Mean Squared Error; masked mean when ``mask`` is given."""
-    return _reduce((pred - target) ** 2, mask)
-
-
-def huber(
-    pred: jnp.ndarray,
-    target: jnp.ndarray,
-    mask: Optional[jnp.ndarray] = None,
-) -> jnp.ndarray:
-    """Huber loss with ``delta = 1.0`` (smooth L1); masked mean when ``mask`` is given.
+def huber(pred: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
+    """Huber loss with ``delta = 1.0`` (smooth L1).
 
     Quadratic for small residuals (``|r| <= 1``) and linear beyond, giving the
     smooth gradients of MSE near zero with the outlier-robustness of MAE in the
@@ -73,7 +61,7 @@ def huber(
     abs_r = jnp.abs(r)
     quadratic = 0.5 * r * r
     linear = abs_r - 0.5
-    return _reduce(jnp.where(abs_r <= 1.0, quadratic, linear), mask)
+    return jnp.mean(jnp.where(abs_r <= 1.0, quadratic, linear))
 
 
 # Registry of built-in window losses, addressable by name.
