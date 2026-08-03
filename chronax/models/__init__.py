@@ -49,6 +49,22 @@ from .randomWalkWithDrift import RandomWalkWithDrift
 # NOTE: GRU is imported lazily (see __getattr__ below) — it hard-pins flax 0.10.x,
 # so `import chronax.models` must not force a flax import on callers using other models.
 
+# The autoformer package exports the forecaster as ``AutoformerForecaster``; expose it
+# under the public registry name ``Autoformer`` that ``__all__`` advertises.
+from .autoformer import AutoformerForecaster as Autoformer
+
+# Likewise, the fedformer package exports ``FEDformerForecaster``; expose it under
+# the public registry name ``FEDformer``.
+from .fedformer import FEDformerForecaster as FEDformer
+
+# The rnn/deepar/nbeats/tide/tsmixer packages export ``*Forecaster``; expose them
+# under the public registry names matching their neuralforecast counterparts.
+from .rnn import RNNForecaster as RNN
+from .deepar import DeepARForecaster as DeepAR
+from .nbeats import NBEATSForecaster as NBEATS
+from .tide import TiDEForecaster as TiDE
+from .tsmixer import TSMixerForecaster as TSMixer
+
 try:
     from .kan import KAN
 except ImportError:
@@ -254,6 +270,11 @@ __all__ = [
     "TimeXer",
     "BatchedForecaster",
     "XLSTM",
+    "RNN",
+    "DeepAR",
+    "NBEATS",
+    "TiDE",
+    "TSMixer",
 ]
 
 

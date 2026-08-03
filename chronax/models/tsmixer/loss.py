@@ -11,9 +11,11 @@ kept as a separate copy so each model sub-package is self-contained.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Callable, Optional
 
 import jax.numpy as jnp
+
+LossFn = Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray]
 
 
 # ---------------------------------------------------------------------------
@@ -79,3 +81,21 @@ def masked_mse(
     """Mean Squared Error with multiplicative masking."""
     weights = _compute_weights(y=y, mask=mask, horizon_weight=horizon_weight)
     return _weighted_mean((y - y_hat) ** 2, weights)
+
+
+LOSSES = {
+    "mae": masked_mae,
+    "mse": masked_mse,
+}
+
+
+def resolve(loss):
+    """Return a callable loss from either a registry string or a callable."""
+    if callable(loss):
+        return loss
+    if loss not in LOSSES:
+        raise ValueError(
+            f"Unknown loss {loss!r}. Available: {sorted(LOSSES)}. "
+            "Pass a callable for custom losses."
+        )
+    return LOSSES[loss]

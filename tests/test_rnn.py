@@ -685,16 +685,16 @@ def test_forecaster_fit_predict_runs_univariate():
     """RNNForecaster.fit_predict on a single seasonal series returns finite [h]."""
     from chronax.models.rnn.forecaster import RNNForecaster
 
-    cfg = RNNConfig(
+    fc = RNNForecaster(
         h=12, input_size=24, encoder_hidden_size=8, encoder_n_layers=1,
         recurrent=True,
+        max_steps=30, learning_rate=1e-2, batch_size=4, random_seed=0,
     )
-    fc = RNNForecaster(cfg, max_steps=30, learning_rate=1e-2, batch_size=4, seed=0)
     t = np.arange(120, dtype=np.float32)
     y = np.sin(2 * np.pi * t / 12) + 0.1 * np.random.RandomState(0).randn(120)
 
     preds = fc.fit_predict(y.astype(np.float32))
-    assert preds.shape == (cfg.h,)
+    assert preds.shape == (fc.config.h,)
     assert np.all(np.isfinite(preds))
 
 
@@ -702,18 +702,18 @@ def test_forecaster_fit_predict_runs_panel():
     """RNNForecaster on a panel of 3 series returns [n_series, h] preds."""
     from chronax.models.rnn.forecaster import RNNForecaster
 
-    cfg = RNNConfig(
-        h=6, input_size=18, encoder_hidden_size=8, encoder_n_layers=1,
-        recurrent=True,
-    )
     rng = np.random.RandomState(1)
     series = [
         np.sin(2 * np.pi * np.arange(80) / 12).astype(np.float32) + 0.05 * rng.randn(80)
         for _ in range(3)
     ]
-    fc = RNNForecaster(cfg, max_steps=30, learning_rate=1e-2, batch_size=3, seed=0)
+    fc = RNNForecaster(
+        h=6, input_size=18, encoder_hidden_size=8, encoder_n_layers=1,
+        recurrent=True,
+        max_steps=30, learning_rate=1e-2, batch_size=3, random_seed=0,
+    )
     preds = fc.fit_predict(series)
-    assert preds.shape == (3, cfg.h)
+    assert preds.shape == (3, fc.config.h)
     assert np.all(np.isfinite(preds))
 
 
@@ -721,14 +721,14 @@ def test_forecaster_direct_decoder_runs():
     """Direct (non-recurrent) MLP-decoder path also produces finite predictions."""
     from chronax.models.rnn.forecaster import RNNForecaster
 
-    cfg = RNNConfig(
+    y = np.sin(np.linspace(0, 8 * np.pi, 60)).astype(np.float32)
+    fc = RNNForecaster(
         h=4, input_size=12, encoder_hidden_size=8, encoder_n_layers=1,
         decoder_hidden_size=8, decoder_layers=2, recurrent=False,
+        max_steps=20, learning_rate=1e-2, batch_size=2, random_seed=0,
     )
-    y = np.sin(np.linspace(0, 8 * np.pi, 60)).astype(np.float32)
-    fc = RNNForecaster(cfg, max_steps=20, learning_rate=1e-2, batch_size=2, seed=0)
     preds = fc.fit_predict(y)
-    assert preds.shape == (cfg.h,)
+    assert preds.shape == (fc.config.h,)
     assert np.all(np.isfinite(preds))
 
 
