@@ -146,6 +146,19 @@ try:
 except ImportError:
     HINT = None
 
+# TimeMixer depends on flax NNX; guard like TCN so an incompatible flax degrades
+# it to None instead of breaking the namespace.
+try:
+    from .timemixer import TimeMixer
+except ImportError:
+    TimeMixer = None
+
+# TimeXer depends on flax NNX; guard like TimeMixer.
+try:
+    from .timexer import TimeXer
+except ImportError:
+    TimeXer = None
+
 from .batched_forecaster import BatchedForecaster
 
 from .xlstm import XLSTM
@@ -197,6 +210,8 @@ __all__ = [
     "StemGNN",
     "MLP",
     "HINT",
+    "TimeMixer",
+    "TimeXer",
     "BatchedForecaster",
     "XLSTM",
 ]
