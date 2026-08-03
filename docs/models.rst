@@ -189,6 +189,10 @@ Deep Learning
    :members:
    :undoc-members:
 
+.. autoclass:: chronax.models.DilatedRNN
+   :members:
+   :undoc-members:
+
 .. autoclass:: chronax.models.XLSTM
    :members:
    :undoc-members:

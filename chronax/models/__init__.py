@@ -136,6 +136,13 @@ try:
 except ImportError:
     SOFTS = None
 
+# DilatedRNN hard-pins flax 0.10.x (raises ImportError otherwise); guard like SOFTS so a
+# version/availability mismatch degrades to DilatedRNN=None instead of breaking the
+# namespace.
+try:
+    from .dilated_rnn import DilatedRNN
+except ImportError:
+    DilatedRNN = None
 # SOFTSSharp (SOFTS#) hard-pins flax 0.10.x (raises ImportError otherwise); guard like
 # SOFTS so a version/availability mismatch degrades to SOFTSSharp=None instead of
 # breaking the namespace.
@@ -221,6 +228,7 @@ __all__ = [
     "BiTCN",
     "DeepNPTS",
     "SOFTS",
+    "DilatedRNN",
     "SOFTSSharp",
     "TCN",
     "StemGNN",
