@@ -70,6 +70,17 @@ try:
 except ImportError:
     KAN = None
 
+# Autoformer / FEDformer hard-pin flax 0.10.x; guard so a version mismatch
+# degrades to None instead of breaking the chronax.models namespace.
+try:
+    from .autoformer import Autoformer
+except ImportError:
+    Autoformer = None
+
+try:
+    from .fedformer import FEDformer
+except ImportError:
+    FEDformer = None
 # NLinear depends on flax NNX (pinned 0.10.x — see chronax/models/nlinear/__init__.py).
 # Guard like KAN/PatchTST so an incompatible flax degrades this model to None instead
 # of crashing the entire chronax.models namespace. Note the trade-off: the pin's
@@ -144,6 +155,21 @@ try:
 except ImportError:
     SOFTS = None
 
+# DilatedRNN hard-pins flax 0.10.x (raises ImportError otherwise); guard like SOFTS so a
+# version/availability mismatch degrades to DilatedRNN=None instead of breaking the
+# namespace.
+try:
+    from .dilated_rnn import DilatedRNN
+except ImportError:
+    DilatedRNN = None
+# SOFTSSharp (SOFTS#) hard-pins flax 0.10.x (raises ImportError otherwise); guard like
+# SOFTS so a version/availability mismatch degrades to SOFTSSharp=None instead of
+# breaking the namespace.
+try:
+    from .softssharp import SOFTSSharp
+except ImportError:
+    SOFTSSharp = None
+
 # TCN depends on flax NNX; guard like BiTCN so an incompatible flax degrades it to None
 # instead of breaking the namespace.
 try:
@@ -171,6 +197,19 @@ try:
     from .hint import HINT
 except ImportError:
     HINT = None
+
+# TimeMixer depends on flax NNX; guard like TCN so an incompatible flax degrades
+# it to None instead of breaking the namespace.
+try:
+    from .timemixer import TimeMixer
+except ImportError:
+    TimeMixer = None
+
+# TimeXer depends on flax NNX; guard like TimeMixer.
+try:
+    from .timexer import TimeXer
+except ImportError:
+    TimeXer = None
 
 from .batched_forecaster import BatchedForecaster
 
@@ -221,10 +260,14 @@ __all__ = [
     "BiTCN",
     "DeepNPTS",
     "SOFTS",
+    "DilatedRNN",
+    "SOFTSSharp",
     "TCN",
     "StemGNN",
     "MLP",
     "HINT",
+    "TimeMixer",
+    "TimeXer",
     "BatchedForecaster",
     "XLSTM",
     "RNN",

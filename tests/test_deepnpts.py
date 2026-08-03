@@ -370,7 +370,9 @@ def test_conformal_does_not_corrupt_fitted_model():
 # Parity vs neuralforecast (batch_norm=False)
 # ============================================================================
 
-_NF_VENV_PY = Path(__file__).resolve().parents[1] / "benchmarks" / ".venv-nf" / "bin" / "python"
+from benchmarks.neural import resolve_nf_venv_py
+
+_NF_VENV_PY = resolve_nf_venv_py(Path(__file__).resolve().parents[1])
 
 
 @pytest.mark.skipif(not _NF_VENV_PY.exists(),

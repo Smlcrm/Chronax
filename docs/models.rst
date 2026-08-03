@@ -189,6 +189,10 @@ Deep Learning
    :members:
    :undoc-members:
 
+.. autoclass:: chronax.models.DilatedRNN
+   :members:
+   :undoc-members:
+
 .. autoclass:: chronax.models.XLSTM
    :members:
    :undoc-members:
@@ -198,6 +202,10 @@ Deep Learning
    :undoc-members:
 
 .. autoclass:: chronax.models.DeepNPTS
+   :members:
+   :undoc-members:
+
+.. autoclass:: chronax.models.SOFTSSharp
    :members:
    :undoc-members:
 
@@ -218,5 +226,13 @@ Deep Learning
    :undoc-members:
 
 .. autoclass:: chronax.models.HINT
+   :members:
+   :undoc-members:
+
+.. autoclass:: chronax.models.TimeMixer
+   :members:
+   :undoc-members:
+
+.. autoclass:: chronax.models.TimeXer
    :members:
    :undoc-members:
