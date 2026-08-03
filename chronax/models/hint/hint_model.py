@@ -26,7 +26,7 @@ from flax import nnx
 
 from chronax.models.base_forecaster import BaseForecaster
 from chronax.models.mlp.mlp_model import MLP
-from chronax.models.mlp.mlp_training import build_windows, predict_params, train_on_windows
+from chronax.models.mlp.mlp_training import predict_params
 from chronax.utils import ConformalIntervals
 
 
@@ -175,31 +175,13 @@ class HINT(BaseForecaster):
         else:
             raise ValueError(f"y must be 1-D or 2-D; got shape {y.shape}.")
 
-        cfg = self.model
-        L = cfg.input_size
-        if y2.shape[0] <= L:
-            raise ValueError(
-                f"Series length {y2.shape[0]} too short for input_size={L} "
-                f"(need at least input_size+1)."
-            )
-
-        # Pool every series' h-padded windows and cross-learn ONE network.
-        # The column count is static config (S's row count), so the loop unrolls
-        # cleanly under jit/vmap.
-        windows, masks = [], []
-        for j in range(n_total):
-            w, m = build_windows(y2[:, j], L, cfg.h)
-            windows.append(w)
-            masks.append(m)
-        net = cfg._build_net()
-        train_on_windows(
-            net, jnp.concatenate(windows), jnp.concatenate(masks),
-            h=cfg.h, input_size=L, max_steps=cfg.max_steps,
-            windows_batch_size=cfg.windows_batch_size, lr=cfg.learning_rate,
-            seed=cfg.random_seed, loss_fn=cfg._loss_fn, scaler=cfg._scaler,
-        )
-        self.model_ = net
-        self._contexts = y2[-L:, :].T          # [n_total, L]
+        # Cross-learn ONE network over the hierarchy's columns via the base
+        # MLP's own 2-D fit (pooled h-padded windows). The fit runs on a clone,
+        # so the passed config-carrier stays pristine.
+        base = self.model.new()
+        base.fit(y2)
+        self.model_ = base.model_
+        self._contexts = base._contexts        # [n_total, L]
         self._train_y = y
         self._train_rank = rank
         return self
