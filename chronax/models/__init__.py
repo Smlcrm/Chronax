@@ -49,19 +49,22 @@ from .randomWalkWithDrift import RandomWalkWithDrift
 # NOTE: GRU is imported lazily (see __getattr__ below) — it hard-pins flax 0.10.x,
 # so `import chronax.models` must not force a flax import on callers using other models.
 
-# The autoformer package exports the forecaster as ``AutoformerForecaster``; expose it
-# under the public registry name ``Autoformer`` that ``__all__`` advertises.
-from .autoformer import AutoformerForecaster as Autoformer
-
-# Likewise, the fedformer package exports ``FEDformerForecaster``; expose it under
-# the public registry name ``FEDformer``.
-from .fedformer import FEDformerForecaster as FEDformer
-
 try:
     from .kan import KAN
 except ImportError:
     KAN = None
 
+# Autoformer / FEDformer hard-pin flax 0.10.x; guard so a version mismatch
+# degrades to None instead of breaking the chronax.models namespace.
+try:
+    from .autoformer import Autoformer
+except ImportError:
+    Autoformer = None
+
+try:
+    from .fedformer import FEDformer
+except ImportError:
+    FEDformer = None
 # NLinear depends on flax NNX (pinned 0.10.x — see chronax/models/nlinear/__init__.py).
 # Guard like KAN/PatchTST so an incompatible flax degrades this model to None instead
 # of crashing the entire chronax.models namespace. Note the trade-off: the pin's
