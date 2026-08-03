@@ -226,14 +226,23 @@ def test_encoder_stack_shape_and_layer_count():
     assert len(enc.layers) == 3
 
 
-def test_encoder_applies_final_layernorm():
-    # The final norm_layer normalizes each token to ~zero mean across hidden.
-    B, T, hidden, d_core = 2, 4, 32, 16
+def test_encoder_has_no_final_layernorm():
+    # NF's TransEncoder applies norm_layer only `if self.norm is not None`, and
+    # SOFTS constructs it positionally with no norm_layer -- so there is no final
+    # normalization and the encoder output reaches `projection` directly.
+    #
+    # Note a zero-mean check CANNOT test this: every layer already ends in
+    # `norm2`, so the encoder output is zero-mean either way. The observable
+    # difference is the extra LayerNorm's LEARNABLE scale/bias, so pin the
+    # parameter set instead. benchmarks/softs_weight_parity.py is the end-to-end
+    # check; this is the unit-level guard against it creeping back.
+    hidden, d_core = 32, 16
     enc = TransEncoder(e_layers=1, hidden_size=hidden, d_core=d_core, d_ff=64,
                        dropout=0.0, rngs=nnx.Rngs(0))
-    x = jnp.asarray(np.random.RandomState(0).randn(B, T, hidden), dtype=jnp.float32)
-    out = np.asarray(enc(x, deterministic=True))
-    np.testing.assert_allclose(out.mean(axis=-1), np.zeros((B, T)), atol=1e-4)
+    assert not hasattr(enc, "norm")
+    _, params, *_ = nnx.split(enc, nnx.Param, ...)
+    paths = {"/".join(str(k) for k in path) for path, _ in nnx.to_flat_state(params)}
+    assert not any(p.startswith("norm/") for p in paths), sorted(paths)
 
 
 def test_resolve_activation_gelu_is_exact():
