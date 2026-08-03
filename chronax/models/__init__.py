@@ -65,6 +65,33 @@ try:
     from .fedformer import FEDformer
 except ImportError:
     FEDformer = None
+# NLinear depends on flax NNX (pinned 0.10.x — see chronax/models/nlinear/__init__.py).
+# Guard like KAN/PatchTST so an incompatible flax degrades this model to None instead
+# of crashing the entire chronax.models namespace. Note the trade-off: the pin's
+# informative ImportError is swallowed here; importing chronax.models.nlinear
+# directly surfaces it.
+try:
+    from .nlinear import NLinear
+except ImportError:
+    NLinear = None
+
+# XLinear depends on flax NNX (pinned 0.10.x — see chronax/models/xlinear/__init__.py).
+# Guard like NLinear so an incompatible flax degrades this model to None instead of
+# crashing the entire chronax.models namespace; the pin's informative ImportError is
+# swallowed here, but importing chronax.models.xlinear directly surfaces it.
+# (Distinct from XLSTM below — different model family.)
+try:
+    from .xlinear import XLinear
+except ImportError:
+    XLinear = None
+# DLinear depends on flax NNX (pinned 0.10.x — see chronax/models/dlinear/__init__.py).
+# Guard like NLinear so an incompatible flax degrades this model to None instead of
+# crashing the entire chronax.models namespace; the pin's informative ImportError is
+# swallowed here, but importing chronax.models.dlinear directly surfaces it.
+try:
+    from .dlinear import DLinear
+except ImportError:
+    DLinear = None
 
 # iTransformer / VanillaTransformer depend on flax NNX (flax 0.10.x). If flax's
 # nnx import fails (e.g. an incompatible resolved jax that dropped an API nnx
@@ -104,6 +131,69 @@ try:
     from .deepnpts import DeepNPTS
 except ImportError:
     DeepNPTS = None
+
+# SOFTS hard-pins flax 0.10.x (raises ImportError otherwise); guard like DeepNPTS so a
+# version/availability mismatch degrades to SOFTS=None instead of breaking the namespace.
+try:
+    from .softs import SOFTS
+except ImportError:
+    SOFTS = None
+
+# DilatedRNN hard-pins flax 0.10.x (raises ImportError otherwise); guard like SOFTS so a
+# version/availability mismatch degrades to DilatedRNN=None instead of breaking the
+# namespace.
+try:
+    from .dilated_rnn import DilatedRNN
+except ImportError:
+    DilatedRNN = None
+# SOFTSSharp (SOFTS#) hard-pins flax 0.10.x (raises ImportError otherwise); guard like
+# SOFTS so a version/availability mismatch degrades to SOFTSSharp=None instead of
+# breaking the namespace.
+try:
+    from .softssharp import SOFTSSharp
+except ImportError:
+    SOFTSSharp = None
+
+# TCN depends on flax NNX; guard like BiTCN so an incompatible flax degrades it to None
+# instead of breaking the namespace.
+try:
+    from .tcn import TCN
+except ImportError:
+    TCN = None
+
+# StemGNN depends on flax NNX; guard like TCN so an incompatible flax degrades it to None
+# instead of breaking the namespace.
+try:
+    from .stemgnn import StemGNN
+except ImportError:
+    StemGNN = None
+
+# MLP depends on flax NNX; guard like TCN so an incompatible flax degrades it to None
+# instead of breaking the namespace. GMM (the distribution loss MLP/HINT train with)
+# is importable from chronax.models.mlp.
+try:
+    from .mlp import MLP
+except ImportError:
+    MLP = None
+
+# HINT wraps an MLP base model (flax NNX); guard like MLP.
+try:
+    from .hint import HINT
+except ImportError:
+    HINT = None
+
+# TimeMixer depends on flax NNX; guard like TCN so an incompatible flax degrades
+# it to None instead of breaking the namespace.
+try:
+    from .timemixer import TimeMixer
+except ImportError:
+    TimeMixer = None
+
+# TimeXer depends on flax NNX; guard like TimeMixer.
+try:
+    from .timexer import TimeXer
+except ImportError:
+    TimeXer = None
 
 from .batched_forecaster import BatchedForecaster
 
@@ -147,9 +237,21 @@ __all__ = [
     "TFT",
     "Informer",
     "KAN",
+    "NLinear",
+    "XLinear",
+    "DLinear",
     "PatchTST",
     "BiTCN",
     "DeepNPTS",
+    "SOFTS",
+    "DilatedRNN",
+    "SOFTSSharp",
+    "TCN",
+    "StemGNN",
+    "MLP",
+    "HINT",
+    "TimeMixer",
+    "TimeXer",
     "BatchedForecaster",
     "XLSTM",
 ]
