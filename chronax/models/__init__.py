@@ -57,6 +57,14 @@ from .autoformer import AutoformerForecaster as Autoformer
 # the public registry name ``FEDformer``.
 from .fedformer import FEDformerForecaster as FEDformer
 
+# The rnn/deepar/nbeats/tide/tsmixer packages export ``*Forecaster``; expose them
+# under the public registry names matching their neuralforecast counterparts.
+from .rnn import RNNForecaster as RNN
+from .deepar import DeepARForecaster as DeepAR
+from .nbeats import NBEATSForecaster as NBEATS
+from .tide import TiDEForecaster as TiDE
+from .tsmixer import TSMixerForecaster as TSMixer
+
 try:
     from .kan import KAN
 except ImportError:
@@ -219,6 +227,11 @@ __all__ = [
     "HINT",
     "BatchedForecaster",
     "XLSTM",
+    "RNN",
+    "DeepAR",
+    "NBEATS",
+    "TiDE",
+    "TSMixer",
 ]
 
 
