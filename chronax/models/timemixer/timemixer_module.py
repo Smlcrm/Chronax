@@ -109,9 +109,12 @@ def _torch_linear(n_in: int, n_out: int, *, rngs: nnx.Rngs) -> nnx.Linear:
 
 def _moving_avg(x: jnp.ndarray, kernel_size: int) -> jnp.ndarray:
     """Trend extraction: replicate-pad ``(k-1)//2`` on both ends of the time
-    axis, then a stride-1 windowed mean — ``k`` shifted adds, no conv
-    primitive. x: [B, T, N]. Even kernels would shorten the output by one in
-    the reference (its pooling errors downstream), so they are rejected."""
+    axis, then a stride-1 windowed mean via cumulative-sum differences —
+    two slices per call instead of a k-term add chain (the chain dominated
+    the training step at the default k=25, which runs at ~10 decomposition
+    sites per forward). No conv primitive. x: [B, T, N]. Even kernels would
+    shorten the output by one in the reference (its pooling errors
+    downstream), so they are rejected."""
     if kernel_size % 2 == 0:
         raise ValueError(f"moving_avg kernel must be odd; got {kernel_size}.")
     pad = (kernel_size - 1) // 2
@@ -119,10 +122,9 @@ def _moving_avg(x: jnp.ndarray, kernel_size: int) -> jnp.ndarray:
     front = jnp.repeat(x[:, :1, :], pad, axis=1)
     end = jnp.repeat(x[:, -1:, :], pad, axis=1)
     xp = jnp.concatenate([front, x, end], axis=1)          # [B, T + 2*pad, N]
-    out = xp[:, 0:T, :]
-    for j in range(1, kernel_size):
-        out = out + xp[:, j:j + T, :]
-    return out / kernel_size
+    cs = jnp.cumsum(xp, axis=1)
+    cs = jnp.concatenate([jnp.zeros_like(cs[:, :1]), cs], axis=1)
+    return (cs[:, kernel_size:kernel_size + T] - cs[:, 0:T]) / kernel_size
 
 
 def _series_decomp(x: jnp.ndarray, kernel_size: int) -> tuple[jnp.ndarray, jnp.ndarray]:
@@ -358,6 +360,12 @@ class TimeMixerNet(nnx.Module):
             raise ValueError(f"down_sampling_method must be 'avg', 'max' or 'conv'; got {down_sampling_method!r}.")
         if moving_avg % 2 == 0:
             raise ValueError(f"moving_avg kernel must be odd; got {moving_avg}.")
+        if down_sampling_layers < 1:
+            raise ValueError(
+                f"down_sampling_layers must be >= 1; got {down_sampling_layers}. "
+                "The season/trend mixing chains need at least two scales (the "
+                "reference errors out at zero layers too)."
+            )
         divisor = down_sampling_window ** down_sampling_layers
         if input_size % divisor != 0:
             raise ValueError(

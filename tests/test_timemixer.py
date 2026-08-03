@@ -66,7 +66,9 @@ class TestMovingAvgAndDecomp:
             [np.repeat(xn[:, :1], pad, 1), xn, np.repeat(xn[:, -1:], pad, 1)], axis=1
         )
         ref = np.stack([xp[:, j:j + 10] for j in range(k)], 0).mean(0)
-        np.testing.assert_allclose(got, ref, rtol=1e-6)
+        # Cumulative-sum differences re-associate the window sum; tolerance
+        # covers the float32 running-sum error (measured ~4e-6 at k=25, T~100).
+        np.testing.assert_allclose(got, ref, rtol=1e-5, atol=1e-5)
 
     def test_moving_avg_even_kernel_raises(self):
         with pytest.raises(ValueError, match="odd"):
@@ -225,6 +227,12 @@ class TestTimeMixerNet:
     def test_even_moving_avg_raises(self):
         with pytest.raises(ValueError, match="odd"):
             _tiny_net(moving_avg=4)
+
+    def test_zero_down_sampling_layers_raises(self):
+        # The mixing chains need >= 2 scales (the reference indexes
+        # season_list[1] unconditionally and errors out at zero layers too).
+        with pytest.raises(ValueError, match="down_sampling_layers"):
+            _tiny_net(down_sampling_layers=0)
 
     def test_dropout_train_vs_eval(self):
         net = _tiny_net(dropout=0.5)
