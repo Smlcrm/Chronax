@@ -1,0 +1,163 @@
+# Generate the Chronax docs and deploy them to the dev Cloud Run service.
+#
+# Replaces the Cloud Build trigger. The Gemini key comes from Secret Manager
+# at generate time, never from a substitution or an image layer.
+name: Web docs (dev)
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - 'chronax/**'
+      - 'web-docs/**'
+      - '.github/workflows/web-docs-dev.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: web-docs-chronax-dev
+  cancel-in-progress: true
+
+env:
+  PROJECT_SLUG: chronax
+  ARTIFACT_PROJECT_ID: sml-artifacts-dev
+  ARTIFACT_REGION: us-central1
+  ARTIFACT_REPOSITORY: sml-web-doc-docker
+  RUNTIME_PROJECT_ID: sml-website-dev
+  SERVICE_NAME: web-docs-chronax-dev
+  CLOUD_RUN_REGION: us-central1
+  # Recreated in sml-website-dev, the original died with sml-web-doc-gen-dev
+  # on 2026-08-02. The first run after that is a cold build: every module
+  # goes through Gemini. Subsequent runs only regenerate what changed.
+  CACHE_BUCKET: gs://sml-website-dev-docgen-cache/chronax
+  SECRET_PROJECT_ID: sml-website-dev
+  BUILDER_IMAGE: us-central1-docker.pkg.dev/sml-artifacts-dev/sml-web-doc-docker/docgen-builder:latest
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: sml-bootstrap-cicd
+          workload_identity_provider: projects/972498125049/locations/global/workloadIdentityPools/github-pool-sml-bootstrap-cicd/providers/github
+          service_account: github-ci-sml-bootstrap-cicd@sml-bootstrap-cicd.iam.gserviceaccount.com
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker auth
+        run: gcloud auth configure-docker "${ARTIFACT_REGION}-docker.pkg.dev" --quiet
+
+      - name: Read the Gemini key from Secret Manager
+        id: secret
+        run: |
+          set -euo pipefail
+          KEY="$(gcloud secrets versions access latest \
+            --secret=web-doc-gemini-api-key \
+            --project="${SECRET_PROJECT_ID}")"
+          echo "::add-mask::${KEY}"
+          echo "key=${KEY}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the doc cache
+        run: |
+          mkdir -p .docgen-cache
+          gsutil -m rsync -r "${CACHE_BUCKET}" .docgen-cache || true
+
+      - name: Generate the docs
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -e GEMINI_API_KEY \
+            -v "${PWD}:/work" \
+            -v "${PWD}/.docgen-cache:/app/.docgen-cache" \
+            "${BUILDER_IMAGE}" \
+            --repo /work --out /work/site --config /work/web-docs/docgen.toml
+        env:
+          GEMINI_API_KEY: ${{ steps.secret.outputs.key }}
+
+      - name: Verify the site actually generated
+        run: |
+          set -euo pipefail
+          test -f site/index.html || { echo "::error::site/index.html missing"; exit 1; }
+          COUNT="$(find site -name '*.html' | wc -l)"
+          echo "generated ${COUNT} html file(s)"
+          [ "${COUNT}" -gt 1 ] || { echo "::error::only ${COUNT} page(s) generated"; exit 1; }
+
+      - name: Save the doc cache
+        run: gsutil -m rsync -d -r .docgen-cache "${CACHE_BUCKET}"
+
+      - name: Stage serve.py from the builder image
+        run: |
+          set -euo pipefail
+          CID="$(docker create "${BUILDER_IMAGE}")"
+          docker cp "${CID}:/app/serve.py" ./serve.py
+          docker rm "${CID}"
+          test -f serve.py
+
+      - name: Build and push the serve-only image
+        id: push
+        run: |
+          set -euo pipefail
+          IMAGE="${ARTIFACT_REGION}-docker.pkg.dev/${ARTIFACT_PROJECT_ID}/${ARTIFACT_REPOSITORY}/${PROJECT_SLUG}"
+          docker build -t "${IMAGE}:sha-${GITHUB_SHA}" -f web-docs/Dockerfile .
+          docker push "${IMAGE}:sha-${GITHUB_SHA}"
+          DIGEST="$(docker inspect --format='{{index .RepoDigests 0}}' "${IMAGE}:sha-${GITHUB_SHA}" | cut -d@ -f2)"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Pushed ${IMAGE}@${DIGEST}"
+
+      - name: Deploy dev by digest
+        run: |
+          set -euo pipefail
+          IMAGE="${ARTIFACT_REGION}-docker.pkg.dev/${ARTIFACT_PROJECT_ID}/${ARTIFACT_REPOSITORY}/${PROJECT_SLUG}"
+          REF="${IMAGE}@${{ steps.push.outputs.digest }}"
+          LABELS="managed-by=github-actions,source-repo=chronax,commit-sha=${GITHUB_SHA},environment=dev"
+
+          # The dev services were destroyed with sml-web-doc-gen-dev on
+          # 2026-08-02, so the first run in sml-website-dev must CREATE them.
+          # `services update` fails on a missing service; `deploy` creates or
+          # updates. Prefer update once the service exists so we never restate
+          # config that belongs elsewhere.
+          if gcloud run services describe "${SERVICE_NAME}" \
+               --project="${RUNTIME_PROJECT_ID}" --region="${CLOUD_RUN_REGION}" \
+               --format='value(metadata.name)' >/dev/null 2>&1; then
+            echo "Service exists, rolling the image forward."
+            gcloud run services update "${SERVICE_NAME}" \
+              --image="${REF}" \
+              --project="${RUNTIME_PROJECT_ID}" \
+              --region="${CLOUD_RUN_REGION}" \
+              --update-labels="${LABELS}" \
+              --quiet
+          else
+            echo "Service absent, creating it (first deploy after the project move)."
+            gcloud run deploy "${SERVICE_NAME}" \
+              --image="${REF}" \
+              --project="${RUNTIME_PROJECT_ID}" \
+              --region="${CLOUD_RUN_REGION}" \
+              --platform=managed \
+              --allow-unauthenticated \
+              --port=8080 \
+              --set-secrets=GEMINI_API_KEY=web-doc-gemini-api-key:latest \
+              --labels="${LABELS}" \
+              --quiet
+          fi
+
+      - name: Verify the deployed revision serves
+        run: |
+          set -euo pipefail
+          URL="$(gcloud run services describe "${SERVICE_NAME}" \
+            --project="${RUNTIME_PROJECT_ID}" --region="${CLOUD_RUN_REGION}" \
+            --format='value(status.url)')"
+          for i in $(seq 1 10); do
+            CODE="$(curl -s -o /dev/null -w '%{http_code}' "${URL}")"
+            [ "${CODE}" = "200" ] && { echo "OK ${URL}"; exit 0; }
+            echo "attempt ${i}: HTTP ${CODE}"; sleep 6
+          done
+          echo "::error::${URL} never returned 200"; exit 1
