@@ -145,7 +145,11 @@ def nf_subprocess_code(
 
     Dataset kinds:
       univariate  — (unique_id, ds, y); n_series=1 when required
-      multivariate — one unique_id per y_col; n_series=N when required
+      multivariate — N INDEPENDENT univariate fits (one per y_col), metrics
+        averaged and one timer around all N — mirroring run_chronax_seed's
+        multivariate branch. Chronax is univariate-only by design, so fitting NF
+        jointly (n_series=N) would compare N independent models against one
+        cross-learning model and measure parameter sharing, not the engine.
       covariate   — single series + hist_exog_list / futr_exog_list when supported
     """
     extra = _nf_extra_dict(params)
@@ -157,7 +161,6 @@ def nf_subprocess_code(
 
     if kind == "multivariate":
         y_cols = list(spec["y_cols"])
-        n_series = len(y_cols)
         return f'''
 import json, time, inspect, numpy as np, pandas as pd
 import torch
@@ -168,32 +171,35 @@ from neuralforecast.models import {nf_name}
 raw = pd.read_csv({path!r})
 raw = raw.rename(columns={{ {ds_col!r}: 'ds' }})
 raw['ds'] = pd.to_datetime(raw['ds'])
-parts = []
-for col in {y_cols!r}:
-    p = raw[['ds', col]].rename(columns={{col: 'y'}}).copy()
-    p['unique_id'] = col
-    parts.append(p)
-df = pd.concat(parts, ignore_index=True).sort_values(['unique_id','ds']).reset_index(drop=True)
-# holdout: last h timestamps (shared across series)
-cut_ds = sorted(df['ds'].unique())[-{h}]
-train = df[df['ds'] < cut_ds]
-test = df[df['ds'] >= cut_ds]
-y_true = test.sort_values(['unique_id','ds'])['y'].to_numpy()
-kw = {extra}
 sig = inspect.signature({nf_name}).parameters
-if 'n_series' in sig and sig['n_series'].default is inspect.Parameter.empty:
-    kw['n_series'] = {n_series}
-m = {nf_name}(h={h}, input_size={input_size}, loss=MAE(), random_seed={seed},
-    accelerator='cpu', enable_progress_bar=False, logger=False,
-    enable_model_summary=False, enable_checkpointing=False, **kw)
-nf = NeuralForecast(models=[m], freq={freq!r})
-t0 = time.perf_counter(); nf.fit(df=train); fcst = nf.predict(); t = time.perf_counter() - t0
-fcst = fcst.reset_index() if 'unique_id' not in fcst.columns else fcst
-y_hat = fcst.sort_values(['unique_id','ds'])[{nf_name!r}].to_numpy()
-mae = float(np.mean(np.abs(y_true - y_hat)))
-denom = (np.abs(y_true) + np.abs(y_hat)) / 2
-smape = float(np.mean(np.where(denom == 0, 0, np.abs(y_true - y_hat) / denom)) * 100)
-print(json.dumps({{'mae': mae, 'smape': smape, 'wallclock': t}}))
+maes, smapes = [], []
+# PER-SERIES: one independent univariate fit per channel, mirroring the Chronax
+# side (run_chronax_seed's multivariate branch). Chronax is univariate-only by
+# design, so a joint n_series=N fit here would pit N independent models against
+# one cross-learning model — measuring shared parameters, not the engine.
+# One timer spans ALL N fits, matching run_chronax_seed's single `elapsed`.
+t0 = time.perf_counter()
+for col in {y_cols!r}:
+    df = raw[['ds', col]].rename(columns={{col: 'y'}}).copy()
+    df['unique_id'] = col
+    df = df[['unique_id','ds','y']].sort_values('ds').reset_index(drop=True)
+    train, test = df.iloc[:-{h}], df.iloc[-{h}:]
+    y_true = test['y'].to_numpy()
+    kw = {extra}
+    if 'n_series' in sig and sig['n_series'].default is inspect.Parameter.empty:
+        kw.setdefault('n_series', 1)   # univariate benchmark
+    m = {nf_name}(h={h}, input_size={input_size}, loss=MAE(), random_seed={seed},
+        accelerator='cpu', enable_progress_bar=False, logger=False,
+        enable_model_summary=False, enable_checkpointing=False, **kw)
+    nf = NeuralForecast(models=[m], freq={freq!r})
+    nf.fit(df=train)
+    fcst = nf.predict()
+    y_hat = fcst[{nf_name!r}].to_numpy()
+    maes.append(float(np.mean(np.abs(y_true - y_hat))))
+    denom = (np.abs(y_true) + np.abs(y_hat)) / 2
+    smapes.append(float(np.mean(np.where(denom == 0, 0, np.abs(y_true - y_hat) / denom)) * 100))
+t = time.perf_counter() - t0
+print(json.dumps({{'mae': float(np.mean(maes)), 'smape': float(np.mean(smapes)), 'wallclock': t}}))
 '''
 
     if kind == "covariate":

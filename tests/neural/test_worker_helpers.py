@@ -56,15 +56,26 @@ def test_nf_subprocess_code_pins_threads_and_imports_model():
     assert code.index("import torch") < code.index("t0 = time.perf_counter()")
 
 
-def test_nf_subprocess_code_multivariate_sets_n_series():
+def test_nf_subprocess_code_multivariate_fits_per_series():
+    """NF must run PER-SERIES on multivariate datasets, mirroring the Chronax side.
+
+    Chronax is univariate-only by design (one model per series), so a joint
+    n_series=N NF fit would compare N independent models against one
+    cross-learning model — NF would win on shared parameters, not on the engine.
+    Both libraries therefore fit N independent univariate models and average.
+    """
     spec = {
         "name": "WeeklyCushingUS", "path": "/abs/cushing.csv", "ds_col": "Datetime",
         "kind": "multivariate",
         "y_cols": ["a", "b", "c"], "freq": "W-WED",
     }
     code = worker.nf_subprocess_code("TSMixer", spec, 24, 72, {"loss": "MAE"}, 42, 1)
-    assert "kw['n_series'] = 3" in code
-    assert "unique_id" in code
+    assert "kw['n_series'] = 3" not in code       # no joint fit
+    assert "n_series', 1" in code or "n_series'] = 1" in code
+    assert "for col in ['a', 'b', 'c']" in code   # one fit per series
+    assert "np.mean(maes)" in code                # averaged like the chronax side
+    # one timer around ALL N fits, matching run_chronax_seed's single elapsed
+    assert code.count("t0 = time.perf_counter()") == 1
 
 
 def test_nf_subprocess_code_covariate_passes_exog_lists():
