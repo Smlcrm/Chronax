@@ -86,9 +86,35 @@ def test_batchnorm_running_stats_used_in_eval_after_train():
     x = jnp.asarray(np.random.RandomState(3).randn(16, 8, 1), dtype=jnp.float32)
     before = np.asarray(net(x, deterministic=True))
     for _ in range(5):
-        net(x, deterministic=False)                                     # updates BatchStat
+        # forward-only loop: updates the BatchStat running stats, NOT the params.
+        # Do not add an optimizer step here — that would let BatchNorm's per-batch
+        # renormalization cancel param movement and weaken the mutant detection.
+        net(x, deterministic=False)
     after = np.asarray(net(x, deterministic=True))
     assert not np.allclose(before, after)
+
+
+def test_taylor_expert_hand_computed_uses_full_order():
+    # Independent recomputation at order=3 with the top (i=2) coeff contributing,
+    # so a mutation that slices/hardcodes a lower order is caught (not just the
+    # constructor-driven shape difference).
+    from chronax.models.rmok.rmok_module import _taylor
+    x = jnp.array([[2.0, 3.0]], dtype=jnp.float32)          # [B=1, L=2]
+    coeffs = jnp.asarray(np.array([[[1.0, 0.0, 0.5], [0.0, 1.0, 0.0]]], dtype=np.float32))  # [h=1,L=2,order=3]
+    bias = jnp.array([[0.1]], dtype=jnp.float32)
+    xn = np.asarray(x); cn = np.asarray(coeffs)
+    expected = sum((xn ** i) @ cn[0, :, i] for i in range(3)) + 0.1   # 1 + 3 + 2 + 0.1 = 6.1
+    np.testing.assert_allclose(np.asarray(_taylor(x, coeffs, bias, 3))[0], expected, rtol=1e-6)
+
+
+def test_jacobi_expert_hand_computed_uses_degree_terms():
+    # degree=1: cols = [1, 2*tanh(x)] (a=b=1); y = coeffs·[1, 2*tanh(x)]. A mutation
+    # dropping the degree>0 term would return only coeffs[...,0].
+    from chronax.models.rmok.rmok_module import _jacobi
+    x = jnp.array([[1.0]], dtype=jnp.float32)               # [B=1, L=1]
+    coeffs = jnp.asarray(np.array([[[3.0, 5.0]]], dtype=np.float32))  # [L=1, h=1, degree+1=2]
+    expected = 3.0 + 5.0 * (2.0 * np.tanh(1.0))
+    np.testing.assert_allclose(float(np.asarray(_jacobi(x, coeffs, 1))[0, 0]), expected, rtol=1e-6)
 
 
 def test_wavelet_invalid_raises_and_all_valid_finite():

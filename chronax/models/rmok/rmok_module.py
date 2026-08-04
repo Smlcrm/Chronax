@@ -1,13 +1,15 @@
 """RMoK network: RevIN + mixture of KAN experts (NF-faithful forward).
 
 Univariate port of neuralforecast.RMoK's forward. RevIN is inline and NF-exact
-(stop-grad mean, std=sqrt(var+eps), forward-local stats). Four experts map the
-lookback L -> h: Taylor-KAN (poly expansion), Jacobi-KAN (Jacobi recurrence),
-Wave-KAN (mexican-hat wavelet + BatchNorm), and a plain Linear; a softmax gate
-mixes them. BatchNorm running stats + dropout are driven by a ``deterministic``
-flag (DeepNPTS pattern): False in training (batch stats, running-stat update,
-dropout on), True at inference. Expert/gate weights are raw torch-layout params
-([out,in], forward x@w.T+b) so an NF state_dict transplants by pure copy. The
+(stop-grad mean AND std, std=sqrt(var+eps), forward-local stats). Four experts
+map the lookback L -> h: Taylor-KAN (poly expansion), Jacobi-KAN (Jacobi
+recurrence), Wave-KAN (mexican-hat wavelet + BatchNorm), and a plain Linear; a
+softmax gate mixes them. BatchNorm running stats + dropout are driven by a
+``deterministic`` flag (DeepNPTS pattern): False in training (batch stats,
+running-stat update, dropout on), True at inference. Expert/gate weights are raw
+torch-layout params ([out,in], forward x@w.T+b) so an NF state_dict copies over
+without transposing or reshaping any weight (the BatchNorm state still needs a
+torch->flax key mapping). The
 WaveKAN ``weight1`` param exists (faithful pytree) but is unused (frozen). Init
 distributions replicate torch (draws differ). Only ``mexican_hat`` is parity-
 checked; the other four wavelets run finite but have no NF-parity arbiter.
@@ -24,7 +26,9 @@ from flax import nnx
 _WAVELETS = ("mexican_hat", "morlet", "dog", "meyer", "shannon")
 
 
-def _revin_norm(x, affine_weight, affine_bias, *, affine, eps=1e-5):
+def _revin_norm(x: jnp.ndarray, affine_weight: "jnp.ndarray | None",
+                affine_bias: "jnp.ndarray | None", *, affine: bool, eps: float = 1e-5
+                ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """NF RevINMultivariate norm. x [B,L,N] -> (xn, mean, std); stats stop-grad."""
     mean = jax.lax.stop_gradient(jnp.mean(x, axis=1, keepdims=True))
     std = jax.lax.stop_gradient(jnp.sqrt(jnp.var(x, axis=1, keepdims=True) + eps))
@@ -34,13 +38,15 @@ def _revin_norm(x, affine_weight, affine_bias, *, affine, eps=1e-5):
     return xn, mean, std
 
 
-def _revin_denorm(y, affine_weight, affine_bias, *, affine, mean, std):
+def _revin_denorm(y: jnp.ndarray, affine_weight: "jnp.ndarray | None",
+                  affine_bias: "jnp.ndarray | None", *, affine: bool,
+                  mean: jnp.ndarray, std: jnp.ndarray) -> jnp.ndarray:
     if affine:
         y = (y - affine_bias) / affine_weight
     return y * std + mean
 
 
-def _taylor(x, coeffs, bias, order):
+def _taylor(x: jnp.ndarray, coeffs: jnp.ndarray, bias: jnp.ndarray, order: int) -> jnp.ndarray:
     """coeffs [h,L,order], bias [1,h]; x [B,L] -> [B,h]. y = Σ_i (x^i · c[:,:,i]).sum_L + b."""
     xe = x[:, None, :]                                   # [B,1,L]
     y = jnp.zeros((x.shape[0], coeffs.shape[0]), jnp.float32)
@@ -49,7 +55,7 @@ def _taylor(x, coeffs, bias, order):
     return y + bias
 
 
-def _jacobi(x, coeffs, degree, a=1.0, b=1.0):
+def _jacobi(x: jnp.ndarray, coeffs: jnp.ndarray, degree: int, a: float = 1.0, b: float = 1.0) -> jnp.ndarray:
     """coeffs [L,h,degree+1]; x [B,L] -> [B,h] via tanh + Jacobi recurrence + einsum."""
     x = jnp.tanh(x)
     cols = [jnp.ones_like(x)]
@@ -64,7 +70,8 @@ def _jacobi(x, coeffs, degree, a=1.0, b=1.0):
     return jnp.einsum("bid,iod->bo", jac, coeffs)
 
 
-def _wavelet(x, scale, translation, weights, kind):
+def _wavelet(x: jnp.ndarray, scale: jnp.ndarray, translation: jnp.ndarray,
+             weights: jnp.ndarray, kind: str) -> jnp.ndarray:
     """Wavelet transform (pre-BN). x [B,L] -> [B,h]. Only mexican_hat is parity-checked."""
     xs = (x[:, None, :] - translation[None]) / scale[None]        # [B,h,L]
     if kind == "mexican_hat":
@@ -86,16 +93,18 @@ def _wavelet(x, scale, translation, weights, kind):
     return (psi * weights[None]).sum(axis=2)                       # [B,h]
 
 
-def _torch_uniform(key, shape, fan_in):
+def _torch_uniform(key: jax.Array, shape: tuple[int, ...], fan_in: int) -> jnp.ndarray:
     bound = 1.0 / math.sqrt(fan_in)
     return jax.random.uniform(key, shape, jnp.float32, -bound, bound)
 
 
 class RMoKNet(nnx.Module):
-    """RMoK forward (univariate, n_series channels). I/O [B,L,N]->[B,h,N]."""
+    """RMoK forward. Generic over ``n_series`` channels; the forecaster always
+    builds it with ``n_series=1``. I/O [B,L,N]->[B,h,N]."""
 
-    def __init__(self, h, input_size, n_series, taylor_order, jacobi_degree,
-                 wavelet_function, dropout, revin_affine, *, rngs: nnx.Rngs):
+    def __init__(self, h: int, input_size: int, n_series: int, taylor_order: int,
+                 jacobi_degree: int, wavelet_function: str, dropout: float,
+                 revin_affine: bool, *, rngs: nnx.Rngs):
         if wavelet_function not in _WAVELETS:
             raise ValueError(f"wavelet_function must be one of {_WAVELETS}; got {wavelet_function!r}.")
         self.h = h
@@ -130,7 +139,7 @@ class RMoKNet(nnx.Module):
         self.gate_bias = nnx.Param(_torch_uniform(k[7], (4,), L))
         self.dropout = nnx.Dropout(rate=dropout, rngs=rngs)
 
-    def __call__(self, x, *, deterministic: bool):
+    def __call__(self, x: jnp.ndarray, *, deterministic: bool) -> jnp.ndarray:
         B, L, N = x.shape
         aw = self.affine_weight.value if self.revin_affine else None
         ab = self.affine_bias.value if self.revin_affine else None

@@ -220,3 +220,43 @@ def test_rmok_auto_discovered_by_benchmark_harness():
     from benchmarks.neural import registry
     assert "RMoK" in registry.list_models()
     assert registry.resolve_chronax("RMoK") is RMoK
+
+
+def test_input_size_default_resolves_to_3h():
+    assert RMoK(h=10).input_size == 30
+
+
+def test_default_input_size_fits_and_predicts():
+    m = RMoK(h=4, max_steps=5, windows_batch_size=16, random_seed=0).fit(_make_y())
+    assert m.input_size == 12 and m._context.shape == (12,)
+    assert jnp.all(jnp.isfinite(m.predict(h=4)["mean"]))
+
+
+def test_predict_level_without_conformal_params_raises():
+    m = _tiny().fit(_make_y())
+    with pytest.raises(ValueError, match="conformal_params"):
+        m.predict(h=4, level=[80])
+
+
+@pytest.mark.parametrize("loss", ["mse", "huber"])
+def test_named_loss_knob_trains_and_predicts(loss):
+    m = _tiny(loss=loss).fit(_make_y())
+    assert jnp.all(jnp.isfinite(m.predict(h=4)["mean"]))
+
+
+def test_huber_piecewise_delta_one():
+    from chronax.models.rmok.rmok_losses import huber
+    # |r|=0.5 -> 0.5*0.25=0.125 (quadratic); |r|=3 -> 3-0.5=2.5 (linear); mean=1.3125
+    val = huber(jnp.array([[0.0, 0.0]]), jnp.array([[0.5, 3.0]]))
+    assert float(val) == pytest.approx(1.3125)
+
+
+def test_revin_affine_false_fits_and_predicts():
+    m = _tiny(revin_affine=False).fit(_make_y())
+    assert jnp.all(jnp.isfinite(m.predict(h=4)["mean"]))
+    assert not hasattr(m.model_, "affine_weight")   # no affine params created
+
+
+def test_fit_raises_on_2d_y():
+    with pytest.raises(ValueError, match="1-D"):
+        _tiny().fit(jnp.ones((200, 2), dtype=jnp.float32))

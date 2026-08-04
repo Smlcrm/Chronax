@@ -28,8 +28,8 @@ class RMoK(BaseForecaster):
 
     This is a UNIVARIATE adaptation of a model neuralforecast marks multivariate:
     ``n_series`` is fixed to 1 internally (the benchmark auto-injects ``n_series=1``
-    on the neuralforecast side). RevIN normalizes over the single channel; the
-    WaveKAN expert's BatchNorm running statistics are trained through the fit and
+    on the neuralforecast side). RevIN normalizes each window over time (per
+    channel); the WaveKAN expert's BatchNorm running statistics are trained through the fit and
     used at prediction (a ``deterministic`` flag drives both BatchNorm and dropout,
     like DeepNPTS).
 
@@ -46,7 +46,9 @@ class RMoK(BaseForecaster):
     normalization) or ``"robust"``. Constructor guards (``taylor_order >= 0``,
     ``jacobi_degree >= 0``, ``wavelet_function`` in the five KAN4TSF wavelets,
     ``0 <= dropout < 1``) are mostly NF-faithful; ``dropout < 1`` is deliberately
-    stricter than neuralforecast (``dropout=1`` would divide by zero here). Only
+    stricter than neuralforecast: ``dropout=1`` would zero the entire normalized
+    input, feeding the experts all-zeros — a degenerate config we reject rather
+    than silently train. Only
     ``wavelet_function="mexican_hat"`` (the default) is verified at parity with
     neuralforecast; the other four run but are not parity-checked. ``float32``
     throughout, matching torch/neuralforecast defaults.
@@ -178,18 +180,21 @@ class RMoK(BaseForecaster):
         return jnp.concatenate([nan_head, first])
 
     def __getstate__(self) -> dict:
-        """Serialize NNX state (params + BatchNorm running stats) and rebuild the
-        GraphDef via _build_net() on load — smaller payload and robust to
-        flax-internal GraphDef changes across versions (same convention as KAN)."""
+        """Serialize NNX state (params + WaveKAN BatchNorm running stats) and
+        rebuild the GraphDef via _build_net() on load — smaller payload and robust
+        to flax-internal GraphDef changes across versions. A full ``nnx.split``
+        captures both ``nnx.Param`` and the ``nnx.BatchStat`` running stats, so a
+        reloaded model predicts identically (same convention as DeepNPTS, the
+        sibling that also carries BatchNorm state)."""
         state = self.__dict__.copy()
         if state.get("model_") is not None:
             _, full_state = nnx.split(state["model_"])
-            state["model_"] = ("__params_only__", full_state)
+            state["model_"] = ("__nnx_state__", full_state)
         return state
 
     def __setstate__(self, state: dict) -> None:
         m = state.get("model_")
-        if isinstance(m, tuple) and m and m[0] == "__params_only__":
+        if isinstance(m, tuple) and m and m[0] == "__nnx_state__":
             saved_state = m[1]
             state["model_"] = None
             self.__dict__.update(state)

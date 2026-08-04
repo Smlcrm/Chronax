@@ -67,11 +67,9 @@ def _sample_batch_idx(step_keys: jnp.ndarray, n_windows: int, windows_batch_size
     distribution-equivalent to NF's ``randperm(n)[:k]`` (by symmetry every
     k-subset is equally likely, and batch order is irrelevant to a mean-reduced
     loss). Selection runs via ``np.argpartition`` on the host when the keys are
-    concrete: measured per fit at ~7k-window scale (5000 steps, the largest
-    benchmark dataset; CPU, 2026-07), sampling cost was 9.6s for a vmapped full
-    permutation, 4.6s for ``lax.top_k``, 2.3s for jitted ``jnp.argpartition``
-    and 0.4s for this hybrid — against ~0.5s for the ENTIRE training scan, since
-    RMoK's per-step compute is one small matmul. Under a trace of the keys
+    concrete (host sorting avoids a full jitted permutation over all windows; the
+    sampling cost is model-independent and negligible next to RMoK's per-step
+    training compute). Under a trace of the keys
     themselves (e.g. ``jax.jit`` over ``step_keys``, as in the equivalence test)
     it falls back to pure-JAX ``argpartition``; note that
     ``BaseForecaster.conformity_scores``' vmap does NOT trace the keys (the seed
