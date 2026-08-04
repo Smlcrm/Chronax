@@ -69,14 +69,23 @@ jobs:
       - name: Generate the docs
         run: |
           set -euo pipefail
-          # RUNNER_TEMP is mounted at the same path inside the container so the
-          # ADC file written by google-github-actions/auth resolves, including
-          # the OIDC token file it points at. No credential is ever copied.
+          # ADC has to resolve INSIDE the container, and every path involved is
+          # an absolute HOST path: GOOGLE_APPLICATION_CREDENTIALS, and the OIDC
+          # token file named inside that credential file. So both directories
+          # google-github-actions/auth writes to are mounted at their original
+          # paths — the workspace (where the credential file actually lands)
+          # and RUNNER_TEMP — and the env var is passed through unchanged.
+          #
+          # Mounting the workspace only at /work is what broke this: the file
+          # was present, under a path the credential chain never looks at, so
+          # generation failed with DefaultCredentialsError after ingesting the
+          # whole repo. Read-only, and no credential is ever copied.
           docker run --rm \
             -e GOOGLE_APPLICATION_CREDENTIALS \
             -e GOOGLE_CLOUD_PROJECT \
             -e GOOGLE_CLOUD_LOCATION \
             -v "${RUNNER_TEMP}:${RUNNER_TEMP}:ro" \
+            -v "${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}:ro" \
             -v "${PWD}:/work" \
             -v "${PWD}/.docgen-cache:/app/.docgen-cache" \
             "${BUILDER_IMAGE}" \
