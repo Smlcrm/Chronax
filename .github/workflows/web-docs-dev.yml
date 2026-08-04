@@ -1,0 +1,168 @@
+# Generate the Chronax docs and deploy them to the dev Cloud Run service.
+#
+# Replaces the Cloud Build trigger. Generation authenticates to Vertex AI
+# through ADC, so there is no API key anywhere in this pipeline.
+name: Web docs (dev)
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - 'chronax/**'
+      - 'web-docs/**'
+      - '.github/workflows/web-docs-dev.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: web-docs-chronax-dev
+  cancel-in-progress: true
+
+env:
+  PROJECT_SLUG: chronax
+  ARTIFACT_PROJECT_ID: sml-artifacts-dev
+  ARTIFACT_REGION: us-central1
+  ARTIFACT_REPOSITORY: sml-web-doc-docker
+  RUNTIME_PROJECT_ID: sml-website-dev
+  SERVICE_NAME: web-docs-chronax-dev
+  CLOUD_RUN_REGION: us-central1
+  # Recreated in sml-website-dev, the original died with sml-web-doc-gen-dev
+  # on 2026-08-02. The first run after that is a cold build: every module
+  # goes through Gemini. Subsequent runs only regenerate what changed.
+  CACHE_BUCKET: gs://sml-website-dev-docgen-cache/chronax
+  # Generation runs against Vertex AI through ADC. There is no API key: org
+  # policy forbids long-lived keys, and the job is already federated via WIF.
+  VERTEX_PROJECT_ID: sml-website-dev
+  # Matches what Terraform sets on the runtime services, so generation and
+  # Ask AI both hit the same endpoint.
+  VERTEX_LOCATION: global
+  BUILDER_IMAGE: us-central1-docker.pkg.dev/sml-artifacts-dev/sml-web-doc-docker/docgen-builder:latest
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: sml-bootstrap-cicd
+          workload_identity_provider: projects/972498125049/locations/global/workloadIdentityPools/github-pool-sml-bootstrap-cicd/providers/github
+          service_account: github-ci-sml-bootstrap-cicd@sml-bootstrap-cicd.iam.gserviceaccount.com
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker auth
+        run: gcloud auth configure-docker "${ARTIFACT_REGION}-docker.pkg.dev" --quiet
+
+      - name: Restore the doc cache
+        run: |
+          mkdir -p .docgen-cache
+          gsutil -m rsync -r "${CACHE_BUCKET}" .docgen-cache || true
+
+      - name: Generate the docs
+        run: |
+          set -euo pipefail
+          # RUNNER_TEMP is mounted at the same path inside the container so the
+          # ADC file written by google-github-actions/auth resolves, including
+          # the OIDC token file it points at. No credential is ever copied.
+          docker run --rm \
+            -e GOOGLE_APPLICATION_CREDENTIALS \
+            -e GOOGLE_CLOUD_PROJECT \
+            -e GOOGLE_CLOUD_LOCATION \
+            -v "${RUNNER_TEMP}:${RUNNER_TEMP}:ro" \
+            -v "${PWD}:/work" \
+            -v "${PWD}/.docgen-cache:/app/.docgen-cache" \
+            "${BUILDER_IMAGE}" \
+            --repo /work --out /work/site --config /work/web-docs/docgen.toml
+        env:
+          GOOGLE_CLOUD_PROJECT: ${{ env.VERTEX_PROJECT_ID }}
+          GOOGLE_CLOUD_LOCATION: ${{ env.VERTEX_LOCATION }}
+
+      - name: Verify the site actually generated
+        run: |
+          set -euo pipefail
+          test -f site/index.html || { echo "::error::site/index.html missing"; exit 1; }
+          COUNT="$(find site -name '*.html' | wc -l)"
+          echo "generated ${COUNT} html file(s)"
+          [ "${COUNT}" -gt 1 ] || { echo "::error::only ${COUNT} page(s) generated"; exit 1; }
+
+      - name: Save the doc cache
+        run: gsutil -m rsync -d -r .docgen-cache "${CACHE_BUCKET}"
+
+      - name: Stage serve.py from the builder image
+        run: |
+          set -euo pipefail
+          CID="$(docker create "${BUILDER_IMAGE}")"
+          docker cp "${CID}:/app/serve.py" ./serve.py
+          docker rm "${CID}"
+          test -f serve.py
+
+      - name: Build and push the serve-only image
+        id: push
+        run: |
+          set -euo pipefail
+          IMAGE="${ARTIFACT_REGION}-docker.pkg.dev/${ARTIFACT_PROJECT_ID}/${ARTIFACT_REPOSITORY}/${PROJECT_SLUG}"
+          docker build -t "${IMAGE}:sha-${GITHUB_SHA}" -f web-docs/Dockerfile .
+          docker push "${IMAGE}:sha-${GITHUB_SHA}"
+          DIGEST="$(docker inspect --format='{{index .RepoDigests 0}}' "${IMAGE}:sha-${GITHUB_SHA}" | cut -d@ -f2)"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Pushed ${IMAGE}@${DIGEST}"
+
+      - name: Deploy dev by digest
+        run: |
+          set -euo pipefail
+          IMAGE="${ARTIFACT_REGION}-docker.pkg.dev/${ARTIFACT_PROJECT_ID}/${ARTIFACT_REPOSITORY}/${PROJECT_SLUG}"
+          REF="${IMAGE}@${{ steps.push.outputs.digest }}"
+          LABELS="managed-by=github-actions,source-repo=chronax,commit-sha=${GITHUB_SHA},environment=dev"
+
+          # Update only. The service definition (ingress, invoker, runtime SA,
+          # scaling, env) is owned by Terraform; anything set here would be
+          # invisible to it and read as unmanaged drift. This step rolls the
+          # image forward and nothing else, so it fails loudly if the service
+          # has not been provisioned yet.
+          gcloud run services update "${SERVICE_NAME}" \
+            --image="${REF}" \
+            --project="${RUNTIME_PROJECT_ID}" \
+            --region="${CLOUD_RUN_REGION}" \
+            --update-labels="${LABELS}" \
+            --quiet
+
+      - name: Verify the new revision converged
+        run: |
+          set -euo pipefail
+          IMAGE="${ARTIFACT_REGION}-docker.pkg.dev/${ARTIFACT_PROJECT_ID}/${ARTIFACT_REPOSITORY}/${PROJECT_SLUG}"
+          EXPECTED="${IMAGE}@${{ steps.push.outputs.digest }}"
+
+          # The service sits behind the load balancer with internal ingress, so
+          # its run.app URL does not answer from a GitHub runner even on a good
+          # deploy. Assert convergence instead: Cloud Run must reach a Ready
+          # revision that is the newest one AND serves the digest we just built.
+          for i in $(seq 1 30); do
+            READY="$(gcloud run services describe "${SERVICE_NAME}" \
+              --project="${RUNTIME_PROJECT_ID}" --region="${CLOUD_RUN_REGION}" \
+              --format='value(status.latestReadyRevisionName)')"
+            CREATED="$(gcloud run services describe "${SERVICE_NAME}" \
+              --project="${RUNTIME_PROJECT_ID}" --region="${CLOUD_RUN_REGION}" \
+              --format='value(status.latestCreatedRevisionName)')"
+            if [ -n "${READY}" ] && [ "${READY}" = "${CREATED}" ]; then
+              SERVING="$(gcloud run revisions describe "${READY}" \
+                --project="${RUNTIME_PROJECT_ID}" --region="${CLOUD_RUN_REGION}" \
+                --format='value(spec.containers[0].image)')"
+              if [ "${SERVING}" = "${EXPECTED}" ]; then
+                echo "OK ${READY} serving ${SERVING}"
+                exit 0
+              fi
+              echo "::error::${READY} serves ${SERVING}, expected ${EXPECTED}"
+              exit 1
+            fi
+            echo "attempt ${i}: created=${CREATED} ready=${READY}"
+            sleep 6
+          done
+          echo "::error::no revision became ready in time"; exit 1

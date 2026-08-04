@@ -1,0 +1,175 @@
+# Promote an already-tested dev docs image to production by digest.
+#
+# No rebuild: this copies the exact bytes that the dev workflow generated,
+# tested, and deployed. The release tag names the version; the digest is
+# the through-line.
+name: Web docs (promote to prod)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: 'Commit SHA whose dev image should be promoted'
+        required: true
+      version:
+        description: 'Production tag to apply (e.g. v1.4.2)'
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  # The prod registry is writable only by github-ci-promote-prod. The ordinary
+  # CI service account can read dev images but cannot write to sml-artifacts-prod,
+  # so the promote job must authenticate as the promotion account.
+  PROMOTE_SERVICE_ACCOUNT: "github-ci-promote-prod@sml-bootstrap-cicd.iam.gserviceaccount.com"
+  AUTH_PROJECT_NUMBER: "972498125049"
+  AUTH_WORKLOAD_IDENTITY_POOL: "github-pool-sml-bootstrap-cicd"
+  AUTH_WORKLOAD_IDENTITY_PROVIDER: "github"
+  PROJECT_SLUG: chronax
+  ARTIFACT_REGION: us-central1
+  ARTIFACT_REPOSITORY: sml-web-doc-docker
+  DEV_ARTIFACT_PROJECT_ID: sml-artifacts-dev
+  PROD_ARTIFACT_PROJECT_ID: sml-artifacts-prod
+  PROD_RUNTIME_PROJECT_ID: sml-website-prod
+  PROD_SERVICE_NAME: web-docs-chronax-prod
+  CLOUD_RUN_REGION: us-central1
+
+jobs:
+  promote:
+    # Two supported entry points: pushing a release tag (v*), and a manual
+    # dispatch that names the commit and version explicitly.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Resolve the commit and version being promoted
+        id: target
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            COMMIT="${{ inputs.commit_sha }}"
+            VERSION="${{ inputs.version }}"
+          else
+            # Tag push: GITHUB_SHA is the commit the tag points at and
+            # GITHUB_REF_NAME is the tag itself (e.g. v1.4.2).
+            COMMIT="${GITHUB_SHA}"
+            VERSION="${GITHUB_REF_NAME}"
+          fi
+          if ! printf '%s' "${COMMIT}" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::commit '${COMMIT}' is not a full 40-character SHA. Dev images are tagged sha-<full sha>."
+            exit 1
+          fi
+          if [ -z "${VERSION}" ]; then
+            echo "::error::No version resolved for this promotion."
+            exit 1
+          fi
+          echo "commit=${COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Promoting commit ${COMMIT} as ${VERSION}"
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: sml-bootstrap-cicd
+          workload_identity_provider: projects/${{ env.AUTH_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ env.AUTH_WORKLOAD_IDENTITY_POOL }}/providers/${{ env.AUTH_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.PROMOTE_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      # Pinned to a commit SHA: this job holds prod-write credentials, so a
+      # moved tag here would be a supply-chain foothold. v0.4.
+      - uses: imjasonh/setup-crane@31b88efe9de28ae0ffa220711af4b60be9435f6e
+
+      - name: Resolve the tested dev digest
+        id: digest
+        run: |
+          set -euo pipefail
+          DEV_IMAGE="${ARTIFACT_REGION}-docker.pkg.dev/${DEV_ARTIFACT_PROJECT_ID}/${ARTIFACT_REPOSITORY}/${PROJECT_SLUG}"
+          DIGEST="$(gcloud artifacts docker images describe \
+            "${DEV_IMAGE}:sha-${{ steps.target.outputs.commit }}" \
+            --format='value(image_summary.digest)')"
+          if [ -z "${DIGEST}" ]; then
+            echo "::error::No dev image for commit ${{ steps.target.outputs.commit }}. Promote only commits the dev workflow has built and tested."
+            exit 1
+          fi
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Resolved ${DEV_IMAGE}@${DIGEST}"
+
+      - name: Copy the digest into the production registry
+        run: |
+          set -euo pipefail
+          gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+          DEV_IMAGE="${ARTIFACT_REGION}-docker.pkg.dev/${DEV_ARTIFACT_PROJECT_ID}/${ARTIFACT_REPOSITORY}/${PROJECT_SLUG}"
+          PROD_IMAGE="${ARTIFACT_REGION}-docker.pkg.dev/${PROD_ARTIFACT_PROJECT_ID}/${ARTIFACT_REPOSITORY}/${PROJECT_SLUG}"
+          crane cp \
+            "${DEV_IMAGE}@${{ steps.digest.outputs.digest }}" \
+            "${PROD_IMAGE}:${{ steps.target.outputs.version }}"
+          echo "Promoted to ${PROD_IMAGE}:${{ steps.target.outputs.version }}"
+
+      - name: Verify digest parity between dev and prod
+        run: |
+          set -euo pipefail
+          PROD_IMAGE="${ARTIFACT_REGION}-docker.pkg.dev/${PROD_ARTIFACT_PROJECT_ID}/${ARTIFACT_REPOSITORY}/${PROJECT_SLUG}"
+          PROD_DIGEST="$(crane digest "${PROD_IMAGE}:${{ steps.target.outputs.version }}")"
+          if [ "${{ steps.digest.outputs.digest }}" != "${PROD_DIGEST}" ]; then
+            echo "::error::digest parity check FAILED: ${{ steps.digest.outputs.digest }} != ${PROD_DIGEST}"
+            exit 1
+          fi
+          echo "Digest parity OK: ${PROD_DIGEST}"
+
+      - name: Deploy production by digest
+        run: |
+          set -euo pipefail
+          PROD_IMAGE="${ARTIFACT_REGION}-docker.pkg.dev/${PROD_ARTIFACT_PROJECT_ID}/${ARTIFACT_REPOSITORY}/${PROJECT_SLUG}"
+          REF="${PROD_IMAGE}@${{ steps.digest.outputs.digest }}"
+          LABELS="managed-by=github-actions,source-repo=chronax,commit-sha=${{ steps.target.outputs.commit }},release=${{ steps.target.outputs.version }},environment=prod"
+
+          # Update only. The service definition (ingress, invoker, runtime SA,
+          # scaling, env) is owned by Terraform; anything set here would be
+          # invisible to it and read as unmanaged drift, and in prod would put
+          # the service on a bare run.app URL outside the load balancer.
+          gcloud run services update "${PROD_SERVICE_NAME}" \
+            --image="${REF}" \
+            --project="${PROD_RUNTIME_PROJECT_ID}" \
+            --region="${CLOUD_RUN_REGION}" \
+            --update-labels="${LABELS}" \
+            --quiet
+
+      - name: Verify the production revision converged
+        run: |
+          set -euo pipefail
+          PROD_IMAGE="${ARTIFACT_REGION}-docker.pkg.dev/${PROD_ARTIFACT_PROJECT_ID}/${ARTIFACT_REPOSITORY}/${PROJECT_SLUG}"
+          EXPECTED="${PROD_IMAGE}@${{ steps.digest.outputs.digest }}"
+
+          # Prod sits behind the load balancer with internal ingress, so its
+          # run.app URL does not answer from a GitHub runner. Assert that Cloud
+          # Run reached a Ready revision serving the promoted digest instead.
+          for i in $(seq 1 30); do
+            READY="$(gcloud run services describe "${PROD_SERVICE_NAME}" \
+              --project="${PROD_RUNTIME_PROJECT_ID}" --region="${CLOUD_RUN_REGION}" \
+              --format='value(status.latestReadyRevisionName)')"
+            CREATED="$(gcloud run services describe "${PROD_SERVICE_NAME}" \
+              --project="${PROD_RUNTIME_PROJECT_ID}" --region="${CLOUD_RUN_REGION}" \
+              --format='value(status.latestCreatedRevisionName)')"
+            if [ -n "${READY}" ] && [ "${READY}" = "${CREATED}" ]; then
+              SERVING="$(gcloud run revisions describe "${READY}" \
+                --project="${PROD_RUNTIME_PROJECT_ID}" --region="${CLOUD_RUN_REGION}" \
+                --format='value(spec.containers[0].image)')"
+              if [ "${SERVING}" = "${EXPECTED}" ]; then
+                echo "OK ${READY} serving ${SERVING}"
+                exit 0
+              fi
+              echo "::error::${READY} serves ${SERVING}, expected ${EXPECTED}"
+              exit 1
+            fi
+            echo "attempt ${i}: created=${CREATED} ready=${READY}"
+            sleep 6
+          done
+          echo "::error::no revision became ready in time"; exit 1
