@@ -1,7 +1,7 @@
 # Generate the Chronax docs and deploy them to the dev Cloud Run service.
 #
-# Replaces the Cloud Build trigger. The Gemini key comes from Secret Manager
-# at generate time, never from a substitution or an image layer.
+# Replaces the Cloud Build trigger. Generation authenticates to Vertex AI
+# through ADC, so there is no API key anywhere in this pipeline.
 name: Web docs (dev)
 
 on:
@@ -36,7 +36,9 @@ env:
   # Generation runs against Vertex AI through ADC. There is no API key: org
   # policy forbids long-lived keys, and the job is already federated via WIF.
   VERTEX_PROJECT_ID: sml-website-dev
-  VERTEX_LOCATION: us-central1
+  # Matches what Terraform sets on the runtime services, so generation and
+  # Ask AI both hit the same endpoint.
+  VERTEX_LOCATION: global
   BUILDER_IMAGE: us-central1-docker.pkg.dev/sml-artifacts-dev/sml-web-doc-docker/docgen-builder:latest
 
 jobs:
@@ -132,15 +134,35 @@ jobs:
             --update-labels="${LABELS}" \
             --quiet
 
-      - name: Verify the deployed revision serves
+      - name: Verify the new revision converged
         run: |
           set -euo pipefail
-          URL="$(gcloud run services describe "${SERVICE_NAME}" \
-            --project="${RUNTIME_PROJECT_ID}" --region="${CLOUD_RUN_REGION}" \
-            --format='value(status.url)')"
-          for i in $(seq 1 10); do
-            CODE="$(curl -s -o /dev/null -w '%{http_code}' "${URL}")"
-            [ "${CODE}" = "200" ] && { echo "OK ${URL}"; exit 0; }
-            echo "attempt ${i}: HTTP ${CODE}"; sleep 6
+          IMAGE="${ARTIFACT_REGION}-docker.pkg.dev/${ARTIFACT_PROJECT_ID}/${ARTIFACT_REPOSITORY}/${PROJECT_SLUG}"
+          EXPECTED="${IMAGE}@${{ steps.push.outputs.digest }}"
+
+          # The service sits behind the load balancer with internal ingress, so
+          # its run.app URL does not answer from a GitHub runner even on a good
+          # deploy. Assert convergence instead: Cloud Run must reach a Ready
+          # revision that is the newest one AND serves the digest we just built.
+          for i in $(seq 1 30); do
+            READY="$(gcloud run services describe "${SERVICE_NAME}" \
+              --project="${RUNTIME_PROJECT_ID}" --region="${CLOUD_RUN_REGION}" \
+              --format='value(status.latestReadyRevisionName)')"
+            CREATED="$(gcloud run services describe "${SERVICE_NAME}" \
+              --project="${RUNTIME_PROJECT_ID}" --region="${CLOUD_RUN_REGION}" \
+              --format='value(status.latestCreatedRevisionName)')"
+            if [ -n "${READY}" ] && [ "${READY}" = "${CREATED}" ]; then
+              SERVING="$(gcloud run revisions describe "${READY}" \
+                --project="${RUNTIME_PROJECT_ID}" --region="${CLOUD_RUN_REGION}" \
+                --format='value(spec.containers[0].image)')"
+              if [ "${SERVING}" = "${EXPECTED}" ]; then
+                echo "OK ${READY} serving ${SERVING}"
+                exit 0
+              fi
+              echo "::error::${READY} serves ${SERVING}, expected ${EXPECTED}"
+              exit 1
+            fi
+            echo "attempt ${i}: created=${CREATED} ready=${READY}"
+            sleep 6
           done
-          echo "::error::${URL} never returned 200"; exit 1
+          echo "::error::no revision became ready in time"; exit 1

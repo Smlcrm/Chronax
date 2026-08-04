@@ -142,15 +142,34 @@ jobs:
             --update-labels="${LABELS}" \
             --quiet
 
-      - name: Verify production serves
+      - name: Verify the production revision converged
         run: |
           set -euo pipefail
-          URL="$(gcloud run services describe "${PROD_SERVICE_NAME}" \
-            --project="${PROD_RUNTIME_PROJECT_ID}" --region="${CLOUD_RUN_REGION}" \
-            --format='value(status.url)')"
-          for i in $(seq 1 10); do
-            CODE="$(curl -s -o /dev/null -w '%{http_code}' "${URL}")"
-            [ "${CODE}" = "200" ] && { echo "OK ${URL}"; exit 0; }
-            echo "attempt ${i}: HTTP ${CODE}"; sleep 6
+          PROD_IMAGE="${ARTIFACT_REGION}-docker.pkg.dev/${PROD_ARTIFACT_PROJECT_ID}/${ARTIFACT_REPOSITORY}/${PROJECT_SLUG}"
+          EXPECTED="${PROD_IMAGE}@${{ steps.digest.outputs.digest }}"
+
+          # Prod sits behind the load balancer with internal ingress, so its
+          # run.app URL does not answer from a GitHub runner. Assert that Cloud
+          # Run reached a Ready revision serving the promoted digest instead.
+          for i in $(seq 1 30); do
+            READY="$(gcloud run services describe "${PROD_SERVICE_NAME}" \
+              --project="${PROD_RUNTIME_PROJECT_ID}" --region="${CLOUD_RUN_REGION}" \
+              --format='value(status.latestReadyRevisionName)')"
+            CREATED="$(gcloud run services describe "${PROD_SERVICE_NAME}" \
+              --project="${PROD_RUNTIME_PROJECT_ID}" --region="${CLOUD_RUN_REGION}" \
+              --format='value(status.latestCreatedRevisionName)')"
+            if [ -n "${READY}" ] && [ "${READY}" = "${CREATED}" ]; then
+              SERVING="$(gcloud run revisions describe "${READY}" \
+                --project="${PROD_RUNTIME_PROJECT_ID}" --region="${CLOUD_RUN_REGION}" \
+                --format='value(spec.containers[0].image)')"
+              if [ "${SERVING}" = "${EXPECTED}" ]; then
+                echo "OK ${READY} serving ${SERVING}"
+                exit 0
+              fi
+              echo "::error::${READY} serves ${SERVING}, expected ${EXPECTED}"
+              exit 1
+            fi
+            echo "attempt ${i}: created=${CREATED} ready=${READY}"
+            sleep 6
           done
-          echo "::error::${URL} never returned 200"; exit 1
+          echo "::error::no revision became ready in time"; exit 1
