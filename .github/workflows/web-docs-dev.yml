@@ -33,7 +33,10 @@ env:
   # on 2026-08-02. The first run after that is a cold build: every module
   # goes through Gemini. Subsequent runs only regenerate what changed.
   CACHE_BUCKET: gs://sml-website-dev-docgen-cache/chronax
-  SECRET_PROJECT_ID: sml-website-dev
+  # Generation runs against Vertex AI through ADC. There is no API key: org
+  # policy forbids long-lived keys, and the job is already federated via WIF.
+  VERTEX_PROJECT_ID: sml-website-dev
+  VERTEX_LOCATION: us-central1
   BUILDER_IMAGE: us-central1-docker.pkg.dev/sml-artifacts-dev/sml-web-doc-docker/docgen-builder:latest
 
 jobs:
@@ -56,16 +59,6 @@ jobs:
       - name: Configure Docker auth
         run: gcloud auth configure-docker "${ARTIFACT_REGION}-docker.pkg.dev" --quiet
 
-      - name: Read the Gemini key from Secret Manager
-        id: secret
-        run: |
-          set -euo pipefail
-          KEY="$(gcloud secrets versions access latest \
-            --secret=web-doc-gemini-api-key \
-            --project="${SECRET_PROJECT_ID}")"
-          echo "::add-mask::${KEY}"
-          echo "key=${KEY}" >> "$GITHUB_OUTPUT"
-
       - name: Restore the doc cache
         run: |
           mkdir -p .docgen-cache
@@ -74,14 +67,21 @@ jobs:
       - name: Generate the docs
         run: |
           set -euo pipefail
+          # RUNNER_TEMP is mounted at the same path inside the container so the
+          # ADC file written by google-github-actions/auth resolves, including
+          # the OIDC token file it points at. No credential is ever copied.
           docker run --rm \
-            -e GEMINI_API_KEY \
+            -e GOOGLE_APPLICATION_CREDENTIALS \
+            -e GOOGLE_CLOUD_PROJECT \
+            -e GOOGLE_CLOUD_LOCATION \
+            -v "${RUNNER_TEMP}:${RUNNER_TEMP}:ro" \
             -v "${PWD}:/work" \
             -v "${PWD}/.docgen-cache:/app/.docgen-cache" \
             "${BUILDER_IMAGE}" \
             --repo /work --out /work/site --config /work/web-docs/docgen.toml
         env:
-          GEMINI_API_KEY: ${{ steps.secret.outputs.key }}
+          GOOGLE_CLOUD_PROJECT: ${{ env.VERTEX_PROJECT_ID }}
+          GOOGLE_CLOUD_LOCATION: ${{ env.VERTEX_LOCATION }}
 
       - name: Verify the site actually generated
         run: |
@@ -120,34 +120,17 @@ jobs:
           REF="${IMAGE}@${{ steps.push.outputs.digest }}"
           LABELS="managed-by=github-actions,source-repo=chronax,commit-sha=${GITHUB_SHA},environment=dev"
 
-          # The dev services were destroyed with sml-web-doc-gen-dev on
-          # 2026-08-02, so the first run in sml-website-dev must CREATE them.
-          # `services update` fails on a missing service; `deploy` creates or
-          # updates. Prefer update once the service exists so we never restate
-          # config that belongs elsewhere.
-          if gcloud run services describe "${SERVICE_NAME}" \
-               --project="${RUNTIME_PROJECT_ID}" --region="${CLOUD_RUN_REGION}" \
-               --format='value(metadata.name)' >/dev/null 2>&1; then
-            echo "Service exists, rolling the image forward."
-            gcloud run services update "${SERVICE_NAME}" \
-              --image="${REF}" \
-              --project="${RUNTIME_PROJECT_ID}" \
-              --region="${CLOUD_RUN_REGION}" \
-              --update-labels="${LABELS}" \
-              --quiet
-          else
-            echo "Service absent, creating it (first deploy after the project move)."
-            gcloud run deploy "${SERVICE_NAME}" \
-              --image="${REF}" \
-              --project="${RUNTIME_PROJECT_ID}" \
-              --region="${CLOUD_RUN_REGION}" \
-              --platform=managed \
-              --allow-unauthenticated \
-              --port=8080 \
-              --set-secrets=GEMINI_API_KEY=web-doc-gemini-api-key:latest \
-              --labels="${LABELS}" \
-              --quiet
-          fi
+          # Update only. The service definition (ingress, invoker, runtime SA,
+          # scaling, env) is owned by Terraform; anything set here would be
+          # invisible to it and read as unmanaged drift. This step rolls the
+          # image forward and nothing else, so it fails loudly if the service
+          # has not been provisioned yet.
+          gcloud run services update "${SERVICE_NAME}" \
+            --image="${REF}" \
+            --project="${RUNTIME_PROJECT_ID}" \
+            --region="${CLOUD_RUN_REGION}" \
+            --update-labels="${LABELS}" \
+            --quiet
 
       - name: Verify the deployed revision serves
         run: |

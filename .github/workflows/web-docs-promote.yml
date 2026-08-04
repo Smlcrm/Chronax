@@ -83,7 +83,9 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@v2
 
-      - uses: imjasonh/setup-crane@v0.4
+      # Pinned to a commit SHA: this job holds prod-write credentials, so a
+      # moved tag here would be a supply-chain foothold. v0.4.
+      - uses: imjasonh/setup-crane@31b88efe9de28ae0ffa220711af4b60be9435f6e
 
       - name: Resolve the tested dev digest
         id: digest
@@ -129,33 +131,16 @@ jobs:
           REF="${PROD_IMAGE}@${{ steps.digest.outputs.digest }}"
           LABELS="managed-by=github-actions,source-repo=chronax,commit-sha=${{ steps.target.outputs.commit }},release=${{ steps.target.outputs.version }},environment=prod"
 
-          # sml-website-prod was provisioned fresh, so the first promote has to
-          # CREATE the service. `services update` fails on a missing service;
-          # `deploy` creates or updates. Prefer update once it exists so we
-          # never restate config that belongs elsewhere.
-          if gcloud run services describe "${PROD_SERVICE_NAME}" \
-               --project="${PROD_RUNTIME_PROJECT_ID}" --region="${CLOUD_RUN_REGION}" \
-               --format='value(metadata.name)' >/dev/null 2>&1; then
-            echo "Service exists, rolling the image forward."
-            gcloud run services update "${PROD_SERVICE_NAME}" \
-              --image="${REF}" \
-              --project="${PROD_RUNTIME_PROJECT_ID}" \
-              --region="${CLOUD_RUN_REGION}" \
-              --update-labels="${LABELS}" \
-              --quiet
-          else
-            echo "Service absent, creating it (first promote into sml-website-prod)."
-            gcloud run deploy "${PROD_SERVICE_NAME}" \
-              --image="${REF}" \
-              --project="${PROD_RUNTIME_PROJECT_ID}" \
-              --region="${CLOUD_RUN_REGION}" \
-              --platform=managed \
-              --allow-unauthenticated \
-              --port=8080 \
-              --set-secrets=GEMINI_API_KEY=web-doc-gemini-api-key:latest \
-              --labels="${LABELS}" \
-              --quiet
-          fi
+          # Update only. The service definition (ingress, invoker, runtime SA,
+          # scaling, env) is owned by Terraform; anything set here would be
+          # invisible to it and read as unmanaged drift, and in prod would put
+          # the service on a bare run.app URL outside the load balancer.
+          gcloud run services update "${PROD_SERVICE_NAME}" \
+            --image="${REF}" \
+            --project="${PROD_RUNTIME_PROJECT_ID}" \
+            --region="${CLOUD_RUN_REGION}" \
+            --update-labels="${LABELS}" \
+            --quiet
 
       - name: Verify production serves
         run: |
