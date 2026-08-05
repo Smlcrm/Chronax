@@ -109,6 +109,15 @@ try:
 except ImportError:
     DLinear = None
 
+# RMoK depends on flax NNX (pinned 0.10.x — see chronax/models/rmok/__init__.py).
+# Guard like NLinear so an incompatible flax degrades this model to None instead of
+# crashing the entire chronax.models namespace; the pin's informative ImportError is
+# swallowed here, but importing chronax.models.rmok directly surfaces it.
+try:
+    from .rmok import RMoK
+except ImportError:
+    RMoK = None
+
 # iTransformer / VanillaTransformer depend on flax NNX (flax 0.10.x). If flax's
 # nnx import fails (e.g. an incompatible resolved jax that dropped an API nnx
 # needs), guard like PatchTST/BiTCN so the model degrades to None instead of
@@ -256,6 +265,7 @@ __all__ = [
     "NLinear",
     "XLinear",
     "DLinear",
+    "RMoK",
     "PatchTST",
     "BiTCN",
     "DeepNPTS",
