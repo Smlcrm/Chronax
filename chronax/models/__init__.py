@@ -146,6 +146,13 @@ try:
 except ImportError:
     HINT = None
 
+# NHITS depends on flax NNX; guard like MLP. GMM is importable from
+# chronax.models.nhits as well.
+try:
+    from .nhits import NHITS
+except ImportError:
+    NHITS = None
+
 # TimeMixer depends on flax NNX; guard like TCN so an incompatible flax degrades
 # it to None instead of breaking the namespace.
 try:
@@ -210,6 +217,7 @@ __all__ = [
     "StemGNN",
     "MLP",
     "HINT",
+    "NHITS",
     "TimeMixer",
     "TimeXer",
     "BatchedForecaster",
