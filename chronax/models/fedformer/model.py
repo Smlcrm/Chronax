@@ -908,6 +908,7 @@ class FEDformerConfig:
         fea_activation: Frequency cross-attention score nonlinearity --
             ``"tanh"`` or ``"softmax"``.
         random_seed: Base seed for deterministic Fourier-mode selection.
+        futr_exog_size: Number of future-known exogenous channels (0 = none).
     """
 
     h: int = 24
@@ -925,11 +926,14 @@ class FEDformerConfig:
     activation: str = "gelu"
     fea_activation: str = "tanh"
     random_seed: int = 1
+    futr_exog_size: int = 0
 
     def __post_init__(self) -> None:
         for name in ("h", "input_size", "hidden_size", "n_heads", "modes"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive, got {getattr(self, name)}.")
+        if self.futr_exog_size < 0:
+            raise ValueError(f"futr_exog_size must be >= 0, got {self.futr_exog_size}.")
         # FEDformer's learnable spectral weights hard-code 8 heads.
         if self.n_heads != _N_HEADS_FIXED:
             raise ValueError(
@@ -988,6 +992,12 @@ class FEDformerModel(fnn.Module):
 
     Forward pass: ``[B, input_size, 1] -> [B, h, 1]``.
 
+    When ``config.futr_exog_size > 0``, pass ``futr_exog`` of shape
+    ``[B, input_size + h, F]``; a bias-free temporal embedding is added to the
+    token embeddings (NF FEDformer). When ``futr_exog_size == 0``, no temporal
+    modules are created and ``futr_exog`` is ignored — identical to the
+    no-exogenous path.
+
     During training pass ``deterministic=False`` and supply a ``"dropout"`` RNG
     via ``rngs={"dropout": key}`` in ``model.apply(...)``.
     """
@@ -998,6 +1008,7 @@ class FEDformerModel(fnn.Module):
     def __call__(
         self,
         insample_y: jnp.ndarray,
+        futr_exog: jnp.ndarray | None = None,
         deterministic: bool = True,
     ) -> jnp.ndarray:
         cfg = self.config
@@ -1005,7 +1016,7 @@ class FEDformerModel(fnn.Module):
         h, label_len = cfg.h, cfg.label_len
         c_out = 1  # univariate point forecast
 
-        # --- (1) Decomposition-based decoder initialisation ---
+        # --- (1) Decomposition-based decoder initialisation (y-only) ---
         # Horizon trend prior = the historical mean, broadcast over h steps.
         mean = jnp.broadcast_to(
             jnp.mean(insample_y, axis=1, keepdims=True), (b, h, c)
@@ -1019,9 +1030,30 @@ class FEDformerModel(fnn.Module):
         )
 
         # --- (2) Encoder ---
-        enc_out = TokenEmbedding(
-            hidden_size=cfg.hidden_size, dropout_rate=cfg.dropout, name="enc_embedding"
-        )(insample_y, deterministic)
+        # F=0 keeps TokenEmbedding (param-identical to prior). F>0 inlines
+        # value embed + temporal add + dropout (NF DataEmbedding order).
+        if cfg.futr_exog_size > 0:
+            if futr_exog is None:
+                raise ValueError(
+                    f"futr_exog of shape [B, L+h, {cfg.futr_exog_size}] is required "
+                    f"when futr_exog_size={cfg.futr_exog_size}."
+                )
+            mark_enc = futr_exog[:, : cfg.input_size, :]
+            enc_out = _torch_conv(
+                cfg.hidden_size, 3 * c,
+                kernel_size=(3,), padding="CIRCULAR", name="enc_embedding",
+                token_embed=True,
+            )(insample_y)
+            enc_out = enc_out + fnn.Dense(
+                cfg.hidden_size, use_bias=False, name="enc_temporal"
+            )(mark_enc.astype(jnp.float32))
+            enc_out = fnn.Dropout(rate=cfg.dropout, name="enc_drop")(
+                enc_out, deterministic=deterministic
+            )
+        else:
+            enc_out = TokenEmbedding(
+                hidden_size=cfg.hidden_size, dropout_rate=cfg.dropout, name="enc_embedding"
+            )(insample_y, deterministic)
         enc_out = Encoder(
             n_layers=cfg.encoder_layers,
             hidden_size=cfg.hidden_size,
@@ -1041,9 +1073,23 @@ class FEDformerModel(fnn.Module):
         # The decoder operates on length (label_len + h). neuralforecast picks
         # its self/cross query modes using (input_size // 2 + h); we match that.
         dec_seq_len = cfg.input_size // 2 + h
-        dec_out = TokenEmbedding(
-            hidden_size=cfg.hidden_size, dropout_rate=cfg.dropout, name="dec_embedding"
-        )(seasonal_init, deterministic)
+        if cfg.futr_exog_size > 0:
+            mark_dec = futr_exog[:, -(label_len + h) :, :]
+            dec_out = _torch_conv(
+                cfg.hidden_size, 3 * c,
+                kernel_size=(3,), padding="CIRCULAR", name="dec_embedding",
+                token_embed=True,
+            )(seasonal_init)
+            dec_out = dec_out + fnn.Dense(
+                cfg.hidden_size, use_bias=False, name="dec_temporal"
+            )(mark_dec.astype(jnp.float32))
+            dec_out = fnn.Dropout(rate=cfg.dropout, name="dec_drop")(
+                dec_out, deterministic=deterministic
+            )
+        else:
+            dec_out = TokenEmbedding(
+                hidden_size=cfg.hidden_size, dropout_rate=cfg.dropout, name="dec_embedding"
+            )(seasonal_init, deterministic)
         seasonal_part, trend_part = Decoder(
             n_layers=cfg.decoder_layers,
             hidden_size=cfg.hidden_size,

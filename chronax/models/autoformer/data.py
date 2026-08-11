@@ -85,6 +85,30 @@ class RobustScaler:
 # ---------------------------------------------------------------------------
 
 
+def build_exog_windows(
+    arr: np.ndarray | jnp.ndarray,
+    input_size: int,
+    h: int,
+    n_windows: int,
+    span: str = "full",
+) -> jnp.ndarray:
+    """Rolling windows of an exog array ``[T, F]``.
+
+    Matches :func:`build_windows` right-padding of ``h`` zeros when
+    ``span="full"``, yielding ``[n_windows, input_size+h, F]``.
+    ``span="input"`` yields ``[n_windows, input_size, F]`` without pad.
+    """
+    arr = jnp.asarray(arr, dtype=jnp.float32)
+    if arr.ndim != 2:
+        raise ValueError(f"exog array must be 2-D [T, F]; got shape {arr.shape}.")
+    length = input_size if span == "input" else input_size + h
+    if span == "full":
+        pad = jnp.zeros((h, arr.shape[1]), dtype=arr.dtype)
+        arr = jnp.concatenate([arr, pad], axis=0)
+    idx = jnp.arange(length)[None, :] + jnp.arange(n_windows)[:, None]
+    return arr[idx]
+
+
 def build_windows(
     y: np.ndarray, input_size: int, h: int
 ) -> Tuple[np.ndarray, np.ndarray]:

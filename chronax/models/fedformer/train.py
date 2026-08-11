@@ -32,7 +32,12 @@ import jax.numpy as jnp
 import optax
 from flax.training import train_state
 
-from chronax.models.fedformer.data import RobustScaler, build_windows, split_train_val_windows
+from chronax.models.fedformer.data import (
+    RobustScaler,
+    build_exog_windows,
+    build_windows,
+    split_train_val_windows,
+)
 from chronax.models.fedformer.loss import mae as _mae
 from chronax.models.fedformer.loss import masked_mae
 from chronax.models.fedformer.model import FEDformerConfig, FEDformerModel
@@ -185,7 +190,18 @@ def create_train_state(
 
     # A single dummy window is enough to materialise all parameter shapes.
     dummy_y = jnp.zeros((1, config.input_size, 1))
-    params = model.init({"params": init_rng, "dropout": init_rng}, dummy_y, deterministic=True)
+    if config.futr_exog_size > 0:
+        dummy_f = jnp.zeros((1, config.input_size + config.h, config.futr_exog_size))
+        params = model.init(
+            {"params": init_rng, "dropout": init_rng},
+            dummy_y,
+            dummy_f,
+            deterministic=True,
+        )
+    else:
+        params = model.init(
+            {"params": init_rng, "dropout": init_rng}, dummy_y, deterministic=True
+        )
 
     if optimizer is None:
         optimizer = _get_optimizer(
@@ -275,6 +291,12 @@ def eval_step(
 _SCALER = RobustScaler()
 
 
+def _scale_exog(windows: jnp.ndarray, scaler: RobustScaler) -> jnp.ndarray:
+    """Per-channel per-window robust scaling of ``[B, T, F]`` exog."""
+    shift, scale = scaler.stats(windows, axis=1)  # [B, 1, F]
+    return scaler.transform(windows, shift, scale)
+
+
 def _window_forward_loss(
     params: Any,
     apply_fn: Callable,
@@ -284,6 +306,7 @@ def _window_forward_loss(
     loss_fn: Callable,
     rng: Optional[jax.Array],
     deterministic: bool,
+    futr_windows: Optional[jnp.ndarray] = None,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Forward + loss on raw ``[B, input_size + h]`` windows with per-window scaling.
 
@@ -298,8 +321,11 @@ def _window_forward_loss(
     shift, scale = _SCALER.stats(insample, axis=1)                      # [B, 1] each
     insample_z = _SCALER.transform(insample, shift, scale)[..., None]   # [B, L, 1]
     target_z = _SCALER.transform(target, shift, scale)                  # [B, h]
+    futr_z = _scale_exog(futr_windows, _SCALER) if futr_windows is not None else None
     rngs = {"dropout": rng} if (rng is not None and not deterministic) else {}
-    pred = apply_fn(params, insample_z, deterministic=deterministic, rngs=rngs)  # [B, h, 1]
+    pred = apply_fn(
+        params, insample_z, futr_exog=futr_z, deterministic=deterministic, rngs=rngs
+    )  # [B, h, 1]
     loss = loss_fn(pred[..., 0], target_z, out_mask)
     return loss, pred
 
@@ -312,6 +338,7 @@ def train_window_step(
     rng: jax.Array,
     input_size: int,
     loss_fn: Callable = _mae,
+    futr_windows: Optional[jnp.ndarray] = None,
 ) -> Tuple[TrainState, jnp.ndarray, jnp.ndarray]:
     """JIT-compiled training step on raw ``[B, input_size + h]`` windows.
 
@@ -329,6 +356,7 @@ def train_window_step(
             loss_fn=loss_fn,
             rng=rng,
             deterministic=False,
+            futr_windows=futr_windows,
         )
 
     (loss, predictions), grads = jax.value_and_grad(compute, has_aux=True)(state.params)
@@ -345,6 +373,7 @@ def scan_train_steps(
     rng_seq: jnp.ndarray,
     input_size: int,
     loss_fn: Callable = _mae,
+    all_futr: Optional[jnp.ndarray] = None,
 ) -> Tuple[TrainState, jnp.ndarray]:
     """Run ``lax.scan`` over precomputed window indices (no per-step host sync).
 
@@ -353,12 +382,14 @@ def scan_train_steps(
         all_masks: Matching availability masks.
         batch_idx: ``[n_steps, batch_size]`` indices into ``all_windows``.
         rng_seq: ``[n_steps, 2]`` dropout keys.
+        all_futr: Optional exog windows ``[n_train, L+h, F]``.
     """
 
     def body(carry: TrainState, xs):
         idx, rng = xs
         windows = all_windows[idx]
         masks = all_masks[idx]
+        futr = all_futr[idx] if all_futr is not None else None
 
         def compute(params):
             return _window_forward_loss(
@@ -370,6 +401,7 @@ def scan_train_steps(
                 loss_fn=loss_fn,
                 rng=rng,
                 deterministic=False,
+                futr_windows=futr,
             )
 
         (loss, _), grads = jax.value_and_grad(compute, has_aux=True)(carry.params)
@@ -400,6 +432,7 @@ def eval_window_step(
     masks: jnp.ndarray,
     input_size: int,
     loss_fn: Callable = _mae,
+    futr_windows: Optional[jnp.ndarray] = None,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """JIT-compiled evaluation on raw windows. Deterministic, no gradients."""
     return _window_forward_loss(
@@ -411,6 +444,7 @@ def eval_window_step(
         loss_fn=loss_fn,
         rng=None,
         deterministic=True,
+        futr_windows=futr_windows,
     )
 
 
@@ -484,10 +518,12 @@ def predict_step(
     h: int,
     input_size: int,
     scaler: Optional[RobustScaler] = None,
+    futr_full: Optional[jnp.ndarray] = None,
 ) -> jnp.ndarray:
     """Deterministic forecast from a 1-D context window of length ``input_size``.
 
     Returns a 1-D array of shape ``(h,)`` on the original scale.
+    ``futr_full`` is optional future-known exog of shape ``[input_size + h, F]``.
     """
     if scaler is None:
         scaler = _SCALER
@@ -499,7 +535,13 @@ def predict_step(
     x = insample[None, :]  # [1, L]
     shift, scale = scaler.stats(x, axis=1)
     x_z = scaler.transform(x, shift, scale)[..., None]  # [1, L, 1]
-    pred_z = state.apply_fn(state.params, x_z, deterministic=True)  # [1, h, 1]
+    futr_z = None
+    if futr_full is not None:
+        futr = jnp.asarray(futr_full, dtype=jnp.float32)[None, ...]  # [1, L+h, F]
+        futr_z = _scale_exog(futr, scaler)
+    pred_z = state.apply_fn(
+        state.params, x_z, futr_exog=futr_z, deterministic=True
+    )  # [1, h, 1]
     return scaler.inverse(pred_z[0, :, 0], shift[0, 0], scale[0, 0])
 
 
@@ -519,10 +561,12 @@ def train(
     loss_fn: Callable = _mae,
     random_seed: int = 1,
     verbose: bool = False,
+    futr_exog: Optional[jnp.ndarray] = None,
 ) -> TrainState:
     """Train on a univariate 1-D series; return best-validation ``TrainState``.
 
     Raises ``RuntimeError`` if a non-finite training loss is observed.
+    ``futr_exog`` optional ``[T, F]`` future-known covariates aligned with ``y``.
     """
     y_np = np.asarray(y, dtype=np.float32).ravel()
     all_windows, all_masks = build_windows(y_np, config.input_size, config.h)
@@ -531,6 +575,22 @@ def train(
     )
     n_train = len(train_windows_np)
     has_val = len(val_windows_np) > 0
+    n_all = len(all_windows)
+
+    train_futr_dev = None
+    val_futr_dev = None
+    if futr_exog is not None:
+        futr_all = build_exog_windows(
+            futr_exog, config.input_size, config.h, n_all, span="full"
+        )
+        n_val = len(val_windows_np)
+        if n_val > 0:
+            train_futr_np = np.asarray(futr_all[:-n_val])
+            val_futr_np = np.asarray(futr_all[-n_val:])
+            val_futr_dev = jax.device_put(jnp.asarray(val_futr_np))
+        else:
+            train_futr_np = np.asarray(futr_all)
+        train_futr_dev = jax.device_put(jnp.asarray(train_futr_np))
 
     train_windows_dev = jax.device_put(jnp.asarray(train_windows_np))
     train_masks_dev = jax.device_put(jnp.asarray(train_masks_np))
@@ -561,6 +621,7 @@ def train(
     # callers that want a pure lax.scan over a chunk.
     batch_windows = train_windows_dev[batch_idx]  # [max_steps, B, L+h]
     batch_masks = train_masks_dev[batch_idx]
+    batch_futr = train_futr_dev[batch_idx] if train_futr_dev is not None else None
 
     best_params = _snapshot(state)
     best_val_loss = float("inf")
@@ -570,6 +631,7 @@ def train(
     all_losses: List[jnp.ndarray] = []
 
     for step in range(max_steps):
+        futr_b = batch_futr[step] if batch_futr is not None else None
         state, loss, _ = train_window_step(
             state,
             batch_windows[step],
@@ -577,6 +639,7 @@ def train(
             step_keys[step],
             input_size,
             loss_fn,
+            futr_windows=futr_b,
         )
         all_losses.append(loss)
 
@@ -592,6 +655,7 @@ def train(
                 val_loss_val, _ = eval_window_step(
                     state, val_windows_dev, val_masks_dev,
                     input_size=input_size, loss_fn=loss_fn,
+                    futr_windows=val_futr_dev,
                 )
                 msg += f"  val_loss={float(val_loss_val):.5f}"
             print(msg)
@@ -602,6 +666,7 @@ def train(
         val_loss_val, _ = eval_window_step(
             state, val_windows_dev, val_masks_dev,
             input_size=input_size, loss_fn=loss_fn,
+            futr_windows=val_futr_dev,
         )
         val_scalar = float(val_loss_val)
         if val_scalar < best_val_loss:

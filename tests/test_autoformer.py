@@ -71,3 +71,59 @@ def test_constructor_core_args_for_registry():
     import inspect
     params = set(inspect.signature(Autoformer.__init__).parameters)
     assert {"h", "input_size", "random_seed"} <= params
+
+
+def test_uses_exog_true_but_none_valid():
+    assert Autoformer(h=12).uses_exog is True
+    m = _tiny().fit(_make_y())
+    assert m._futr_size == 0
+    assert m.predict(h=12)["mean"].shape == (12,)
+
+
+def test_fit_X_not_implemented():
+    with pytest.raises(NotImplementedError, match="futr_exog"):
+        _tiny().fit(_make_y(), X=jnp.ones((200, 1), jnp.float32))
+
+
+def test_futr_exog_fit_predict_shapes():
+    y = _make_y(240)
+    T = int(y.shape[0])
+    futr = jnp.asarray(np.random.RandomState(1).randn(T, 2), jnp.float32)
+    m = _tiny()
+    m.max_steps = 10
+    m = m.fit(y, futr_exog=futr)
+    out = m.predict(h=12, futr_exog=jnp.asarray(np.random.RandomState(2).randn(12, 2), jnp.float32))
+    assert out["mean"].shape == (12,)
+    assert bool(jnp.all(jnp.isfinite(out["mean"])))
+
+
+def test_futr_required_at_predict_raises():
+    y = _make_y(240)
+    futr = jnp.asarray(np.random.RandomState(1).randn(int(y.shape[0]), 1), jnp.float32)
+    m = _tiny()
+    m.max_steps = 5
+    m = m.fit(y, futr_exog=futr)
+    with pytest.raises(ValueError, match="futr_exog"):
+        m.predict(h=12)
+
+
+def test_futr_wrong_shape_raises():
+    y = _make_y(240)
+    futr = jnp.asarray(np.random.RandomState(1).randn(int(y.shape[0]), 2), jnp.float32)
+    m = _tiny()
+    m.max_steps = 5
+    m = m.fit(y, futr_exog=futr)
+    with pytest.raises(ValueError, match="futr_exog"):
+        m.predict(h=12, futr_exog=jnp.ones((12, 3), jnp.float32))
+
+
+def test_different_futr_yields_different_preds():
+    y = _make_y(240)
+    T = int(y.shape[0])
+    futr = jnp.asarray(np.random.RandomState(1).randn(T, 1), jnp.float32)
+    m = _tiny()
+    m.max_steps = 15
+    m = m.fit(y, futr_exog=futr)
+    a = np.asarray(m.predict(h=12, futr_exog=jnp.zeros((12, 1), jnp.float32))["mean"])
+    b = np.asarray(m.predict(h=12, futr_exog=jnp.ones((12, 1), jnp.float32))["mean"])
+    assert not np.allclose(a, b)

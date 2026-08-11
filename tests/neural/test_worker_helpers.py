@@ -87,8 +87,24 @@ def test_nf_subprocess_code_covariate_passes_exog_lists():
     code = worker.nf_subprocess_code("TFT", spec, 24, 72, {"loss": "MAE"}, 42, 1)
     assert "hist_exog_list" in code
     assert "futr_exog_list" in code
+    assert "EXOGENOUS_HIST" in code
     assert "temp" in code and "hum" in code
 
+
+def test_nf_subprocess_code_covariate_skips_hist_when_futr_only():
+    """Autoformer/FEDformer/Informer accept hist_exog_list kw but reject hist at runtime."""
+    spec = {
+        "name": "CapitalBikeshare", "path": "/abs/bike.csv", "ds_col": "Datetime",
+        "kind": "covariate", "y_col": "bike_trips",
+        "hist_exog_cols": ["temp", "hum"], "freq": "D",
+    }
+    code = worker.nf_subprocess_code("Autoformer", spec, 24, 72, {"loss": "MAE"}, 42, 1)
+    assert "futr_exog_list" in code
+    assert "supports_hist" in code
+    assert "EXOGENOUS_HIST" in code
+    # hist list assignment is gated; unconditional assignment must not appear
+    assert "kw['hist_exog_list']" in code  # still present behind supports_hist guard
+    assert "and supports_hist" in code
 
 def test_resolve_horizon_uses_dataset_override():
     spec = {"h": 7, "input_size": 35}

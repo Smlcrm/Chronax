@@ -221,7 +221,8 @@ train, test = df.iloc[:-{h}], df.iloc[-{h}:]
 y_true = test['y'].to_numpy()
 kw = {extra}
 sig = inspect.signature({nf_name}).parameters
-if 'hist_exog_list' in sig:
+supports_hist = bool(getattr({nf_name}, 'EXOGENOUS_HIST', False))
+if 'hist_exog_list' in sig and supports_hist:
     kw['hist_exog_list'] = {exog_cols!r}
 if 'futr_exog_list' in sig:
     kw['futr_exog_list'] = {exog_cols!r}

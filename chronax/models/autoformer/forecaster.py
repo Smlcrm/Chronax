@@ -28,7 +28,7 @@ class Autoformer(BaseForecaster):
         ``predict(level=...)``. Defaults match neuralforecast.Autoformer.
     """
 
-    uses_exog = False
+    uses_exog = True
 
     def __init__(
         self,
@@ -87,11 +87,17 @@ class Autoformer(BaseForecaster):
         self.model_: TrainState | None = None
         self._context: jnp.ndarray | None = None
         self._train_y: jnp.ndarray | None = None
+        self._futr_size: int = 0
+        self._futr_ctx: jnp.ndarray | None = None
         self._scaler = RobustScaler()
 
     @property
     def _loss_fn(self) -> LossFn:
         return _resolve_loss(self.loss)
+
+    @property
+    def _has_temporal_exog(self) -> bool:
+        return self._futr_size > 0
 
     def _build_config(self) -> AutoformerConfig:
         return AutoformerConfig(
@@ -107,12 +113,19 @@ class Autoformer(BaseForecaster):
             decoder_input_size_multiplier=self.decoder_input_size_multiplier,
             dropout=self.dropout,
             activation=self.activation,
+            futr_exog_size=self._futr_size,
         )
 
-    def fit(self, y: jnp.ndarray, X: jnp.ndarray | None = None) -> "Autoformer":
-        """Fit on a univariate 1-D series."""
+    def fit(self, y: jnp.ndarray, X: jnp.ndarray | None = None, *, futr_exog=None) -> "Autoformer":
+        """Fit on a univariate 1-D series.
+
+        Future-known exogenous: pass ``futr_exog`` of shape ``(T, F)`` aligned
+        with ``y``. Historical ``X=`` is not supported.
+        """
         if X is not None:
-            raise NotImplementedError("Exogenous variables are not supported.")
+            raise NotImplementedError(
+                "Autoformer supports future-known exog only; pass futr_exog="
+            )
         y = jnp.asarray(y, dtype=jnp.float32)
         if y.ndim != 1:
             raise ValueError(f"y must be 1-D; got shape {y.shape}.")
@@ -121,6 +134,14 @@ class Autoformer(BaseForecaster):
                 f"Series length {y.shape[0]} too short for "
                 f"input_size={self.input_size} + h={self.h}."
             )
+        futr_exog = None if futr_exog is None else jnp.asarray(futr_exog, jnp.float32)
+        if futr_exog is not None and futr_exog.shape[0] != y.shape[0]:
+            raise ValueError(
+                f"futr_exog must align with y at fit (len {y.shape[0]}); "
+                f"got {futr_exog.shape[0]}."
+            )
+        self._futr_size = 0 if futr_exog is None else int(futr_exog.shape[1])
+
         self.model_ = train(
             y,
             config=self._build_config(),
@@ -135,16 +156,44 @@ class Autoformer(BaseForecaster):
             weight_decay=self.weight_decay,
             loss_fn=self._loss_fn,
             random_seed=self.random_seed,
+            futr_exog=futr_exog,
         )
         self._context = y[-self.input_size :]
         self._train_y = y
+        self._futr_ctx = None if futr_exog is None else futr_exog[-self.input_size :]
         return self
+
+    def _raw_predict(self, futr_exog=None) -> jnp.ndarray:
+        futr_full = None
+        if self._futr_size > 0:
+            if futr_exog is None:
+                raise ValueError(
+                    "This Autoformer was fit with future-known exog; predict requires "
+                    f"futr_exog of shape (h={self.h}, F={self._futr_size})."
+                )
+            futr_exog = jnp.asarray(futr_exog, jnp.float32)
+            if futr_exog.shape != (self.h, self._futr_size):
+                raise ValueError(
+                    f"futr_exog must be (h={self.h}, F={self._futr_size}); "
+                    f"got {futr_exog.shape}."
+                )
+            futr_full = jnp.concatenate([self._futr_ctx, futr_exog], axis=0)
+        return predict_step(
+            self.model_,
+            self._context,
+            h=self.h,
+            input_size=self.input_size,
+            scaler=self._scaler,
+            futr_full=futr_full,
+        )
 
     def predict(
         self,
         h: int,
         X: jnp.ndarray | None = None,
         level: list[int | float] | None = None,
+        *,
+        futr_exog=None,
     ) -> dict:
         """Forecast ``h`` steps from the fitted context."""
         if self.model_ is None or self._context is None:
@@ -156,15 +205,14 @@ class Autoformer(BaseForecaster):
                 f"Autoformer was trained for h={self.h}; predict(h={h}) is not supported. "
                 f"Pass h <= {self.h} or re-fit with a larger h."
             )
-        full = predict_step(
-            self.model_,
-            self._context,
-            h=self.h,
-            input_size=self.input_size,
-            scaler=self._scaler,
-        )
+        full = self._raw_predict(futr_exog=futr_exog)
         fcst = {"mean": full[:h]}
         if level is not None:
+            if self._has_temporal_exog:
+                raise ValueError(
+                    "Conformal intervals are not supported with temporal "
+                    "(future-known) exog. Omit level=..."
+                )
             if self.conformal_params is None:
                 raise ValueError(
                     "predict(h, level=...) requires `model.conformal_params` to be set. "
@@ -186,12 +234,20 @@ class Autoformer(BaseForecaster):
         X_future: jnp.ndarray | None = None,
         level: list[int | float] | None = None,
         fitted: bool = False,
+        *,
+        futr_exog=None,
     ) -> dict:
-        """Stateless fit-then-predict on ``y``."""
-        if X is not None or X_future is not None:
-            raise NotImplementedError("Exogenous variables are not supported.")
-        self.fit(y)
-        result = self.predict(h=h, level=level)
+        """Stateless fit-then-predict on ``y``.
+
+        ``X`` is unsupported (future-known only). ``futr_exog`` = history
+        ``(T, F)``; ``X_future`` = horizon ``(h, F)``.
+        """
+        if X is not None:
+            raise NotImplementedError(
+                "Autoformer supports future-known exog only; pass futr_exog= / X_future="
+            )
+        self.fit(y, futr_exog=futr_exog)
+        result = self.predict(h=h, futr_exog=X_future, level=level)
         if fitted:
             result["fitted"] = self._compute_fitted_values()
         return result
@@ -200,6 +256,10 @@ class Autoformer(BaseForecaster):
         """One-step-ahead fitted values; first ``input_size`` entries are NaN."""
         if self._train_y is None or self.model_ is None:
             raise RuntimeError("Call fit(y) before computing fitted values.")
+        if self._has_temporal_exog:
+            raise NotImplementedError(
+                "Fitted values are not supported when the model was fit with futr_exog."
+            )
         y = self._train_y
         n_windows = y.shape[0] - self.input_size
         if n_windows <= 0:
@@ -269,3 +329,5 @@ class AutoformerForecaster(Autoformer):
         # Allow callables that are already resolved LossFn
         if callable(loss) and not isinstance(loss, str):
             self.loss = loss
+        if getattr(config, "futr_exog_size", 0):
+            self._futr_size = int(config.futr_exog_size)

@@ -61,11 +61,14 @@ class AutoformerConfig:
     decoder_input_size_multiplier: float = 0.5
     dropout: float = 0.05
     activation: str = "gelu"
+    futr_exog_size: int = 0
 
     def __post_init__(self) -> None:
         for name in ("h", "input_size", "hidden_size", "n_heads"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive, got {getattr(self, name)}.")
+        if self.futr_exog_size < 0:
+            raise ValueError(f"futr_exog_size must be >= 0, got {self.futr_exog_size}.")
         if self.hidden_size % self.n_heads != 0:
             raise ValueError(
                 f"hidden_size ({self.hidden_size}) must be divisible by "
@@ -460,6 +463,12 @@ class AutoformerModel(fnn.Module):
 
     Forward pass: ``[B, input_size, 1] -> [B, h, 1]``.
 
+    When ``config.futr_exog_size > 0``, pass ``futr_exog`` of shape
+    ``[B, input_size + h, F]``; a bias-free temporal embedding is added to the
+    token embeddings (NF Autoformer). When ``futr_exog_size == 0``, no temporal
+    modules are created and ``futr_exog`` is ignored — identical to the
+    no-exogenous path.
+
     During training pass ``deterministic=False`` and supply a ``"dropout"``
     key via ``rngs={"dropout": key}`` in ``model.apply(...)``.
     """
@@ -470,13 +479,14 @@ class AutoformerModel(fnn.Module):
     def __call__(
         self,
         insample_y: jnp.ndarray,
+        futr_exog: jnp.ndarray | None = None,
         deterministic: bool = True,
     ) -> jnp.ndarray:
         cfg = self.config
         b, _, c = insample_y.shape
         h, label_len = cfg.h, cfg.label_len
 
-        # Decompose input into seasonal + trend init for the decoder
+        # Decompose input into seasonal + trend init for the decoder (y-only)
         mean = jnp.broadcast_to(jnp.mean(insample_y, axis=1, keepdims=True), (b, h, c))
         zeros = jnp.zeros((b, h, c), dtype=insample_y.dtype)
         seasonal_init, trend_init = series_decomp(insample_y, cfg.moving_avg_window)
@@ -489,6 +499,16 @@ class AutoformerModel(fnn.Module):
             kernel_size=(3,), padding="CIRCULAR", name="enc_embedding",
             token_embed=True,
         )(insample_y)
+        if cfg.futr_exog_size > 0:
+            if futr_exog is None:
+                raise ValueError(
+                    f"futr_exog of shape [B, L+h, {cfg.futr_exog_size}] is required "
+                    f"when futr_exog_size={cfg.futr_exog_size}."
+                )
+            mark_enc = futr_exog[:, : cfg.input_size, :]
+            enc_out = enc_out + fnn.Dense(
+                cfg.hidden_size, use_bias=False, name="enc_temporal"
+            )(mark_enc.astype(jnp.float32))
         enc_out = fnn.Dropout(rate=cfg.dropout, name="enc_drop")(
             enc_out, deterministic=deterministic
         )
@@ -510,6 +530,11 @@ class AutoformerModel(fnn.Module):
             kernel_size=(3,), padding="CIRCULAR", name="dec_embedding",
             token_embed=True,
         )(seasonal_init)
+        if cfg.futr_exog_size > 0:
+            mark_dec = futr_exog[:, -(label_len + h) :, :]
+            dec_out = dec_out + fnn.Dense(
+                cfg.hidden_size, use_bias=False, name="dec_temporal"
+            )(mark_dec.astype(jnp.float32))
         dec_out = fnn.Dropout(rate=cfg.dropout, name="dec_drop")(
             dec_out, deterministic=deterministic
         )
