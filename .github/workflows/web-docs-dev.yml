@@ -1,7 +1,12 @@
-# Generate the Chronax docs and deploy them to the dev Cloud Run service.
+# Generate the Chronax docs and publish them into the aggregated docs repo.
 #
-# Replaces the Cloud Build trigger. Generation authenticates to Vertex AI
-# through ADC, so there is no API key anywhere in this pipeline.
+# This repo no longer builds or deploys a docs image. All products are served
+# from one Cloud Run service at one hostname, where each product is a path
+# (docs.smlcrm.com/chronax), so the built site is pushed into the chronax/
+# folder of Smlcrm/web-docs and that repo builds and deploys.
+#
+# Generation stays here: the Vertex ADC federation and the per-project GCS
+# cache both belong with the source they document.
 name: Web docs (dev)
 
 on:
@@ -23,12 +28,9 @@ concurrency:
 
 env:
   PROJECT_SLUG: chronax
-  ARTIFACT_PROJECT_ID: sml-artifacts-dev
-  ARTIFACT_REGION: us-central1
-  ARTIFACT_REPOSITORY: sml-web-doc-docker
-  RUNTIME_PROJECT_ID: sml-website-dev
-  SERVICE_NAME: web-docs-chronax-dev
-  CLOUD_RUN_REGION: us-central1
+  # Where the built site lands. The branch mirrors this one: dev -> dev.
+  DOCS_REPO: Smlcrm/web-docs
+  DOCS_BRANCH: dev
   # Recreated in sml-website-dev, the original died with sml-web-doc-gen-dev
   # on 2026-08-02. The first run after that is a cold build: every module
   # goes through Gemini. Subsequent runs only regenerate what changed.
@@ -42,10 +44,8 @@ env:
   BUILDER_IMAGE: us-central1-docker.pkg.dev/sml-artifacts-dev/sml-web-doc-docker/docgen-builder:latest
 
 jobs:
-  build-and-deploy:
+  generate-and-publish:
     runs-on: ubuntu-latest
-    outputs:
-      digest: ${{ steps.push.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
 
@@ -59,7 +59,8 @@ jobs:
       - uses: google-github-actions/setup-gcloud@v2
 
       - name: Configure Docker auth
-        run: gcloud auth configure-docker "${ARTIFACT_REGION}-docker.pkg.dev" --quiet
+        # Only to pull the builder image; nothing is pushed from this repo now.
+        run: gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
 
       - name: Restore the doc cache
         run: |
@@ -105,73 +106,45 @@ jobs:
       - name: Save the doc cache
         run: gsutil -m rsync -d -r .docgen-cache "${CACHE_BUCKET}"
 
-      - name: Stage serve.py from the builder image
+      - name: Publish the site into the docs repo
+        env:
+          DOCS_TOKEN: ${{ secrets.DOCGEN_TOKEN }}
         run: |
           set -euo pipefail
-          CID="$(docker create "${BUILDER_IMAGE}")"
-          docker cp "${CID}:/app/serve.py" ./serve.py
-          docker rm "${CID}"
-          test -f serve.py
+          if [ -z "${DOCS_TOKEN:-}" ]; then
+            echo "::error::DOCGEN_TOKEN is not set. It needs contents:write on ${DOCS_REPO}."
+            exit 1
+          fi
 
-      - name: Build and push the serve-only image
-        id: push
-        run: |
-          set -euo pipefail
-          IMAGE="${ARTIFACT_REGION}-docker.pkg.dev/${ARTIFACT_PROJECT_ID}/${ARTIFACT_REPOSITORY}/${PROJECT_SLUG}"
-          docker build -t "${IMAGE}:sha-${GITHUB_SHA}" -f web-docs/Dockerfile .
-          docker push "${IMAGE}:sha-${GITHUB_SHA}"
-          DIGEST="$(docker inspect --format='{{index .RepoDigests 0}}' "${IMAGE}:sha-${GITHUB_SHA}" | cut -d@ -f2)"
-          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
-          echo "Pushed ${IMAGE}@${DIGEST}"
+          CLONE="${RUNNER_TEMP}/web-docs"
+          git clone --depth 1 --branch "${DOCS_BRANCH}" \
+            "https://x-access-token:${DOCS_TOKEN}@github.com/${DOCS_REPO}.git" "${CLONE}"
 
-      - name: Deploy dev by digest
-        run: |
-          set -euo pipefail
-          IMAGE="${ARTIFACT_REGION}-docker.pkg.dev/${ARTIFACT_PROJECT_ID}/${ARTIFACT_REPOSITORY}/${PROJECT_SLUG}"
-          REF="${IMAGE}@${{ steps.push.outputs.digest }}"
-          LABELS="managed-by=github-actions,source-repo=chronax,commit-sha=${GITHUB_SHA},environment=dev"
+          # --delete so pages removed from the source disappear from the site
+          # instead of lingering as orphans nothing links to.
+          rsync -a --delete site/ "${CLONE}/${PROJECT_SLUG}/"
 
-          # Update only. The service definition (ingress, invoker, runtime SA,
-          # scaling, env) is owned by Terraform; anything set here would be
-          # invisible to it and read as unmanaged drift. This step rolls the
-          # image forward and nothing else, so it fails loudly if the service
-          # has not been provisioned yet.
-          gcloud run services update "${SERVICE_NAME}" \
-            --image="${REF}" \
-            --project="${RUNTIME_PROJECT_ID}" \
-            --region="${CLOUD_RUN_REGION}" \
-            --update-labels="${LABELS}" \
-            --quiet
+          cd "${CLONE}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A "${PROJECT_SLUG}"
+          if git diff --cached --quiet; then
+            echo "No documentation changes to publish."
+            exit 0
+          fi
+          git commit -q -m "docs(${PROJECT_SLUG}): sync from ${GITHUB_REPOSITORY}@${GITHUB_SHA}"
 
-      - name: Verify the new revision converged
-        run: |
-          set -euo pipefail
-          IMAGE="${ARTIFACT_REGION}-docker.pkg.dev/${ARTIFACT_PROJECT_ID}/${ARTIFACT_REPOSITORY}/${PROJECT_SLUG}"
-          EXPECTED="${IMAGE}@${{ steps.push.outputs.digest }}"
-
-          # The service sits behind the load balancer with internal ingress, so
-          # its run.app URL does not answer from a GitHub runner even on a good
-          # deploy. Assert convergence instead: Cloud Run must reach a Ready
-          # revision that is the newest one AND serves the digest we just built.
-          for i in $(seq 1 30); do
-            READY="$(gcloud run services describe "${SERVICE_NAME}" \
-              --project="${RUNTIME_PROJECT_ID}" --region="${CLOUD_RUN_REGION}" \
-              --format='value(status.latestReadyRevisionName)')"
-            CREATED="$(gcloud run services describe "${SERVICE_NAME}" \
-              --project="${RUNTIME_PROJECT_ID}" --region="${CLOUD_RUN_REGION}" \
-              --format='value(status.latestCreatedRevisionName)')"
-            if [ -n "${READY}" ] && [ "${READY}" = "${CREATED}" ]; then
-              SERVING="$(gcloud run revisions describe "${READY}" \
-                --project="${RUNTIME_PROJECT_ID}" --region="${CLOUD_RUN_REGION}" \
-                --format='value(spec.containers[0].image)')"
-              if [ "${SERVING}" = "${EXPECTED}" ]; then
-                echo "OK ${READY} serving ${SERVING}"
-                exit 0
-              fi
-              echo "::error::${READY} serves ${SERVING}, expected ${EXPECTED}"
-              exit 1
+          # Both product repos push to the same branch, so a concurrent publish
+          # can land first. Rebase and retry rather than failing a good build.
+          for i in 1 2 3 4 5; do
+            if git push origin "${DOCS_BRANCH}"; then
+              echo "Published ${PROJECT_SLUG} docs to ${DOCS_REPO}@${DOCS_BRANCH}"
+              exit 0
             fi
-            echo "attempt ${i}: created=${CREATED} ready=${READY}"
-            sleep 6
+            echo "push rejected (attempt ${i}), rebasing onto the latest ${DOCS_BRANCH}"
+            git fetch origin "${DOCS_BRANCH}"
+            git rebase "origin/${DOCS_BRANCH}"
+            sleep $((i * 3))
           done
-          echo "::error::no revision became ready in time"; exit 1
+          echo "::error::could not push to ${DOCS_REPO} after 5 attempts"
+          exit 1
