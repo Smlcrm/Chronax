@@ -109,3 +109,26 @@ overrides:
       scaler_type: robust
       val_check_steps: 100
       early_stop_patience_steps: -1
+
+  # VanillaTransformer ships the same NF defaults as Autoformer/FEDformer
+  # (max_steps=5000 / windows_batch_size=1024) and was the only transformer never
+  # pinned to the port protocol above. Unpinned it does ~160x the work of SOFTS
+  # (5x the steps at 32x the batch), which measured at 332 min for a single seed —
+  # dataset-independent, so no dataset is cheap. Pinned identically on both sides,
+  # exactly as Autoformer/FEDformer are, so the comparison stays like-for-like.
+  VanillaTransformer:
+    chronax_params:
+      max_steps: 1000
+      batch_size: 32
+      num_lr_decays: 3
+      val_fraction: 0.0
+      val_check_steps: 100
+      early_stop_patience_steps: -1
+      grad_clip: 0.0
+    nf_params:
+      max_steps: 1000
+      windows_batch_size: 32
+      num_lr_decays: 3
+      scaler_type: robust
+      val_check_steps: 100
+      early_stop_patience_steps: -1
