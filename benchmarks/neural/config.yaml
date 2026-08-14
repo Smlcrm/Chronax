@@ -119,16 +119,7 @@ overrides:
   VanillaTransformer:
     chronax_params:
       max_steps: 1000
-      batch_size: 32
-      num_lr_decays: 3
-      val_fraction: 0.0
-      val_check_steps: 100
-      early_stop_patience_steps: -1
-      grad_clip: 0.0
+      windows_batch_size: 32
     nf_params:
       max_steps: 1000
       windows_batch_size: 32
-      num_lr_decays: 3
-      scaler_type: robust
-      val_check_steps: 100
-      early_stop_patience_steps: -1
