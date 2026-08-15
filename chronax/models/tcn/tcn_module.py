@@ -36,6 +36,12 @@ class _TorchLinearInit:
         bound = 1.0 / math.sqrt(self.fan_in)
         return jax.random.uniform(key, shape, dtype, minval=-bound, maxval=bound)
 
+    def __eq__(self, other):  # value equality: same-config initializers make
+        return type(other) is type(self) and other.fan_in == self.fan_in
+
+    def __hash__(self):  # same-config graphdefs EQUAL, so nnx.jit caches hit
+        return hash((type(self), self.fan_in))  # across net instances
+
 
 class _TorchConvInit:
     """Picklable initializer matching torch ``nn.Conv1d`` default.
@@ -52,6 +58,12 @@ class _TorchConvInit:
 
     def __call__(self, key, shape, dtype=jnp.float32):
         return jax.random.uniform(key, shape, dtype, minval=-self.bound, maxval=self.bound)
+
+    def __eq__(self, other):  # value equality — see _TorchLinearInit
+        return type(other) is type(self) and other.bound == self.bound
+
+    def __hash__(self):
+        return hash((type(self), self.bound))
 
 
 # Supported encoder activations.

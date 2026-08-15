@@ -4,7 +4,10 @@ Covers the TCN subpackage in banner sections (Losses, Scaler, Module, Training,
 Model, Namespace), matching the ``test_<model>.py`` convention used elsewhere
 in ``tests/``.
 """
+import io
+import logging
 import pickle
+import re
 
 import jax
 import jax.numpy as jnp
@@ -57,9 +60,11 @@ def test_mqloss_multiplier_median_and_pickle():
 
 
 def test_mqloss_pinball_value():
-    # err = y - yhat; pred zeros, target 2 -> mean_q q*2 = mean{0.2,1.0,1.8} = 1.0
+    # err = y - yhat; pred zeros, target 2 -> sum_q q*2 = sum{0.2,1.0,1.8} = 3.0 —
+    # NF's effective reduction (its 1/len(quantiles) factor is dead), matching
+    # the trainer's masked inline branch.
     loss = MultiQuantileLoss((0.1, 0.5, 0.9))
-    assert float(loss(jnp.zeros((1, 1, 3)), jnp.array([[2.0]]))) == pytest.approx(1.0)
+    assert float(loss(jnp.zeros((1, 1, 3)), jnp.array([[2.0]]))) == pytest.approx(3.0)
 
 
 # === Scaler ===
@@ -279,6 +284,63 @@ def _tiny(**kw):
                 max_steps=20, windows_batch_size=64, random_seed=0)
     base.update(kw)
     return TCN(**base)
+
+
+_COMPILE_LOG_RE = re.compile(r"Compiling ")
+
+
+def _count_compiles(fn):
+    """Run fn under jax.log_compiles and return (result, n_xla_compilations)."""
+    buf = io.StringIO()
+    handler = logging.StreamHandler(buf)
+    loggers = [
+        logging.getLogger("jax._src.dispatch"),
+        logging.getLogger("jax._src.interpreters.pxla"),
+    ]
+    with jax.log_compiles(True):
+        for lg in loggers:
+            lg.addHandler(handler)
+        try:
+            out = fn()
+            jax.block_until_ready(out)
+        finally:
+            for lg in loggers:
+                lg.removeHandler(handler)
+    return out, len(_COMPILE_LOG_RE.findall(buf.getvalue()))
+
+
+def test_count_compiles_canary():
+    # Live-fire proof _count_compiles can still see a compile: a fresh jit'd
+    # closure always compiles (pjit keys on callable identity), so the counter
+    # must report >=1. If a jax bump renames the "Compiling " message or the
+    # logger paths, this fails instead of letting test_refit_does_not_recompile
+    # go vacuously green on a counter that matches nothing.
+    def fresh():
+        @jax.jit
+        def f(x):
+            return x * 3.0 - 1.0
+        return f(jnp.ones((2, 5)))
+
+    _, n = _count_compiles(fresh)
+    assert n >= 1
+
+
+def test_refit_does_not_recompile():
+    # The training program is a module-level nnx.jit whose cache keys on config
+    # graphdefs (value-__eq__ initializers, _adam/scaler singletons) and operand
+    # shapes — never on data or call-site closures. A refit AND a fresh
+    # same-config instance must both hit the cache with zero XLA compiles;
+    # fit #2 is counted directly (no uncounted settle call). No dropout-freshness
+    # companion test — deliberately: the TCN forward is deterministic and the
+    # only RNG (batch-index sampling) runs eagerly outside the jitted program.
+    y = _make_y(60)
+    m = _tiny(max_steps=3, windows_batch_size=4)
+    m.fit(y)                                     # first fit pays the one compile
+    _, n_refit = _count_compiles(lambda: m.fit(y)._train_y)
+    assert n_refit == 0
+    m2 = _tiny(max_steps=3, windows_batch_size=4)
+    _, n_fresh = _count_compiles(lambda: m2.fit(y)._train_y)
+    assert n_fresh == 0
 
 
 def test_tcn_is_base_forecaster_and_uses_exog():

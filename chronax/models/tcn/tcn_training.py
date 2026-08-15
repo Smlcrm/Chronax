@@ -10,6 +10,8 @@ and conformal windows are bit-identical by construction.
 """
 from __future__ import annotations
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import optax
@@ -125,6 +127,43 @@ def _finite_or_raise(losses: jnp.ndarray) -> jnp.ndarray:
     return losses
 
 
+@functools.lru_cache(maxsize=None)
+def _adam(lr: float):
+    """One optax transform per learning rate. The optimizer's graphdef embeds the
+    transform object, so a fresh ``optax.adam`` per fit would make same-config
+    optimizers unequal and defeat the cross-fit ``_train_scan`` cache."""
+    return optax.adam(lr)
+
+
+@functools.partial(nnx.jit, static_argnames=("h", "input_size", "scaler", "loss_fn"))
+def _train_scan(net, optimizer, y_windows, target_mask, batch_idx, futr_w,
+                *, h, input_size, scaler, loss_fn):
+    """The whole training loop as one cached program.
+
+    Module-level so the traced/compiled program is reused across ``fit()`` calls:
+    the jit cache keys on the net/optimizer graphdefs (value-``__eq__``
+    initializers, the ``_adam`` and scaler singletons make same-config instances
+    equal), the static config args, and operand shapes -- never on data. A
+    per-call scan closure would retrace and recompile every fit, because pjit
+    caches on the callable's identity.
+    """
+
+    @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
+    def step(carry, idx):
+        net, opt = carry
+        yb = y_windows[idx]
+        mb = target_mask[idx]
+        fb = futr_w[idx] if futr_w is not None else None
+        loss, grads = nnx.value_and_grad(
+            lambda m: forward_loss(m, yb, mb, h=h, input_size=input_size, scaler=scaler,
+                                   loss_fn=loss_fn, futr_windows=fb))(net)
+        opt.update(grads)
+        return (net, opt), loss
+
+    _, losses = step((net, optimizer), batch_idx)
+    return losses
+
+
 def train(net, y, *, h, input_size, max_steps, windows_batch_size, lr, seed, loss_fn, scaler,
           futr_exog=None):
     """Train ``net`` in place via one ``nnx.scan``. Returns per-step losses.
@@ -141,21 +180,9 @@ def train(net, y, *, h, input_size, max_steps, windows_batch_size, lr, seed, los
     else:                                               # enough windows: without replacement
         sample = lambda k: jax.random.permutation(k, n)[:windows_batch_size]
     batch_idx = jax.vmap(sample)(step_keys)             # [max_steps, B]
-    optimizer = nnx.Optimizer(net, optax.adam(lr), wrt=nnx.Param)
-
-    @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
-    def step(carry, idx):
-        net, opt = carry
-        yb = y_windows[idx]
-        mb = target_mask[idx]
-        fb = futr_w[idx] if futr_w is not None else None
-        loss, grads = nnx.value_and_grad(
-            lambda m: forward_loss(m, yb, mb, h=h, input_size=input_size, scaler=scaler,
-                                   loss_fn=loss_fn, futr_windows=fb))(net)
-        opt.update(grads)
-        return (net, opt), loss
-
-    _, losses = step((net, optimizer), batch_idx)
+    optimizer = nnx.Optimizer(net, _adam(lr), wrt=nnx.Param)
+    losses = _train_scan(net, optimizer, y_windows, target_mask, batch_idx, futr_w,
+                         h=h, input_size=input_size, scaler=scaler, loss_fn=loss_fn)
     return _finite_or_raise(losses)
 
 
