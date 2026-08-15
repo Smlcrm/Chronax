@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import functools
+
 import optax
 from flax import nnx
 
@@ -139,9 +141,33 @@ def train(net, y, *, h, input_size, max_steps, windows_batch_size, lr, num_lr_de
         sample = lambda k: jax.random.permutation(k, n)[:windows_batch_size]
     batch_idx = jax.vmap(sample)(step_keys)             # [max_steps, B]
     drop_keys = jax.random.split(drop_key, max_steps)   # [max_steps, 2]
-    optimizer = nnx.Optimizer(
-        net, optax.adam(_lr_schedule(lr, max_steps, num_lr_decays)), wrt=nnx.Param
-    )
+    optimizer = nnx.Optimizer(net, _adam_steplr(lr, max_steps, num_lr_decays), wrt=nnx.Param)
+    losses = _train_scan(net, optimizer, y_windows, target_mask, batch_idx, drop_keys,
+                         h=h, input_size=input_size, scaler=scaler, loss_fn=loss_fn)
+    return _finite_or_raise(losses)
+
+
+@functools.lru_cache(maxsize=None)
+def _adam_steplr(lr: float, max_steps: int, num_lr_decays: int):
+    """One optax transform per (lr, max_steps, num_lr_decays). The optimizer's
+    graphdef embeds the transform object, so a fresh ``optax.adam`` per fit
+    would make same-config optimizers unequal and defeat the cross-fit
+    ``_train_scan`` cache."""
+    return optax.adam(_lr_schedule(lr, max_steps, num_lr_decays))
+
+
+@functools.partial(nnx.jit, static_argnames=("h", "input_size", "scaler", "loss_fn"))
+def _train_scan(net, optimizer, y_windows, target_mask, batch_idx, drop_keys,
+                *, h, input_size, scaler, loss_fn):
+    """The whole training loop as one cached program.
+
+    Module-level so the traced/compiled program is reused across ``fit()`` calls:
+    the jit cache keys on the net/optimizer graphdefs (value-``__eq__``
+    initializers, the ``_adam_steplr`` and scaler singletons make same-config
+    instances equal), the static config args, and operand shapes -- never on
+    data. A per-call scan closure would retrace and recompile every fit, because
+    pjit caches on the callable's identity.
+    """
 
     @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
     def step(carry, xs):
@@ -157,7 +183,7 @@ def train(net, y, *, h, input_size, max_steps, windows_batch_size, lr, num_lr_de
         return (net, opt), loss
 
     _, losses = step((net, optimizer), (batch_idx, drop_keys))
-    return _finite_or_raise(losses)
+    return losses
 
 
 @nnx.jit

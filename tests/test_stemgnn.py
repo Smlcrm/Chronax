@@ -5,7 +5,10 @@ anchors are the NumPy-reference forward at n_series=3 (graph path alive), the
 analytic parameter-count formula, the exact-DFT GEMM checks against ``jnp.fft``,
 and the N=1 degeneracy pins (input-independent constant head).
 """
+import io
+import logging
 import pickle
+import re
 
 import jax
 import jax.numpy as jnp
@@ -81,8 +84,10 @@ def test_mqloss_pinball_value():
     q = MultiQuantileLoss((0.25, 0.5, 0.75))
     pred = jnp.zeros((1, 1, 3))
     target = jnp.ones((1, 1))                  # err = 1 for every quantile head
-    # mean over quantiles of q*err = mean(0.25, 0.5, 0.75) = 0.5
-    assert float(q(pred, target)) == pytest.approx(0.5)
+    # sum over quantiles of q*err = 0.25 + 0.5 + 0.75 = 1.5 — NF's effective
+    # reduction (its 1/len(quantiles) factor is dead), matching the trainer's
+    # masked inline branch.
+    assert float(q(pred, target)) == pytest.approx(1.5)
 
 
 # === Scaler ===
@@ -769,6 +774,81 @@ def test_beats_naive_identity_cheb_on_sine():
 
 
 # === Namespace ===
+
+_COMPILE_LOG_RE = re.compile(r"Compiling ")
+
+
+def _count_compiles(fn):
+    """Run fn under jax.log_compiles and return (result, n_xla_compilations)."""
+    buf = io.StringIO()
+    handler = logging.StreamHandler(buf)
+    loggers = [
+        logging.getLogger("jax._src.dispatch"),
+        logging.getLogger("jax._src.interpreters.pxla"),
+    ]
+    with jax.log_compiles(True):
+        for lg in loggers:
+            lg.addHandler(handler)
+        try:
+            out = fn()
+            jax.block_until_ready(out)
+        finally:
+            for lg in loggers:
+                lg.removeHandler(handler)
+    return out, len(_COMPILE_LOG_RE.findall(buf.getvalue()))
+
+
+def test_count_compiles_canary():
+    # Live-fire proof _count_compiles can still see a compile: a fresh jit'd
+    # closure always compiles (pjit keys on callable identity), so the counter
+    # must report >=1. Guards test_refit_does_not_recompile against going
+    # vacuously green if a jax bump renames the log message or logger paths.
+    def fresh():
+        @jax.jit
+        def f(x):
+            return x * 7.0 + 0.5
+        return f(jnp.ones((3, 4)))
+
+    _, n = _count_compiles(fresh)
+    assert n >= 1
+
+
+def test_refit_does_not_recompile():
+    # The training program is a module-level nnx.jit keyed on config graphdefs
+    # (value-__eq__ initializers, _adam_steplr/scaler singletons) and operand
+    # shapes — a refit AND a fresh same-config instance must hit the cache with
+    # zero XLA compiles; fit #2 is counted directly (no uncounted settle call).
+    y = jnp.asarray(np.sin(np.arange(40) / 5.0), jnp.float32)
+    kw = dict(h=4, input_size=8, multi_layer=2, max_steps=3,
+              windows_batch_size=4, random_seed=0)
+    m = StemGNN(**kw)
+    m.fit(y)                                     # first fit pays the one compile
+    _, n_refit = _count_compiles(lambda: m.fit(y)._train_y)
+    assert n_refit == 0
+    m2 = StemGNN(**kw)
+    _, n_fresh = _count_compiles(lambda: m2.fit(y)._train_y)
+    assert n_fresh == 0
+
+
+def test_dropout_keys_fresh_and_det_repeatable():
+    # Training threads one explicit dropout key per scan step (split off the
+    # seed): different keys must produce different stochastic forwards, and the
+    # deterministic path must be exactly repeatable (the _forward_det contract).
+    # n_series=3 keeps the graph path ALIVE — at N=1 the Laplacian branch is
+    # identically zero and dropout there is inert, so the discriminator would
+    # be vacuous (the documented degeneracy).
+    from chronax.models.stemgnn.stemgnn_module import StemGNNNet
+
+    net = StemGNNNet(h=4, input_size=8, n_series=3, multi_layer=2,
+                     dropout_rate=0.5, rngs=nnx.Rngs(0))
+    x = jnp.asarray(np.random.RandomState(0).randn(2, 8, 3), jnp.float32)
+    a = net(x, dropout_key=jax.random.PRNGKey(1), deterministic=False)
+    b = net(x, dropout_key=jax.random.PRNGKey(2), deterministic=False)
+    assert not np.allclose(np.asarray(a), np.asarray(b))
+    c = net(x, deterministic=True)
+    d = net(x, deterministic=True)
+    np.testing.assert_array_equal(np.asarray(c), np.asarray(d))
+
 
 def test_importable_from_models_namespace():
     import chronax.models as M
