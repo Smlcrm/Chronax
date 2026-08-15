@@ -229,6 +229,10 @@ Deep Learning
    :members:
    :undoc-members:
 
+.. autoclass:: chronax.models.NHITS
+   :members:
+   :undoc-members:
+
 .. autoclass:: chronax.models.TimeMixer
    :members:
    :undoc-members:
