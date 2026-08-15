@@ -191,6 +191,59 @@ def eval_step(
     )
 
 
+@partial(jax.jit, static_argnames=("loss_fn",))
+def train_step_recurrent(
+    state: TrainState,
+    insample_y: jnp.ndarray,
+    next_step_y: jnp.ndarray,
+    rng: jax.Array,
+    loss_fn: Callable = masked_mae,
+) -> Tuple[TrainState, jnp.ndarray, jnp.ndarray]:
+    """JIT-compiled training step for recurrent mode.
+
+    Uses a 1-step-ahead prediction loss, matching NeuralForecast RNN's
+    ``h_train=1`` training objective.
+
+    The model returns ``output[:, -h:]`` where each position i predicts
+    y[i+1] (one step ahead).  ``next_step_y [B, h, 1]`` is built as
+    ``concat(insample_y[:, -(h-1):], outsample_y[:, :1])`` so every
+    comparison is a valid next-step target.
+    """
+    def compute(params):
+        rngs = {"dropout": rng}
+        output, _ = state.apply_fn(
+            params,
+            insample_y=insample_y,
+            deterministic=False,
+            rngs=rngs,
+        )
+        # output: [B, h, 1]; next_step_y: [B, h, 1] (correct 1-step-ahead targets)
+        loss = loss_fn(y=next_step_y, y_hat=output, mask=None)
+        return loss, output
+
+    (loss, predictions), grads = jax.value_and_grad(compute, has_aux=True)(state.params)
+    new_state = state.apply_gradients(grads=grads)
+    return new_state, loss, predictions
+
+
+@partial(jax.jit, static_argnames=("loss_fn",))
+def eval_step_recurrent(
+    state: TrainState,
+    insample_y: jnp.ndarray,
+    next_step_y: jnp.ndarray,
+    loss_fn: Callable = masked_mae,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """JIT-compiled eval step for recurrent mode. Deterministic, no gradients."""
+    output, _ = state.apply_fn(
+        state.params,
+        insample_y=insample_y,
+        deterministic=True,
+    )
+    # output: [B, h, 1]; next_step_y: [B, h, 1]
+    loss = loss_fn(y=next_step_y, y_hat=output, mask=None)
+    return loss, output
+
+
 # ---------------------------------------------------------------------------
 # Loop
 # ---------------------------------------------------------------------------

@@ -8,8 +8,17 @@ The `neuralforecast` side runs in an isolated venv (its PyTorch/Lightning stack
 conflicts with the JAX env):
 
 ```bash
+# Unix / Git Bash / WSL
 bash benchmarks/setup_nf_venv.sh
 ```
+
+```powershell
+# Windows PowerShell
+python -m venv benchmarks\.venv-nf
+.\benchmarks\.venv-nf\Scripts\pip.exe install -r benchmarks\requirements-nf.txt
+```
+
+The harness auto-detects `Scripts\python.exe` (Windows) or `bin/python` (Unix).
 
 ## Run
 
@@ -38,6 +47,37 @@ run parameters (horizon, lookback, seeds, threads) are defined in
 `benchmarks/neural/config.yaml`, along with optional per-model overrides.
 
 > If `python` isn't the project interpreter, use `.venv/bin/python`.
+
+## Dataset kinds
+
+Each entry under `datasets:` has a `kind` (default `univariate`):
+
+| kind | Config fields | Evaluation |
+|------|---------------|------------|
+| `univariate` | `y_col` | 1-D target (legacy Airline / Births / RoomTemp) |
+| `multivariate` | `y_cols` (2–4) | joint targets; Chronax fits each channel independently; NF uses one `unique_id` per channel and `n_series=N` when required |
+| `covariate` | `y_col` + `hist_exog_cols` | target + exogenous; Chronax passes `X`/`futr_exog` only when `uses_exog=True`; NF sets `hist_exog_list` / `futr_exog_list` when the model accepts them |
+
+Optional per-dataset `h` / `input_size` override the experiment defaults (used for short GA4 series).
+
+Wide CSVs live under `benchmarks/benchmark_datasets/` in the same layout as the
+univariate files (`Datetime` + numeric columns). Regenerate the TempusBench-derived
+set with:
+
+```bash
+python benchmarks/neural/import_tempus_datasets.py
+```
+
+### TempusBench-derived datasets (non-Kaggle, ≤4 features)
+
+| Name | Kind | Source |
+|------|------|--------|
+| `GA4EcommerceKPI` | multivariate | Google Analytics BigQuery sample |
+| `WeeklyCushingUS` | multivariate | EIA Cushing / Weekly Petroleum |
+| `SplitSmartACEnergy` | multivariate | SplitSmart AC (data.gov); 4 dense sensors |
+| `GA4RevenueTraffic` | covariate | GA4 revenue + traffic mix |
+| `GEFCom2014PV` | covariate | GEFCom2014 PV + weather |
+| `CapitalBikeshare` | covariate | UCI Capital Bikeshare |
 
 ## Output
 

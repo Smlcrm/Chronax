@@ -193,6 +193,10 @@ Deep Learning
    :members:
    :undoc-members:
 
+.. autoclass:: chronax.models.DilatedRNN
+   :members:
+   :undoc-members:
+
 .. autoclass:: chronax.models.XLSTM
    :members:
    :undoc-members:
@@ -213,6 +217,10 @@ Deep Learning
    :members:
    :undoc-members:
 
+.. autoclass:: chronax.models.SOFTSSharp
+   :members:
+   :undoc-members:
+
 .. autoclass:: chronax.models.TCN
    :members:
    :undoc-members:
@@ -222,5 +230,25 @@ Deep Learning
    :undoc-members:
 
 .. autoclass:: chronax.models.VanillaTransformer
+   :members:
+   :undoc-members:
+
+.. autoclass:: chronax.models.MLP
+   :members:
+   :undoc-members:
+
+.. autoclass:: chronax.models.HINT
+   :members:
+   :undoc-members:
+
+.. autoclass:: chronax.models.NHITS
+   :members:
+   :undoc-members:
+
+.. autoclass:: chronax.models.TimeMixer
+   :members:
+   :undoc-members:
+
+.. autoclass:: chronax.models.TimeXer
    :members:
    :undoc-members:
