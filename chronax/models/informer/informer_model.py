@@ -49,9 +49,14 @@ class Informer(BaseForecaster):
 
     def __init__(self, h, input_size=-1, decoder_input_size_multiplier=0.5, hidden_size=128,
                  n_head=4, factor=3, conv_hidden_size=32, encoder_layers=2, decoder_layers=1,
-                 distil=True, dropout=0.05, activation="gelu", max_steps=5000,
-                 learning_rate=1e-4, windows_batch_size=1024, scaler_type="identity",
-                 loss="mae", quantile_sort=True, random_seed=1, alias="Informer"):
+                 distil=True, dropout=0.05, activation="gelu", attention_mixing="nf",
+                 max_steps=5000, learning_rate=1e-4, windows_batch_size=1024,
+                 scaler_type="identity", loss="mae", quantile_sort=True, random_seed=1,
+                 alias="Informer"):
+        if attention_mixing not in ("nf", "official"):
+            raise ValueError(
+                f"attention_mixing must be 'nf' or 'official'; got {attention_mixing!r}."
+            )
         if input_size < 1:
             input_size = 3 * h
         label_len = math.ceil(input_size * decoder_input_size_multiplier)
@@ -66,6 +71,7 @@ class Informer(BaseForecaster):
         self.input_size = input_size
         self.decoder_input_size_multiplier = decoder_input_size_multiplier
         self.label_len = label_len
+        self.attention_mixing = attention_mixing
         self.hidden_size = hidden_size
         self.n_head = n_head
         self.factor = factor
@@ -111,7 +117,7 @@ class Informer(BaseForecaster):
             decoder_layers=self.decoder_layers, distil=self.distil, dropout=self.dropout,
             activation=self.activation, futr_exog_size=self._futr_size,
             outputsize_multiplier=outputsize_multiplier(self._loss_fn),
-            rngs=nnx.Rngs(self.random_seed),
+            attention_mixing=self.attention_mixing, rngs=nnx.Rngs(self.random_seed),
         )
 
     # ---- fit -----------------------------------------------------------------
@@ -123,9 +129,11 @@ class Informer(BaseForecaster):
         y = jnp.asarray(y, dtype=jnp.float32)
         if y.ndim != 1:
             raise ValueError(f"y must be 1-D; got shape {y.shape}.")
-        if y.shape[0] < self.input_size + self.h:
+        if y.shape[0] < self.input_size + 1:
+            # NF trains on h-padded partial windows, so one window (T >= L+1) suffices.
             raise ValueError(
-                f"Series length {y.shape[0]} too short for input_size={self.input_size} + h={self.h}."
+                f"Series length {y.shape[0]} too short for input_size={self.input_size} "
+                f"(need at least input_size+1)."
             )
         futr_exog = None if futr_exog is None else jnp.asarray(futr_exog, jnp.float32)
         if futr_exog is not None and futr_exog.shape[0] != y.shape[0]:
@@ -259,6 +267,10 @@ class Informer(BaseForecaster):
         return state
 
     def __setstate__(self, state: dict) -> None:
+        # Estimators pickled before the attention_mixing flag existed were built
+        # with the official transpose; restoring them as "official" preserves
+        # their stored predictions exactly (new instances default to "nf").
+        state.setdefault("attention_mixing", "official")
         m = state.get("model_")
         if isinstance(m, tuple) and m and m[0] == "__params_only__":
             saved = m[1]

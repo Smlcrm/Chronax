@@ -4,8 +4,11 @@ Covers the Informer subpackage in banner sections (Losses, Scaler, Layers,
 Module, Training, Model, Namespace), matching the ``test_<model>.py``
 convention used elsewhere in ``tests/``.
 """
+import io
+import logging
 import math
 import pickle
+import re
 
 import jax
 import jax.numpy as jnp
@@ -59,11 +62,13 @@ def test_mqloss_multiplier_and_requires_median():
 
 def test_mqloss_pinball_value():
     # err = y - yhat. For q and a single (h=1) point with pred all zeros, target=2:
-    # QL = mean_q max(q*2, (q-1)*2) = mean_q q*2  -> mean of {0.2,1.0,1.8} = 1.0
+    # QL = sum_q max(q*2, (q-1)*2) = sum of {0.2,1.0,1.8} = 3.0 — NF's effective
+    # reduction (its 1/len(quantiles) factor is dead), matching the trainer's
+    # masked inline branch.
     loss = MultiQuantileLoss((0.1, 0.5, 0.9))
     pred = jnp.zeros((1, 1, 3))
     target = jnp.array([[2.0]])
-    assert float(loss(pred, target)) == pytest.approx(1.0)
+    assert float(loss(pred, target)) == pytest.approx(3.0)
 
 
 def test_mqloss_pickles():
@@ -274,13 +279,15 @@ def test_prob_attention_masked_differs_from_unmasked():
 
 def test_attention_layer_matches_manual_dense_in_clamped_regime():
     # n_head=2, L=8, factor=3 -> clamped regime (see above tests): _prob_attention's
-    # output per head exactly equals dense attention regardless of sample_key. This test
-    # therefore also guards the head-reassembly deviation documented on AttentionLayer:
-    # if the implementation flattened [B,H,L,E] straight to [B,L,hid] (the Nixtla-main
-    # bug, which interleaves heads and time) instead of transposing to [B,L,H,E] first,
-    # `out` would differ from this manually-reassembled `expected`.
+    # output per head exactly equals dense attention regardless of sample_key. The
+    # manual reference reassembles heads in the ALIGNED convention (transpose to
+    # [B,L,H,E] before flattening), so the layer is pinned to
+    # attention_mixing="official" here — the "nf" default flattens head-major
+    # memory directly and is a genuinely different function at n_head > 1
+    # (guarded by test_attention_mixing_modes_differ_at_multi_head).
     B, L, hidden, n_head = 2, 8, 8, 2
-    layer = AttentionLayer(hidden_size=hidden, n_head=n_head, factor=3, mask_flag=False, rngs=nnx.Rngs(0))
+    layer = AttentionLayer(hidden_size=hidden, n_head=n_head, factor=3, mask_flag=False,
+                           mixing="official", rngs=nnx.Rngs(0))
     x = jnp.asarray(np.random.RandomState(5).randn(B, L, hidden), jnp.float32)
     out = layer(x, x, x, sample_key=jax.random.PRNGKey(7))
 
@@ -702,9 +709,142 @@ def test_predict_smaller_h_slices_larger_raises():
 
 def test_short_series_and_2d_raise():
     with pytest.raises(ValueError, match="too short|short"):
-        _tiny().fit(_make_y(40))
+        _tiny().fit(_make_y(36))  # T == input_size: zero windows
     with pytest.raises(ValueError, match="1-D"):
         _tiny().fit(jnp.ones((200, 2), jnp.float32))
+
+
+def test_fit_at_minimum_length_nf_parity():
+    # NF trains on h-padded partial windows: one window (T = input_size+1) is
+    # enough to fit. The old gate demanded T >= input_size+h.
+    m = _tiny().fit(_make_y(37))
+    pred = m.predict(h=12)["mean"]
+    assert pred.shape == (12,)
+    assert bool(jnp.all(jnp.isfinite(pred)))
+
+
+_COMPILE_LOG_RE = re.compile(r"Compiling ")
+
+
+def _count_compiles(fn):
+    """Run fn under jax.log_compiles and return (result, n_xla_compilations)."""
+    buf = io.StringIO()
+    handler = logging.StreamHandler(buf)
+    loggers = [
+        logging.getLogger("jax._src.dispatch"),
+        logging.getLogger("jax._src.interpreters.pxla"),
+    ]
+    with jax.log_compiles(True):
+        for lg in loggers:
+            lg.addHandler(handler)
+        try:
+            out = fn()
+            jax.block_until_ready(out)
+        finally:
+            for lg in loggers:
+                lg.removeHandler(handler)
+    return out, len(_COMPILE_LOG_RE.findall(buf.getvalue()))
+
+
+def test_count_compiles_canary():
+    # Live-fire proof _count_compiles can still see a compile: a fresh jit'd
+    # closure always compiles (pjit keys on callable identity), so the counter
+    # must report >=1. Guards test_refit_does_not_recompile against going
+    # vacuously green if a jax bump renames the log message or logger paths.
+    def fresh():
+        @jax.jit
+        def f(x):
+            return x * 5.0 - 2.0
+        return f(jnp.ones((4, 3)))
+
+    _, n = _count_compiles(fresh)
+    assert n >= 1
+
+
+def test_refit_does_not_recompile():
+    # The training program is a module-level nnx.jit keyed on config graphdefs
+    # (value-__eq__ initializers, _adam/scaler singletons) and operand shapes —
+    # a refit AND a fresh same-config instance must hit the cache with zero XLA
+    # compiles; fit #2 is counted directly (no uncounted settle call).
+    y = _make_y(60)
+    m = _tiny(max_steps=3, windows_batch_size=4)
+    m.fit(y)                                     # first fit pays the one compile
+    _, n_refit = _count_compiles(lambda: m.fit(y)._train_y)
+    assert n_refit == 0
+    m2 = _tiny(max_steps=3, windows_batch_size=4)
+    _, n_fresh = _count_compiles(lambda: m2.fit(y)._train_y)
+    assert n_fresh == 0
+
+
+def test_attention_mixing_modes_identical_at_single_head():
+    # At n_head == 1 the official transpose is a no-op, so both flatten
+    # conventions must produce the same forward.
+    from chronax.models.informer.informer_module import InformerNet
+
+    x = jnp.asarray(np.random.RandomState(0).randn(2, 12, 1), jnp.float32)
+    outs = []
+    for mode in ("nf", "official"):
+        net = InformerNet(h=4, input_size=12, label_len=6, hidden_size=16, n_head=1,
+                          conv_hidden_size=8, dropout=0.0, attention_mixing=mode,
+                          rngs=nnx.Rngs(0))
+        outs.append(np.asarray(net(x, sample_key=jax.random.PRNGKey(0),
+                                   deterministic=True, use_running_average=True)))
+    np.testing.assert_array_equal(outs[0], outs[1])
+
+
+def test_attention_mixing_modes_differ_at_multi_head():
+    # At n_head > 1 the nf flatten reinterprets head-major memory — the two
+    # conventions are genuinely different functions of the same weights.
+    from chronax.models.informer.informer_module import InformerNet
+
+    x = jnp.asarray(np.random.RandomState(0).randn(2, 12, 1), jnp.float32)
+    outs = []
+    for mode in ("nf", "official"):
+        net = InformerNet(h=4, input_size=12, label_len=6, hidden_size=16, n_head=2,
+                          conv_hidden_size=8, dropout=0.0, attention_mixing=mode,
+                          rngs=nnx.Rngs(0))
+        outs.append(np.asarray(net(x, sample_key=jax.random.PRNGKey(0),
+                                   deterministic=True, use_running_average=True)))
+    assert not np.allclose(outs[0], outs[1])
+
+
+def test_attention_mixing_pickle_roundtrip_and_legacy_default():
+    m = _tiny(attention_mixing="official", max_steps=3, windows_batch_size=4).fit(_make_y(60))
+    m2 = pickle.loads(pickle.dumps(m))
+    assert m2.attention_mixing == "official"
+    np.testing.assert_array_equal(np.asarray(m.predict(h=12)["mean"]),
+                                  np.asarray(m2.predict(h=12)["mean"]))
+    # Estimators pickled before the flag existed carry no attention_mixing key;
+    # they were built with the official transpose and must restore that way.
+    state = m.__getstate__()
+    del state["attention_mixing"]
+    legacy = Informer.__new__(Informer)
+    legacy.__setstate__(state)
+    assert legacy.attention_mixing == "official"
+
+
+def test_dropout_masks_fresh_per_scan_step_and_det_repeatable():
+    # Dropout RNG must advance per nnx.scan step even at a FIXED ProbSparse
+    # sample_key (the streams are independent); and the deterministic path with
+    # a fixed key must be exactly repeatable (the _forward_det contract).
+    from chronax.models.informer.informer_module import InformerNet
+
+    net = InformerNet(h=4, input_size=12, label_len=6, hidden_size=16, n_head=2,
+                      conv_hidden_size=8, dropout=0.5, rngs=nnx.Rngs(0))
+    x = jnp.ones((2, 12, 1))
+    fixed = jax.random.PRNGKey(7)
+
+    @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
+    def step(carry, _):
+        return carry, carry(x, sample_key=fixed, deterministic=False,
+                            use_running_average=False)
+
+    _, outs = step(net, jnp.arange(3))
+    assert not np.allclose(np.asarray(outs[0]), np.asarray(outs[1]))
+
+    a = net(x, sample_key=fixed, deterministic=True, use_running_average=True)
+    b = net(x, sample_key=fixed, deterministic=True, use_running_average=True)
+    np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
 
 
 def test_predict_before_fit_raises():

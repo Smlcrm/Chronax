@@ -227,28 +227,33 @@ class AttentionLayer(nnx.Module):
     cross-attention run queries from the decoder against keys/values from the encoder.
     The inner attention is :func:`_prob_attention` rather than dense softmax attention.
 
-    **Deliberate correctness deviation from Nixtla main:** NF's ``AttentionLayer.forward``
-    flattens the ProbAttention context straight from its ``[B, H, L, E]`` layout (``out =
-    out.view(B, L, -1)``), which silently interleaves the head and time axes whenever
-    ``H > 1`` (reinterpreting ``[B, H, L, E]``-ordered memory as ``[B, L, H*E]`` mixes
-    each head's features with the wrong time steps). The original Informer2020 code (and
-    every other multi-head attention layer in this repo, e.g. ``itransformer_module.py``'s
-    ``AttentionLayer``) transposes to ``[B, L, H, E]`` *before* flattening. We follow that
-    correct convention — ``ctx.transpose(0, 2, 1, 3).reshape(B, L_Q, hidden_size)`` — here
-    rather than reproduce NF's bug.
+    **Head mixing (``mixing``):** two flatten conventions exist for the multi-head
+    context at ``H > 1``. ``"official"`` transposes to ``[B, L, H, E]`` before
+    flattening (the Informer2020-paper convention; keeps each head's features
+    aligned with its own time steps). ``"nf"`` — the default — flattens straight
+    from the ``[B, H, L, E]`` layout (``out.view(B, L, -1)`` in the
+    neuralforecast reference), reinterpreting head-major memory as ``[B, L, H*E]``.
+    The nf form is the variant the benchmarked reference trains, and it
+    measurably trains better on period≈L data (paired A/B across the losing
+    cells), so it is the default; ``"official"`` preserves paper-exact per-head
+    alignment. The two are identical at ``n_head == 1``.
 
     No dropout (``_prob_attention`` never applies its own), no ``deterministic`` arg.
     """
 
     def __init__(
-        self, *, hidden_size: int, n_head: int, factor: int, mask_flag: bool, rngs: nnx.Rngs,
+        self, *, hidden_size: int, n_head: int, factor: int, mask_flag: bool,
+        mixing: str = "nf", rngs: nnx.Rngs,
     ) -> None:
         if hidden_size % n_head != 0:
             raise ValueError(f"hidden_size ({hidden_size}) must be divisible by n_head ({n_head}).")
+        if mixing not in ("nf", "official"):
+            raise ValueError(f"mixing must be 'nf' or 'official'; got {mixing!r}.")
         self.hidden_size = hidden_size
         self.n_head = n_head
         self.factor = factor
         self.mask_flag = mask_flag
+        self.mixing = mixing
         self.w_q = _torch_linear(hidden_size, hidden_size, rngs=rngs)
         self.w_k = _torch_linear(hidden_size, hidden_size, rngs=rngs)
         self.w_v = _torch_linear(hidden_size, hidden_size, rngs=rngs)
@@ -268,7 +273,10 @@ class AttentionLayer(nnx.Module):
         k = self._split_heads(self.w_k(keys))
         v = self._split_heads(self.w_v(values))
         ctx = _prob_attention(q, k, v, factor=self.factor, mask_flag=self.mask_flag, key=sample_key)
-        ctx = ctx.transpose(0, 2, 1, 3).reshape(B, L_Q, self.hidden_size)  # [B,H,L_Q,E]->[B,L_Q,H,E]->[B,L_Q,hid]
+        if self.mixing == "official":
+            ctx = ctx.transpose(0, 2, 1, 3).reshape(B, L_Q, self.hidden_size)  # [B,H,L,E]->[B,L,H,E]->[B,L,hid]
+        else:  # "nf": reference head-flatten, straight from the head-major layout
+            ctx = ctx.reshape(B, L_Q, self.hidden_size)                        # [B,H,L,E] memory as [B,L,H*E]
         return self.w_o(ctx)
 
 
@@ -338,11 +346,12 @@ class TransEncoderLayer(nnx.Module):
 
     def __init__(
         self, *, hidden_size: int, n_head: int, conv_hidden_size: int, factor: int,
-        dropout: float, activation: str = "gelu", rngs: nnx.Rngs,
+        dropout: float, activation: str = "gelu", mixing: str = "nf", rngs: nnx.Rngs,
     ) -> None:
         self.activation = activation
         self.attn = AttentionLayer(
-            hidden_size=hidden_size, n_head=n_head, factor=factor, mask_flag=False, rngs=rngs,
+            hidden_size=hidden_size, n_head=n_head, factor=factor, mask_flag=False,
+            mixing=mixing, rngs=rngs,
         )
         self.conv1 = _torch_linear(hidden_size, conv_hidden_size, rngs=rngs)
         self.conv2 = _torch_linear(conv_hidden_size, hidden_size, rngs=rngs)
@@ -376,14 +385,16 @@ class TransDecoderLayer(nnx.Module):
 
     def __init__(
         self, *, hidden_size: int, n_head: int, conv_hidden_size: int, factor: int,
-        dropout: float, activation: str = "gelu", rngs: nnx.Rngs,
+        dropout: float, activation: str = "gelu", mixing: str = "nf", rngs: nnx.Rngs,
     ) -> None:
         self.activation = activation
         self.self_attn = AttentionLayer(
-            hidden_size=hidden_size, n_head=n_head, factor=factor, mask_flag=True, rngs=rngs,
+            hidden_size=hidden_size, n_head=n_head, factor=factor, mask_flag=True,
+            mixing=mixing, rngs=rngs,
         )
         self.cross_attn = AttentionLayer(
-            hidden_size=hidden_size, n_head=n_head, factor=factor, mask_flag=False, rngs=rngs,
+            hidden_size=hidden_size, n_head=n_head, factor=factor, mask_flag=False,
+            mixing=mixing, rngs=rngs,
         )
         self.conv1 = _torch_linear(hidden_size, conv_hidden_size, rngs=rngs)
         self.conv2 = _torch_linear(conv_hidden_size, hidden_size, rngs=rngs)

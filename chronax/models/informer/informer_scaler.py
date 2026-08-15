@@ -7,10 +7,21 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
+import jax
 import jax.numpy as jnp
 
 _MAD_TO_STD = 0.6744897501960817  # scipy.stats.norm.ppf(0.75)
 _EPS = 1e-6
+
+
+def _torch_median(x: jnp.ndarray, axis: int) -> jnp.ndarray:
+    """torch ``median``/``nanmedian`` convention: the LOWER of the two middle
+    order statistics on even-length axes (``jnp.median`` averages them — a
+    per-window shift difference on every even window; ``input_size = 3h`` is
+    even whenever h is). Axis length is static, so the index is compile-time.
+    """
+    n = x.shape[axis]
+    return jax.lax.index_in_dim(jnp.sort(x, axis=axis), (n - 1) // 2, axis, keepdims=True)
 
 
 @runtime_checkable
@@ -34,13 +45,19 @@ class IdentityScaler:
     def inverse(self, z: jnp.ndarray, shift: jnp.ndarray, scale: jnp.ndarray) -> jnp.ndarray:
         return z
 
+    def __eq__(self, other):  # stateless: any two instances are interchangeable, which
+        return type(other) is type(self)  # keeps them usable as jit static args
+
+    def __hash__(self):
+        return hash(type(self))
+
 
 class RobustScaler:
     """Median + MAD scaler with 0.6745*std fallback when MAD=0."""
 
     def stats(self, x: jnp.ndarray, axis: int = 1) -> tuple[jnp.ndarray, jnp.ndarray]:
-        median = jnp.median(x, axis=axis, keepdims=True)
-        mad = jnp.median(jnp.abs(x - median), axis=axis, keepdims=True)
+        median = _torch_median(x, axis)
+        mad = _torch_median(jnp.abs(x - median), axis)
         mean = jnp.mean(x, axis=axis, keepdims=True)
         std = jnp.sqrt(jnp.mean((x - mean) ** 2, axis=axis, keepdims=True))
         scale = jnp.where(mad == 0.0, std * _MAD_TO_STD, mad)
@@ -53,13 +70,26 @@ class RobustScaler:
     def inverse(self, z: jnp.ndarray, shift: jnp.ndarray, scale: jnp.ndarray) -> jnp.ndarray:
         return z * scale + shift
 
+    def __eq__(self, other):  # stateless: any two instances are interchangeable, which
+        return type(other) is type(self)  # keeps them usable as jit static args
+
+    def __hash__(self):
+        return hash(type(self))
+
+
+_IDENTITY = IdentityScaler()
+_ROBUST = RobustScaler()
+
 
 def resolve_scaler(scaler: "str | Scaler") -> Scaler:
-    """Resolve a scaler from a name (``'identity'``/``'robust'``) or a Scaler instance."""
+    """Resolve a scaler from a name (``'identity'``/``'robust'``) or a Scaler instance.
+
+    Registry names return module singletons so repeated resolution yields the
+    same object (jit static-arg cache hits across fits)."""
     if isinstance(scaler, str):
         if scaler == "identity":
-            return IdentityScaler()
+            return _IDENTITY
         if scaler == "robust":
-            return RobustScaler()
+            return _ROBUST
         raise ValueError(f"Unknown scaler {scaler!r}. Available: 'identity', 'robust'.")
     return scaler
