@@ -95,9 +95,11 @@ class TFT(BaseForecaster):
         y = jnp.asarray(y, dtype=jnp.float32)
         if y.ndim != 1:
             raise ValueError(f"y must be 1-D; got shape {y.shape}.")
-        if y.shape[0] < self.input_size + self.h:
+        if y.shape[0] < self.input_size + 1:
+            # NF trains on h-padded partial windows, so one window (T >= L+1) suffices.
             raise ValueError(
-                f"Series length {y.shape[0]} too short for input_size={self.input_size} + h={self.h}."
+                f"Series length {y.shape[0]} too short for input_size={self.input_size} "
+                f"(need at least input_size+1)."
             )
         X = None if X is None else jnp.asarray(X, jnp.float32)
         futr_exog = None if futr_exog is None else jnp.asarray(futr_exog, jnp.float32)

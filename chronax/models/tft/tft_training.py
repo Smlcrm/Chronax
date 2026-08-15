@@ -7,6 +7,8 @@ training loop is one ``nnx.scan`` so it stays ``vmap``-traceable for
 """
 from __future__ import annotations
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import optax
@@ -128,23 +130,26 @@ def _finite_or_raise(losses: jnp.ndarray) -> jnp.ndarray:
     return losses
 
 
-def train(net, y, *, h, input_size, max_steps, windows_batch_size, lr, seed, loss_fn, scaler,
-          hist_exog=None, futr_exog=None, stat_exog=None):
-    """Train ``net`` in place via one ``nnx.scan``. Returns per-step losses."""
-    y_windows, target_mask = build_windows(y, input_size, h)
-    n = y_windows.shape[0]
-    hist_w = build_exog_windows(hist_exog, input_size, h, n, "input") if hist_exog is not None else None
-    futr_w = build_exog_windows(futr_exog, input_size, h, n, "full") if futr_exog is not None else None
-    stat_w = jnp.broadcast_to(stat_exog[None, :], (n, stat_exog.shape[0])) if stat_exog is not None else None
+@functools.lru_cache(maxsize=None)
+def _adam(lr: float):
+    """One optax transform per learning rate. The optimizer's graphdef embeds the
+    transform object, so a fresh ``optax.adam`` per fit would make same-config
+    optimizers unequal and defeat the cross-fit ``_train_scan`` cache."""
+    return optax.adam(lr)
 
-    step_keys = jax.random.split(jax.random.PRNGKey(seed), max_steps)
-    if n < windows_batch_size:                          # NF: torch.randint -> with replacement
-        sample = lambda k: jax.random.choice(k, n, shape=(windows_batch_size,), replace=True)
-    else:                                               # NF: torch.randperm[:B] -> without replacement
-        sample = lambda k: jax.random.permutation(k, n)[:windows_batch_size]
-    batch_idx = jax.vmap(sample)(step_keys)             # [max_steps, B]
 
-    optimizer = nnx.Optimizer(net, optax.adam(lr), wrt=nnx.Param)
+@functools.partial(nnx.jit, static_argnames=("h", "input_size", "scaler", "loss_fn"))
+def _train_scan(net, optimizer, y_windows, target_mask, batch_idx,
+                hist_w, futr_w, stat_w, *, h, input_size, scaler, loss_fn):
+    """The whole training loop as one cached program.
+
+    Module-level so the traced/compiled program is reused across ``fit()`` calls:
+    the jit cache keys on the net/optimizer graphdefs (value-``__eq__``
+    initializers, the ``_adam`` and scaler singletons make same-config instances
+    equal), the static config args, and operand shapes -- never on data. A
+    per-call scan closure would retrace and recompile every fit, because pjit
+    caches on the callable's identity.
+    """
 
     @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
     def step(carry, idx):
@@ -163,6 +168,29 @@ def train(net, y, *, h, input_size, max_steps, windows_batch_size, lr, seed, los
         return (net, opt), loss
 
     _, losses = step((net, optimizer), batch_idx)
+    return losses
+
+
+def train(net, y, *, h, input_size, max_steps, windows_batch_size, lr, seed, loss_fn, scaler,
+          hist_exog=None, futr_exog=None, stat_exog=None):
+    """Train ``net`` in place via one ``nnx.scan``. Returns per-step losses."""
+    y_windows, target_mask = build_windows(y, input_size, h)
+    n = y_windows.shape[0]
+    hist_w = build_exog_windows(hist_exog, input_size, h, n, "input") if hist_exog is not None else None
+    futr_w = build_exog_windows(futr_exog, input_size, h, n, "full") if futr_exog is not None else None
+    stat_w = jnp.broadcast_to(stat_exog[None, :], (n, stat_exog.shape[0])) if stat_exog is not None else None
+
+    step_keys = jax.random.split(jax.random.PRNGKey(seed), max_steps)
+    if n < windows_batch_size:                          # NF: torch.randint -> with replacement
+        sample = lambda k: jax.random.choice(k, n, shape=(windows_batch_size,), replace=True)
+    else:                                               # NF: torch.randperm[:B] -> without replacement
+        sample = lambda k: jax.random.permutation(k, n)[:windows_batch_size]
+    batch_idx = jax.vmap(sample)(step_keys)             # [max_steps, B]
+
+    optimizer = nnx.Optimizer(net, _adam(lr), wrt=nnx.Param)
+    losses = _train_scan(net, optimizer, y_windows, target_mask, batch_idx,
+                         hist_w, futr_w, stat_w,
+                         h=h, input_size=input_size, scaler=scaler, loss_fn=loss_fn)
     return _finite_or_raise(losses)
 
 

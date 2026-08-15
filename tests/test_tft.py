@@ -4,8 +4,11 @@ Covers the TFT subpackage (losses, scaler, layers, module, training, model) in
 one flat file, matching the ``test_<model>.py`` convention used elsewhere in
 ``tests/``.
 """
+import io
+import logging
 import math
 import pickle
+import re
 
 import jax
 import jax.numpy as jnp
@@ -61,11 +64,13 @@ def test_mqloss_multiplier_and_requires_median():
 
 def test_mqloss_pinball_value():
     # err = y - yhat. For q and a single (h=1) point with pred all zeros, target=2:
-    # QL = mean_q max(q*2, (q-1)*2) = mean_q q*2  -> mean of {0.2,1.0,1.8} = 1.0
+    # QL = sum_q max(q*2, (q-1)*2) = sum of {0.2,1.0,1.8} = 3.0 — NF's effective
+    # reduction (its 1/len(quantiles) factor is dead), matching the trainer's
+    # masked inline branch.
     loss = MultiQuantileLoss((0.1, 0.5, 0.9))
     pred = jnp.zeros((1, 1, 3))
     target = jnp.array([[2.0]])
-    assert float(loss(pred, target)) == pytest.approx(1.0)
+    assert float(loss(pred, target)) == pytest.approx(3.0)
 
 
 def test_mqloss_pickles():
@@ -90,6 +95,16 @@ def test_robust_scaler_uses_median():
     x = jnp.asarray([[1.0, 2.0, 3.0, 4.0, 100.0]], dtype=jnp.float32)
     shift, _ = RobustScaler().stats(x, axis=1)
     assert float(shift[0, 0]) == pytest.approx(3.0)  # median, robust to the 100 outlier
+
+
+def test_robust_scaler_torch_median_convention():
+    # torch median/nanmedian returns the LOWER of the two middle order stats on
+    # even lengths (jnp.median would average to 2.5 here). MAD inherits it.
+    x = jnp.asarray([[4.0, 1.0, 3.0, 2.0]], dtype=jnp.float32)
+    shift, scale = RobustScaler().stats(x, axis=1)
+    assert float(shift[0, 0]) == pytest.approx(2.0)
+    # |x - 2| = [2, 1, 1, 0] -> sorted [0, 1, 1, 2] -> lower middle = 1
+    assert float(scale[0, 0]) == pytest.approx(1.0 + 1e-6)
 
 
 def test_identity_scaler_is_noop():
@@ -366,6 +381,40 @@ def test_imha_query_slice_matches_compute_then_slice():
     np.testing.assert_allclose(np.asarray(attn_full[:, :, 6:]), np.asarray(attn_sliced), rtol=0, atol=1e-6)
 
 
+def test_imha_matches_numpy_reference():
+    # Implementation-independent oracle for the interpretable attention (paper
+    # Eq 13-16 / NF lineage): multi-head Q/K, SHARED single-head V, causal mask
+    # including the diagonal, softmax, per-head context, mean over heads, out
+    # projection. Guards the q-slice einsum path against silent math drift.
+    H, d, T, B = 2, 8, 5, 3
+    hidden = H * d
+    imha = InterpretableMultiHeadAttention(n_head=H, hidden_size=hidden,
+                                           attn_dropout=0.0, dropout=0.0, rngs=nnx.Rngs(3))
+    x = np.random.RandomState(7).randn(B, T, hidden).astype(np.float32)
+    w_qkv = np.asarray(imha.qkv.kernel.value)          # [hidden, (2H+1)*d]
+    w_out = np.asarray(imha.out_proj.kernel.value)     # [d, hidden]
+
+    qkv = x @ w_qkv
+    nh = H * d
+    q, k, v = qkv[..., :nh], qkv[..., nh:2 * nh], qkv[..., 2 * nh:]   # v: [B,T,d] shared
+    causal = np.tril(np.ones((T, T), dtype=bool))
+    ctx_heads = []
+    for hh in range(H):
+        qh = q[..., hh * d:(hh + 1) * d]
+        kh = k[..., hh * d:(hh + 1) * d]
+        scores = (qh @ kh.transpose(0, 2, 1)) * (d ** -0.5)           # [B,T,T]
+        scores = np.where(causal[None], scores, -1e9)
+        e = np.exp(scores - scores.max(axis=-1, keepdims=True))
+        attn = e / e.sum(axis=-1, keepdims=True)
+        ctx_heads.append(attn @ v)                                    # [B,T,d]
+    ref = (np.mean(ctx_heads, axis=0)) @ w_out                        # [B,T,hidden]
+
+    out_full, _ = imha(jnp.asarray(x), deterministic=True)
+    np.testing.assert_allclose(np.asarray(out_full), ref, rtol=0, atol=1e-5)
+    out_sliced, _ = imha(jnp.asarray(x), deterministic=True, query_start=2)
+    np.testing.assert_allclose(np.asarray(out_sliced), ref[:, 2:], rtol=0, atol=1e-5)
+
+
 def test_same_config_nets_share_graphdef():
     # Value-__eq__ on the picklable initializers makes same-config graphdefs
     # EQUAL, so the module-level @nnx.jit _forward_det cache hits across nets
@@ -414,6 +463,34 @@ def test_net_quantile_multiplier_widens_output():
     net = _net(outputsize_multiplier=3)
     out = net(jnp.ones((2, 6, 1)), deterministic=True)
     assert out.shape == (2, 4, 3)
+
+
+def test_param_count_pins_nf_structure():
+    # Structure pin at the audit config (hidden=128, n_head=4, lstm, no exog).
+    # NF 3.1.7 counts 870,158 at the same config; the +1,024 delta is exactly
+    # torch nn.LSTM's redundant double bias (2 cells x 4 gates x 128: b_ih+b_hh
+    # vs flax's single fused bias) — expressivity-equal. Any other drift in
+    # either direction is a structural regression.
+    net = TFTNet(h=24, input_size=72, hidden_size=128, rngs=nnx.Rngs(1))
+    params = nnx.state(net, nnx.Param)
+    total = sum(int(np.prod(x.shape)) for x in jax.tree.leaves(params))
+    assert total == 869_134
+
+
+def test_dropout_masks_fresh_per_scan_step():
+    # Dropout RNG must advance per nnx.scan step (NF semantics: fresh
+    # per-element masks every training step). A frozen mask would be silent —
+    # the loss still decreases — so pin the mechanism directly.
+    net = _net(dropout=0.5)
+    x = jnp.ones((2, 6, 1))
+
+    @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
+    def step(carry, _):
+        return carry, carry(x, deterministic=False)
+
+    _, outs = step(net, jnp.arange(3))
+    assert not np.allclose(np.asarray(outs[0]), np.asarray(outs[1]))
+    assert not np.allclose(np.asarray(outs[1]), np.asarray(outs[2]))
 
 
 # =============================================================================
@@ -609,9 +686,18 @@ def test_predict_smaller_h_slices_and_larger_raises():
 
 def test_fit_short_series_and_2d_raise():
     with pytest.raises(ValueError, match="too short|short"):
-        _tiny().fit(_make_y(40))
+        _tiny().fit(_make_y(36))  # T == input_size: zero windows
     with pytest.raises(ValueError, match="1-D"):
         _tiny().fit(jnp.ones((200, 2), jnp.float32))
+
+
+def test_fit_at_minimum_length_nf_parity():
+    # NF trains on h-padded partial windows: one window (T = input_size+1) is
+    # enough to fit. The old gate demanded T >= input_size+h.
+    m = _tiny().fit(_make_y(37))
+    pred = m.predict(h=12)["mean"]
+    assert pred.shape == (12,)
+    assert bool(jnp.all(jnp.isfinite(pred)))
 
 
 def test_predict_before_fit_raises():
@@ -657,11 +743,18 @@ def test_futr_exog_required_at_predict_when_fit_with_it():
 
 
 def test_exog_improves_accuracy_on_covariate_driven_signal():
-    # Target is a noisy copy of a known future covariate -> exog must help vs univariate.
+    # Target is a noisy copy of a known future covariate that is UNPREDICTABLE
+    # from its own history (smoothed random walk): the univariate model cannot
+    # anticipate the horizon while the exog model reads it off the covariate,
+    # so the margin is decisive. (A periodic covariate makes this a knife-edge
+    # single-seed race between two good fits, re-rolled by any ULP-class
+    # program change.)
     rng = np.random.RandomState(0)
     T = 360
-    futr = np.sin(np.arange(T + 12) / 6.0).astype(np.float32)
-    y = (futr[:T] + 0.05 * rng.randn(T)).astype(np.float32)
+    walk = np.cumsum(rng.randn(T + 12)).astype(np.float32)
+    futr = np.convolve(walk, np.ones(5, np.float32) / 5.0, mode="same")
+    futr = (futr / (np.abs(futr).max() + 1e-6)).astype(np.float32)
+    y = (futr[:T] + 0.02 * rng.randn(T)).astype(np.float32)
     fk = dict(h=12, input_size=48, hidden_size=32, n_head=4, max_steps=250,
               windows_batch_size=64, random_seed=0)
     m_ex = TFT(**fk).fit(jnp.asarray(y), futr_exog=jnp.asarray(futr[:T, None]))
@@ -718,6 +811,61 @@ def test_constant_series_and_h1_finite():
     m = TFT(h=1, input_size=12, hidden_size=8, n_head=2, max_steps=5,
             windows_batch_size=16, random_seed=0).fit(_make_y(60))
     assert m.predict(h=1)["mean"].shape == (1,)
+
+
+_COMPILE_LOG_RE = re.compile(r"Compiling ")
+
+
+def _count_compiles(fn):
+    """Run fn under jax.log_compiles and return (result, n_xla_compilations)."""
+    buf = io.StringIO()
+    handler = logging.StreamHandler(buf)
+    loggers = [
+        logging.getLogger("jax._src.dispatch"),
+        logging.getLogger("jax._src.interpreters.pxla"),
+    ]
+    with jax.log_compiles(True):
+        for lg in loggers:
+            lg.addHandler(handler)
+        try:
+            out = fn()
+            jax.block_until_ready(out)
+        finally:
+            for lg in loggers:
+                lg.removeHandler(handler)
+    return out, len(_COMPILE_LOG_RE.findall(buf.getvalue()))
+
+
+def test_count_compiles_canary():
+    # Live-fire proof _count_compiles can still see a compile: a fresh jit'd
+    # closure always compiles (pjit keys on callable identity), so the counter
+    # must report >=1. If a jax bump renames the "Compiling " message or the
+    # logger paths, this fails instead of letting test_refit_does_not_recompile
+    # go vacuously green on a counter that matches nothing.
+    def fresh():
+        @jax.jit
+        def f(x):
+            return x * 2.0 + 1.0
+        return f(jnp.ones((3, 7)))
+
+    _, n = _count_compiles(fresh)
+    assert n >= 1
+
+
+def test_refit_does_not_recompile():
+    # The training program is a module-level nnx.jit whose cache keys on config
+    # graphdefs (value-__eq__ initializers, _adam/scaler singletons) and operand
+    # shapes — never on data or call-site closures. A refit AND a fresh
+    # same-config instance must both hit the cache with zero XLA compiles;
+    # fit #2 is counted directly (no uncounted settle call).
+    y = _make_y(60)
+    m = _tiny(max_steps=3, windows_batch_size=4)
+    m.fit(y)                                     # first fit pays the one compile
+    _, n_refit = _count_compiles(lambda: m.fit(y)._train_y)
+    assert n_refit == 0
+    m2 = _tiny(max_steps=3, windows_batch_size=4)
+    _, n_fresh = _count_compiles(lambda: m2.fit(y)._train_y)
+    assert n_fresh == 0
 
 
 def test_pickle_round_trip_point():

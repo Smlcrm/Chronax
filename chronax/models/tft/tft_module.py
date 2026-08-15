@@ -65,8 +65,10 @@ class StaticCovariateEncoder(nnx.Module):
         )
         n_states = 2 if rnn_type == "lstm" else 1
         self.n_context = 2 + n_states * n_rnn_layers
+        # NF hardcodes ELU for the 2+2L context GRNs regardless of grn_activation
+        # (only the VSN GRNs follow the configured activation).
         self.context_grns = [
-            GRN(hidden_size, hidden_size, dropout=dropout, activation=activation, rngs=rngs)
+            GRN(hidden_size, hidden_size, dropout=dropout, activation="ELU", rngs=rngs)
             for _ in range(self.n_context)
         ]
 
