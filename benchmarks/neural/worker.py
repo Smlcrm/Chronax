@@ -189,7 +189,7 @@ for col in {y_cols!r}:
     if 'n_series' in sig and sig['n_series'].default is inspect.Parameter.empty:
         kw.setdefault('n_series', 1)   # univariate benchmark
     m = {nf_name}(h={h}, input_size={input_size}, loss=MAE(), random_seed={seed},
-        accelerator='cpu', enable_progress_bar=False, logger=False,
+        accelerator='gpu', enable_progress_bar=False, logger=False,
         enable_model_summary=False, enable_checkpointing=False, **kw)
     nf = NeuralForecast(models=[m], freq={freq!r})
     nf.fit(df=train)
@@ -228,7 +228,7 @@ if 'futr_exog_list' in sig:
 if 'n_series' in sig and sig['n_series'].default is inspect.Parameter.empty:
     kw.setdefault('n_series', 1)
 m = {nf_name}(h={h}, input_size={input_size}, loss=MAE(), random_seed={seed},
-    accelerator='cpu', enable_progress_bar=False, logger=False,
+    accelerator='gpu', enable_progress_bar=False, logger=False,
     enable_model_summary=False, enable_checkpointing=False, **kw)
 nf = NeuralForecast(models=[m], freq={freq!r})
 futr_df = None
@@ -265,7 +265,7 @@ sig = inspect.signature({nf_name}).parameters
 if 'n_series' in sig and sig['n_series'].default is inspect.Parameter.empty:
     kw.setdefault('n_series', 1)   # univariate benchmark
 m = {nf_name}(h={h}, input_size={input_size}, loss=MAE(), random_seed={seed},
-    accelerator='cpu', enable_progress_bar=False, logger=False,
+    accelerator='gpu', enable_progress_bar=False, logger=False,
     enable_model_summary=False, enable_checkpointing=False, **kw)
 nf = NeuralForecast(models=[m], freq={freq!r})
 t0 = time.perf_counter(); nf.fit(df=train); fcst = nf.predict(); t = time.perf_counter() - t0
