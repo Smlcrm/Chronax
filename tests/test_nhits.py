@@ -743,3 +743,38 @@ def test_mqloss_pinball_value_nf_sum():
 
     loss = MultiQuantileLoss((0.1, 0.5, 0.9))
     assert float(loss(jnp.zeros((1, 1, 3)), jnp.array([[2.0]]))) == pytest.approx(3.0)
+
+
+def test_exog_scale_floor_bounds_degenerate_windows():
+    # A near-constant stats span (all-night zero runs; jitter-constant channel)
+    # collapses the robust scale toward its epsilon; without the floor,
+    # regime-shifted horizon values scale to 1e4-class inputs (the diurnal-
+    # covariate divergence class). The floor bounds |scaled| by construction.
+    from chronax.models.nhits.nhits_training import build_exog_windows, _scale_exog
+    from chronax.models.nhits.nhits_scaler import resolve_scaler
+
+    t = np.arange(240)
+    day = (np.sin(t / 12.0) > 0.6).astype(np.float32) * 7000.0     # zero runs > L
+    const = np.full(240, 1.0, np.float32)
+    const[::37] = 0.997                                             # f32-jitter constant
+    Xp = np.stack([day, const], axis=1)
+    w = build_exog_windows(jnp.asarray(Xp), 24, 12, 240 - 24, "full")
+    z = _scale_exog(w, resolve_scaler("robust"), stats_len=24)
+    assert bool(jnp.all(jnp.isfinite(z)))
+    assert float(jnp.max(jnp.abs(z))) <= 105.0   # bound = 1/frac (+slack)
+
+
+def test_exog_scale_floor_inert_on_offset_covariate():
+    # Level-offset covariates (temperature-in-Kelvin class: mean >> spread) must
+    # NOT trip the floor: the spread-based form compares like with like, so the
+    # transform is bit-identical to the unfloored insample-robust scaling. A
+    # magnitude-based floor would fire on every window here and compress the
+    # channel ~10x.
+    from chronax.models.nhits.nhits_training import _scale_exog
+    rng = np.random.RandomState(3)
+    w = jnp.asarray(100.0 + 2.0 * rng.randn(4, 12, 2), jnp.float32)   # 100 +- 2
+    sc = RobustScaler()
+    shift, scale = sc.stats(w[:, :8], axis=1)
+    unfloored = (w - shift) / scale
+    np.testing.assert_array_equal(np.asarray(_scale_exog(w, sc, stats_len=8)),
+                                  np.asarray(unfloored))

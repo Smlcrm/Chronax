@@ -548,17 +548,24 @@ def test_build_exog_windows_spans():
 
 
 def test_exog_scaling_stats_use_insample_span_only():
-    # NF's _normalization masks the horizon out of the scaler stats: exog
-    # statistics come from the insample span only; the horizon slice is
-    # transformed with those stats but never feeds them.
-    from chronax.models.tft.tft_training import _scale_exog
+    # Exog CENTERING comes from the insample span only; the scale is the
+    # insample robust scale unless the degeneracy floor binds — the floor
+    # deliberately reads the FULL window's spread (a regime-shifted horizon
+    # after a near-constant insample span is exactly the case it exists for).
+    # Pin the whole contract in closed form, bitwise.
+    from chronax.models.tft.tft_training import (
+        _EXOG_SCALE_FLOOR_FRAC, _scale_exog,
+    )
     rng = np.random.RandomState(0)
     L, h, F = 8, 4, 2
     w = jnp.asarray(rng.randn(3, L + h, F), jnp.float32)
-    a = _scale_exog(w, RobustScaler(), stats_len=L)
-    w2 = w.at[:, L:, :].add(1e4)         # perturb horizon slice massively
-    b = _scale_exog(w2, RobustScaler(), stats_len=L)
-    np.testing.assert_array_equal(np.asarray(a[:, :L]), np.asarray(b[:, :L]))
+    w = w.at[:, L:, :].add(1e4)          # massive horizon regime shift
+    sc = RobustScaler()
+    shift, scale = sc.stats(w[:, :L], axis=1)            # insample-span stats
+    rng_full = jnp.max(w, axis=1, keepdims=True) - jnp.min(w, axis=1, keepdims=True)
+    expected = (w - shift) / jnp.maximum(scale, _EXOG_SCALE_FLOOR_FRAC * rng_full)
+    np.testing.assert_array_equal(np.asarray(_scale_exog(w, sc, stats_len=L)),
+                                  np.asarray(expected))
 
 
 def test_masked_loss_ignores_padded_tail():
@@ -891,3 +898,38 @@ def test_pickle_round_trip_quantile_and_exog():
 def test_importable_from_models_namespace():
     from chronax.models import TFT as T
     assert T is TFT
+
+
+def test_exog_scale_floor_bounds_degenerate_windows():
+    # A near-constant stats span (all-night zero runs; jitter-constant channel)
+    # collapses the robust scale toward its epsilon; without the floor,
+    # regime-shifted horizon values scale to 1e4-class inputs (the diurnal-
+    # covariate divergence class). The floor bounds |scaled| by construction.
+    from chronax.models.tft.tft_training import build_exog_windows, _scale_exog
+    from chronax.models.tft.tft_scaler import resolve_scaler
+
+    t = np.arange(240)
+    day = (np.sin(t / 12.0) > 0.6).astype(np.float32) * 7000.0     # zero runs > L
+    const = np.full(240, 1.0, np.float32)
+    const[::37] = 0.997                                             # f32-jitter constant
+    Xp = np.stack([day, const], axis=1)
+    w = build_exog_windows(jnp.asarray(Xp), 24, 12, 240 - 24, "full")
+    z = _scale_exog(w, resolve_scaler("robust"), stats_len=24)
+    assert bool(jnp.all(jnp.isfinite(z)))
+    assert float(jnp.max(jnp.abs(z))) <= 105.0   # bound = 1/frac (+slack)
+
+
+def test_exog_scale_floor_inert_on_offset_covariate():
+    # Level-offset covariates (temperature-in-Kelvin class: mean >> spread) must
+    # NOT trip the floor: the spread-based form compares like with like, so the
+    # transform is bit-identical to the unfloored insample-robust scaling. A
+    # magnitude-based floor would fire on every window here and compress the
+    # channel ~10x.
+    from chronax.models.tft.tft_training import _scale_exog
+    rng = np.random.RandomState(3)
+    w = jnp.asarray(100.0 + 2.0 * rng.randn(4, 12, 2), jnp.float32)   # 100 +- 2
+    sc = RobustScaler()
+    shift, scale = sc.stats(w[:, :8], axis=1)
+    unfloored = (w - shift) / scale
+    np.testing.assert_array_equal(np.asarray(_scale_exog(w, sc, stats_len=8)),
+                                  np.asarray(unfloored))

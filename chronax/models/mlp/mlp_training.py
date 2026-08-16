@@ -65,6 +65,9 @@ def build_exog_windows(arr: jnp.ndarray, input_size: int, h: int, n_windows: int
     return arr_pad[idx]
 
 
+_EXOG_SCALE_FLOOR_FRAC = 0.01  # floor = frac * window range  =>  |scaled| <= 1/frac
+
+
 def _scale_exog(windows: jnp.ndarray, scaler, stats_len: int | None = None) -> jnp.ndarray:
     """Per-channel per-window robust scaling of ``[B, T, F]`` exog.
 
@@ -75,7 +78,20 @@ def _scale_exog(windows: jnp.ndarray, scaler, stats_len: int | None = None) -> j
     """
     stats_src = windows if stats_len is None else windows[:, :stats_len]
     shift, scale = scaler.stats(stats_src, axis=1)      # [B, 1, F]
-    return scaler.transform(windows, shift, scale)
+    # A near-constant stats span collapses the robust scale to its epsilon, and
+    # any regime-shifted value in the window then divides to a 1e5-scale input
+    # (diurnal covariates: an all-night span before a daytime horizon). The
+    # SPREAD-based floor bounds |scaled| <= range/(frac*range) = 1/frac by
+    # construction (the shift lies inside [min, max]). frac sits ~15x below the
+    # Gaussian scale/range ratio (~0.15 at these window lengths), so ordinary
+    # covariates — including level-offset ones like temperature in Kelvin —
+    # never trip it, while degenerate spans (scale/range ~ 1e-9) always do.
+    # Covariate values are known inputs, so the bound may read the full window;
+    # the CENTERING stays insample-span.
+    rng_full = (jnp.max(windows, axis=1, keepdims=True)
+                - jnp.min(windows, axis=1, keepdims=True))
+    return scaler.transform(windows, shift,
+                            jnp.maximum(scale, _EXOG_SCALE_FLOOR_FRAC * rng_full))
 
 
 # Elementwise forms of the registry point losses, for masked reduction
