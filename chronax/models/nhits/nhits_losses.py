@@ -43,8 +43,10 @@ LOSSES: Mapping[str, LossFn] = {"mae": mae, "mse": mse, "huber": huber}
 class MultiQuantileLoss:
     """Multi-quantile (pinball) loss. ``__call__(pred[...,h,Q], target[...,h])``.
 
-    ``QL(y, y_hat, q) = q*(y-y_hat)+ + (1-q)*(y_hat-y)+``, averaged over quantiles
-    and all elements. Quantiles are sorted, must lie in (0, 1), and must include
+    ``QL(y, y_hat, q) = q*(y-y_hat)+ + (1-q)*(y_hat-y)+``, SUMMED over quantiles
+    and averaged over all other elements — neuralforecast's effective reduction
+    (its ``1/len(quantiles)`` factor is dead); the trainer's masked inline
+    branch computes the same reduction. Quantiles are sorted, must lie in (0, 1), and must include
     0.5 (the median / ``"mean"`` head). Picklable (holds a plain tuple).
     """
 
@@ -61,7 +63,13 @@ class MultiQuantileLoss:
         q = jnp.asarray(self.quantiles, dtype=pred.dtype)        # [Q]
         err = target[..., None] - pred                            # [..., h, Q]
         ql = jnp.maximum(q * err, (q - 1.0) * err)                # pinball
-        return jnp.mean(ql)
+        return jnp.mean(jnp.sum(ql, axis=-1))                     # NF: sum over Q, mean elsewhere
+
+    def __eq__(self, other):  # value equality: same-quantile instances are
+        return type(other) is type(self) and other.quantiles == self.quantiles
+
+    def __hash__(self):  # interchangeable, which keeps them usable as jit static args
+        return hash((type(self), self.quantiles))
 
 
 def weighted_average(x: jnp.ndarray, weights: jnp.ndarray | None = None, axis=None) -> jnp.ndarray:
@@ -220,6 +228,12 @@ class GMM:
         mu = jnp.take_along_axis(means, idx, axis=-1)
         sd = jnp.take_along_axis(stds, idx, axis=-1)
         return mu + sd * jax.random.normal(k_norm, idx.shape, dtype=means.dtype)
+
+    def __eq__(self, other):  # value equality over the full config surface:
+        return type(other) is type(self) and self.__dict__ == other.__dict__
+
+    def __hash__(self):  # equal configs hash equal, usable as jit static args
+        return hash((type(self), self.n_components, self.quantiles, self.num_samples))
 
 
 def outputsize_multiplier(loss) -> int:
