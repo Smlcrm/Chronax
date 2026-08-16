@@ -1,8 +1,9 @@
 # Generate the Chronax docs and publish them into the aggregated docs repo.
 #
-# Prod twin of web-docs-dev.yml: generates from THIS branch (prod) and
-# publishes into the prod branch of Smlcrm/web-docs, so docs.smlcrm.com
-# documents the code users actually install. All products are served
+# Prod twin of web-docs-dev.yml, but triggered by RELEASES, not pushes:
+# a published release generates docs from the exact commit its tag points
+# at and publishes them into the prod branch of Smlcrm/web-docs, so
+# docs.smlcrm.com documents the code users actually install. All products are served
 # from one Cloud Run service at one hostname, where each product is a path
 # (docs.smlcrm.com/chronax), so the built site is pushed into the chronax/
 # folder of Smlcrm/web-docs and that repo builds and deploys.
@@ -12,12 +13,10 @@
 name: Web docs (prod)
 
 on:
-  push:
-    branches: [prod]
-    paths:
-      - 'chronax/**'
-      - 'web-docs/**'
-      - '.github/workflows/web-docs-prod.yml'
+  release:
+    types: [published]
+  # Manual escape hatch: regenerate without cutting a release (runs
+  # against the ref you dispatch it on).
   workflow_dispatch:
 
 permissions:
@@ -30,7 +29,8 @@ concurrency:
 
 env:
   PROJECT_SLUG: chronax
-  # Where the built site lands. The branch mirrors this one: prod -> prod.
+  # Where the built site lands. Releases are cut from prod, so the site
+  # goes to the web-docs branch production serves from.
   DOCS_REPO: Smlcrm/web-docs
   DOCS_BRANCH: prod
   # Recreated in sml-website-dev, the original died with sml-web-doc-gen-dev
