@@ -1,0 +1,11 @@
+# Documentation config for docgen (github.com/Smlcrm/web-doc-generator).
+# Passed explicitly via --config in web-docs/cloudbuild.yaml.
+
+[project]
+name = "Chronax"
+description = "A JAX-accelerated time-series forecasting library with a unified fit / predict interface."
+package = "chronax"
+# instructions = [add repo link to the instructions]
+
+[theme]
+preset = "simulacrum"
