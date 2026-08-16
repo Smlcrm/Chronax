@@ -9,3 +9,8 @@ package = "chronax"
 
 [theme]
 preset = "simulacrum"
+
+# Assets referenced by old release tags that have since moved. Tags are
+# immutable; docgen rewrites these href/src prefixes at render time.
+[render.url_rewrites]
+"https://github.com/Smlcrm/assets/" = "https://github.com/Smlcrm/smlcrm-brand-assets/"
