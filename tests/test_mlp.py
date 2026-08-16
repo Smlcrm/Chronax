@@ -684,3 +684,72 @@ class TestMLPMultivariate:
         o3 = m2.predict(h=4, level=[90])
         for k in o1:
             np.testing.assert_array_equal(np.asarray(o1[k]), np.asarray(o3[k]))
+
+
+# === Refit compile-cache gates (module-level nnx.jit _train_scan) ===
+import io as _io
+import logging as _logging
+import re as _re
+
+_COMPILE_LOG_RE = _re.compile(r"Compiling ")
+
+
+def _count_compiles(fn):
+    """Run fn under jax.log_compiles and return (result, n_xla_compilations)."""
+    buf = _io.StringIO()
+    handler = _logging.StreamHandler(buf)
+    loggers = [
+        _logging.getLogger("jax._src.dispatch"),
+        _logging.getLogger("jax._src.interpreters.pxla"),
+    ]
+    with jax.log_compiles(True):
+        for lg in loggers:
+            lg.addHandler(handler)
+        try:
+            out = fn()
+            jax.block_until_ready(out)
+        finally:
+            for lg in loggers:
+                lg.removeHandler(handler)
+    return out, len(_COMPILE_LOG_RE.findall(buf.getvalue()))
+
+
+def test_count_compiles_canary():
+    # Live-fire proof _count_compiles can still see a compile: a fresh jit'd
+    # closure always compiles (pjit keys on callable identity), so the counter
+    # must report >=1. Guards test_refit_does_not_recompile against going
+    # vacuously green if a jax bump renames the log message or logger paths.
+    def fresh():
+        @jax.jit
+        def f(x):
+            return x * 4.0 - 3.0
+        return f(jnp.ones((2, 5)))
+
+    _, n = _count_compiles(fresh)
+    assert n >= 1
+
+
+def test_refit_does_not_recompile():
+    # The training program is a module-level nnx.jit keyed on config graphdefs
+    # (value-__eq__ initializers and the memoized optax transform) and operand
+    # shapes — a refit AND a fresh same-config instance must hit the cache with
+    # zero XLA compiles; fit #2 is counted directly (no uncounted settle call).
+    y = jnp.asarray(np.sin(np.arange(40) / 5.0), jnp.float32)
+    kw = dict(h=4, input_size=8, max_steps=3, windows_batch_size=4, random_seed=0)
+    m = MLP(**kw)
+    m.fit(y)                                     # first fit pays the one compile
+    _, n_refit = _count_compiles(lambda: (m.fit(y), None)[1])
+    assert n_refit == 0
+    m2 = MLP(**kw)
+    _, n_fresh = _count_compiles(lambda: (m2.fit(y), None)[1])
+    assert n_fresh == 0
+
+
+def test_mqloss_pinball_value_nf_sum():
+    # err = y - yhat. Pred zeros, target 2: sum_q max(q*2, (q-1)*2) =
+    # 0.2 + 1.0 + 1.8 = 3.0 — neuralforecast's effective reduction (its
+    # 1/len(quantiles) factor is dead), matching the trainer's masked branch.
+    from chronax.models.mlp.mlp_losses import MultiQuantileLoss
+
+    loss = MultiQuantileLoss((0.1, 0.5, 0.9))
+    assert float(loss(jnp.zeros((1, 1, 3)), jnp.array([[2.0]]))) == pytest.approx(3.0)
