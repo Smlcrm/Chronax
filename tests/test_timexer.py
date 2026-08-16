@@ -435,3 +435,63 @@ class TestBoxCoxConformal:
         lam_exp = m.fit(y_exp)._bc_lambda
         lam_lin = m.fit(y_lin)._bc_lambda
         assert lam_exp != lam_lin
+
+
+# === Refit compile-cache gates (module-level nnx.jit _train_scan) ===
+import io as _io
+import logging as _logging
+import re as _re
+
+_COMPILE_LOG_RE = _re.compile(r"Compiling ")
+
+
+def _count_compiles(fn):
+    """Run fn under jax.log_compiles and return (result, n_xla_compilations)."""
+    buf = _io.StringIO()
+    handler = _logging.StreamHandler(buf)
+    loggers = [
+        _logging.getLogger("jax._src.dispatch"),
+        _logging.getLogger("jax._src.interpreters.pxla"),
+    ]
+    with jax.log_compiles(True):
+        for lg in loggers:
+            lg.addHandler(handler)
+        try:
+            out = fn()
+            jax.block_until_ready(out)
+        finally:
+            for lg in loggers:
+                lg.removeHandler(handler)
+    return out, len(_COMPILE_LOG_RE.findall(buf.getvalue()))
+
+
+def test_count_compiles_canary():
+    # Live-fire proof _count_compiles can still see a compile: a fresh jit'd
+    # closure always compiles (pjit keys on callable identity), so the counter
+    # must report >=1. Guards test_refit_does_not_recompile against going
+    # vacuously green if a jax bump renames the log message or logger paths.
+    def fresh():
+        @jax.jit
+        def f(x):
+            return x * 9.0 - 3.0
+        return f(jnp.ones((2, 3)))
+
+    _, n = _count_compiles(fresh)
+    assert n >= 1
+
+
+def test_refit_does_not_recompile():
+    # The training program is a module-level nnx.jit keyed on config graphdefs
+    # (value-__eq__ initializers and the memoized optax transform) and operand
+    # shapes — a refit AND a fresh same-config instance must hit the cache with
+    # zero XLA compiles; fit #2 is counted directly (no uncounted settle call).
+    y = jnp.asarray(np.sin(np.arange(40) / 5.0), jnp.float32)
+    kw = dict(h=4, input_size=16, patch_len=8, max_steps=3,
+              windows_batch_size=4, random_seed=0)
+    m = TimeXer(**kw)
+    m.fit(y)                                     # first fit pays the one compile
+    _, n_refit = _count_compiles(lambda: (m.fit(y), None)[1])
+    assert n_refit == 0
+    m2 = TimeXer(**kw)
+    _, n_fresh = _count_compiles(lambda: (m2.fit(y), None)[1])
+    assert n_fresh == 0
