@@ -1,0 +1,154 @@
+# Generate the Chronax docs and publish them into the aggregated docs repo.
+#
+# Prod twin of web-docs-dev.yml, but triggered by RELEASES, not pushes:
+# a published release generates docs from the exact commit its tag points
+# at and publishes them into the prod branch of Smlcrm/web-docs, so
+# docs.smlcrm.com documents the code users actually install. All products are served
+# from one Cloud Run service at one hostname, where each product is a path
+# (docs.smlcrm.com/chronax), so the built site is pushed into the chronax/
+# folder of Smlcrm/web-docs and that repo builds and deploys.
+#
+# Generation stays here: the Vertex ADC federation and the per-project GCS
+# cache both belong with the source they document.
+name: Web docs (prod)
+
+on:
+  release:
+    types: [published]
+  # Manual escape hatch: regenerate without cutting a release (runs
+  # against the ref you dispatch it on).
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: web-docs-chronax-prod
+  cancel-in-progress: true
+
+env:
+  PROJECT_SLUG: chronax
+  # Where the built site lands. Releases are cut from prod, so the site
+  # goes to the web-docs branch production serves from.
+  DOCS_REPO: Smlcrm/web-docs
+  DOCS_BRANCH: prod
+  # Recreated in sml-website-dev, the original died with sml-web-doc-gen-dev
+  # on 2026-08-02. The first run after that is a cold build: every module
+  # goes through Gemini. Subsequent runs only regenerate what changed.
+  # Separate prefix from the dev pipeline: the two branches generate
+  # different content and `rsync -d` would clobber the other's cache.
+  CACHE_BUCKET: gs://sml-website-dev-docgen-cache/chronax-prod
+  # Generation runs against Vertex AI through ADC. There is no API key: org
+  # policy forbids long-lived keys, and the job is already federated via WIF.
+  VERTEX_PROJECT_ID: sml-website-dev
+  # Matches what Terraform sets on the runtime services, so generation and
+  # Ask AI both hit the same endpoint.
+  VERTEX_LOCATION: global
+  BUILDER_IMAGE: us-central1-docker.pkg.dev/sml-artifacts-dev/sml-web-doc-docker/docgen-builder:latest
+
+jobs:
+  generate-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: sml-bootstrap-cicd
+          workload_identity_provider: projects/972498125049/locations/global/workloadIdentityPools/github-pool-sml-bootstrap-cicd/providers/github
+          service_account: github-ci-sml-bootstrap-cicd@sml-bootstrap-cicd.iam.gserviceaccount.com
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker auth
+        # Only to pull the builder image; nothing is pushed from this repo now.
+        run: gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+
+      - name: Restore the doc cache
+        run: |
+          mkdir -p .docgen-cache
+          gsutil -m rsync -r "${CACHE_BUCKET}" .docgen-cache || true
+
+      - name: Generate the docs
+        run: |
+          set -euo pipefail
+          # ADC has to resolve INSIDE the container, and every path involved is
+          # an absolute HOST path: GOOGLE_APPLICATION_CREDENTIALS, and the OIDC
+          # token file named inside that credential file. So both directories
+          # google-github-actions/auth writes to are mounted at their original
+          # paths — the workspace (where the credential file actually lands)
+          # and RUNNER_TEMP — and the env var is passed through unchanged.
+          #
+          # Mounting the workspace only at /work is what broke this: the file
+          # was present, under a path the credential chain never looks at, so
+          # generation failed with DefaultCredentialsError after ingesting the
+          # whole repo. Read-only, and no credential is ever copied.
+          docker run --rm \
+            -e GOOGLE_APPLICATION_CREDENTIALS \
+            -e GOOGLE_CLOUD_PROJECT \
+            -e GOOGLE_CLOUD_LOCATION \
+            -v "${RUNNER_TEMP}:${RUNNER_TEMP}:ro" \
+            -v "${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}:ro" \
+            -v "${PWD}:/work" \
+            -v "${PWD}/.docgen-cache:/app/.docgen-cache" \
+            "${BUILDER_IMAGE}" \
+            --repo /work --out /work/site --config /work/web-docs/docgen.toml
+        env:
+          GOOGLE_CLOUD_PROJECT: ${{ env.VERTEX_PROJECT_ID }}
+          GOOGLE_CLOUD_LOCATION: ${{ env.VERTEX_LOCATION }}
+
+      - name: Verify the site actually generated
+        run: |
+          set -euo pipefail
+          test -f site/index.html || { echo "::error::site/index.html missing"; exit 1; }
+          COUNT="$(find site -name '*.html' | wc -l)"
+          echo "generated ${COUNT} html file(s)"
+          [ "${COUNT}" -gt 1 ] || { echo "::error::only ${COUNT} page(s) generated"; exit 1; }
+
+      - name: Save the doc cache
+        run: gsutil -m rsync -d -r .docgen-cache "${CACHE_BUCKET}"
+
+      - name: Publish the site into the docs repo
+        env:
+          DOCS_TOKEN: ${{ secrets.DOCGEN_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DOCS_TOKEN:-}" ]; then
+            echo "::error::DOCGEN_TOKEN is not set. It needs contents:write on ${DOCS_REPO}."
+            exit 1
+          fi
+
+          CLONE="${RUNNER_TEMP}/web-docs"
+          git clone --depth 1 --branch "${DOCS_BRANCH}" \
+            "https://x-access-token:${DOCS_TOKEN}@github.com/${DOCS_REPO}.git" "${CLONE}"
+
+          # --delete so pages removed from the source disappear from the site
+          # instead of lingering as orphans nothing links to.
+          rsync -a --delete site/ "${CLONE}/${PROJECT_SLUG}/"
+
+          cd "${CLONE}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A "${PROJECT_SLUG}"
+          if git diff --cached --quiet; then
+            echo "No documentation changes to publish."
+            exit 0
+          fi
+          git commit -q -m "docs(${PROJECT_SLUG}): sync from ${GITHUB_REPOSITORY}@${GITHUB_SHA}"
+
+          # Both product repos push to the same branch, so a concurrent publish
+          # can land first. Rebase and retry rather than failing a good build.
+          for i in 1 2 3 4 5; do
+            if git push origin "${DOCS_BRANCH}"; then
+              echo "Published ${PROJECT_SLUG} docs to ${DOCS_REPO}@${DOCS_BRANCH}"
+              exit 0
+            fi
+            echo "push rejected (attempt ${i}), rebasing onto the latest ${DOCS_BRANCH}"
+            git fetch origin "${DOCS_BRANCH}"
+            git rebase "origin/${DOCS_BRANCH}"
+            sleep $((i * 3))
+          done
+          echo "::error::could not push to ${DOCS_REPO} after 5 attempts"
+          exit 1
