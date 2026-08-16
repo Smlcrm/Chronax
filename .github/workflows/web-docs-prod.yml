@@ -15,9 +15,14 @@ name: Web docs (prod)
 on:
   release:
     types: [published]
-  # Manual escape hatch: regenerate without cutting a release (runs
-  # against the ref you dispatch it on).
+  # Manual escape hatch and the BACKFILL path: name any existing release
+  # tag to (re)generate its docs. The workflow definition runs from the
+  # branch you dispatch on; the named tag is what gets checked out.
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release tag to document, verbatim (e.g. v1.4.2)'
+        required: true
 
 permissions:
   contents: read
@@ -25,7 +30,10 @@ permissions:
 
 concurrency:
   group: web-docs-chronax-prod
-  cancel-in-progress: true
+  # Never cancel: each run publishes a DIFFERENT version's docs, so a
+  # superseded run is still work that must land. The publish step already
+  # rebases and retries when runs race on the docs repo.
+  cancel-in-progress: false
 
 env:
   PROJECT_SLUG: chronax
@@ -51,7 +59,40 @@ jobs:
   generate-and-publish:
     runs-on: ubuntu-latest
     steps:
+      # Release events check out the release tag's commit by default; a
+      # dispatch names the tag explicitly ('' falls through to the default).
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}
+
+      - name: Resolve the version being documented
+        id: version
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version }}"
+            RELEASED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          else
+            VERSION="${{ github.event.release.tag_name }}"
+            RELEASED="${{ github.event.release.published_at }}"
+          fi
+          # The tag becomes a directory name and a JSON value, verbatim.
+          if ! printf '%s' "${VERSION}" | grep -Eq '^[A-Za-z0-9._-]+$'; then
+            echo "::error::version '${VERSION}' is not a safe path segment"
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "released=${RELEASED}" >> "$GITHUB_OUTPUT"
+          echo "Documenting ${VERSION} (released ${RELEASED})"
+
+      - name: Ensure the docgen config exists (backfilled tags predate it)
+        run: |
+          set -euo pipefail
+          if [ ! -f web-docs/docgen.toml ]; then
+            git fetch --depth 1 origin prod
+            git checkout origin/prod -- web-docs/
+            echo "web-docs/ overlaid from prod (tag predates the docs config)"
+          fi
 
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
@@ -94,7 +135,8 @@ jobs:
             -v "${PWD}:/work" \
             -v "${PWD}/.docgen-cache:/app/.docgen-cache" \
             "${BUILDER_IMAGE}" \
-            --repo /work --out /work/site --config /work/web-docs/docgen.toml
+            --repo /work --out /work/site --config /work/web-docs/docgen.toml \
+            --version "${{ steps.version.outputs.version }}"
         env:
           GOOGLE_CLOUD_PROJECT: ${{ env.VERTEX_PROJECT_ID }}
           GOOGLE_CLOUD_LOCATION: ${{ env.VERTEX_LOCATION }}
@@ -113,6 +155,8 @@ jobs:
       - name: Publish the site into the docs repo
         env:
           DOCS_TOKEN: ${{ secrets.DOCGEN_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+          RELEASED: ${{ steps.version.outputs.released }}
         run: |
           set -euo pipefail
           if [ -z "${DOCS_TOKEN:-}" ]; then
@@ -124,9 +168,41 @@ jobs:
           git clone --depth 1 --branch "${DOCS_BRANCH}" \
             "https://x-access-token:${DOCS_TOKEN}@github.com/${DOCS_REPO}.git" "${CLONE}"
 
-          # --delete so pages removed from the source disappear from the site
-          # instead of lingering as orphans nothing links to.
-          rsync -a --delete site/ "${CLONE}/${PROJECT_SLUG}/"
+          # One self-contained site per release, side by side. --delete is
+          # scoped INSIDE this version's directory: republishing a version
+          # replaces it wholesale, and other versions are never touched.
+          rsync -a --delete site/ "${CLONE}/${PROJECT_SLUG}/${VERSION}/"
+
+          # Maintain the manifest the version switcher and serve.py read.
+          # Latest is the highest tag numerically, not the newest publish,
+          # so backfilling an old release never steals "latest". (Plain
+          # vX.Y.Z tags sort exactly; suffixed prereleases sort textually.)
+          python3 - "${CLONE}/${PROJECT_SLUG}/versions.json" <<'EOF'
+          import json, os, re, sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          version = os.environ["VERSION"]
+          released = os.environ["RELEASED"]
+          data = json.loads(path.read_text()) if path.exists() else {}
+          versions = [
+              v for v in data.get("versions", [])
+              if v.get("version") != version
+          ]
+          versions.append({"version": version, "released": released})
+
+          def key(entry):
+              return [
+                  (1, int(p)) if p.isdigit() else (0, p)
+                  for p in re.split(r"[.\-]", entry["version"].lstrip("vV"))
+              ]
+
+          versions.sort(key=key, reverse=True)
+          data["latest"] = versions[0]["version"]
+          data["versions"] = versions
+          path.write_text(json.dumps(data, indent=2) + "\n")
+          print(f"manifest: {len(versions)} version(s), latest {data['latest']}")
+          EOF
 
           cd "${CLONE}"
           git config user.name "github-actions[bot]"
@@ -136,7 +212,7 @@ jobs:
             echo "No documentation changes to publish."
             exit 0
           fi
-          git commit -q -m "docs(${PROJECT_SLUG}): sync from ${GITHUB_REPOSITORY}@${GITHUB_SHA}"
+          git commit -q -m "docs(${PROJECT_SLUG}): ${VERSION} from ${GITHUB_REPOSITORY}@${GITHUB_SHA}"
 
           # Both product repos push to the same branch, so a concurrent publish
           # can land first. Rebase and retry rather than failing a good build.
