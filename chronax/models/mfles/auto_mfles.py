@@ -158,15 +158,22 @@ _METRIC_MAP: Dict[str, Any] = {
 # =============================================================================
 
 def _ensure_float(x: Any) -> jnp.ndarray:
-    """Flattens and casts to float32 for JAX.
-    
-    Args:
-        x (Any): The input data structure containing time series values.
-        
-    Returns:
-        jnp.ndarray: A flattened, 1-dimensional array of 32-bit floats.
+    """Flatten and ensure a floating dtype, preserving the input's precision.
+
+    Preserves float64 (matching plain MFLES and statsforecast); only non-float
+    inputs are cast to float32. Fit and the fast forecast path both route
+    through here, so the cached conformity scores and the per-window fits
+    stay at one consistent dtype.
     """
-    return jnp.asarray(x, dtype=jnp.float32).ravel()
+    a = jnp.asarray(x).ravel()
+    return a if jnp.issubdtype(a.dtype, jnp.floating) else a.astype(jnp.float32)
+
+
+def _ensure_float_2d(x: Any) -> jnp.ndarray:
+    """As _ensure_float but keeps the (n, n_features) exogenous shape."""
+    a = jnp.asarray(x)
+    a = a if jnp.issubdtype(a.dtype, jnp.floating) else a.astype(jnp.float32)
+    return a.reshape(-1, 1) if a.ndim == 1 else a
 
 def _validate_levels(level: Optional[Union[List[int], Tuple[int, ...]]]) -> Optional[List[int]]:
     """Sanitizes prediction interval levels.
@@ -434,7 +441,9 @@ def optimize_grid_threaded(
     else:
         scores = [_worker(g) for g in grid]
 
-    print(f"  [AutoMFLES] Grid Search: Planned {tracker.total} runs | Completed {tracker.success} successfully.")
+    if verbose:
+        print(f"  [AutoMFLES] Grid Search: Planned {tracker.total} runs | "
+              f"Completed {tracker.success} successfully.")
 
     best_idx = int(np.argmin(scores))
     return grid[best_idx]
@@ -522,8 +531,7 @@ class AutoMFLES(BaseForecaster):
         y_hash = hash(y.tobytes())  # Simple hash to detect y changes
         
         if X is not None:
-            X = jnp.asarray(X, dtype=jnp.float32)
-            if X.ndim == 1: X = X.reshape(-1, 1)
+            X = _ensure_float_2d(X)
             self.scaling_stats_ = _get_stats(X)
             X = _standardize_data(X, *self.scaling_stats_)
         
@@ -647,16 +655,12 @@ class AutoMFLES(BaseForecaster):
         if X is not None:
             if self.scaling_stats_ is None:
                 raise ValueError("Model trained without X, but X provided.")
-            X = jnp.asarray(X, dtype=jnp.float32)
-            if X.ndim == 1:
-                X = X.reshape(-1, 1)
+            X = _ensure_float_2d(X)
             X = _standardize_data(X, *self.scaling_stats_)
         if X_future is not None:
             if self.scaling_stats_ is None:
                 raise ValueError("Model trained without X, but X_future provided.")
-            X_future = jnp.asarray(X_future, dtype=jnp.float32)
-            if X_future.ndim == 1:
-                X_future = X_future.reshape(-1, 1)
+            X_future = _ensure_float_2d(X_future)
             X_future = _standardize_data(X_future, *self.scaling_stats_)
 
         # Mirror predict(): delegate level to the inner conformal machinery

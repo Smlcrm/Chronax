@@ -1,7 +1,7 @@
 """Window construction and JIT/scan training for TCN.
 
 Windows are scaled per-window (scaler stats on the insample target; per-channel
-scaling on future-known exog), the loss is computed in scaled space, and the
+scaling on historical and future-known exog), the loss is computed in scaled space, and the
 whole training loop is one ``nnx.scan`` so it stays ``vmap``-traceable for
 ``BaseForecaster.conformity_scores``. The TCN forward is fully deterministic
 (no dropout or batchnorm), so the only RNG stream is the batch-index sampling;
@@ -98,7 +98,7 @@ _ELEMENTWISE = {
 
 
 def forward_loss(net, y_windows, target_mask=None, *, h, input_size, scaler, loss_fn,
-                 futr_windows=None):
+                 hist_windows=None, futr_windows=None):
     """Scale, forward, and reduce a point/quantile loss in scaled space.
 
     ``target_mask [B, h]`` marks real target positions (0 in the h-padded tail);
@@ -109,9 +109,13 @@ def forward_loss(net, y_windows, target_mask=None, *, h, input_size, scaler, los
     shift, scale = scaler.stats(insample, axis=1)       # [B, 1]
     insample_z = scaler.transform(insample, shift, scale)[..., None]   # [B, L, 1]
     target_z = scaler.transform(target, shift, scale)   # [B, h]
+    # Historical exog spans only the input (stats read the whole window);
+    # future-known exog spans input+horizon (stats restricted to the input span).
+    hist_z = (_scale_exog(hist_windows, scaler, stats_len=None)
+              if hist_windows is not None else None)
     futr_z = (_scale_exog(futr_windows, scaler, stats_len=input_size)
               if futr_windows is not None else None)
-    pred = net(insample_z, futr_exog=futr_z)            # [B, h, mult]
+    pred = net(insample_z, hist_exog=hist_z, futr_exog=futr_z)   # [B, h, mult]
     if target_mask is None:
         target_mask = jnp.ones_like(target_z)
     denom = jnp.sum(target_mask)
@@ -152,7 +156,7 @@ def _adam(lr: float):
 
 
 @functools.partial(nnx.jit, static_argnames=("h", "input_size", "scaler", "loss_fn"))
-def _train_scan(net, optimizer, y_windows, target_mask, batch_idx, futr_w,
+def _train_scan(net, optimizer, y_windows, target_mask, batch_idx, hist_w, futr_w,
                 *, h, input_size, scaler, loss_fn):
     """The whole training loop as one cached program.
 
@@ -169,10 +173,11 @@ def _train_scan(net, optimizer, y_windows, target_mask, batch_idx, futr_w,
         net, opt = carry
         yb = y_windows[idx]
         mb = target_mask[idx]
+        hb = hist_w[idx] if hist_w is not None else None
         fb = futr_w[idx] if futr_w is not None else None
         loss, grads = nnx.value_and_grad(
             lambda m: forward_loss(m, yb, mb, h=h, input_size=input_size, scaler=scaler,
-                                   loss_fn=loss_fn, futr_windows=fb))(net)
+                                   loss_fn=loss_fn, hist_windows=hb, futr_windows=fb))(net)
         opt.update(grads)
         return (net, opt), loss
 
@@ -181,7 +186,7 @@ def _train_scan(net, optimizer, y_windows, target_mask, batch_idx, futr_w,
 
 
 def train(net, y, *, h, input_size, max_steps, windows_batch_size, lr, seed, loss_fn, scaler,
-          futr_exog=None):
+          hist_exog=None, futr_exog=None):
     """Train ``net`` in place via one ``nnx.scan``. Returns per-step losses.
 
     Batch-index sampling splits on dataset size: with replacement when there are
@@ -189,6 +194,7 @@ def train(net, y, *, h, input_size, max_steps, windows_batch_size, lr, seed, los
     """
     y_windows, target_mask = build_windows(y, input_size, h)
     n = y_windows.shape[0]
+    hist_w = build_exog_windows(hist_exog, input_size, h, n, "input") if hist_exog is not None else None
     futr_w = build_exog_windows(futr_exog, input_size, h, n, "full") if futr_exog is not None else None
     step_keys = jax.random.split(jax.random.PRNGKey(seed), max_steps)
     if n < windows_batch_size:                          # fewer windows than batch: with replacement
@@ -197,27 +203,30 @@ def train(net, y, *, h, input_size, max_steps, windows_batch_size, lr, seed, los
         sample = lambda k: jax.random.permutation(k, n)[:windows_batch_size]
     batch_idx = jax.vmap(sample)(step_keys)             # [max_steps, B]
     optimizer = nnx.Optimizer(net, _adam(lr), wrt=nnx.Param)
-    losses = _train_scan(net, optimizer, y_windows, target_mask, batch_idx, futr_w,
+    losses = _train_scan(net, optimizer, y_windows, target_mask, batch_idx, hist_w, futr_w,
                          h=h, input_size=input_size, scaler=scaler, loss_fn=loss_fn)
     return _finite_or_raise(losses)
 
 
 @nnx.jit
-def _forward_det(net, insample_z, futr_z):
+def _forward_det(net, insample_z, hist_z, futr_z):
     """Inference forward. The TCN forward is deterministic — jit for dispatch speed."""
-    return net(insample_z, futr_exog=futr_z)
+    return net(insample_z, hist_exog=hist_z, futr_exog=futr_z)
 
 
-def predict_step(net, y_context, *, h, input_size, scaler, futr_full=None):
+def predict_step(net, y_context, *, h, input_size, scaler, hist_full=None, futr_full=None):
     """Forecast next ``h`` steps from the final ``input_size`` of the series.
 
-    Returns ``[h, multiplier]`` in the **original** scale. ``futr_full`` is the
+    Returns ``[h, multiplier]`` in the **original** scale. ``hist_full`` is the
+    ``[input_size, F]`` historical-exog window; ``futr_full`` is the
     ``[input_size+h, F]`` future-known window (history + horizon).
     """
     insample = y_context[None, :]                       # [1, L]
     shift, scale = scaler.stats(insample, axis=1)
     insample_z = scaler.transform(insample, shift, scale)[..., None]   # [1, L, 1]
+    hist_z = (_scale_exog(hist_full[None], scaler, stats_len=None)
+              if hist_full is not None else None)
     futr_z = (_scale_exog(futr_full[None], scaler, stats_len=input_size)
               if futr_full is not None else None)
-    pred_z = _forward_det(net, insample_z, futr_z)[0]  # [h, mult]
+    pred_z = _forward_det(net, insample_z, hist_z, futr_z)[0]  # [h, mult]
     return scaler.inverse(pred_z, shift[0, 0], scale[0, 0])

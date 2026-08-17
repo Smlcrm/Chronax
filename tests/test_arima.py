@@ -18,9 +18,9 @@ from chronax.models import ARIMA, AutoARIMA
 
 # 2. Low-Level Functions (Math & Logic)
 from chronax.models.arima.auto_arima import (
-    diff, 
-    partrans, 
-    invpartrans, 
+    diff,
+    partrans,
+    invpartrans,
     arima_transpar,
     arima_css,
     make_arima,
@@ -28,7 +28,15 @@ from chronax.models.arima.auto_arima import (
     StateSpaceModel,
     ndiffs,   # Stationarity Test
     nsdiffs,  # Seasonality Test
-    arima_fit
+    arima_fit,
+    _kalman_filter_core,
+    _kalman_filter_steadystate,
+    _objective_ml,
+    _objective_ml_ss,
+    _use_steadystate,
+    _unpack_and_adjust_jit,
+    _STEADYSTATE_BURNIN,
+    _STEADYSTATE_MIN_N,
 )
 
 # ----------------------------
@@ -208,3 +216,113 @@ def test_drift_like_behavior_when_d_gt_0_and_mean_included():
     overall_trend = (pred[-1] - pred[0]) / (len(pred) - 1)
     assert overall_trend > 0, "Forecast should have positive overall trend"
     print("  -> [Test 8] Passed.")
+
+
+# =============================================================================
+# Steady-state Kalman (Rung 2) — large-n eager ML path
+# =============================================================================
+def _ss_long_series(n=3000, seed=7):
+    """A long non-seasonal ARIMA(1,1,1)-like series (n > _STEADYSTATE_MIN_N)."""
+    rs = np.random.RandomState(seed)
+    e = rs.randn(n + 1)
+    d = np.zeros(n)                      # ARMA(1,1) on the differences
+    for t in range(1, n):
+        d[t] = 0.6 * d[t - 1] + e[t] + 0.3 * e[t - 1]
+    return np.cumsum(d) * 5.0 + 100.0    # integrate -> d=1
+
+
+def _ss_fitted_mod(n=3000):
+    """Fit ARIMA(1,1,1) on a long series; return (mod, y_adj) for the filter referee."""
+    y = jnp.asarray(_ss_long_series(n), dtype=jnp.float64)
+    m = ARIMA(order=(1, 1, 1), method="CSS-ML")
+    m.fit(y)
+    md = m.model_
+    params, arma, delta = md["coef"], md["arma"], md["delta"]
+    narma = sum(arma[:4]); ncxreg = params.shape[0] - narma; n_exog = ncxreg - 1
+    y_adj, phi, theta, _ = _unpack_and_adjust_jit(params, y, None, arma, ncxreg, n_exog, True)
+    return make_arima(phi, theta, delta, arma), y_adj, (params, arma, delta, ncxreg, n_exog)
+
+
+def _nll(ssq, sumlog, nu):
+    snu = max(float(nu), 1.0); sq = max(float(ssq), 1e-8)
+    return 0.5 * (snu * float(jnp.log(sq / snu)) + float(sumlog))
+
+
+def test_steadystate_matches_full_filter():
+    """The frozen-gain filter matches the full filter's NLL + end state to ~machine precision
+    (the gain converges far inside the burn-in). Gate on the NLL the optimizer consumes."""
+    mod, y_adj, _ = _ss_fitted_mod()
+    (a1, _, ssq1, sl1, nu1), _, _ = _kalman_filter_core(y_adj, mod)
+    a2, _, ssq2, sl2, nu2 = _kalman_filter_steadystate(y_adj, mod, _STEADYSTATE_BURNIN)
+    nll1, nll2 = _nll(ssq1, sl1, nu1), _nll(ssq2, sl2, nu2)
+    assert abs(nll2 - nll1) / abs(nll1) < 1e-9            # objective value (the gate)
+    assert jnp.allclose(a2, a1, rtol=1e-9, atol=1e-8)    # end state (feeds the forecast)
+    assert int(nu2) == int(nu1)
+
+
+def test_objective_ml_ss_grad_matches_full():
+    """Reverse-differentiability gate: value_and_grad of the steady-state objective RUNS
+    (no while_loop) and matches the full objective at a realistic AND a displaced point."""
+    import jax
+    _, y_adj, (params, arma, delta, ncxreg, n_exog) = _ss_fitted_mod()
+    full = lambda q: _objective_ml(q, y_adj, None, delta, arma, ncxreg, n_exog, True)
+    ss = lambda q: _objective_ml_ss(q, y_adj, None, delta, arma, ncxreg, n_exog, True)
+    narma = sum(arma[:4])
+    for p in [params, params.at[:narma].add(0.1)]:
+        vf, gf = jax.value_and_grad(full)(p)
+        vs, gs = jax.value_and_grad(ss)(p)
+        assert abs(float(vs) - float(vf)) / abs(float(vf)) < 1e-9
+        assert jnp.allclose(gs, gf, rtol=1e-6, atol=1e-7)
+
+
+def test_use_steadystate_gate():
+    """Routing predicate: long, non-seasonal, d+D<=1 only. Short/seasonal/over-differenced fall back."""
+    ns = (1, 1, 0, 0, 1, 1, 0)                 # non-seasonal ARIMA(1,1,1), d=1
+    assert _use_steadystate(_STEADYSTATE_MIN_N + 1, ns) is True
+    assert _use_steadystate(_STEADYSTATE_MIN_N - 1, ns) is False       # short series
+    assert _use_steadystate(9999, (1, 1, 0, 2, 52, 1, 0)) is False     # seasonal MA (Q>0)
+    assert _use_steadystate(9999, (1, 1, 1, 0, 12, 1, 0)) is False     # seasonal AR (P>0)
+    assert _use_steadystate(9999, (1, 1, 0, 0, 12, 1, 1)) is False     # seasonal diff (D>0)
+    assert _use_steadystate(9999, (0, 1, 0, 0, 1, 2, 0)) is False      # over-differenced (d=2)
+
+
+def test_forecast_largen_is_finite_and_deterministic():
+    """forecast() on a long series (steady-state branch) is finite and repeatable."""
+    y = jnp.asarray(_ss_long_series(3000), dtype=jnp.float64)
+    m = ARIMA(order=(1, 1, 1), method="CSS-ML")
+    f1 = np.asarray(m.forecast(h=24, y=y)["mean"])
+    f2 = np.asarray(m.forecast(h=24, y=y)["mean"])
+    assert np.all(np.isfinite(f1))
+    assert np.array_equal(f1, f2)
+
+
+def test_overdifferenced_largen_forecast_uses_full_filter():
+    """Over-differenced (d>=2) long series are NOT routed to steady-state — their MA roots reach
+    the invertibility boundary where the frozen gain never converges — so they forecast through
+    the exact full filter. (Regression: the pre-fix routing lacked the d+D<=1 guard.)"""
+    y = jnp.asarray(_ss_long_series(3000), dtype=jnp.float64)
+    assert _use_steadystate(len(y), (0, 1, 0, 0, 1, 2, 0)) is False   # d=2 excluded by construction
+    fc = np.asarray(ARIMA(order=(0, 2, 1), method="CSS-ML").forecast(h=24, y=y)["mean"])
+    assert np.all(np.isfinite(fc))
+
+
+def test_arima_fit_steadystate_flag(monkeypatch):
+    """arima_fit(steadystate=False) must NOT enter the frozen-gain path (AutoARIMA's search
+    needs the exact objective); steadystate=True on a long non-seasonal fit must. Monkeypatch
+    the SS filter to raise so the guard is proven live, not vacuous. jax.clear_caches() before
+    the True arm defeats the jit-cache confound (a cached _fit_model_bfgs would never re-trace
+    the patched fn)."""
+    import jax
+    import chronax.models.arima.auto_arima as aa
+    y = jnp.asarray(_ss_long_series(3000), dtype=jnp.float64)
+
+    def _boom(*a, **k):
+        raise RuntimeError("steady-state entered")
+    monkeypatch.setattr(aa, "_kalman_filter_steadystate", _boom)
+
+    jax.clear_caches()
+    r = aa.arima_fit(y, order=(1, 1, 1), method="ML", steadystate=False)  # full filter, no SS
+    assert bool(r["success"])
+    jax.clear_caches()
+    with pytest.raises(RuntimeError):                                     # SS live under the flag
+        aa.arima_fit(y, order=(1, 1, 1), method="ML", steadystate=True)

@@ -3,8 +3,9 @@
 TimeXer splits the endogenous window into patches embedded as tokens, appends
 one learnable GLOBAL token per variate, and runs encoder layers in which patch
 tokens self-attend while ONLY the global token cross-attends to variate-level
-embeddings of the full window (the reference's exogenous pathway; without
-exogenous inputs the cross context is the endogenous variates themselves).
+embeddings of the full window (the reference's exogenous pathway; the cross
+context is the endogenous variate plus one token per historical covariate, or
+the endogenous variate alone when no covariates are passed).
 A flatten head maps each variate's token stack onto the horizon, wrapped in
 non-stationary normalization (per-window mean/std, statistics carry no
 parameter dependence so no stop-gradient is needed for gradient equivalence
@@ -97,14 +98,25 @@ class EnEmbedding(nnx.Module):
 
 class DataEmbeddingInverted(nnx.Module):
     """Variate-as-token embedding: each variate's full window is one token,
-    projected time -> hidden. ``x [B, L, N] -> [B, N, d_model]``."""
+    projected time -> hidden. ``x [B, L, N] -> [B, N, d_model]``.
+
+    Optional exogenous covariates ``x_mark [B, L, X]`` concatenate along the
+    variate axis (endogenous variates first, then covariates — matching the
+    reference), producing ``[B, N + X, d_model]`` extra cross-attention tokens.
+    Covariates enter unnormalized (the reference feeds them raw while only the
+    target is non-stationary-normalized); the value-embedding Linear is shared
+    across all variate tokens, so a covariate adds tokens, not parameters."""
 
     def __init__(self, c_in: int, d_model: int, dropout: float, *, rngs: nnx.Rngs):
         self.value_embedding = _torch_linear(c_in, d_model, rngs=rngs)
         self.dropout = nnx.Dropout(rate=dropout, rngs=rngs)
 
-    def __call__(self, x: jnp.ndarray, *, deterministic: bool) -> jnp.ndarray:
-        e = self.value_embedding(jnp.transpose(x, (0, 2, 1)))
+    def __call__(self, x: jnp.ndarray, x_mark: jnp.ndarray | None = None, *,
+                 deterministic: bool) -> jnp.ndarray:
+        xt = jnp.transpose(x, (0, 2, 1))                     # [B, N, L]
+        if x_mark is not None:
+            xt = jnp.concatenate([xt, jnp.transpose(x_mark, (0, 2, 1))], axis=1)  # [B, N+X, L]
+        e = self.value_embedding(xt)
         return self.dropout(e, deterministic=deterministic)
 
 
@@ -203,7 +215,7 @@ class TimeXerNet(nnx.Module):
     def __init__(self, *, h: int, input_size: int, n_series: int, patch_len: int = 16,
                  hidden_size: int = 512, n_heads: int = 8, e_layers: int = 2,
                  d_ff: int = 2048, dropout: float = 0.1, use_norm: bool = True,
-                 outputsize_multiplier: int = 1, rngs: nnx.Rngs):
+                 hist_exog_size: int = 0, outputsize_multiplier: int = 1, rngs: nnx.Rngs):
         if input_size < patch_len:
             raise ValueError(
                 f"input_size ({input_size}) must be >= patch_len ({patch_len}); "
@@ -212,6 +224,7 @@ class TimeXerNet(nnx.Module):
         self.h = h
         self.input_size = input_size
         self.n_series = n_series
+        self.hist_exog_size = hist_exog_size
         self.patch_len = patch_len
         self.hidden_size = hidden_size
         self.use_norm = use_norm
@@ -230,7 +243,10 @@ class TimeXerNet(nnx.Module):
         self.head = _torch_linear(head_nf, h * outputsize_multiplier, rngs=rngs)
         self.head_dropout = nnx.Dropout(rate=dropout, rngs=rngs)
 
-    def __call__(self, insample_y: jnp.ndarray, *, deterministic: bool = True) -> jnp.ndarray:
+    def __call__(self, insample_y: jnp.ndarray, hist_exog: jnp.ndarray | None = None,
+                 *, deterministic: bool = True) -> jnp.ndarray:
+        """insample_y: [B, L, N] target; hist_exog: [B, L, X] historical covariates
+        (raw — only the target is non-stationary-normalized)."""
         x = insample_y.astype(jnp.float32)                    # [B, L, N]
         B, _, N = x.shape
         if self.use_norm:
@@ -241,7 +257,8 @@ class TimeXerNet(nnx.Module):
 
         en, n_vars = self.en_embedding(jnp.transpose(x, (0, 2, 1)),
                                        deterministic=deterministic)
-        ex = self.ex_embedding(x, deterministic=deterministic)  # [B, N, d]
+        # Endogenous variate (normalized) + raw covariate variates as cross tokens.
+        ex = self.ex_embedding(x, x_mark=hist_exog, deterministic=deterministic)  # [B, N(+X), d]
 
         out = en
         for layer in self.layers:

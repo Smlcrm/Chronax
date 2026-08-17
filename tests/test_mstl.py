@@ -133,3 +133,21 @@ def test_no_seasonality_smooth_trend():
     y = jnp.asarray(10.0 + 0.2 * np.arange(120, dtype=np.float64))
     out = MSTL(period=1).fit(y).predict(h=12)
     assert out["mean"].shape == (12,) and np.all(np.isfinite(np.asarray(out["mean"])))
+
+
+def test_predict_in_sample_level_no_broadcast_crash():
+    # Regression: predict_in_sample(level) previously applied (n_windows, h)
+    # CV conformity scores to the (n,) fitted mean and crashed. Native fitted
+    # intervals come from the remainder scale and match the series length.
+    rng = np.random.default_rng(0)
+    n = 120
+    t = np.arange(n)
+    y = jnp.asarray(50 + 0.2 * t + 8 * np.sin(2 * np.pi * t / 12) + rng.normal(0, 1, n))
+    m = MSTL(period=12).fit(y)
+    out = m.predict_in_sample(level=[80, 95])
+    for k in ("fitted-lo-80", "fitted-hi-80", "fitted-lo-95", "fitted-hi-95"):
+        assert k in out
+        assert np.asarray(out[k]).shape == (n,)
+    # Ordering: wider level fully contains the narrower one.
+    assert np.all(np.asarray(out["fitted-lo-95"]) <= np.asarray(out["fitted-lo-80"]))
+    assert np.all(np.asarray(out["fitted-hi-80"]) <= np.asarray(out["fitted-hi-95"]))

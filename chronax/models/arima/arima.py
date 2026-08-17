@@ -62,8 +62,9 @@ from .auto_arima import (
     _fit_model_scan,
     _objective_css,
     _objective_ml,
+    _objective_ml_ss,
+    _use_steadystate,
     _forecast_from_params,
-    _reconstruct_forecast,
     predict_arima,
     _aa_standardize,
     _aa_denormalize
@@ -128,8 +129,11 @@ class ARIMA(BaseForecaster):
     Notes:
         This class is stateful and not thread-safe for concurrent mutation.
     """
-    uses_exog: bool = True
-    
+    # Exogenous support is not wired end-to-end on the stateless/CV paths
+    # (X is silently ignored there), so it is not advertised; passing X
+    # raises instead of silently dropping it.
+    uses_exog: bool = False
+
     def __init__(
         self,
         order: Tuple[int, int, int] = (0, 0, 0),
@@ -240,7 +244,11 @@ class ARIMA(BaseForecaster):
         # break conformity_scores' vmapped forecast->fit path.
         y_jax = jnp.asarray(y, dtype=jnp.float64)
         if X is not None:
-            X = jnp.asarray(X, dtype=jnp.float64)
+            raise ValueError(
+                "ARIMA does not currently support exogenous regressors "
+                "end-to-end; fit accepts only y (use arima_fit(xreg=...) for "
+                "the low-level exogenous API)."
+            )
 
         # Standardize training series if enabled
         if self.standardize:
@@ -311,6 +319,11 @@ class ARIMA(BaseForecaster):
         Notes:
             Uses cached polynomial metadata from constructor configuration.
         """
+        if X is not None or X_future is not None:
+            raise ValueError(
+                "ARIMA does not currently support exogenous regressors "
+                "end-to-end; forecast accepts only y."
+            )
         y_jax = jnp.asarray(y, dtype=jnp.float64)
 
         # Standardize input series for fast one-shot fit if enabled
@@ -323,7 +336,7 @@ class ARIMA(BaseForecaster):
         p, d, q = self.order
         P, D, Q = self.seasonal_order
         
-        # --- BFGS optimization (same as arima_fit, but uses cached delta) ---
+        # --- Scan optimization (same objectives as arima_fit, cached delta) ---
         use_drift = self.include_mean and (d + D) == 1
         init_params = jnp.zeros(self._narma + self._ncxreg, dtype=jnp.float64) + 1e-3
         
@@ -333,40 +346,58 @@ class ARIMA(BaseForecaster):
         if use_drift:
             if D == 1 and self.period > 1:
                 dx = y_fit[self.period:] - y_fit[:-self.period]
+                per_step = self.period
             else:
                 dx = y_fit[1:] - y_fit[:-1]
-            init_params = init_params.at[self._narma + self._n_exog].set(jnp.nanmean(dx))
+                per_step = 1
+            init_params = init_params.at[self._narma + self._n_exog].set(jnp.nanmean(dx) / per_step)
 
         method = self.method.upper()
         current_params = init_params
-        maxiter = 50  # Reduced: CSS converges fast for low-order models
-        
+        # Each phase gets the full budget (matches arima_fit); the optimizer's
+        # convergence gate exits early on easy fits, so the cap only matters
+        # on hard surfaces.
+        maxiter = 100
+
         # _fit_model_scan (not jax.scipy BFGS): this path runs under
         # conformity_scores' vmap; the scan optimizer is batch-stable by
         # construction and robust to BFGS's inconsistent line-search-failure
         # returns.
         if "CSS" in method:
-            css_iter = maxiter // 2 if method == "CSS-ML" else maxiter
             current_params = _fit_model_scan(
                 current_params, y_fit, None, self._delta, _objective_css,
-                self._arma, self._ncxreg, self._n_exog, self.include_mean, css_iter
+                self._arma, self._ncxreg, self._n_exog, self.include_mean, maxiter
             )
         if "ML" in method:
-            ml_iter = maxiter // 2 if method == "CSS-ML" else maxiter
+            # Long non-seasonal series use the steady-state likelihood (frozen-gain
+            # tail, exact after burn-in) to skip the full-series covariance recursion
+            # on every optimizer evaluation.
+            ml_obj = _objective_ml_ss if _use_steadystate(y_fit.shape[0], self._arma) else _objective_ml
             current_params = _fit_model_scan(
-                current_params, y_fit, None, self._delta, _objective_ml,
-                self._arma, self._ncxreg, self._n_exog, self.include_mean, ml_iter
+                current_params, y_fit, None, self._delta, ml_obj,
+                self._arma, self._ncxreg, self._n_exog, self.include_mean, maxiter
             )
 
+        # Closed-form mean/drift pin (same rescue as arima_fit, so the fast
+        # path and fit()+predict() agree on the deterministic component).
+        if self.include_mean:
+            _mi = self._narma + self._n_exog
+            if use_drift:
+                current_params = current_params.at[_mi].set(jnp.nanmean(dx) / per_step)
+            elif (d + D) == 0:
+                pass  # in-objective clip already bounds the mean
+            else:
+                current_params = current_params.at[_mi].set(0.0)
+
         # --- Fused forecast: single XLA dispatch for params → forecast ---
-        raw_fc = _forecast_from_params(
+        raw_fc, raw_se = _forecast_from_params(
             current_params, y_fit, self._delta,
             self._arma, self._ncxreg, self._n_exog, self.include_mean, h
         )
 
-        # --- Reconstruction using delta polynomial inverse filter ---
-        fc_norm = _reconstruct_forecast(raw_fc, y_fit, self._arma, h)
-        fc = _aa_denormalize(fc_norm, f_mean, f_std)
+        # raw_fc is on the training-series scale: the state space's
+        # differencing rows integrate internally.
+        fc = _aa_denormalize(raw_fc, f_mean, f_std)
 
         res = {"mean": fc}
         if level is None:
@@ -374,7 +405,14 @@ class ARIMA(BaseForecaster):
 
         level = sorted(level)
         if self.conformal_params is None:
-            raise Exception("You must pass `conformal_params` to compute them.")
+            # Analytic z-score fallback, mirroring predict()'s behaviour when
+            # no conformal configuration exists.
+            se_orig = raw_se * (f_std if self.standardize else jnp.array(1.0, dtype=jnp.float64))
+            z_scores = _quantiles(level)
+            for i, lv in enumerate(level):
+                res[f"lo-{lv}"] = res["mean"] - z_scores[i] * se_orig
+                res[f"hi-{lv}"] = res["mean"] + z_scores[i] * se_orig
+            return res
         if h != self.conformal_params.h:
             raise ValueError(
                 f"h={h} does not match conformal_params.h={self.conformal_params.h}; "
@@ -422,7 +460,10 @@ class ARIMA(BaseForecaster):
         if self.model_ is None:
             raise RuntimeError("Model not fitted.")
         if X is not None:
-            X = jnp.asarray(X, dtype=jnp.float64)
+            raise ValueError(
+                "ARIMA does not currently support exogenous regressors "
+                "end-to-end; predict accepts only h."
+            )
 
         # Conformal intervals take over whenever conformal_params is set;
         # analytic z-score intervals remain the fallback. Standard errors are
@@ -438,18 +479,17 @@ class ARIMA(BaseForecaster):
         else:
             mean_pred, se_pred = preds, None
 
-        # Reconstruct in standardized space
-        fc_norm = _reconstruct_forecast(mean_pred, self.y_train_, self.model_["arma"], h)
-        # Map back to original scale if standardization was used
+        # mean_pred is on the training-series scale (integration lives in the
+        # state space); map back to the original scale if standardization was
+        # used.
         if self.standardize:
-            mean_orig = _aa_denormalize(fc_norm, self._y_mean, self._y_std)
+            mean_orig = _aa_denormalize(mean_pred, self._y_mean, self._y_std)
         else:
-            mean_orig = fc_norm
+            mean_orig = mean_pred
 
         if se_pred is not None:
-            # se_pred is already the integrated-series forecast SE (the state-
-            # space bakes differencing into T/Z); the old sqrt(cumsum(se^2))
-            # double-integrated. See _predict_core's P0=0 note in auto_arima.py.
+            # se_pred is the integrated-series forecast SE (the state space
+            # bakes differencing into T/Z); only rescale to original units.
             se_orig = se_pred * (self._y_std if self.standardize else 1.0)
         else:
             se_orig = None

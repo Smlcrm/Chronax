@@ -1470,6 +1470,73 @@ def run_all_tests():
     print("="*70)
     return results
 
+
+# ============================================================================
+# Forecast-variance and structure regression tests
+# ============================================================================
+
+def test_sigmah_variance_recursion_de_livera():
+    """Native interval variance must follow v_h = sigma2*(1 + sum_{j<h} c_j^2)
+    with c_j = w' F^(j-1) g — the first tail term uses F^0 = I, not F."""
+    from chronax.models.tbats.tbats_core import _compute_sigmah_core
+    F = jnp.array([[0.9]]); w = jnp.array([1.0]); g = jnp.array([0.5])
+    sigma2 = jnp.asarray(4.0); y_sigma = jnp.asarray(1.0)
+    se = np.asarray(_compute_sigmah_core(F, w, g, sigma2, y_sigma, 3, True))
+    c1 = 0.5                # w' F^0 g
+    c2 = 0.9 * 0.5          # w' F^1 g
+    expect = np.sqrt(4.0 * np.array([1.0, 1.0 + c1**2, 1.0 + c1**2 + c2**2]))
+    np.testing.assert_allclose(se, expect, rtol=1e-12)
+
+
+def test_default_trend_grid_omits_damped_candidate():
+    """The default AutoTBATS grid deliberately OMITS the (True, True) damped
+    candidate: A/B showed adding it regresses airline/synth-multi holdout
+    (chronax's damped fit underperforms there while its AIC wins selection —
+    IC != holdout). It is only searched when explicitly requested."""
+    from chronax.models.tbats.tbats_core import _trend_grid
+    assert _trend_grid(None, None) == [(False, False), (True, False)]
+    assert _trend_grid(True, None) == [(True, False), (True, True)]
+    assert _trend_grid(True, True) == [(True, True)]
+    assert _trend_grid(True, False) == [(True, False)]
+    assert _trend_grid(False, None) == [(False, False)]
+
+
+def test_boxcox_seed_roundtrip_preserves_negative_components():
+    """The seed-state Box-Cox roundtrip must NOT clamp negative components
+    (e.g. a downward trend slope) to a tiny positive value: the removed
+    `_ensure_pos` wrapper would have sign-flipped them. This test pins that
+    (a) the clamp genuinely changes such a seed (so its removal is
+    observable) and (b) a downtrending series fit with forced Box-Cox+trend
+    stays finite end-to-end."""
+    from chronax.models.tbats.tbats_core import _inv_boxcox, _ensure_pos
+    x0_bc = jnp.asarray([10.0, -1.5, 0.3])  # level, NEGATIVE trend, seasonal
+    unclamped = np.asarray(_inv_boxcox(x0_bc, jnp.asarray(1.0)))  # = x + 1
+    clamped = np.asarray(_ensure_pos(_inv_boxcox(x0_bc, jnp.asarray(1.0))))
+    # The seed prep now uses `unclamped`; the old code used `clamped`.
+    assert unclamped[1] < 0.0, "inv_boxcox should preserve the negative trend"
+    assert clamped[1] > 0.0, "ensure_pos should have clamped it positive"
+    assert not np.allclose(unclamped, clamped), "clamp must be observable here"
+
+    rng = np.random.default_rng(0)
+    n = 120
+    y = 500.0 - 3.0 * np.arange(n) + rng.normal(0, 5, n)  # positive downtrend
+    m = TBATS(season_length=12, use_boxcox=True, use_trend=True, use_damped_trend=False)
+    fc = np.asarray(m.forecast(y=jnp.asarray(y), h=12)["mean"])
+    assert np.all(np.isfinite(fc))
+    assert float(np.polyfit(np.arange(12), fc, 1)[0]) < 0.0, "downtrend lost"
+
+
+def test_find_harmonics_short_series_runs():
+    """n < 2m must use the expanding rolling mean (no constant-mean special
+    case) and return finite output."""
+    from chronax.models.tbats.tbats_core import find_harmonics
+    rng = np.random.default_rng(1)
+    y = jnp.asarray(50 + 10 * np.sin(2 * np.pi * np.arange(18) / 12) + rng.normal(0, 0.5, 18))
+    k, z = find_harmonics(y, 12)
+    assert int(k) >= 1
+    assert np.all(np.isfinite(np.asarray(z)))
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("Testing AutoTBATS Class")

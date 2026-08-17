@@ -1,9 +1,10 @@
 """TCN forecaster: BaseForecaster wrapper around the flax.nnx backbone.
 
-Univariate + future-known-exogenous point and multi-quantile forecasting via a
-dilated causal convolution encoder and an MLP decoder. Exog size is inferred at
-fit; intervals come from the conformal path (point loss, no temporal exog) or
-natively from the quantile heads. ``float32`` throughout.
+Univariate point and multi-quantile forecasting with future-known and
+historical exogenous inputs, via a dilated causal convolution encoder and an
+MLP decoder. Exog size is inferred at fit; intervals come from the conformal
+path (point loss, no temporal exog) or natively from the quantile heads.
+``float32`` throughout.
 """
 from __future__ import annotations
 
@@ -36,13 +37,14 @@ class TCN(BaseForecaster):
     increasing dilations give an exponentially large receptive field), a
     context adapter ``Linear(input_size -> h)`` maps the encoded history onto
     the forecasting window in a single pass (no autoregressive loop), and a
-    per-timestep MLP decodes each horizon step. Future-known exogenous inputs
-    are supported (``uses_exog = True``): their history joins the encoder
-    channels and their horizon slice is residual-concatenated before the
-    decoder. Historical and static exog are not modeled. ``context_size`` is
-    accepted for neuralforecast API parity but is unused. Point or
-    multi-quantile losses; conformal or native quantile intervals.
-    ``float32`` throughout.
+    per-timestep MLP decodes each horizon step. Future-known (``futr_exog=``)
+    and historical (``X=``) exogenous inputs are supported
+    (``uses_exog = True``): future-known exog joins the encoder channels over
+    the input span and residual-concatenates its horizon slice before the
+    decoder, while historical exog joins the encoder channels only (it has no
+    horizon values). Static exog is not modeled. ``context_size`` is accepted
+    for neuralforecast API parity but is unused. Point or multi-quantile losses;
+    conformal or native quantile intervals. ``float32`` throughout.
     """
 
     uses_exog = True
@@ -77,9 +79,11 @@ class TCN(BaseForecaster):
         self.alias = alias
         self.conformal_params: ConformalIntervals | None = None
         self.model_: TCNNet | None = None
+        self._hist_size = 0
         self._futr_size = 0
         self._context = None
         self._train_y = None
+        self._hist_ctx = None
         self._futr_ctx = None
 
     # ---- helpers -------------------------------------------------------------
@@ -93,7 +97,7 @@ class TCN(BaseForecaster):
 
     @property
     def _has_temporal_exog(self) -> bool:
-        return self._futr_size > 0
+        return self._futr_size > 0 or self._hist_size > 0
 
     def _build_net(self) -> TCNNet:
         return TCNNet(
@@ -101,17 +105,14 @@ class TCN(BaseForecaster):
             dilations=self.dilations, encoder_hidden_size=self.encoder_hidden_size,
             encoder_activation=self.encoder_activation,
             decoder_hidden_size=self.decoder_hidden_size,
-            decoder_layers=self.decoder_layers, futr_exog_size=self._futr_size,
+            decoder_layers=self.decoder_layers, hist_exog_size=self._hist_size,
+            futr_exog_size=self._futr_size,
             outputsize_multiplier=outputsize_multiplier(self._loss_fn),
             rngs=nnx.Rngs(self.random_seed),
         )
 
     # ---- fit -----------------------------------------------------------------
     def fit(self, y, X=None, *, futr_exog=None) -> "TCN":
-        if X is not None:
-            raise NotImplementedError(
-                "TCN supports future-known exog only; pass futr_exog="
-            )
         y = jnp.asarray(y, dtype=jnp.float32)
         if y.ndim != 1:
             raise ValueError(f"y must be 1-D; got shape {y.shape}.")
@@ -121,10 +122,16 @@ class TCN(BaseForecaster):
                 f"Series length {y.shape[0]} too short for input_size={self.input_size} "
                 f"(need at least input_size+1)."
             )
+        # X = historical exog (T, F): known only over the input span. futr_exog =
+        # future-known exog (T, F): also supplied for the horizon at predict.
+        hist_exog = None if X is None else jnp.asarray(X, jnp.float32)
+        if hist_exog is not None and hist_exog.shape[0] != y.shape[0]:
+            raise ValueError(f"X (historical exog) must align with y at fit (len {y.shape[0]}); got {hist_exog.shape[0]}.")
         futr_exog = None if futr_exog is None else jnp.asarray(futr_exog, jnp.float32)
         if futr_exog is not None and futr_exog.shape[0] != y.shape[0]:
             raise ValueError(f"futr_exog must align with y at fit (len {y.shape[0]}); got {futr_exog.shape[0]}.")
 
+        self._hist_size = 0 if hist_exog is None else int(hist_exog.shape[1])
         self._futr_size = 0 if futr_exog is None else int(futr_exog.shape[1])
 
         net = self._build_net()
@@ -132,12 +139,13 @@ class TCN(BaseForecaster):
             net, y, h=self.h, input_size=self.input_size, max_steps=self.max_steps,
             windows_batch_size=self.windows_batch_size, lr=self.learning_rate,
             seed=self.random_seed, loss_fn=self._loss_fn, scaler=self._scaler,
-            futr_exog=futr_exog,
+            hist_exog=hist_exog, futr_exog=futr_exog,
         )
         L = self.input_size
         self.model_ = net
         self._context = y[-L:]
         self._train_y = y
+        self._hist_ctx = None if hist_exog is None else hist_exog[-L:]   # [L, F]
         self._futr_ctx = None if futr_exog is None else futr_exog[-L:]
         return self
 
@@ -156,7 +164,7 @@ class TCN(BaseForecaster):
             futr_full = jnp.concatenate([self._futr_ctx, futr_exog], axis=0)
         return predict_step(
             self.model_, self._context, h=self.h, input_size=self.input_size,
-            scaler=self._scaler, futr_full=futr_full,
+            scaler=self._scaler, hist_full=self._hist_ctx, futr_full=futr_full,
         )
 
     def predict(self, h, X=None, *, futr_exog=None, level=None) -> dict:
@@ -215,14 +223,26 @@ class TCN(BaseForecaster):
     # ---- forecast ------------------------------------------------------------
     def forecast(self, y, h, X=None, X_future=None, *, futr_exog=None,
                  level=None, fitted=False) -> dict:
-        """Stateless fit-then-predict. ``X`` is unsupported (TCN models
-        future-known exog only); ``X_future`` = future-known exog for the horizon
-        ``(h, F)``; ``futr_exog`` = its history ``(T, F)``."""
+        """Stateless fit-then-predict. ``X`` = historical exog ``(T, F)`` (known
+        only over the input span); ``X_future`` = future-known exog for the
+        horizon ``(h, F)``; ``futr_exog`` = the future-known exog history
+        ``(T, F)``."""
         self.fit(y, X=X, futr_exog=futr_exog)
         result = self.predict(h=h, futr_exog=X_future, level=level)
         if fitted:
             result["fitted"] = self._compute_fitted_values()
         return result
+
+    def conformity_scores(self, y, X=None) -> jnp.ndarray:
+        if X is not None:
+            # Temporal exog (hist here) -> native (quantile) intervals, not
+            # conformal — same refusal as _add_conformal. Guarding here keeps a
+            # passed X out of the base CV vmap, where it could not raise under trace.
+            raise ValueError(
+                "Conformal intervals are not supported with temporal (historical/future) exog. "
+                "Use loss=MultiQuantileLoss([...]) for native intervals, or omit level."
+            )
+        return super().conformity_scores(y, X)
 
     def _compute_fitted_values(self) -> jnp.ndarray:
         if self._has_temporal_exog:
@@ -257,7 +277,7 @@ class TCN(BaseForecaster):
             saved = m[1]
             state["model_"] = None
             self.__dict__.update(state)
-            net = self._build_net()           # uses restored _futr_size/loss
+            net = self._build_net()           # uses restored _hist_size/_futr_size/loss
             nnx.update(net, saved)
             self.model_ = net
             return

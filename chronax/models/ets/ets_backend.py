@@ -629,8 +629,11 @@ def _calc_roll(
             denom_slice = denom[:n_mse_eff]
             a_slice = a_local[:n_mse_eff]
             denom_new = denom_slice + cond.astype(jnp.float64)
-            a_num = a_slice * (denom_slice - 1.0) + tmp * tmp
-            a_new = jnp.where(denom_new > 0.0, a_num / denom_new, a_slice)
+            # SF etscalc: increment the count, then a_mse = (a_mse*(new-1)
+            # + e^2)/new — weight the OLD mean by the OLD count and divide
+            # by the incremented count; inactive horizons stay untouched.
+            a_num = a_slice * denom_slice + tmp * tmp
+            a_new = jnp.where(cond, a_num / jnp.maximum(denom_new, 1.0), a_slice)
 
             denom = denom.at[:n_mse_eff].set(denom_new)
             a_local = a_local.at[:n_mse_eff].set(a_new)
@@ -804,8 +807,11 @@ def _calc_roll_nohist(
                 denom_slice = denom[:n_mse_eff]
                 a_slice = a_local[:n_mse_eff]
                 denom_new = denom_slice + cond.astype(jnp.float64)
-                a_num = a_slice * (denom_slice - 1.0) + tmp * tmp
-                a_new = jnp.where(denom_new > 0.0, a_num / denom_new, a_slice)
+                # SF etscalc: increment the count, then a_mse = (a_mse*(new-1)
+                # + e^2)/new — weight the OLD mean by the OLD count and divide
+                # by the incremented count; inactive horizons stay untouched.
+                a_num = a_slice * denom_slice + tmp * tmp
+                a_new = jnp.where(cond, a_num / jnp.maximum(denom_new, 1.0), a_slice)
 
                 denom = denom.at[:n_mse_eff].set(denom_new)
                 a_local = a_local.at[:n_mse_eff].set(a_new)
@@ -1742,8 +1748,12 @@ def _transform_smoothing_params(
     # --- Pure-sigmoid mode: cleaner independent mapping per param ---
     if pure_sigmoid:
         if opt_alpha:
-            alpha = jax.nn.sigmoid(p[idx])
-            alpha = EPS_PURE + (1.0 - 2.0 * EPS_PURE) * alpha
+            a = jax.nn.sigmoid(p[idx])
+            # Map α into its box [lower[0], upper[0]] with the EPS_PURE margin,
+            # mirroring the φ mapping below. Reduces to [EPS_PURE, 1-EPS_PURE]
+            # when α is admissible ([0, 1]).
+            a = EPS_PURE + (1.0 - 2.0 * EPS_PURE) * a
+            alpha = lower[0] + (upper[0] - lower[0]) * a
             idx += 1
         if opt_beta:
             beta = jax.nn.sigmoid(p[idx])

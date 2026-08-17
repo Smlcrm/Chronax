@@ -138,7 +138,15 @@ class BaseForecaster(ABC):
                 )
             from chronax.utils import detect_period
 
-            m = int(detect_period(jnp.asarray(y, dtype=jnp.float64), strict=strict))
+            # Cap the search range by the series length so long-period series
+            # (e.g. 5-min data with a daily m=288) are reachable on the auto
+            # path, while short series keep the default 60 ceiling. Strict
+            # detection needs >=5 cycles, so n//5 is the natural upper bound;
+            # 400 bounds the ACF grid on very long series.
+            n = int(jnp.asarray(y).shape[0])
+            max_period = min(max(60, n // 5), 400)
+            m = int(detect_period(
+                jnp.asarray(y, dtype=jnp.float64), strict=strict, max_period=max_period))
             return m if m >= 1 else 1
         if not isinstance(season_length, (int, float)) or int(season_length) < 1:
             raise ValueError(
@@ -152,6 +160,19 @@ class BaseForecaster(ABC):
         Fit the model to univariate time series y.
         Must set ``self.model_`` and return self.
         """
+
+    def _require_fitted(self) -> None:
+        """Raise an actionable ValueError if ``predict`` is called before ``fit``.
+
+        The unfitted sentinel is ``model_`` being ``None`` or an empty container;
+        without this, unfitted ``predict`` calls surface as opaque
+        ``TypeError: 'NoneType' object is not subscriptable`` or ``KeyError``.
+        """
+        m = getattr(self, "model_", None)
+        if m is None or (isinstance(m, (dict, list, tuple)) and len(m) == 0):
+            raise ValueError(
+                f"{type(self).__name__} is not fitted; call fit(y) before predict()."
+            )
 
     @abstractmethod
     def predict(self, h: int, X: jnp.ndarray | None = None, level: list[int | float] | None = None) -> dict:
@@ -272,7 +293,7 @@ class BaseForecaster(ABC):
                 X_test = None
 
             fcst_window = self.forecast(h=h, y=y_train, X=X_train, X_future=X_test)  # type: ignore[attr-defined]
-            window_scores = y_test - fcst_window['mean'].astype('float32')
+            window_scores = y_test - fcst_window['mean'].astype(y_test.dtype)
             return window_scores
 
         # Use vmap for parallel processing across windows
@@ -338,7 +359,7 @@ class BaseForecaster(ABC):
                 X_train = None
                 X_test = None
             fcst_window = self.forecast(h=h, y=y_train, X=X_train, X_future=X_test)  # type: ignore[attr-defined]
-            scores.append(y_test - fcst_window['mean'].astype('float32'))
+            scores.append(y_test - fcst_window['mean'].astype(y_test.dtype))
         return jnp.stack(scores)
 
 
@@ -377,7 +398,8 @@ class BaseForecaster(ABC):
             If ``method`` is not a recognised conformal method.
         """
         def conformal_distribution_intervals(fcst, cs, level):
-            level = sorted(level)
+            level = [int(lv) if float(lv).is_integer() else lv
+                     for lv in sorted(level)]
             alphas = jnp.array([100 - lv for lv in level])
             cuts_lower = alphas / 200.0
             cuts_upper = 1 - alphas / 200.0
@@ -398,7 +420,8 @@ class BaseForecaster(ABC):
             return fcst
 
         def conformal_signed_intervals(fcst, cs, level):
-            level = sorted(level)
+            level = [int(lv) if float(lv).is_integer() else lv
+                     for lv in sorted(level)]
             alphas = jnp.array([100 - lv for lv in level])
             cuts_lower = (alphas / 200.0)[::-1]
             cuts_upper = 1 - alphas / 200.0

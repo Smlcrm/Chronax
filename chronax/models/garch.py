@@ -1067,7 +1067,8 @@ class GARCH(BaseForecaster):
         )
 
         if self.conformal_params is not None:
-            self.model_['_cs'] = self.conformity_scores(y=y, X=X)
+            # Score on the REAL span only — the padded tail is not data.
+            self.model_['_cs'] = self.conformity_scores(y=y_actual, X=X)
 
         return self
 
@@ -1144,11 +1145,10 @@ class GARCH(BaseForecaster):
                         f"n_sims={n_sims} is too small for reliable percentile-based intervals. "
                         "Use n_sims >= 30."
                     )
+                for lv in sorted(level, reverse=True):
+                    res[f'lo-{lv}'] = jnp.percentile(paths, (100 - lv) / 2, axis=0)
                 for lv in level:
-                    lower_q = (100 - lv) / 2
-                    upper_q = 100 - lower_q
-                    res[f'lo-{lv}'] = jnp.percentile(paths, lower_q, axis=0)
-                    res[f'hi-{lv}'] = jnp.percentile(paths, upper_q, axis=0)
+                    res[f'hi-{lv}'] = jnp.percentile(paths, 100 - (100 - lv) / 2, axis=0)
 
             return res
 
@@ -1174,9 +1174,11 @@ class GARCH(BaseForecaster):
                 res = self.add_confidence_intervals(res, cs, level, self.conformal_params.method)
             else:
                 sigma_forecast = jnp.sqrt(sigma2_forecast)
-                for lv in level:
+                for lv in sorted(level, reverse=True):
                     z = utils._jax_norm_ppf((100 + lv) / 200)
                     res[f'lo-{lv}'] = mean_forecast - z * sigma_forecast
+                for lv in level:
+                    z = utils._jax_norm_ppf((100 + lv) / 200)
                     res[f'hi-{lv}'] = mean_forecast + z * sigma_forecast
 
         return res
@@ -1201,9 +1203,11 @@ class GARCH(BaseForecaster):
         if level is not None:
             level = sorted(level)
             sigma_t = jnp.sqrt(self.model_['sigma2'])
-            for lv in level:
+            for lv in sorted(level, reverse=True):
                 z = utils._jax_norm_ppf((100 + lv) / 200)
                 res[f'fitted-lo-{lv}'] = self.model_['fitted'] - z * sigma_t
+            for lv in level:
+                z = utils._jax_norm_ppf((100 + lv) / 200)
                 res[f'fitted-hi-{lv}'] = self.model_['fitted'] + z * sigma_t
 
         return res
@@ -1276,9 +1280,11 @@ class GARCH(BaseForecaster):
                 if level is not None:
                     level = sorted(level)
                     sigma_t = jnp.sqrt(m.model_['sigma2'])
-                    for lv in level:
+                    for lv in sorted(level, reverse=True):
                         z = utils._jax_norm_ppf((100 + lv) / 200)
                         res[f'fitted-lo-{lv}'] = m.model_['fitted'] - z * sigma_t
+                    for lv in level:
+                        z = utils._jax_norm_ppf((100 + lv) / 200)
                         res[f'fitted-hi-{lv}'] = m.model_['fitted'] + z * sigma_t
 
             return res
@@ -1311,19 +1317,24 @@ class GARCH(BaseForecaster):
                         f"h={h} does not match conformal_params.h={self.conformal_params.h}; "
                         "conformity scores cover exactly conformal_params.h steps."
                     )
-                cs = self.conformity_scores(y=y, X=X)
+                y_real = y[:actual_len] if actual_len is not None else y
+                cs = self.conformity_scores(y=y_real, X=X)
                 res = self.add_confidence_intervals(res, cs, level, self.conformal_params.method)
             else:
                 sigma_forecast = jnp.sqrt(sigma2_forecast)
-                for lv in level:
+                for lv in sorted(level, reverse=True):
                     z = utils._jax_norm_ppf((100 + lv) / 200)
                     res[f'lo-{lv}'] = mean_forecast - z * sigma_forecast
+                for lv in level:
+                    z = utils._jax_norm_ppf((100 + lv) / 200)
                     res[f'hi-{lv}'] = mean_forecast + z * sigma_forecast
             if fitted:
                 sigma_t = jnp.sqrt(result['sigma2'])
-                for lv in level:
+                for lv in sorted(level, reverse=True):
                     z = utils._jax_norm_ppf((100 + lv) / 200)
                     res[f'fitted-lo-{lv}'] = res['fitted'] - z * sigma_t
+                for lv in level:
+                    z = utils._jax_norm_ppf((100 + lv) / 200)
                     res[f'fitted-hi-{lv}'] = res['fitted'] + z * sigma_t
 
         return res

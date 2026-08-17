@@ -356,8 +356,13 @@ def _predict_without_intervals(
     X: Optional[jnp.ndarray],
     level: Optional[List[int]],
 ) -> ForecastDict:
-    """Predict horizon ``h`` without prediction intervals."""
-    del X, level
+    """Predict horizon ``h``; a level request without conformal config raises."""
+    del X
+    if level is not None:
+        raise ValueError(
+            "You must instantiate the class with `conformal_params` "
+            "to calculate prediction intervals"
+        )
     return _point_predict(model, h)
 
 
@@ -393,8 +398,13 @@ def _forecast_without_intervals(
     level: Optional[List[int]],
     fitted: bool,
 ) -> ForecastDict:
-    """Forecast without interval computation."""
-    del model, X, X_future, level
+    """Forecast; a level request without conformal config raises."""
+    del model, X, X_future
+    if level is not None:
+        raise ValueError(
+            "You must instantiate the class with `conformal_params` "
+            "to calculate prediction intervals"
+        )
     _, res = _forecast_core(y=y, h=h, fitted=fitted)
     return res
 
@@ -507,6 +517,7 @@ class ADIDA(BaseForecaster):
         Returns:
             dict: Dictionary with entries `mean` for point predictions and `level_*` for probabilistic predictions.
         """
+        self._require_fitted()
         return self._predict_impl(self, h, X, level)
 
     def predict_in_sample(self, level: Optional[List[int]] = None) -> ForecastDict:

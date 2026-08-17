@@ -707,16 +707,20 @@ def _fit_body(
         # Using only the incremental `seas` update underestimates forecast seasonality.
         p = config.sp_array[k]
         max_p = state.seas_tail.shape[0]  # This is static (known at trace time)
-        
-        # Always copy last max_p elements (static slice size), track actual period in seas_tail_len
-        # The actual period values are in the last p positions, but we copy max_p for JIT compat
+
+        # Tile the forecast seasonality at the LARGEST accepted period, not the
+        # last round's. Periods are scheduled round-robin (k = i % num_periods),
+        # so a smaller period can be accepted last; tiling the cumulative
+        # seasonal at that smaller period drops the larger cycle's structure
+        # (harmonic multi-seasonal, e.g. [24, 168]). Single-period fits are
+        # unaffected: p_eff == p once the sole period is accepted.
+        p_eff = jnp.maximum(p, state.seas_tail_len).astype(state.seas_tail_len.dtype)
+
+        # Copy the last max_p cumulative-seasonal values (static slice size), then
+        # rotate so the last p_eff values start at index 0 (predict tiles modulo
+        # seas_tail_len from there).
         last_max_p = lax.dynamic_slice(new_seasonal, (n - max_p,), (max_p,))
-        
-        # Rearrange so that the last p values are at the start
-        # We need seas[-p:] at positions [0:p], but we have seas[-max_p:] in last_max_p
-        # seas[-p:] corresponds to last_max_p[max_p - p:]
-        # Shift so it starts at index 0: rotate left by (max_p - p)
-        indices = (jnp.arange(max_p) + (max_p - p)) % max_p
+        indices = (jnp.arange(max_p) + (max_p - p_eff)) % max_p
         rotated = last_max_p[indices]
 
         new_seas_tail = lax.cond(
@@ -726,7 +730,7 @@ def _fit_body(
         )
         new_seas_tail_len = lax.cond(
             seas_improves,
-            lambda: p,
+            lambda: p_eff,
             lambda: state.seas_tail_len
         )
     else:
@@ -744,16 +748,16 @@ def _fit_body(
     # -------------------------------------------------------------------------
     if has_exogenous:
         def exo_update():
+            # statsforecast fits one OLS model on the current residuals every
+            # round i>0 and ACCEPTS it unconditionally (no MSE gate), summing
+            # each round's lr-scaled contribution. The stored beta accumulates
+            # beta*lr so predict() applies X_exo @ Σ(beta_r*lr) in one matmul.
             beta = jnp.linalg.pinv(config.X_exo.T @ config.X_exo) @ (config.X_exo.T @ resids)
             exo = (config.X_exo @ beta) * config.exogenous_lr
-            test_exo = _mse(config.y_tr, new_fitted + exo)
-            exo_improves = test_exo < new_best_after_seas
-
-            upd_fitted = lax.cond(exo_improves, lambda: new_fitted + exo, lambda: new_fitted)
-            upd_exo_comp = lax.cond(exo_improves, lambda: state.exogenous_component + exo, lambda: state.exogenous_component)
-            upd_best = lax.cond(exo_improves, lambda: test_exo, lambda: new_best_after_seas)
-            upd_beta = lax.cond(exo_improves, lambda: beta, lambda: state.exo_beta)
-            return upd_fitted, upd_exo_comp, upd_best, upd_beta
+            new_fit = new_fitted + exo
+            return (new_fit, state.exogenous_component + exo,
+                    _mse(config.y_tr, new_fit),
+                    state.exo_beta + beta * config.exogenous_lr)
 
         def no_exo_update():
             return new_fitted, state.exogenous_component, new_best_after_seas, state.exo_beta
@@ -1094,7 +1098,8 @@ class MFLES(BaseForecaster):
             smoother (bool): Used only when ses_mode="adaptive": True selects SES ensemble, False selects rolling mean. Default is False.
             ses_mode (str): Residual smoothing strategy. One of ``"off"`` (no residual smoothing), ``"lite"`` (rolling mean, StatsForecast default), ``"full"`` (SES ensemble), or ``"adaptive"`` (controlled by the ``smoother`` flag). Default is "lite".
             seasonality_weights (bool): If True, applies recency-weighted OLS for Fourier seasonal fitting. Auto-enabled for multiplicative single-period series. Default is False.
-            gradient_strategy (bool): Legacy flag (currently unused). Default is False.
+            gradient_strategy (bool): Inert legacy flag; retained for API
+                compatibility. Has no effect on the fit.
 
         Returns:
             MFLES: Self (fitted model instance) for method chaining.
@@ -1155,7 +1160,9 @@ class MFLES(BaseForecaster):
             self.trend = jnp.array([base, base], dtype=y.dtype)
             self.seasonality = None
             self._seas_len = None
-            self.penalty = jnp.zeros((), dtype=y.dtype)
+            # 2.0 = "no round-1 trend accepted" sentinel (R² is always <=1, so a
+            # value >1 is unambiguous vs a real, possibly-negative, R²).
+            self.penalty = jnp.full((), 2.0, dtype=y.dtype)
             self.linear_component = jnp.zeros(n, y.dtype)
             self.seasonal_component = jnp.zeros(n, y.dtype)
             self.ses_component = jnp.zeros(n, y.dtype)
@@ -1302,7 +1309,7 @@ class MFLES(BaseForecaster):
             lasso_maxiter = 48
 
         # Pre-compute piecewise basis + spectral step once.
-        if bool(effective_changepoints) and n_cps > 0 and not bool(gradient_strategy):
+        if bool(effective_changepoints) and n_cps > 0:
             knots = _uniform_knots(n, n_cps, max_knots=n_cps)
             hinge_basis = _hinge_basis_from_knots(n, knots)
             lasso_step = jnp.array(_spectral_step(hinge_basis), dtype=y.dtype)
@@ -1310,7 +1317,7 @@ class MFLES(BaseForecaster):
             # each ISTA iteration is a (k,k) matvec, not two (n,k) ones.
             hinge_gram = hinge_basis.T @ hinge_basis
         else:
-            # Dummy values (won't be used if changepoints=False or gradient_strategy=True)
+            # Dummy values (unused when changepoints are inactive).
             hinge_basis = jnp.zeros((n, 1), dtype=y.dtype)
             lasso_step = jnp.array(1.0, dtype=y.dtype)
             hinge_gram = jnp.zeros((1, 1), dtype=y.dtype)
@@ -1357,7 +1364,9 @@ class MFLES(BaseForecaster):
             best=jnp.array(jnp.inf, dtype=y.dtype),  # Match dtype with y
             stalls=jnp.int32(0),
             robust=jnp.bool_(robust_init_value if robust_init_value is not None else False),
-            penalty=jnp.array(0.0, dtype=y.dtype),
+            # 2.0 sentinel = "no round-1 trend accepted yet"; compute_penalty
+            # overwrites it with the real R² on iteration 1 when a trend is accepted.
+            penalty=jnp.array(2.0, dtype=y.dtype),
             exo_beta=jnp.zeros(max(n_exo_features, 1), dtype=y.dtype),
             converged=jnp.bool_(False),
         )
@@ -1412,7 +1421,8 @@ class MFLES(BaseForecaster):
         # `self` stays fit-idempotent; every reader accepts bool/jnp/None.
         if init_robust:
             self._resolved_robust = final_state.robust
-        # penalty <= 0 encodes the old `None` sentinel; predict() masks it.
+        # penalty is a computed R² (<=1, possibly <0), or the 2.0 "no round-1
+        # trend" sentinel; predict() interprets both.
         self.penalty = final_state.penalty
 
         # exo_beta is all-zeros whenever exogenous never improved the fit, so
@@ -1533,13 +1543,20 @@ class MFLES(BaseForecaster):
                 - "lo-{l}" / "hi-{l}": Conformal interval bounds for each level l
                   (only present when level is not None).
         """
+        self._require_fitted()
         h = int(h)
         last, prev = self.trend[1], self.trend[0]
         slope = (last - prev)
         if self.trend_penalty and (self.penalty is not None):
-            # penalty <= 0 encodes the pre-refactor "no damping" None sentinel.
+            # SF applies slope * max(0, R²): a round-1 trend with R² <= 0 is
+            # anti-predictive and forecasts flat. penalty > 1 is the "no round-1
+            # trend accepted" sentinel (no damping); penalty == 0 also maps to no
+            # damping (compatibility with fitted states that encode 0 as the
+            # no-trend sentinel — an unfitted trend has ~zero slope regardless).
+            # Only a genuine computed R² in (-inf, 1] damps, clipped at 0.
             pen = jnp.asarray(self.penalty)
-            slope = jnp.where(pen > 0, slope * pen, slope)
+            no_damp = (pen > 1.0) | (pen == 0.0)
+            slope = jnp.where(no_damp, slope, slope * jnp.maximum(pen, 0.0))
         trend_fcst = slope * jnp.arange(1, h + 1, dtype=jnp.asarray(last).dtype) + last
 
         if self.seasonality is not None and self.seasonality.size > 0:
@@ -1596,6 +1613,7 @@ class MFLES(BaseForecaster):
         X: jnp.ndarray | None = None,
         X_future: jnp.ndarray | None = None,
         level: list[int | float] | None = None,
+        fitted: bool = False,
         seasonal_period: int | list[int] | None = None,
         **fit_kwargs,
     ) -> dict:
@@ -1632,6 +1650,8 @@ class MFLES(BaseForecaster):
         m.conformal_params = None
         m.fit(y, X=X, seasonal_period=seasonal_period, **fit_kwargs)
         out = m.predict(h, X=X_future, level=None)
+        if fitted:
+            out["fitted"] = m.fitted_
 
         if level:
             if self.conformal_params is None:
@@ -1869,7 +1889,8 @@ if __name__ == "__main__":
     print(f"  Trend penalty: {model7.penalty}")
     print(f"  Penalty applied: {model7.trend_penalty}")
     assert model7.penalty is not None, "Should have penalty value!"
-    assert 0 <= model7.penalty <= 1, "Penalty should be between 0 and 1!"
+    # A computed R² is <=1 (can be negative); 2.0 is the no-trend sentinel.
+    assert model7.penalty <= 1.0 or model7.penalty == 2.0, "Penalty must be an R² (<=1) or the sentinel!"
     print("  ✓ Trend penalty OK")
     
     # Test 8: Moving medians initialization

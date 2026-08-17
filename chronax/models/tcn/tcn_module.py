@@ -210,12 +210,15 @@ class TCNNet(nnx.Module):
     """Full TCN: encoder -> context adapter -> futr residual concat -> MLP decoder.
 
     Forward:
-      1. concat scaled insample_y with the historic slice of future-known exog
-         -> encoder input ``[B, L, 1+F]``;
+      1. concat scaled insample_y with the historical exog and the input slice
+         of future-known exog as extra channels -> encoder input
+         ``[B, L, 1+H+F]`` (insample, then hist, then futr — matching the
+         reference);
       2. ``TemporalConvolutionEncoder`` -> ``[B, L, C]``;
       3. transpose to ``[B, C, L]``, ``context_adapter = Linear(L -> h)`` over the
          time axis -> ``[B, C, h]`` (natively handles ``h > input_size``);
-      4. concat the horizon slice of futr exog as extra channels -> ``[B, C+F, h]``;
+      4. concat the horizon slice of futr exog as extra channels -> ``[B, C+F, h]``
+         (historical exog is encoder-only, not part of the decoder residual);
       5. transpose to ``[B, h, C+F]``, per-timestep MLP decoder -> ``[B, h, mult]``.
 
     The forward is fully deterministic (no dropout or batchnorm), so no RNG or
@@ -233,15 +236,17 @@ class TCNNet(nnx.Module):
         encoder_activation: str = "ReLU",
         decoder_hidden_size: int = 128,
         decoder_layers: int = 2,
+        hist_exog_size: int = 0,
         futr_exog_size: int = 0,
         outputsize_multiplier: int = 1,
         rngs: nnx.Rngs,
     ):
         self.h = h
         self.input_size = input_size
+        self.hist_exog_size = hist_exog_size
         self.futr_exog_size = futr_exog_size
         self.hist_encoder = TemporalConvolutionEncoder(
-            1 + futr_exog_size,
+            1 + hist_exog_size + futr_exog_size,
             encoder_hidden_size,
             kernel_size,
             tuple(dilations),
@@ -260,14 +265,18 @@ class TCNNet(nnx.Module):
             rngs=rngs,
         )
 
-    def __call__(self, insample_z: jnp.ndarray, futr_exog: jnp.ndarray | None = None) -> jnp.ndarray:
-        """insample_z: [B, L, 1] scaled target; futr_exog: [B, L+h, F] or None.
+    def __call__(self, insample_z: jnp.ndarray, hist_exog: jnp.ndarray | None = None,
+                 futr_exog: jnp.ndarray | None = None) -> jnp.ndarray:
+        """insample_z: [B, L, 1] scaled target; hist_exog: [B, L, H] or None;
+        futr_exog: [B, L+h, F] or None.
 
         Returns [B, h, outputsize_multiplier] in scaled space.
         """
         x = insample_z.astype(jnp.float32)
+        if self.hist_exog_size > 0:
+            x = jnp.concatenate([x, hist_exog], axis=2)                       # [B, L, 1+H]
         if self.futr_exog_size > 0:
-            x = jnp.concatenate([x, futr_exog[:, : self.input_size]], axis=2)  # [B, L, 1+F]
+            x = jnp.concatenate([x, futr_exog[:, : self.input_size]], axis=2)  # [B, L, 1+H+F]
         hidden = self.hist_encoder(x)                     # [B, L, C]
         hidden = jnp.transpose(hidden, (0, 2, 1))         # [B, C, L]
         context = self.context_adapter(hidden)            # [B, C, h]

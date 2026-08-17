@@ -1,5 +1,7 @@
 import jax
 import jax.numpy as jnp
+import numpy as np
+import pytest
 from functools import partial as _partial
 from typing import Optional, List, Dict
 from chronax import utils
@@ -8,6 +10,43 @@ from chronax.utils import ConformalIntervals
 
 from chronax.models import CrostonClassic
 
+
+# ============================================================================
+# Collected tests
+# ============================================================================
+
+def _intermittent_y(trailing_zeros=5):
+    base = [0, 0, 3, 0, 0, 0, 5, 0, 2, 0, 0, 4, 0, 0, 6, 0, 1, 0, 0, 3] * 3
+    return np.array(base + [0] * trailing_zeros, dtype=float)
+
+
+def test_forecast_mean_matches_statsforecast():
+    sf_models = pytest.importorskip("statsforecast.models")
+    y = _intermittent_y()
+    cx = np.asarray(CrostonClassic().forecast(y=y, h=4)["mean"])
+    sf = sf_models.CrostonClassic().forecast(y=y, h=4)["mean"]
+    np.testing.assert_allclose(cx, sf, rtol=1e-6)
+
+
+def test_fitted_values_match_statsforecast():
+    # Fitted values are one-step-ahead: position i uses only demands before i,
+    # and positions after the last demand carry the final level (no NaN tail).
+    sf_models = pytest.importorskip("statsforecast.models")
+    for tz in (0, 5):
+        y = _intermittent_y(trailing_zeros=tz)
+        cx = np.asarray(CrostonClassic().forecast(y=y, h=4, fitted=True)["fitted"])
+        sf = sf_models.CrostonClassic().forecast(y=y, h=4, fitted=True)["fitted"]
+        np.testing.assert_allclose(cx, sf, rtol=1e-6, equal_nan=True)
+
+
+def test_forecast_fitted_with_level_returns_fitted_intervals():
+    y = _intermittent_y()
+    m = CrostonClassic(conformal_params=ConformalIntervals(n_windows=2, h=4))
+    res = m.forecast(y=y, h=4, level=[80, 95], fitted=True)
+    for key in ("mean", "fitted", "lo-95", "hi-95",
+                "fitted-lo-95", "fitted-hi-95", "fitted-lo-80", "fitted-hi-80"):
+        assert key in res, f"missing {key}"
+    assert np.asarray(res["fitted-lo-95"]).shape == y.shape
 
 
 # ============================================================================

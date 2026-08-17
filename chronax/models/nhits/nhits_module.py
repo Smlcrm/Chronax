@@ -165,6 +165,7 @@ class NHITSBlock(nnx.Module):
         interpolation_mode: str,
         dropout_prob: float,
         activation: str,
+        hist_exog_size: int,
         futr_exog_size: int,
         rngs: nnx.Rngs,
     ):
@@ -177,10 +178,14 @@ class NHITSBlock(nnx.Module):
         self.interpolation_mode = interpolation_mode
         self.dropout_prob = float(dropout_prob)
         self.activation = activation
+        self.hist_exog_size = hist_exog_size
         self.futr_exog_size = futr_exog_size
         pooled_hist = -(-input_size // self.k)
         pooled_futr = -(-(input_size + h) // self.k)
-        first_in = pooled_hist + futr_exog_size * pooled_futr
+        # Historical exog pools over the input span (like the insample target);
+        # future-known exog pools over input+horizon.
+        first_in = (pooled_hist + hist_exog_size * pooled_hist
+                    + futr_exog_size * pooled_futr)
         n_theta = input_size + out_features * n_knots
         widths = ((first_in, mlp_units[0][0]),) + mlp_units
         self.layers = [_torch_linear(a, b, rngs=rngs) for a, b in widths]
@@ -195,15 +200,21 @@ class NHITSBlock(nnx.Module):
     def __call__(
         self,
         insample_y: jnp.ndarray,
+        hist_exog: jnp.ndarray | None = None,
         futr_exog: jnp.ndarray | None = None,
         *,
         deterministic: bool = True,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        """insample_y: [B, L] time-reversed residuals; futr_exog: [B, L+h, F]
-        in natural time order (the reference pools but never reverses exog).
-        Returns ``(backcast [B, L] in reversed orientation, forecast [B, h, Q])``.
+        """insample_y: [B, L] time-reversed residuals; hist_exog: [B, L, F];
+        futr_exog: [B, L+h, F]; both exog in natural time order (the reference
+        pools but never reverses exog). Each exog channel is pooled at the same
+        rate as the insample target and concatenated (hist before futr) onto the
+        pooled input. Returns ``(backcast [B, L] reversed, forecast [B, h, Q])``.
         """
         x = _pool1d(insample_y, self.k, self.avg_pool)
+        if self.hist_exog_size > 0:
+            hh = _pool1d(hist_exog.transpose(0, 2, 1), self.k, self.avg_pool)
+            x = jnp.concatenate([x, hh.transpose(0, 2, 1).reshape(x.shape[0], -1)], axis=1)
         if self.futr_exog_size > 0:
             f = _pool1d(futr_exog.transpose(0, 2, 1), self.k, self.avg_pool)
             x = jnp.concatenate([x, f.transpose(0, 2, 1).reshape(x.shape[0], -1)], axis=1)
@@ -246,6 +257,7 @@ class NHITSNet(nnx.Module):
         *,
         h: int,
         input_size: int,
+        hist_exog_size: int = 0,
         futr_exog_size: int = 0,
         n_blocks=(1, 1, 1),
         mlp_units=((512, 512), (512, 512), (512, 512)),
@@ -298,6 +310,7 @@ class NHITSNet(nnx.Module):
             raise ValueError(f"dropout_prob_theta must be in [0, 1); got {dropout_prob_theta}.")
         self.h = h
         self.input_size = input_size
+        self.hist_exog_size = hist_exog_size
         self.futr_exog_size = futr_exog_size
         self.outputsize_multiplier = outputsize_multiplier
         blocks = []
@@ -316,6 +329,7 @@ class NHITSNet(nnx.Module):
                         interpolation_mode=interpolation_mode,
                         dropout_prob=dropout_prob_theta,
                         activation=activation,
+                        hist_exog_size=hist_exog_size,
                         futr_exog_size=futr_exog_size,
                         rngs=rngs,
                     )
@@ -325,11 +339,13 @@ class NHITSNet(nnx.Module):
     def __call__(
         self,
         insample_z: jnp.ndarray,
+        hist_exog: jnp.ndarray | None = None,
         futr_exog: jnp.ndarray | None = None,
         *,
         deterministic: bool = True,
     ) -> jnp.ndarray:
-        """insample_z: [B, L, 1] scaled target; futr_exog: [B, L+h, F] or None.
+        """insample_z: [B, L, 1] scaled target; hist_exog: [B, L, F] or None;
+        futr_exog: [B, L+h, F] or None.
 
         Returns [B, h, outputsize_multiplier] (scaled space for point/quantile
         heads; raw pre-``domain_map`` parameters for distribution heads).
@@ -339,7 +355,7 @@ class NHITSNet(nnx.Module):
         forecast = y[:, -1:, None]                             # [B, 1, 1] Naive1 anchor
         for block in self.blocks:
             backcast, block_forecast = block(
-                residuals, futr_exog, deterministic=deterministic
+                residuals, hist_exog, futr_exog, deterministic=deterministic
             )
             residuals = residuals - backcast
             forecast = forecast + block_forecast

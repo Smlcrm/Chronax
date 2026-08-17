@@ -112,6 +112,12 @@ class ETS(BaseForecaster):
         prediction_intervals: Optional[ConformalIntervals] = None,
     ) -> None:
         """Initialize a fixed-spec ETS estimator."""
+        if "Z" in str(model).upper():
+            raise ValueError(
+                f"ETS is a fixed-specification estimator; model={model!r} "
+                "contains an auto-selection 'Z' code. Use AutoETS for "
+                "automatic model selection."
+            )
         self.season_length: int = season_length
         self.model: str = model
         if damped is None:
@@ -137,9 +143,10 @@ class ETS(BaseForecaster):
     ) -> "ETS":
         """Fit the ETS model to a univariate time series.
 
-        Optimises smoothing parameters and initial states via ``optax``
-        gradient descent on the likelihood, then stores the full model state
-        in :attr:`model_`.
+        Optimises the smoothing parameters via ``optax`` gradient descent on
+        the likelihood; initial states are seeded from the data (not optimised
+        unless ``opt_init_state`` is set). Stores the full model state in
+        :attr:`model_`.
 
         Parameters
         ----------
@@ -208,6 +215,7 @@ class ETS(BaseForecaster):
         Exception
             If called before :meth:`fit`.
         """
+        self._require_fitted()
         if not hasattr(self, "model_"):
             raise Exception("You have to use the `fit` method first")
         fcst = forecast_ets(self.model_, h=h, level=None)

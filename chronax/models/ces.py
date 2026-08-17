@@ -554,6 +554,11 @@ def _get_ces_param_runner(m: int, season_type: int, max_iter: int):
         lo = _CES_PAR_LO[:n_active].astype(y.dtype)
         hi = _CES_PAR_HI[:n_active].astype(y.dtype)
         init_full = _CES_PAR_INIT.astype(y.dtype)
+        # PARTIAL starts beta_0 at 0.1 (statsforecast's init), not the FULL
+        # variant's 1.3 that _CES_PAR_INIT carries in slot 2. season_type is a
+        # static Python int here, so the branch resolves at trace time.
+        if season_type == PARTIAL:
+            init_full = init_full.at[2].set(jnp.asarray(0.1, y.dtype))
 
         def objective(xa):
             xa_c = jnp.clip(xa, lo, hi)
@@ -687,13 +692,14 @@ def auto_ces(
 
     model_map = {"N": NONE, "S": SIMPLE, "P": PARTIAL, "F": FULL}
 
+    too_short = m < 2 or len(y) < 2 * m  # static: m config, len(y) shape
     if model == "Z":
-        variants = [NONE, SIMPLE, PARTIAL, FULL]
-        # Both conditions are static under trace: m is config, len(y) is shape.
-        if m < 2 or len(y) < 2 * m:
-            variants = [NONE]
+        variants = [NONE] if too_short else [NONE, SIMPLE, PARTIAL, FULL]
     else:
-        variants = [model_map.get(model, NONE)]
+        # A fixed seasonal spec on a too-short series collapses to the
+        # non-seasonal N model (SF's rule) — a seasonal fit is unidentifiable
+        # and would shape-error in _init_state_s when n < m.
+        variants = [NONE if too_short else model_map.get(model, NONE)]
 
     fits = [ces_fit_single(y, m, variant) for variant in variants]
 
@@ -842,6 +848,12 @@ class AutoCES(BaseForecaster):
         # control flow on a traced value. The normal path already yields flat
         # forecasts on constant series (innovations are zero throughout).
         self.model_ = auto_ces(y, m=self._m_eff, model=self.model)
+        if not bool(self.model_['valid']):
+            raise ValueError(
+                "No CES model could be estimated: every candidate produced a "
+                "non-finite information criterion (check for NaN/inf or "
+                "degenerate input)."
+            )
         # Cache the eagerly-selected winning variant so the vmapped conformity_scores
         # CV path re-fits ONLY it per window (the AutoETS _selected_spec pattern).
         # int() here is eager/host-side (fit is never traced); forecast reads this

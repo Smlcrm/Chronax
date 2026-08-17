@@ -90,12 +90,17 @@ class SimpleExponentialSmoothing(BaseForecaster):
         alpha: float,
         alias: str = "SES",
         conformal_params: ConformalIntervals | None = None,
+        prediction_intervals: ConformalIntervals | None = None,
     ) -> None:
         if not 0 <= alpha <= 1:
             raise ValueError(f"alpha must be in [0,1], got {alpha}")
         self.alpha = alpha
         self.alias = alias
-        self.conformal_params = conformal_params
+        # `prediction_intervals` is the fleet/SF-compatible alias for
+        # `conformal_params`; either name configures the conformal intervals.
+        ci = prediction_intervals if prediction_intervals is not None else conformal_params
+        self.prediction_intervals = ci
+        self.conformal_params = ci
         self.model_ = {}
     
     def fit(self, y: jnp.ndarray, X: jnp.ndarray | None = None) -> "SimpleExponentialSmoothing":
@@ -188,6 +193,7 @@ class SimpleExponentialSmoothing(BaseForecaster):
             ValueError: If level is requested but ``conformal_params`` is None.
             ValueError: If level is requested but the model has not been fitted yet.
         """
+        self._require_fitted()
         mean = utils._repeat_val(val=self.model_["mean"][0], h=h)
         res = {"mean": mean}
         
@@ -204,7 +210,7 @@ class SimpleExponentialSmoothing(BaseForecaster):
             raise ValueError("Model must be fitted before computing intervals.")
         
         res = self.add_confidence_intervals(
-            fcst=res, cs=cs, level=level, method="conformal_distribution"
+            fcst=res, cs=cs, level=level, method=self.conformal_params.method
         )
         return res
     

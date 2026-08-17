@@ -14,11 +14,10 @@ Sections
                                    _ses_sse_masked, _ses_forecast_last_masked,
                                    _golden_bounded_minimize,
                                    _optimized_ses_forecast, _optimized_ses_forecast_masked
-6.  Aggregation / Chunking        _window_average_core, _window_average,
-                                   _chunk_sums, _chunk_forecast
+6.  Aggregation / Chunking        _window_average_core, _window_average
 7.  Intermittent Demand Helpers   _demand, _intervals_c, _intervals,
                                    _expand_fitted_demand, _expand_fitted_intervals
-8.  Seasonal & Decomposition      _seasonal_exponential_smoothing, _seasonal_naive,
+8.  Seasonal & Decomposition      _seasonal_naive,
                                    seasonal_decompose, _linear_extrapolate_tail
 9.  IMAPA                         _imapa_aggregate_jit, _imapa
 10. Miscellaneous                 is_constant, acf, calculate_information_criteria
@@ -35,7 +34,7 @@ _repeat_val, _repeat_val_seas, _quantiles, _calculate_intervals,
 _add_fitted_pi, _add_fitted_pi_1,
 _add_conformal_distribution_intervals, _get_conformal_method,
 _conformal_method, _store_cs, _add_conformal_intervals, _add_predict_conformal_intervals,
-_seasonal_naive, _seasonal_exponential_smoothing, _window_average,
+_seasonal_naive, _window_average,
 _intervals, _intervals_c, _expand_fitted_intervals, _expand_fitted_demand, _imapa,
 calculate_information_criteria, is_constant, acf, results,
 minimize_armijo, bounded_line_minimize, multistart_argmin, MinimizeState,
@@ -108,7 +107,7 @@ def calculate_sigma(residuals: jnp.ndarray, n: int) -> jnp.ndarray:
 def _jax_norm_ppf(p: jnp.ndarray) -> jnp.ndarray:
     """Inverse normal CDF (percent-point function) implemented in JAX.
 
-    Uses the Beasley-Springer-Moro rational approximation.
+    Exact inverse normal CDF via jax.scipy.special.ndtri.
 
     Args:
         p: Probability value(s) in (0, 1).
@@ -116,16 +115,11 @@ def _jax_norm_ppf(p: jnp.ndarray) -> jnp.ndarray:
     Returns:
         Corresponding z-score(s).
     """
+    # Exact inverse normal CDF (jax.scipy.special.ndtri) — the former
+    # Beasley-Springer-Moro rational approximation carried a ~4.5e-4 z-error
+    # that biased every native prediction interval slightly.
     p = jnp.clip(p, 1e-10, 1 - 1e-10)
-    sign = jnp.where(p > 0.5, 1.0, -1.0)
-    p_adj = jnp.where(p > 0.5, p, 1.0 - p)
-
-    c0, c1, c2 = 2.515517, 0.802853, 0.010328
-    d1, d2, d3 = 1.432788, 0.189269, 0.001308
-
-    t = jnp.sqrt(-2 * jnp.log(1 - p_adj))
-    z = t - (c0 + c1 * t + c2 * t ** 2) / (1 + d1 * t + d2 * t ** 2 + d3 * t ** 3)
-    return sign * z
+    return jax.scipy.special.ndtri(p)
 
 
 def _quantiles(level: List[Union[int, float]]) -> jnp.ndarray:
@@ -306,7 +300,7 @@ def _add_fitted_pi_1(
     """Calculate native (non-conformal) fitted (in-sample) prediction intervals.
 
     JAX equivalent of statsforecast.models._add_fitted_pi().
-    Used by historic_average and croston_classic models.
+    Used by the STL, Croston, and MSTL models.
 
     Args:
         fitted: Fitted values of shape (t,).
@@ -351,8 +345,8 @@ def _add_conformal_distribution_intervals(
     Returns:
         Updated fcst dict with 'lo-{lv}' and 'hi-{lv}' keys.
     """
-    level = sorted(level)
-    alphas = jnp.array([100 - lv for lv in level], dtype=jnp.float32)
+    level = [int(lv) if float(lv).is_integer() else lv for lv in sorted(level)]
+    alphas = jnp.array([100 - lv for lv in level])
     cuts_lower = (alphas / 200.0)[::-1]
     cuts_upper = 1.0 - (alphas / 200.0)
     cuts = jnp.concatenate([cuts_lower, cuts_upper])
@@ -390,8 +384,8 @@ def _add_conformal_signed_intervals(
     Returns:
         Updated fcst dict with 'lo-{lv}' and 'hi-{lv}' keys.
     """
-    level = sorted(level)
-    alphas = jnp.array([100 - lv for lv in level], dtype=jnp.float32)
+    level = [int(lv) if float(lv).is_integer() else lv for lv in sorted(level)]
+    alphas = jnp.array([100 - lv for lv in level])
     cuts_lower = (alphas / 200.0)[::-1]
     cuts_upper = 1.0 - (alphas / 200.0)
     cuts = jnp.concatenate([cuts_lower, cuts_upper])
@@ -525,49 +519,55 @@ def _add_predict_conformal_intervals(
 
 @jax.jit
 def _ses_forecast_nan(x: jnp.ndarray, alpha: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """Simple Exponential Smoothing forecast with NaN handling.
+    """Simple Exponential Smoothing forecast with NaN-tail handling.
 
-    Skips NaN values in computation — useful for padded arrays from Croston models.
+    One-step-ahead fitted values over the valid prefix of a NaN-padded array
+    (Croston's compact demand/interval arrays):
+    ``fitted[i] = alpha * x[i-1] + (1 - alpha) * fitted[i-1]`` — each fitted
+    value uses only PREVIOUS observations, and ``fitted[first_valid]`` is NaN.
+    When the array carries a NaN tail, the slot right after the last valid
+    entry receives the out-of-sample forecast, so the Croston expansion reads
+    the final level for positions after the last demand.
 
     Args:
-        x: Input array (may contain NaNs).
+        x: Input array (valid prefix + optional NaN padding).
         alpha: Smoothing parameter.
 
     Returns:
-        Tuple of (forecast, fitted) arrays.
+        Tuple of (forecast, fitted). forecast is the out-of-sample level;
+        fitted has the same shape as x.
     """
     complement = 1 - alpha
     n = x.size
     fitted = jnp.full_like(x, jnp.nan)
 
-    # Find first non-NaN value
+    # Seed the recursion at the first valid value (masked to NaN afterwards).
     is_valid = ~jnp.isnan(x)
     first_valid_idx = jnp.argmax(is_valid)
-    first_valid_val = x[first_valid_idx]
-    fitted = fitted.at[first_valid_idx].set(first_valid_val)
+    fitted = fitted.at[first_valid_idx].set(x[first_valid_idx])
 
     def body_fun(i, fitted_arr):
-        val = x[i]
+        x_prev = x[i - 1]
         prev_fitted = fitted_arr[i - 1]
         new_fitted = jnp.where(
-            jnp.isnan(val),
+            jnp.isnan(x_prev) | jnp.isnan(prev_fitted),
             jnp.nan,
-            jnp.where(
-                jnp.isnan(prev_fitted),
-                val,
-                alpha * val + complement * prev_fitted
-            )
+            alpha * x_prev + complement * prev_fitted,
         )
-        fitted_arr = fitted_arr.at[i].set(new_fitted)
-        return fitted_arr
+        return fitted_arr.at[i].set(new_fitted)
 
     fitted = jax.lax.fori_loop(first_valid_idx + 1, n, body_fun, fitted)
 
-    # Forecast from last non-NaN fitted value
+    # Out-of-sample forecast: one more smoothing step past the last valid
+    # entry. With a single valid value the level is that value itself.
     last_valid_idx = n - 1 - jnp.argmax(is_valid[::-1])
-    forecast = fitted[last_valid_idx]
+    prev_level = jnp.where(
+        last_valid_idx == first_valid_idx,
+        x[first_valid_idx],
+        fitted[last_valid_idx],
+    )
+    forecast = alpha * x[last_valid_idx] + complement * prev_level
 
-    # Set first fitted to NaN to match original behavior
     fitted = fitted.at[first_valid_idx].set(jnp.nan)
     return forecast, fitted
 
@@ -1037,48 +1037,8 @@ def _window_average(
     return {"mean": mean}
 
 
-def _chunk_sums(array: jnp.ndarray, chunk_size: int) -> jnp.ndarray:
-    """Split array into equal chunks and sum each. Incomplete tail discarded.
-
-    Uses jnp.add.reduceat for efficiency.
-
-    Args:
-        array: Input array.
-        chunk_size: Size of each chunk.
-
-    Returns:
-        Array of chunk sums.
-    """
-    n = array.size
-    n_chunks = n // chunk_size
-    n_elems = n_chunks * chunk_size
-    trimmed = array[:n_elems]
-    if n_chunks == 0:
-        return jnp.zeros((0,), dtype=array.dtype)
-    idx = jnp.arange(0, n_elems, chunk_size)
-    return jnp.add.reduceat(trimmed, idx)
 
 
-def _chunk_forecast(y: jnp.ndarray, aggregation_level: int) -> jnp.ndarray:
-    """Compute SES forecast on aggregated (chunked) time series.
-
-    Args:
-        y: Input time series.
-        aggregation_level: Chunk size for temporal aggregation.
-
-    Returns:
-        One-step forecast for the aggregated series.
-    """
-    lost_remainder_data = len(y) % aggregation_level
-    y_cut = y[lost_remainder_data:]
-    aggregation_sums = _chunk_sums(y_cut, aggregation_level)
-    sums_forecast, _ = _optimized_ses_forecast(aggregation_sums)
-    return sums_forecast
-
-
-# ============================================================
-# SECTION 7 — Intermittent Demand Helpers
-# ============================================================
 
 @jax.jit
 def _demand(x: jnp.ndarray) -> jnp.ndarray:
@@ -1244,51 +1204,6 @@ def _expand_fitted_intervals(fitted: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray
 # SECTION 8 — Seasonal & Decomposition
 # ============================================================
 
-def _seasonal_exponential_smoothing(
-    y: jnp.ndarray,
-    h: int,
-    fitted: bool,
-    season_length: int,
-    alpha: float,
-) -> Dict[str, jnp.ndarray]:
-    """Seasonal exponential smoothing forecast.
-
-    Applies SES independently to each seasonal sub-series, then tiles the
-    forecasts to cover horizon h.
-
-    Args:
-        y: Input time series.
-        h: Forecast horizon.
-        fitted: Whether to return in-sample fitted values.
-        season_length: Seasonal period.
-        alpha: Smoothing parameter for SES.
-
-    Returns:
-        Dict with 'mean' and optionally 'fitted' keys.
-    """
-    n = y.size
-    if n < season_length:
-        return {"mean": jnp.full(h, jnp.nan, dtype=y.dtype)}
-
-    season_vals = jnp.full((season_length,), jnp.nan, dtype=y.dtype)
-    fitted_vals = jnp.full_like(y, jnp.nan)
-
-    for i in range(season_length):
-        init_idx = i + n % season_length
-        x = y[init_idx::season_length]
-
-        forecast, fitted_season = _ses_forecast(x, alpha)
-
-        season_vals = season_vals.at[i].set(forecast)
-
-        for k in range(fitted_season.size):
-            fitted_vals = fitted_vals.at[init_idx + k * season_length].set(fitted_season[k])
-
-    out = _repeat_val_seas(season_vals, h)
-    fcst = {"mean": out}
-    if fitted:
-        fcst["fitted"] = fitted_vals
-    return fcst
 
 
 def _seasonal_naive(

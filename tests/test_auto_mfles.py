@@ -317,5 +317,93 @@ def test_auto_mfles() -> None:
     print("="*60)
 
 
+import pytest
+from chronax.models import MFLES
+import chronax.models.mfles.auto_mfles as _am
+
+
+def test_mfles_exog_forecast_uses_accumulated_scaled_beta():
+    # Exogenous contribution must propagate into out-of-sample forecasts:
+    # each boosting round's lr-scaled OLS beta accumulates so predict applies
+    # X_future @ Sum(beta_r * lr). Previously only the last round's unscaled
+    # beta survived, so the exog forecast was ~zero.
+    rng = np.random.default_rng(0)
+    n = 120
+    Xtr = rng.normal(0, 1, (n, 2))
+    y = (10 + 0.5 * Xtr[:, 0] - 0.3 * Xtr[:, 1]
+         + np.sin(np.arange(n) * 2 * np.pi / 12) + rng.normal(0, 0.3, n))
+    m = MFLES()
+    m.fit(jnp.asarray(y), X=jnp.asarray(Xtr))
+    Xf = rng.normal(0, 1, (12, 2))
+    fc_x = np.asarray(m.predict(h=12, X=jnp.asarray(Xf))["mean"])
+    fc_nox = np.asarray(m.predict(h=12)["mean"])
+    assert not np.allclose(fc_x, fc_nox), "exog does not move the forecast"
+    beta = np.asarray(m._exo_beta)
+    # Signs recover the generative coefficients.
+    assert beta[0] > 0 and beta[1] < 0
+
+
+def test_mfles_negative_r2_penalty_forecasts_flat():
+    # F3: SF applies slope * max(0, R²) to the round-1 trend. A round-1 trend with
+    # R² <= 0 is anti-predictive and must forecast FLAT (slope damped to 0);
+    # masking only R² > 0 would keep the full undamped slope (the sentinel case),
+    # a divergent forecast SF never produces.
+    rng = np.random.default_rng(3)
+    n = 120
+    t = np.arange(n)
+    y = jnp.asarray(10.0 + 0.4 * t + rng.normal(0, 0.5, n))  # clear upward trend
+    m = MFLES()
+    m.fit(y)
+    h = 10
+
+    # penalty only scales the trend slope; seasonal/exog/last are identical across
+    # toggles, so (fc(a) - fc(b)) isolates the slope-ramp difference.
+    m.penalty = jnp.array(-0.5, dtype=y.dtype)   # R² < 0 -> flat
+    fc_neg = np.asarray(m.predict(h=h)["mean"])
+    m.penalty = jnp.array(2.0, dtype=y.dtype)     # sentinel -> full slope
+    fc_sent = np.asarray(m.predict(h=h)["mean"])
+    m.penalty = jnp.array(0.5, dtype=y.dtype)      # R²=0.5 -> half slope
+    fc_half = np.asarray(m.predict(h=h)["mean"])
+
+    ramp = fc_sent - fc_neg                        # == full slope * arange(1,h+1)
+    assert np.abs(ramp).max() > 1e-3, "sentinel and R²<0 must differ (the F3 bug)"
+    assert np.all(np.diff(ramp) > 0), "the isolated trend ramp must be monotone"
+    # R²=0.5 damps the slope to exactly half of the undamped ramp.
+    np.testing.assert_allclose(fc_half - fc_neg, 0.5 * ramp, rtol=1e-5, atol=1e-6)
+
+
+def test_mfles_multiperiod_tiles_at_max_period():
+    # F2: with harmonic multi-seasonal [7, 14], the forecast seasonality must tile
+    # at the LARGEST accepted period (14 = lcm), not whichever the round-robin
+    # (k = i % num_periods) accepted last. Tiling at a smaller period drops the
+    # larger cycle's structure. Single-period fits are unaffected (p_eff == p).
+    t = np.arange(168)
+    y = jnp.asarray(100 + 5 * np.sin(2 * np.pi * t / 7) + 5 * np.sin(2 * np.pi * t / 14)
+                    + 0.2 * np.random.default_rng(0).normal(0, 1, 168))
+    m = MFLES()
+    m.fit(y, seasonal_period=[7, 14])
+    assert int(m._seas_len) == 14, f"tiled at {int(m._seas_len)}, want max period 14"
+    fc = np.asarray(m.predict(h=28)["mean"])
+    # cumulative seasonal has period lcm(7,14)=14 -> the forecast repeats every 14
+    np.testing.assert_allclose(fc[:14], fc[14:28], atol=0.05)
+
+
+def test_automfles_ensure_float_preserves_precision():
+    assert _am._ensure_float(np.arange(5, dtype=np.float64)).dtype == np.float64
+    assert _am._ensure_float(np.arange(5, dtype=np.float32)).dtype == np.float32
+    assert _am._ensure_float(np.arange(5, dtype=np.int64)).dtype == np.float32
+
+
+def test_mfles_gradient_strategy_is_inert():
+    rng = np.random.default_rng(1)
+    n = 200
+    t = np.arange(n)
+    y = jnp.asarray(10 + 0.3 * t + 5 * np.sin(2 * np.pi * t / 12) + rng.normal(0, 1, n))
+    a = MFLES(); a.fit(y, gradient_strategy=False)
+    b = MFLES(); b.fit(y, gradient_strategy=True)
+    np.testing.assert_array_equal(np.asarray(a.predict(h=12)["mean"]),
+                                  np.asarray(b.predict(h=12)["mean"]))
+
+
 if __name__ == '__main__':
     test_auto_mfles()

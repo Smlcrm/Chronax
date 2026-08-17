@@ -1,7 +1,7 @@
 """Window construction and JIT/scan training for NHITS.
 
 Windows are scaled per-window (scaler stats on the insample target; per-channel
-scaling on future-known exog) and the whole training loop is one ``nnx.scan``
+scaling on historical and future-known exog) and the whole training loop is one ``nnx.scan``
 so it stays ``vmap``-traceable for ``BaseForecaster.conformity_scores``. Point
 and multi-quantile losses are computed in scaled space; distribution losses
 (``GMM``) are evaluated against the ORIGINAL-scale target with the predicted
@@ -131,7 +131,7 @@ _ELEMENTWISE = {
 
 
 def forward_loss(net, y_windows, target_mask=None, *, h, input_size, scaler, loss_fn,
-                 futr_windows=None, deterministic=True):
+                 hist_windows=None, futr_windows=None, deterministic=True):
     """Scale, forward, and reduce the training loss.
 
     ``target_mask [B, h]`` marks real target positions (0 in the h-padded tail);
@@ -143,9 +143,14 @@ def forward_loss(net, y_windows, target_mask=None, *, h, input_size, scaler, los
     target = y_windows[:, input_size:]                  # [B, h]
     shift, scale = scaler.stats(insample, axis=1)       # [B, 1]
     insample_z = scaler.transform(insample, shift, scale)[..., None]   # [B, L, 1]
+    # Historical exog spans only the input (stats read the whole window);
+    # future-known exog spans input+horizon (stats restricted to the input span).
+    hist_z = (_scale_exog(hist_windows, scaler, stats_len=None)
+              if hist_windows is not None else None)
     futr_z = (_scale_exog(futr_windows, scaler, stats_len=input_size)
               if futr_windows is not None else None)
-    pred = net(insample_z, futr_exog=futr_z, deterministic=deterministic)  # [B, h, mult]
+    pred = net(insample_z, hist_exog=hist_z, futr_exog=futr_z,
+               deterministic=deterministic)             # [B, h, mult]
     if target_mask is None:
         target_mask = jnp.ones_like(target)
     if getattr(loss_fn, "is_distribution_output", False):
@@ -185,7 +190,7 @@ def _finite_or_raise(losses: jnp.ndarray) -> jnp.ndarray:
 
 def train_on_windows(net, y_windows, target_mask, *, h, input_size, max_steps,
                      windows_batch_size, lr, num_lr_decays, seed, loss_fn, scaler,
-                     futr_windows=None):
+                     hist_windows=None, futr_windows=None):
     """Train ``net`` in place on prebuilt window arrays via one ``nnx.scan``.
 
     Accepts pooled windows from any number of series (cross-learning); batch
@@ -203,7 +208,8 @@ def train_on_windows(net, y_windows, target_mask, *, h, input_size, max_steps,
         sample = lambda k: jax.random.permutation(k, n)[:windows_batch_size]
     batch_idx = jax.vmap(sample)(step_keys)             # [max_steps, B]
     optimizer = nnx.Optimizer(net, _adam_steplr(lr, max_steps, num_lr_decays), wrt=nnx.Param)
-    losses = _train_scan(net, optimizer, y_windows, target_mask, batch_idx, futr_windows,
+    losses = _train_scan(net, optimizer, y_windows, target_mask, batch_idx,
+                         hist_windows, futr_windows,
                          h=h, input_size=input_size, scaler=scaler, loss_fn=loss_fn)
     return _finite_or_raise(losses)
 
@@ -218,7 +224,7 @@ def _adam_steplr(lr: float, max_steps: int, num_lr_decays: int):
 
 
 @functools.partial(nnx.jit, static_argnames=("h", "input_size", "scaler", "loss_fn"))
-def _train_scan(net, optimizer, y_windows, target_mask, batch_idx, futr_windows,
+def _train_scan(net, optimizer, y_windows, target_mask, batch_idx, hist_windows, futr_windows,
                 *, h, input_size, scaler, loss_fn):
     """The whole training loop as one cached program.
 
@@ -235,10 +241,12 @@ def _train_scan(net, optimizer, y_windows, target_mask, batch_idx, futr_windows,
         net, opt = carry
         yb = y_windows[idx]
         mb = target_mask[idx]
+        hb = hist_windows[idx] if hist_windows is not None else None
         fb = futr_windows[idx] if futr_windows is not None else None
         loss, grads = nnx.value_and_grad(
             lambda m: forward_loss(m, yb, mb, h=h, input_size=input_size, scaler=scaler,
-                                   loss_fn=loss_fn, futr_windows=fb, deterministic=False))(net)
+                                   loss_fn=loss_fn, hist_windows=hb, futr_windows=fb,
+                                   deterministic=False))(net)
         opt.update(grads)
         return (net, opt), loss
 
@@ -247,66 +255,76 @@ def _train_scan(net, optimizer, y_windows, target_mask, batch_idx, futr_windows,
 
 
 def train(net, y, *, h, input_size, max_steps, windows_batch_size, lr, num_lr_decays,
-          seed, loss_fn, scaler, futr_exog=None):
+          seed, loss_fn, scaler, hist_exog=None, futr_exog=None):
     """Build windows from a single series and train (see ``train_on_windows``)."""
     y_windows, target_mask = build_windows(y, input_size, h)
     n = y_windows.shape[0]
+    hist_w = build_exog_windows(hist_exog, input_size, h, n, "input") if hist_exog is not None else None
     futr_w = build_exog_windows(futr_exog, input_size, h, n, "full") if futr_exog is not None else None
     return train_on_windows(
         net, y_windows, target_mask, h=h, input_size=input_size, max_steps=max_steps,
         windows_batch_size=windows_batch_size, lr=lr, num_lr_decays=num_lr_decays,
-        seed=seed, loss_fn=loss_fn, scaler=scaler, futr_windows=futr_w,
+        seed=seed, loss_fn=loss_fn, scaler=scaler, hist_windows=hist_w, futr_windows=futr_w,
     )
 
 
 @nnx.jit
-def _forward_det(net, insample_z, futr_z):
+def _forward_det(net, insample_z, hist_z, futr_z):
     """Inference-mode forward (dropout disabled). Cached across calls; the
     value-equal initializers keep same-config graphdefs cache-equal across
     refits."""
-    return net(insample_z, futr_exog=futr_z, deterministic=True)
+    return net(insample_z, hist_exog=hist_z, futr_exog=futr_z, deterministic=True)
 
 
-def predict_step(net, y_context, *, h, input_size, scaler, futr_full=None):
+def _broadcast_exog(full, ctx_rows, *, input_size, scaler, stats_len):
+    """Scale a single shared exog window ``[span, F]`` and broadcast to ``ctx_rows``
+    contexts. ``stats_len`` restricts the scaler stats to the insample span
+    (``None`` = whole window, used for input-span historical exog)."""
+    z = _scale_exog(full[None], scaler, stats_len=stats_len)
+    return jnp.broadcast_to(z, (ctx_rows,) + z.shape[1:])
+
+
+def predict_step(net, y_context, *, h, input_size, scaler, hist_full=None, futr_full=None):
     """Forecast next ``h`` steps from per-series contexts, in the **original**
     scale (point/quantile heads only — distribution heads go through
     ``predict_params``).
 
     ``y_context`` is ``[L]`` (one series) or ``[B, L]`` (a batch of series
     tails); returns ``[h, multiplier]`` / ``[B, h, multiplier]`` accordingly.
-    ``futr_full`` (``[input_size+h, F]``, history + horizon) is shared across a
-    batch of contexts.
+    ``hist_full`` (``[input_size, F]``) and ``futr_full`` (``[input_size+h, F]``)
+    are each shared across a batch of contexts.
     """
     single = y_context.ndim == 1
     ctx = y_context[None, :] if single else y_context   # [B, L]
     shift, scale = scaler.stats(ctx, axis=1)            # [B, 1]
     insample_z = scaler.transform(ctx, shift, scale)[..., None]        # [B, L, 1]
-    futr_z = None
-    if futr_full is not None:
-        futr_z = _scale_exog(futr_full[None], scaler, stats_len=input_size)
-        futr_z = jnp.broadcast_to(futr_z, (ctx.shape[0],) + futr_z.shape[1:])
-    pred_z = _forward_det(net, insample_z, futr_z)      # [B, h, mult]
+    hist_z = None if hist_full is None else _broadcast_exog(
+        hist_full, ctx.shape[0], input_size=input_size, scaler=scaler, stats_len=None)
+    futr_z = None if futr_full is None else _broadcast_exog(
+        futr_full, ctx.shape[0], input_size=input_size, scaler=scaler, stats_len=input_size)
+    pred_z = _forward_det(net, insample_z, hist_z, futr_z)   # [B, h, mult]
     out = scaler.inverse(pred_z, shift[..., None], scale[..., None])
     return out[0] if single else out
 
 
-def predict_params(net, y_context, *, input_size, scaler, loss_fn, futr_full=None):
+def predict_params(net, y_context, *, input_size, scaler, loss_fn, hist_full=None, futr_full=None):
     """Distribution parameters for the next ``h`` steps, in the ORIGINAL scale.
 
     ``y_context`` is ``[L]`` (one series) or ``[B, L]`` (a batch of contexts —
     per-series tails); returns the loss's decoupled parameter tuple with arrays
-    ``[h, K]`` / ``[B, h, K]`` accordingly. ``futr_full`` (``[input_size+h, F]``,
-    history + horizon) is shared across a batch of contexts.
+    ``[h, K]`` / ``[B, h, K]`` accordingly. ``hist_full`` (``[input_size, F]``)
+    and ``futr_full`` (``[input_size+h, F]``) are each shared across a batch of
+    contexts.
     """
     single = y_context.ndim == 1
     ctx = y_context[None, :] if single else y_context   # [B, L]
     shift, scale = scaler.stats(ctx, axis=1)            # [B, 1]
     insample_z = scaler.transform(ctx, shift, scale)[..., None]
-    futr_z = None
-    if futr_full is not None:
-        futr_z = _scale_exog(futr_full[None], scaler, stats_len=input_size)
-        futr_z = jnp.broadcast_to(futr_z, (ctx.shape[0],) + futr_z.shape[1:])
-    raw = _forward_det(net, insample_z, futr_z)         # [B, h, mult]
+    hist_z = None if hist_full is None else _broadcast_exog(
+        hist_full, ctx.shape[0], input_size=input_size, scaler=scaler, stats_len=None)
+    futr_z = None if futr_full is None else _broadcast_exog(
+        futr_full, ctx.shape[0], input_size=input_size, scaler=scaler, stats_len=input_size)
+    raw = _forward_det(net, insample_z, hist_z, futr_z)     # [B, h, mult]
     distr_args = loss_fn.domain_map(raw)
     distr_args = loss_fn.scale_decouple(distr_args, loc=shift[..., None],
                                         scale=scale[..., None])

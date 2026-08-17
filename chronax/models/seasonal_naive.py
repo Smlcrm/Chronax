@@ -96,6 +96,7 @@ class SeasonalNaive(BaseForecaster):
             dict: Dictionary with entries `mean` for point predictions and
                 `level_*` for probabilistic predictions.
         """
+        self._require_fitted()
         del X
         mean = _repeat_val_seas(season_vals=self.model_["mean"], h=h)
         res: ForecastDict = {"mean": mean}

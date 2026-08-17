@@ -274,6 +274,7 @@ class AutoETS(BaseForecaster):
         Returns:
             dict: Dictionary with entries `mean` for point predictions and `level_*` for probabilistic predictions.
         """
+        self._require_fitted()
         self._validate_h(h)
         self._validate_level(level)
         if not hasattr(self, "model_"):

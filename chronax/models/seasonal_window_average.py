@@ -248,6 +248,7 @@ class SeasonalWindowAverage(BaseForecaster):
         Raises:
             Exception: If level is requested but prediction_intervals is None
         """
+        self._require_fitted()
         # Tile stored seasonal pattern to cover horizon h
         mean = utils._repeat_val_seas(self.model_["mean"], h)
         res = {"mean": mean}

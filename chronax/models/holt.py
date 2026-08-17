@@ -250,12 +250,10 @@ def _select_and_fit(y, l0, b0, is_additive, fit_mode, fixed_phi, n_iters):
 
     fit_mode ∈ {_MODE_AAN, _MODE_AADN, _MODE_AUTO}.
     - AAN  : φ≡1 (pure undamped Holt).
-    - AADN : if an explicit phi was given (legacy API: "phi used only if
-      damped=True"), fit the undamped Holt and damp only the
-      extrapolation (classical damped-trend method — guarantees the
-      damped long-horizon forecast lies below the undamped one for a
-      shared positive trend); else φ is optimised in [_PHI_LOWER,
-      _PHI_UPPER] (proper AAdN recursion).
+    - AADN : if an explicit phi was given, the AAdN recursion runs AT that
+      fixed φ (states and smoothing parameters are optimised under the
+      damping the forecasts will use); else φ is optimised in
+      [_PHI_LOWER, _PHI_UPPER].
     - AUTO : fit AAN and free-φ AAdN, keep the lower-AICc one via a pure
       ``jnp.where`` over the (structurally identical) result pytrees —
       fully vmap/jit-safe (= statsforecast Holt).
@@ -267,12 +265,9 @@ def _select_and_fit(y, l0, b0, is_additive, fit_mode, fixed_phi, n_iters):
         if fixed_phi is None:
             return _fit_one_candidate(y, l0, b0, is_additive, True,
                                       1.0, n_iters)
-        # Explicit fixed φ: classical damped extrapolation of the Holt
-        # (undamped) fit — shares (α,β,l0,b0,states), only φ differs.
-        res = _fit_one_candidate(y, l0, b0, is_additive, False,
-                                 1.0, n_iters)
-        res['phi'] = jnp.asarray(fixed_phi, y.dtype)
-        return res
+        # Explicit fixed φ: the recursion itself runs damped at that φ.
+        return _fit_one_candidate(y, l0, b0, is_additive, False,
+                                  float(fixed_phi), n_iters)
     # AUTO: fit both (free-φ damped), branchless min-AICc.
     res_u = _fit_one_candidate(y, l0, b0, is_additive, False,
                                1.0, n_iters)
@@ -372,13 +367,23 @@ class Holt(BaseForecaster):
                                   self.phi, self._n_iters)
         result = fit(y, l0, b0)
 
-        # k for σ̂ dof: α,β,l0,b0 (+φ if the selected model is damped).
-        # |φ−1|<1e-7 ⇒ undamped (k=4) else damped (k=5); branchless so
-        # vmap-safe.
+        # σ̂ dof matches the reference AAN/AAdN convention (n − 6 undamped,
+        # n − 7 damped); |φ−1|<1e-7 ⇒ undamped, branchless so vmap-safe.
+        # Multiplicative error uses RELATIVE residuals (the M-error sigma is
+        # dimensionless; the interval formula multiplies by |mean| once).
         near1 = jnp.abs(result['phi'] - 1.0) < 1e-7
-        k = jnp.where(near1, 4, 5)
-        result['sigma'] = utils.calculate_sigma(
-            result['residuals'], jnp.maximum(len(y) - k, 1))
+        k = jnp.where(near1, 6, 7)
+        dof = jnp.maximum(len(y) - k, 1)
+        if self.error_type == 'M':
+            denom_f = jnp.where(
+                jnp.abs(result['fitted']) > _EPSILON,
+                result['fitted'],
+                jnp.asarray(1.0, y.dtype),
+            )
+            rel_resid = result['residuals'] / denom_f
+            result['sigma'] = utils.calculate_sigma(rel_resid, dof)
+        else:
+            result['sigma'] = utils.calculate_sigma(result['residuals'], dof)
         return result
 
     def _generate_forecasts(self, level: float, trend: float, phi, h: int) -> jnp.ndarray:
@@ -572,6 +577,8 @@ class Holt(BaseForecaster):
 
         if len(y) < 2:
             raise ValueError(f"Time series must have at least 2 observations, got {len(y)}")
+        if self.error_type == 'M' and bool(jnp.any(y <= 0)):
+            raise ValueError("Multiplicative error requires strictly positive data.")
 
         result = self._fit_parameters(y)
         result['y_train'] = y  # Store for conformal prediction

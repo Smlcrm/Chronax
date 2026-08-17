@@ -345,6 +345,19 @@ class TestTraining:
         out = jax.vmap(run)(jnp.arange(2))
         assert out.shape == (2, 3) and bool(jnp.all(jnp.isfinite(out)))
 
+    def test_train_with_hist_exog_is_vmap_traceable(self):
+        # Conformal never exercises the hist path (temporal exog -> native
+        # intervals), but rule 2 still requires the forward+train to trace.
+        T, F = 60, 2
+        hist = jnp.asarray(np.random.RandomState(0).randn(T, F), jnp.float32)
+        def run(seed):
+            net = _tnet(hist_exog_size=F)
+            return train(net, _make_y(T), h=4, input_size=12, max_steps=3,
+                         windows_batch_size=16, lr=1e-3, num_lr_decays=0, seed=seed,
+                         loss_fn=mae, scaler=RobustScaler(), hist_exog=hist)
+        out = jax.vmap(run)(jnp.arange(2))
+        assert out.shape == (2, 3) and bool(jnp.all(jnp.isfinite(out)))
+
     def test_divergence_guard_raises(self):
         net = _tnet()
         with pytest.raises(RuntimeError, match="diverged"):
@@ -476,6 +489,66 @@ class TestNHITSModel:
         assert out["mean"].shape == (4,)
         with pytest.raises(ValueError, match="futr_exog"):
             m.predict(h=4)
+
+    def test_hist_exog_fit_predict(self):
+        # Historical exog (X): each block pools it at the stack rate and
+        # concatenates onto the pooled input; predict needs no future X.
+        rng = np.random.RandomState(0)
+        T, F = 60, 2
+        X = jnp.asarray(rng.randn(T, F), jnp.float32)
+        m = _tiny().fit(_make_y(T), X=X)
+        # block 0 (k=2, L=12): pooled=ceil(12/2)=6, first_in = 6 + F*6.
+        b0 = m.model_.blocks[0]
+        assert m._hist_size == F and b0.layers[0].in_features == 6 + F * 6
+        out = m.predict(h=4)
+        assert out["mean"].shape == (4,) and bool(jnp.all(jnp.isfinite(out["mean"])))
+
+    def test_hist_and_futr_exog_together(self):
+        rng = np.random.RandomState(1)
+        T, Fh, Ff = 60, 2, 3
+        X = jnp.asarray(rng.randn(T, Fh), jnp.float32)
+        xf = jnp.asarray(rng.randn(T, Ff), jnp.float32)
+        m = _tiny().fit(_make_y(T), X=X, futr_exog=xf)
+        out = m.predict(h=4, futr_exog=jnp.asarray(rng.randn(4, Ff), jnp.float32))
+        assert out["mean"].shape == (4,)
+
+    def test_hist_exog_2d_panel_shared(self):
+        rng = np.random.RandomState(2)
+        T, F, N = 60, 2, 3
+        y = jnp.asarray(rng.randn(T, N), jnp.float32)
+        X = jnp.asarray(rng.randn(T, F), jnp.float32)
+        out = _tiny().fit(y, X=X).predict(h=4)
+        assert out["mean"].shape == (4, N)
+
+    def test_hist_exog_misaligned_raises(self):
+        X = jnp.asarray(np.random.RandomState(0).randn(50, 2), jnp.float32)
+        with pytest.raises(ValueError, match="historical exog.*align"):
+            _tiny().fit(_make_y(60), X=X)
+
+    def test_hist_exog_forecast_threads_X(self):
+        X = jnp.asarray(np.random.RandomState(3).randn(60, 2), jnp.float32)
+        r = _tiny().forecast(_make_y(60), 4, X=X)
+        assert r["mean"].shape == (4,)
+
+    def test_hist_exog_conformal_refused(self):
+        X = jnp.asarray(np.random.RandomState(0).randn(60, 2), jnp.float32)
+        m = _tiny().fit(_make_y(60), X=X)
+        m.conformal_params = ConformalIntervals(n_windows=2, h=4)
+        with pytest.raises(ValueError, match="temporal"):
+            m.predict(h=4, level=[80])
+        with pytest.raises(ValueError, match="temporal"):
+            _tiny().conformity_scores(_make_y(60), X=X)
+
+    def test_hist_exog_gmm_native_intervals_and_pickle(self):
+        # Native (GMM) intervals coexist with hist exog and survive a pickle
+        # round-trip (the hist branch rebuilds from the restored _hist_size).
+        import pickle
+        X = jnp.asarray(np.random.RandomState(0).randn(60, 2), jnp.float32)
+        m = _tiny(loss=GMM(n_components=2)).fit(_make_y(60), X=X)
+        o1 = m.predict(h=4, level=[80])
+        assert {"mean", "lo-80", "hi-80"} <= set(o1)
+        o2 = pickle.loads(pickle.dumps(m)).predict(h=4, level=[80])
+        np.testing.assert_array_equal(np.asarray(o1["mean"]), np.asarray(o2["mean"]))
 
     def test_dropout_fit_and_deterministic_predict(self):
         m = _tiny(dropout_prob_theta=0.3).fit(_make_y())

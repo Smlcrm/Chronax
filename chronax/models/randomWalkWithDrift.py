@@ -115,6 +115,7 @@ class RandomWalkWithDrift(BaseForecaster):
         Returns:
             dict: Dictionary with entries `mean` for point predictions and `level_*` for probabilistic predictions
         """
+        self._require_fitted()
         # Generate forecasts using stored slope and last_y
         forecast_steps = jnp.arange(1, h + 1, dtype=self.model_["last_y"].dtype)
         mean = self.model_["last_y"] + self.model_["slope"] * forecast_steps

@@ -66,6 +66,50 @@ def test_theta():
     print("Theta test passed!")
 
 
+import numpy as np
+from chronax.models.theta import theta_model as _tm
+
+
+def test_autotheta_forward_dispatches_on_winning_variant():
+    # When the auto fit selects a non-STM variant, forward() must re-fit with
+    # THAT variant (dispatch on model_type_int), not the stale fits[0] "STM"
+    # string left by the merge.
+    rng = np.random.default_rng(0)
+    n = 120
+    t = np.arange(n)
+    y = jnp.asarray(10 + 0.5 * t + 5 * np.sin(2 * np.pi * t / 12) + rng.normal(0, 0.5, n),
+                    dtype=jnp.float64)
+    m = AutoTheta(season_length=12)
+    m.fit(y)
+    mt_int = int(m.model_["model_type_int"])
+    # forward with the same series must reproduce the fitted forecast closely
+    # (same variant), which the STM-forced dispatch would not for OTM/DOTM.
+    fc_fit = np.asarray(m.predict(h=6)["mean"])
+    fc_fwd = np.asarray(m.forward(y=y, h=6)["mean"])
+    if mt_int != 1:  # a non-STM winner: STM dispatch would diverge materially
+        np.testing.assert_allclose(fc_fwd, fc_fit, rtol=0.05)
+
+
+def test_autotheta_mc_intervals_finite_and_ordered():
+    rng = np.random.default_rng(1)
+    n = 120
+    t = np.arange(n)
+    y = jnp.asarray(20 + 0.3 * t + 4 * np.sin(2 * np.pi * t / 12) + rng.normal(0, 0.5, n),
+                    dtype=jnp.float64)
+    m = AutoTheta(season_length=12)
+    m.fit(y)
+    out = m.predict(h=8, level=[80, 95])
+    for k in ("lo-80", "hi-80", "lo-95", "hi-95"):
+        assert np.all(np.isfinite(np.asarray(out[k])))
+    assert np.all(np.asarray(out["lo-95"]) <= np.asarray(out["lo-80"]))
+    assert np.all(np.asarray(out["hi-80"]) <= np.asarray(out["hi-95"]))
+
+
+def test_theta_model_compat_shim_resolves():
+    assert _tm.AutoTheta is AutoTheta
+    assert _tm.Theta is Theta
+
+
 if __name__ == "__main__":
     test_autotheta()
     test_theta()

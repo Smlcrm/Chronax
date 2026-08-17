@@ -251,6 +251,7 @@ class SeasonalExponentialSmoothing(BaseForecaster):
         Raises:
             Exception: If level is requested but ``prediction_intervals`` is None.
         """
+        self._require_fitted()
         mean = _repeat_val_seas(self.model_["mean"], h=h)
         res = {"mean": mean}
         if level is None:

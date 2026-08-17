@@ -48,7 +48,7 @@ import jax.random as jrand
 from jax import lax
 
 from . import ets_backend as _ets
-from chronax.utils import _calculate_intervals, results
+from chronax.utils import _calculate_intervals, results, seasonal_decompose
 
 # Global variables
 _smalno = jnp.finfo(float).eps
@@ -296,62 +296,6 @@ def _etssimulate_jit(
     return y
 
 
-def etssimulate(
-    x: jnp.ndarray,
-    m: int,
-    error: _ets.Component,
-    trend: _ets.Component,
-    season: _ets.Component,
-    alpha: float,
-    beta: float,
-    gamma: float,
-    phi: float,
-    h: int,
-    y: jnp.ndarray,
-    e: jnp.ndarray,
-) -> jnp.ndarray:
-    """Simulate *h*-step future sample paths from a given ETS state.
-
-    Thin convenience wrapper around the JIT-compiled
-    :func:`_etssimulate_jit`; the ``y`` argument is unused (output is
-    returned from the inner function).
-
-    Parameters
-    ----------
-    x : jnp.ndarray
-        State vector (level [+ trend] [+ seasonal]).
-    m : int
-        Seasonal period.
-    error, trend, season : _ets.Component
-        Model structure flags.
-    alpha, beta, gamma, phi : float
-        Smoothing parameters.
-    h : int
-        Forecast horizon.
-    y : jnp.ndarray
-        Pre-allocated output buffer (*unused* — kept for API parity).
-    e : jnp.ndarray
-        Innovation draws of length ``h`` (e.g. from ``N(0, σ)``).
-
-    Returns
-    -------
-    jnp.ndarray
-        Simulated future path of length ``h``.
-    """
-    y = _etssimulate_jit(
-        x,
-        m,
-        error,
-        trend,
-        season,
-        alpha,
-        beta,
-        gamma,
-        phi,
-        h,
-        e,
-    )
-    return y
 
 
 @partial(jax.jit, static_argnames=("m", "trend", "season", "h"))
@@ -556,48 +500,6 @@ def _initparam_impl(
     return {"alpha": alpha, "beta": beta, "gamma": gamma, "phi": phi}, lower, upper
 
 
-def _polyroots_power_basis(coeff_power_inc: jnp.ndarray) -> jnp.ndarray:
-    """
-    Compute the roots of a polynomial in power basis with increasing coefficients.
-
-    Parameters
-    ----------
-    coeff_power_inc : jnp.ndarray
-        Coefficients [c0, c1, ..., cN] representing P(x)=c0+c1 x+...+cN x^N.
-
-    Returns
-    -------
-    jnp.ndarray (complex128)
-        Eigenvalues of the companion matrix (the polynomial roots).
-    """
-    c = jnp.asarray(coeff_power_inc, dtype=jnp.float64)
-    n = c.shape[0] - 1
-    if n <= 0:
-        return jnp.array([], dtype=jnp.complex128)
-    # Highest degree coefficient
-    a_n = c[-1]
-    # Handle degenerate
-    if jnp.isclose(a_n, 0.0):
-        # trim trailing zeros
-        idx = jnp.where(jnp.abs(c[::-1]) > 0)[0]
-        if idx.size == 0:
-            return jnp.array([], dtype=jnp.complex128)
-        k = int(idx[0])
-        c = c[: c.shape[0] - k]
-        n = c.shape[0] - 1
-        if n <= 0:
-            return jnp.array([], dtype=jnp.complex128)
-        a_n = c[-1]
-    # normalize to monic
-    c_monic = c / a_n
-    # Companion matrix for x^n + c_{n-1} x^{n-1} + ... + c0
-    # Build with JAX
-    C = jnp.zeros((n, n), dtype=jnp.float64)
-    C = C.at[1:, :-1].set(jnp.eye(n - 1, dtype=jnp.float64))
-    C = C.at[0, :].set(-c_monic[:-1][::-1])
-    # eigenvalues
-    evals = jnp.linalg.eigvals(C.astype(jnp.complex128))
-    return evals
 
 
 def admissible(alpha: float, beta: float, gamma: float, phi: float, m: int) -> bool:
@@ -633,18 +535,15 @@ def admissible(alpha: float, beta: float, gamma: float, phi: float, m: int) -> b
             return False
         if beta < -(1 - phi) * (gamma / m + alpha):
             return False
-        # Characteristic-equation check via companion-matrix roots, routed
-        # through the jitted mirror behind a host memo: the eager build plus
-        # `_polyroots_power_basis` eigvals and a float() sync runs once per SEASONAL
-        # candidate per fit on purely config-derived inputs (start values + default
-        # bounds), so without the memo repeat fits re-pay an identical verdict.
-        # `_admissible_root_ok`
-        # builds the SAME monic polynomial and applies the SAME <= 1+1e-10
-        # boundary (complement-exact for non-NaN moduli; a NaN modulus — LAPACK
-        # non-convergence or NaN params, unreachable from finite start values —
-        # now maps to inadmissible, the safer direction, where the old `>` test
-        # mapped it admissible). The memo makes every fit after the first free
-        # (maxsize bounds growth if data-derived floats ever reach this path).
+        # Characteristic-equation check via companion-matrix roots, behind a
+        # host memo: `_admissible_root_ok` builds the monic polynomial and runs
+        # `jnp.linalg.eigvals` + a float() sync once per SEASONAL candidate per
+        # fit, on purely config-derived inputs (start values + default bounds),
+        # so the memo lets repeat fits skip an identical verdict. The <= 1+1e-10
+        # boundary is complement-exact for non-NaN moduli; a NaN modulus (LAPACK
+        # non-convergence or NaN params, unreachable from finite start values)
+        # maps to inadmissible, the safer direction. maxsize bounds growth if
+        # data-derived floats ever reach this path.
         if not _admissible_root_cached(
                 float(alpha), float(beta), float(gamma), float(phi), int(m)):
             return False
@@ -796,67 +695,6 @@ def _valid_params_jnp(
     return ok
 
 
-@partial(jax.jit, static_argnames=("m", "multiplicative"))
-def _seasonal_decompose_jax(
-    y: jnp.ndarray,
-    m: int,
-    multiplicative: bool,
-) -> Dict[str, jnp.ndarray]:
-    """Lightweight JAX-native seasonal decomposition for ETS state initialisation.
-
-    Computes a centred moving-average trend proxy and derives seasonal
-    patterns from the de-trended residuals (additive) or ratios
-    (multiplicative).
-
-    Parameters
-    ----------
-    y : jnp.ndarray
-        Observed series.
-    m : int
-        Seasonal period.
-    multiplicative : bool
-        If ``True``, decompose as ``y / trend``; otherwise ``y − trend``.
-
-    Returns
-    -------
-    dict[str, jnp.ndarray]
-        ``{"seasonal": …, "trend": …}`` arrays aligned with ``y``.
-    """
-    y = jnp.asarray(y, dtype=jnp.float64)
-    n = y.shape[0]
-    m_eff = max(int(m), 1)
-
-    # Centered moving-average trend proxy
-    w = jnp.ones((m_eff,), dtype=jnp.float64) / float(m_eff)
-    trend = jnp.convolve(y, w, mode="same")
-    if (m_eff % 2) == 0:
-        trend = jnp.convolve(trend, jnp.array([0.5, 0.5], dtype=jnp.float64), mode="same")
-
-    if multiplicative:
-        trend_safe = jnp.where(jnp.abs(trend) > 1e-8, trend, 1e-8)
-        detrended = y / trend_safe
-    else:
-        detrended = y - trend
-
-    n_periods = n // m_eff
-    n_full = n_periods * m_eff
-
-    def _seasonal_from_matrix() -> jnp.ndarray:
-        """Compute a repeated seasonal template from full seasonal blocks."""
-        mat = detrended[:n_full].reshape((n_periods, m_eff))
-        pat = jnp.mean(mat, axis=0)
-        rep = jnp.tile(pat, n // m_eff + 1)[:n]
-        if multiplicative:
-            return rep / jnp.where(jnp.abs(jnp.mean(rep)) > 1e-8, jnp.mean(rep), 1.0)
-        return rep - jnp.mean(rep)
-
-    seasonal = lax.cond(
-        n_periods >= 1,
-        lambda _: _seasonal_from_matrix(),
-        lambda _: jnp.ones((n,), dtype=jnp.float64) if multiplicative else jnp.zeros((n,), dtype=jnp.float64),
-        operand=None,
-    )
-    return {"seasonal": seasonal, "trend": trend}
 
 
 def initstate(y: jnp.ndarray, m: int, trendtype: str, seasontype: str) -> jnp.ndarray:
@@ -897,7 +735,11 @@ def initstate(y: jnp.ndarray, m: int, trendtype: str, seasontype: str) -> jnp.nd
                 seasonal = seasonal / jnp.maximum(jnp.mean(seasonal), 1e-8)
                 y_d = {"seasonal": seasonal}
         else:
-            y_d = _seasonal_decompose_jax(y, m, seasontype == "M")
+            y_d = seasonal_decompose(
+                y,
+                model="multiplicative" if seasontype == "M" else "additive",
+                period=m,
+            )
         init_seas = y_d["seasonal"][1:m][::-1]
         if n < 5 * m:
             if n < 2 * m:
@@ -1969,7 +1811,11 @@ def ets_f(
         seasontype = ["N", "A", "M"]
     else:
         seasontype = [seasontype]
-    prefer_damped_small_n = auto_model and n < 200
+    # The small-n damped preference prunes UNDAMPED trend candidates in favour
+    # of their damped twins; it must only fire when damping is being searched
+    # (damped is None). An explicit damped=False otherwise deletes every trend
+    # candidate, degenerating the grid to level/seasonal-only models.
+    prefer_damped_small_n = auto_model and n < 200 and (damped is None)
     force_additive_error = auto_model and n < 80
     if damped is None:
         damped_opts = [True, False]

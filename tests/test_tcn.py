@@ -280,6 +280,21 @@ def test_train_is_vmap_traceable():
     assert out.shape == (3, 4) and bool(jnp.all(jnp.isfinite(out)))
 
 
+def test_train_with_hist_exog_is_vmap_traceable():
+    # Conformal never exercises the hist path (temporal exog -> native intervals),
+    # but rule 2 still requires the forward+train to trace.
+    y = _make_y()
+    hist = jnp.asarray(np.random.RandomState(0).randn(y.shape[0], 2), jnp.float32)
+    def run(seed):
+        net = TCNNet(h=12, input_size=36, hist_exog_size=2, encoder_hidden_size=8,
+                     decoder_hidden_size=8, rngs=nnx.Rngs(0))
+        return train(net, y, h=12, input_size=36, max_steps=4, windows_batch_size=16,
+                     lr=1e-3, seed=seed, loss_fn=resolve("mae"),
+                     scaler=resolve_scaler("identity"), hist_exog=hist)
+    out = jax.vmap(run)(jnp.arange(3))
+    assert out.shape == (3, 4) and bool(jnp.all(jnp.isfinite(out)))
+
+
 # === Model ===
 
 from chronax.models.base_forecaster import BaseForecaster  # noqa: E402
@@ -431,11 +446,6 @@ def test_predict_before_fit_raises():
         _tiny().predict(h=12)
 
 
-def test_fit_X_not_implemented():
-    with pytest.raises(NotImplementedError, match="futr_exog"):
-        _tiny().fit(_make_y(), X=jnp.ones((200, 1), jnp.float32))
-
-
 def test_repeated_predict_identical():
     m = _tiny().fit(_make_y())
     a = np.asarray(m.predict(h=12)["mean"])
@@ -464,6 +474,68 @@ def test_futr_exog_fit_predict_shapes():
     out = m.predict(h=12, futr_exog=jnp.asarray(np.random.RandomState(2).randn(12, 2), jnp.float32))
     assert out["mean"].shape == (12,)
     assert bool(jnp.all(jnp.isfinite(out["mean"])))
+
+
+def test_hist_exog_fit_predict():
+    # Historical exog (X): joins the encoder channels over the input span;
+    # predict needs no future X (encoder-only, not in the decoder residual).
+    y = _make_y(240)
+    X = jnp.asarray(np.random.RandomState(1).randn(y.shape[0], 2), jnp.float32)
+    m = _tiny(max_steps=10).fit(y, X=X)
+    # encoder in_channels = 1 + hist; decoder input = encoder_hidden + 0 (hist
+    # is encoder-only, so the decoder is untouched).
+    assert m._hist_size == 2
+    assert m.model_.hist_encoder.layers[0].weight.value.shape[1] == 1 + 2
+    assert m.model_.mlp_decoder.layers[0].in_features == m.encoder_hidden_size
+    out = m.predict(h=12)
+    assert out["mean"].shape == (12,) and bool(jnp.all(jnp.isfinite(out["mean"])))
+
+
+def test_hist_and_futr_exog_together():
+    # Encoder sees 1 + hist + futr channels; decoder residual carries futr only.
+    y = _make_y(240)
+    X = jnp.asarray(np.random.RandomState(1).randn(y.shape[0], 2), jnp.float32)
+    xf = jnp.asarray(np.random.RandomState(2).randn(y.shape[0], 3), jnp.float32)
+    m = _tiny(max_steps=10).fit(y, X=X, futr_exog=xf)
+    assert m.model_.hist_encoder.layers[0].weight.value.shape[1] == 1 + 2 + 3
+    assert m.model_.mlp_decoder.layers[0].in_features == m.encoder_hidden_size + 3
+    out = m.predict(h=12, futr_exog=jnp.asarray(np.random.RandomState(3).randn(12, 3), jnp.float32))
+    assert out["mean"].shape == (12,)
+
+
+def test_hist_exog_misaligned_raises():
+    y = _make_y(240)
+    X = jnp.asarray(np.random.RandomState(1).randn(y.shape[0] - 5, 2), jnp.float32)
+    with pytest.raises(ValueError, match="historical exog.*align"):
+        _tiny(max_steps=5).fit(y, X=X)
+
+
+def test_hist_exog_forecast_threads_X():
+    y = _make_y(240)
+    X = jnp.asarray(np.random.RandomState(1).randn(y.shape[0], 2), jnp.float32)
+    r = _tiny(max_steps=10).forecast(y, 12, X=X)
+    assert r["mean"].shape == (12,)
+
+
+def test_hist_exog_conformal_refused():
+    # Temporal exog -> native (quantile) intervals only; conformal is refused
+    # both at predict(level=) and conformity_scores(X=).
+    y = _make_y(240)
+    X = jnp.asarray(np.random.RandomState(1).randn(y.shape[0], 2), jnp.float32)
+    m = _tiny(max_steps=10).fit(y, X=X)
+    m.conformal_params = ConformalIntervals(h=12, n_windows=3)
+    with pytest.raises(ValueError, match="temporal"):
+        m.predict(h=12, level=[80])
+    with pytest.raises(ValueError, match="temporal"):
+        _tiny(max_steps=5).conformity_scores(y, X=X)
+
+
+def test_hist_exog_mq_native_intervals():
+    y = _make_y(240)
+    X = jnp.asarray(np.random.RandomState(1).randn(y.shape[0], 2), jnp.float32)
+    m = _tiny(max_steps=10, loss=MultiQuantileLoss([0.1, 0.5, 0.9])).fit(y, X=X)
+    out = m.predict(h=12, level=[80])
+    assert {"mean", "lo-80", "hi-80"} <= set(out)
 
 
 def test_futr_required_at_predict_raises():

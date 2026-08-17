@@ -41,6 +41,16 @@ def build_windows(y: jnp.ndarray, input_size: int, h: int) -> tuple[jnp.ndarray,
     return y_pad[idx], target_mask
 
 
+def build_exog_windows(arr: jnp.ndarray, input_size: int, h: int, n_windows: int) -> jnp.ndarray:
+    """Rolling input-span windows of a historical-exog array ``[T, X]``,
+    right-padded with ``h`` zero rows to align with ``build_windows``. Returns
+    ``[n, input_size, X]`` (TimeXer's covariates are historical-only, so only the
+    input span is needed). Covariates are fed to the network raw."""
+    arr_pad = jnp.concatenate([arr, jnp.zeros((h, arr.shape[1]), arr.dtype)])
+    idx = jnp.arange(input_size)[None, :] + jnp.arange(n_windows)[:, None]
+    return arr_pad[idx]
+
+
 # Elementwise forms of the registry point losses, for masked reduction
 # (sum(loss*mask)/sum(mask)). Keyed by the registry function OBJECTS so a
 # custom callable that shares a name falls through to the custom branch.
@@ -53,15 +63,17 @@ _ELEMENTWISE = {
 
 def forward_loss(model: TimeXerNet, y_windows: jnp.ndarray,
                  target_mask: jnp.ndarray | None = None, *, h: int,
-                 input_size: int, loss_fn: LossFn) -> jnp.ndarray:
+                 input_size: int, loss_fn: LossFn,
+                 hist_windows: jnp.ndarray | None = None) -> jnp.ndarray:
     """Forward + masked point loss in ORIGINAL scale.
 
     ``y_windows [B, input_size+h]``; the univariate series carries a channel
-    dim of 1 into the N-generic network.
+    dim of 1 into the N-generic network. ``hist_windows [B, input_size, X]`` are
+    the raw historical covariates for the input span (None when absent).
     """
     insample = y_windows[:, :input_size][..., None]     # [B, L, 1]
     target = y_windows[:, input_size:]                  # [B, h]
-    pred = model(insample, deterministic=False)[..., 0]  # [B, h]
+    pred = model(insample, hist_exog=hist_windows, deterministic=False)[..., 0]  # [B, h]
     if target_mask is None:
         target_mask = jnp.ones_like(target)
     ew = _ELEMENTWISE.get(loss_fn)
@@ -88,15 +100,17 @@ def _finite_or_raise(losses: jnp.ndarray) -> jnp.ndarray:
 
 def train(model: TimeXerNet, y: jnp.ndarray, *, h: int, input_size: int,
           max_steps: int, windows_batch_size: int, lr, seed: int,
-          loss_fn: LossFn) -> jnp.ndarray:
+          loss_fn: LossFn, hist_exog: jnp.ndarray | None = None) -> jnp.ndarray:
     """Train ``model`` in place via one ``nnx.scan``. Returns per-step losses.
 
     Window sampling replicates the reference's regime-dependent scheme: with
     fewer windows than ``windows_batch_size`` indices are drawn WITH
     replacement, otherwise a without-replacement permutation slice.
+    ``hist_exog [T, X]`` supplies raw historical covariates when present.
     """
     y_windows, target_mask = build_windows(y, input_size, h)
     n = y_windows.shape[0]
+    hist_w = build_exog_windows(hist_exog, input_size, h, n) if hist_exog is not None else None
     step_keys = jax.random.split(jax.random.PRNGKey(seed), max_steps)
     if n < windows_batch_size:
         sample = lambda k: jax.random.choice(k, n, shape=(windows_batch_size,), replace=True)
@@ -104,7 +118,7 @@ def train(model: TimeXerNet, y: jnp.ndarray, *, h: int, input_size: int,
         sample = lambda k: jax.random.permutation(k, n)[:windows_batch_size]
     batch_idx = jax.vmap(sample)(step_keys)             # [max_steps, B]
     optimizer = nnx.Optimizer(model, _adam(lr), wrt=nnx.Param)
-    losses = _train_scan(model, optimizer, y_windows, target_mask, batch_idx,
+    losses = _train_scan(model, optimizer, y_windows, target_mask, batch_idx, hist_w,
                          h=h, input_size=input_size, loss_fn=loss_fn)
     return _finite_or_raise(losses)
 
@@ -118,7 +132,7 @@ def _adam(lr: float):
 
 
 @functools.partial(nnx.jit, static_argnames=("h", "input_size", "loss_fn"))
-def _train_scan(model, optimizer, y_windows, target_mask, batch_idx,
+def _train_scan(model, optimizer, y_windows, target_mask, batch_idx, hist_windows,
                 *, h, input_size, loss_fn):
     """The whole training loop as one cached program.
 
@@ -133,9 +147,11 @@ def _train_scan(model, optimizer, y_windows, target_mask, batch_idx,
     @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
     def step(carry, idx):
         model, opt = carry
+        hb = hist_windows[idx] if hist_windows is not None else None
         loss, grads = nnx.value_and_grad(
             lambda m: forward_loss(m, y_windows[idx], target_mask[idx], h=h,
-                                   input_size=input_size, loss_fn=loss_fn))(model)
+                                   input_size=input_size, loss_fn=loss_fn,
+                                   hist_windows=hb))(model)
         opt.update(grads)
         return (model, opt), loss
 
@@ -144,16 +160,19 @@ def _train_scan(model, optimizer, y_windows, target_mask, batch_idx,
 
 
 @nnx.jit
-def _forward_det(model: TimeXerNet, x: jnp.ndarray) -> jnp.ndarray:
+def _forward_det(model: TimeXerNet, x: jnp.ndarray, hist: jnp.ndarray | None) -> jnp.ndarray:
     """Inference-mode forward (dropout disabled). Cached across calls; the
     value-equal initializers keep same-config graphdefs cache-equal across
     refits."""
-    return model(x, deterministic=True)
+    return model(x, hist_exog=hist, deterministic=True)
 
 
-def predict_step(model: TimeXerNet, y: jnp.ndarray, *, h: int, input_size: int) -> jnp.ndarray:
+def predict_step(model: TimeXerNet, y: jnp.ndarray, *, h: int, input_size: int,
+                 hist_full: jnp.ndarray | None = None) -> jnp.ndarray:
     """Forecast next ``h`` steps from the final ``input_size`` of ``y``.
-    Returns ``[h, mult]`` in original scale (the net denormalizes internally)."""
+    Returns ``[h, mult]`` in original scale (the net denormalizes internally).
+    ``hist_full [input_size, X]`` supplies the raw covariate context."""
     x = y[-input_size:][None, :, None]                  # [1, L, 1]
-    pred = _forward_det(model, x)                       # [1, h, mult]
+    hist = None if hist_full is None else hist_full[None]  # [1, L, X]
+    pred = _forward_det(model, x, hist)                 # [1, h, mult]
     return pred[0]

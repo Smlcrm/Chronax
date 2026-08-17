@@ -348,3 +348,46 @@ def test_holt_winters():
 
 if __name__ == '__main__':
     test_holt_winters()
+
+def test_native_interval_matches_hyndman_formula():
+    # Self-consistency oracle: interval widths must follow the class-1 AAA
+    # variance with the INNOVATIONS parameters derived from the stored
+    # classical ones.
+    import numpy as np
+    import jax.numpy as jnp
+    from chronax.models import HoltWinters
+    rng = np.random.default_rng(2)
+    n, mlen = 120, 12
+    t0 = np.arange(n)
+    y = jnp.asarray(50 + 0.3 * t0 + 8 * np.sin(2 * np.pi * t0 / mlen) + rng.normal(0, 1, n),
+                    dtype=jnp.float64)
+    m = HoltWinters(season_length=mlen, error_type='A', season_type='A')
+    m.fit(y)
+    h = 24
+    out = m.predict(h=h, level=[95])
+    from chronax.utils import _quantiles
+    z = float(_quantiles((95,))[0])
+    width = (np.asarray(out["hi-95"]) - np.asarray(out["mean"])) / z
+    alpha = float(m.model_["alpha"]); beta_c = float(m.model_["beta"])
+    gamma_c = float(m.model_["gamma"]); sigma = float(m.model_["sigma"])
+    beta_i = alpha * beta_c
+    gamma_i = gamma_c * (1 - alpha)
+    t = np.arange(1, h + 1)
+    exp1 = alpha**2 + alpha * beta_i * t + (1 / 6) * beta_i**2 * t * (2 * t - 1)
+    hm = (t - 1) // mlen
+    seas = gamma_i * hm * (2 * alpha + gamma_i + beta_i * mlen * (hm + 1))
+    ref = sigma * np.sqrt(1 + (t - 1) * exp1 + seas)
+    np.testing.assert_allclose(width, ref, rtol=1e-6)
+
+
+def test_short_series_native_interval_raises_not_zero_width():
+    import numpy as np
+    import jax.numpy as jnp
+    import pytest
+    from chronax.models import HoltWinters
+    mlen = 12
+    y = jnp.asarray(50 + 8 * np.sin(2 * np.pi * np.arange(15) / mlen), dtype=jnp.float64)
+    m = HoltWinters(season_length=mlen)
+    m.fit(y)
+    with pytest.raises(ValueError):
+        m.predict(h=6, level=[95])

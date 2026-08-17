@@ -276,7 +276,6 @@ class STL(BaseForecaster):
                 - lo-{level} (jnp.ndarray): Lower prediction interval for each level, if level is provided.
                 - hi-{level} (jnp.ndarray): Upper prediction interval for each level, if level is provided.
         """
-        y = self.model_["y"]
         mean = self.model_["trend"] + self.model_["seasonal"]
         out = {"mean": mean}
         if self.fitted:
@@ -285,8 +284,14 @@ class STL(BaseForecaster):
             out["seasonal"] = self.model_["seasonal"]
             out["remainder"] = self.model_["remainder"]
         if level:
-            cs = self.conformity_scores(y)
-            out = self.add_confidence_intervals(out, cs, level, "conformal_distribution")
+            # In-sample intervals come from the residual (remainder) scale —
+            # NOT the CV conformity scores, whose (n_windows, h) shape is
+            # both incompatible with the (n,) fitted mean and semantically an
+            # h-step-ahead quantity.
+            level = sorted(level)
+            sigma = utils.calculate_sigma(self.model_["remainder"],
+                                          self.model_["remainder"].shape[0])
+            out = {**out, **utils._add_fitted_pi_1(mean, sigma, level)}
         return out
 
     def predict(self, h: int, X: jnp.ndarray | None = None, level: list[int | float] | None = None) -> dict:

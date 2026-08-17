@@ -244,8 +244,13 @@ class MSTL(BaseForecaster):
                     out[key] = seas_mat[i]
             out["remainder"] = self.model_["remainder"]
         if level:
-            cs = self.conformity_scores(y)
-            out = self.add_confidence_intervals(out, cs, level, "conformal_distribution")
+            # In-sample intervals from the residual scale (see STL note): CV
+            # conformity scores are (n_windows, h) and cannot broadcast onto
+            # the (n,) fitted mean.
+            level = sorted(level)
+            sigma = utils.calculate_sigma(self.model_["remainder"],
+                                          self.model_["remainder"].shape[0])
+            out = {**out, **utils._add_fitted_pi_1(out["mean"], sigma, level)}
         return out
 
     def predict(self, h: int, X: jnp.ndarray | None = None, level: list[int | float] | None = None) -> dict:
@@ -266,6 +271,7 @@ class MSTL(BaseForecaster):
                 - "mean": Point forecasts (extrapolated trend + repeated seasonals)
                 - "lo-{level}" and "hi-{level}": Conformal prediction interval bounds for each specified level (if level is provided)
         """
+        self._require_fitted()
         h = int(h)
         y = self.model_["y"]
         trend = self.model_["trend"]

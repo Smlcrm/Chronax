@@ -270,6 +270,27 @@ class TestMLPNet:
                      hidden_size=8, outputsize_multiplier=1, rngs=nnx.Rngs(0))
         assert net.mlp[0].kernel.shape[0] == 12 + 3 * (12 + 4)
 
+    def test_first_layer_width_includes_hist_and_futr(self):
+        # NF flatten order/width: input + hist*input + futr*(input+h).
+        net = MLPNet(h=4, input_size=12, hist_exog_size=2, futr_exog_size=3,
+                     num_layers=2, hidden_size=8, outputsize_multiplier=1,
+                     rngs=nnx.Rngs(0))
+        assert net.mlp[0].kernel.shape[0] == 12 + 2 * 12 + 3 * (12 + 4)
+
+    def test_forward_concat_order_hist_before_futr(self):
+        # A weight transplant depends on the flatten order matching the reference
+        # (insample -> hist -> futr): swapping the two exog blocks in the input
+        # must change the output, proving hist and futr occupy distinct columns.
+        net = MLPNet(h=2, input_size=3, hist_exog_size=1, futr_exog_size=1,
+                     num_layers=1, hidden_size=4, outputsize_multiplier=1,
+                     rngs=nnx.Rngs(0))
+        z = jnp.ones((1, 3, 1))
+        hist = jnp.asarray([[[1.0], [2.0], [3.0]]])          # [1, L, 1]
+        futr = jnp.asarray([[[4.0], [5.0], [6.0], [7.0], [8.0]]])  # [1, L+h, 1]
+        a = net(z, hist_exog=hist, futr_exog=futr)
+        b = net(z, hist_exog=futr[:, :3], futr_exog=jnp.concatenate([hist, futr[:, 3:]], axis=1))
+        assert not bool(jnp.allclose(a, b))
+
     def test_forward_shape(self):
         net = MLPNet(h=4, input_size=12, num_layers=2, hidden_size=8,
                      outputsize_multiplier=3, rngs=nnx.Rngs(0))
@@ -367,6 +388,20 @@ class TestMLPTraining:
             return train(net, _make_y(), h=4, input_size=12, max_steps=3,
                          windows_batch_size=16, lr=1e-3, seed=seed,
                          loss_fn=GMM(n_components=1), scaler=IdentityScaler())
+        out = jax.vmap(run)(jnp.arange(2))
+        assert out.shape == (2, 3) and bool(jnp.all(jnp.isfinite(out)))
+
+    def test_train_with_hist_exog_is_vmap_traceable(self):
+        # Conformal never exercises the hist path (temporal exog -> native
+        # intervals), but rule 2 still requires the forward+train to trace.
+        T, F = 60, 2
+        hist = jnp.asarray(np.random.RandomState(0).randn(T, F), jnp.float32)
+        def run(seed):
+            net = MLPNet(h=4, input_size=12, hist_exog_size=F, num_layers=2,
+                         hidden_size=8, outputsize_multiplier=1, rngs=nnx.Rngs(0))
+            return train(net, _make_y(T), h=4, input_size=12, max_steps=3,
+                         windows_batch_size=16, lr=1e-3, seed=seed,
+                         loss_fn=mae, scaler=IdentityScaler(), hist_exog=hist)
         out = jax.vmap(run)(jnp.arange(2))
         assert out.shape == (2, 3) and bool(jnp.all(jnp.isfinite(out)))
 
@@ -534,6 +569,74 @@ class TestMLPModel:
         assert out["mean"].shape == (4,)
         with pytest.raises(ValueError, match="futr_exog"):
             m.predict(h=4)
+
+    def test_hist_exog_fit_predict(self):
+        # Historical exog (X): known only over the input span; predict needs no
+        # future X (uses the last input_size rows stored at fit).
+        rng = np.random.RandomState(0)
+        T, F = 60, 2
+        X = jnp.asarray(rng.randn(T, F), jnp.float32)
+        m = _tiny().fit(_make_y(T), X=X)
+        assert m._hist_size == F and m.model_.mlp[0].kernel.shape[0] == 12 + F * 12
+        out = m.predict(h=4)
+        assert out["mean"].shape == (4,) and bool(jnp.all(jnp.isfinite(out["mean"])))
+
+    def test_hist_and_futr_exog_together(self):
+        rng = np.random.RandomState(1)
+        T, Fh, Ff = 60, 2, 3
+        X = jnp.asarray(rng.randn(T, Fh), jnp.float32)
+        xf = jnp.asarray(rng.randn(T, Ff), jnp.float32)
+        m = _tiny().fit(_make_y(T), X=X, futr_exog=xf)
+        assert m.model_.mlp[0].kernel.shape[0] == 12 + Fh * 12 + Ff * (12 + 4)
+        out = m.predict(h=4, futr_exog=jnp.asarray(rng.randn(4, Ff), jnp.float32))
+        assert out["mean"].shape == (4,)
+
+    def test_hist_exog_2d_panel_shared(self):
+        # A 2-D fit cross-learns one net; hist exog is shared across columns.
+        rng = np.random.RandomState(2)
+        T, F, N = 60, 2, 3
+        y = jnp.asarray(rng.randn(T, N), jnp.float32)
+        X = jnp.asarray(rng.randn(T, F), jnp.float32)
+        out = _tiny().fit(y, X=X).predict(h=4)
+        assert out["mean"].shape == (4, N)
+
+    def test_hist_exog_misaligned_raises(self):
+        X = jnp.asarray(np.random.RandomState(0).randn(50, 2), jnp.float32)
+        with pytest.raises(ValueError, match="historical exog.*align"):
+            _tiny().fit(_make_y(60), X=X)
+
+    def test_hist_exog_forecast_threads_X(self):
+        rng = np.random.RandomState(3)
+        T, F = 60, 2
+        X = jnp.asarray(rng.randn(T, F), jnp.float32)
+        r = _tiny().forecast(_make_y(T), 4, X=X)
+        assert r["mean"].shape == (4,)
+
+    def test_hist_exog_conformal_refused(self):
+        # Temporal exog (hist here) -> native intervals only; conformal is refused
+        # both at predict(level=) and at conformity_scores(X=) (the latter keeps a
+        # passed X out of the base CV vmap, where it could not raise under trace).
+        rng = np.random.RandomState(0)
+        T, F = 60, 2
+        X = jnp.asarray(rng.randn(T, F), jnp.float32)
+        m = _tiny().fit(_make_y(T), X=X)
+        m.conformal_params = ConformalIntervals(n_windows=2, h=4)
+        with pytest.raises(ValueError, match="temporal"):
+            m.predict(h=4, level=[80])
+        with pytest.raises(ValueError, match="temporal"):
+            _tiny().conformity_scores(_make_y(T), X=X)
+
+    def test_hist_exog_gmm_native_intervals_and_pickle(self):
+        # Native (GMM) intervals coexist with hist exog and survive a pickle
+        # round-trip (the hist branch rebuilds from the restored _hist_size).
+        rng = np.random.RandomState(0)
+        T, F = 60, 2
+        X = jnp.asarray(rng.randn(T, F), jnp.float32)
+        m = _tiny(loss=GMM(n_components=2)).fit(_make_y(T), X=X)
+        o1 = m.predict(h=4, level=[80])
+        assert {"mean", "lo-80", "hi-80"} <= set(o1)
+        o2 = pickle.loads(pickle.dumps(m)).predict(h=4, level=[80])
+        np.testing.assert_array_equal(np.asarray(o1["mean"]), np.asarray(o2["mean"]))
 
     def test_rejects_3d_y(self):
         with pytest.raises(ValueError, match="1-D or 2-D"):

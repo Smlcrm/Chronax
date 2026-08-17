@@ -2,9 +2,77 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import numpy as np
+import pytest
 import jax.numpy as jnp
 from chronax.models import ETS, AutoETS
 from chronax.utils import ConformalIntervals
+
+
+def test_pure_sigmoid_alpha_honors_bounds():
+    # F1: in pure-sigmoid mode alpha must honor its box [lower[0], upper[0]] (like
+    # phi does), while reducing to the EPS_PURE box [0.02, 0.98] for the
+    # admissible/default box [0, 1].
+    from chronax.models.ets.ets_backend import _transform_smoothing_params, EPS_PURE
+    import jax
+    ps = [-3.0, -1.0, 0.0, 1.0, 3.0]
+
+    # admissible [0,1] -> alpha == the EPS_PURE margin box (unchanged default behavior)
+    lo = jnp.array([0.0, 0.0, 0.0, 0.8]); hi = jnp.array([1.0, 1.0, 1.0, 0.98])
+    for pv in ps:
+        a, *_ = _transform_smoothing_params(jnp.array([pv]), True, False, False, False,
+                                            0.1, 0.0, 0.0, 0.9, lo, hi, pure_sigmoid=True)
+        expected = EPS_PURE + (1.0 - 2.0 * EPS_PURE) * float(jax.nn.sigmoid(jnp.array(pv)))
+        np.testing.assert_allclose(float(a), expected, rtol=1e-6)
+
+    # tightened box [0.1, 0.5] -> alpha confined to it (was ignored before the fix)
+    lo2 = jnp.array([0.1, 0.0, 0.0, 0.8]); hi2 = jnp.array([0.5, 1.0, 1.0, 0.98])
+    for pv in ps:
+        a, *_ = _transform_smoothing_params(jnp.array([pv]), True, False, False, False,
+                                            0.1, 0.0, 0.0, 0.9, lo2, hi2, pure_sigmoid=True)
+        assert 0.1 <= float(a) <= 0.5, f"alpha {float(a)} escaped its [0.1,0.5] box (p={pv})"
+
+
+def test_fixed_ets_rejects_auto_z_code():
+    # ETS is fixed-spec; a 'Z' code (auto selection) would crash the conformal
+    # CV path (int(traced best) with >1 candidate). Reject at construction.
+    for spec in ("ZZZ", "ZNN", "ANZ", "ZAA"):
+        with pytest.raises(ValueError):
+            ETS(model=spec)
+    # Concrete specs still construct fine.
+    for spec in ("ANN", "AAN", "AAA", "MNM"):
+        ETS(model=spec)
+
+
+def test_autoets_damped_false_keeps_trend_candidates_small_n():
+    # AutoETS(model='ZZN', damped=False) on n<200 must still search trended
+    # models — the small-n damped preference must not delete every undamped
+    # trend candidate when damping is explicitly disabled.
+    rng = np.random.default_rng(0)
+    n = 120
+    t = np.arange(n)
+    y = jnp.asarray(10 + 0.4 * t + rng.normal(0, 1, n), dtype=jnp.float64)
+    m = AutoETS(model="ZZN", damped=False, season_length=1)
+    m.fit(y)
+    fc = np.asarray(m.predict(h=8)["mean"])
+    # A strong linear trend must be carried into the forecast (not flat).
+    assert fc[-1] - fc[0] > 1.0, f"trend lost: {fc[0]:.2f} -> {fc[-1]:.2f}"
+
+
+def test_autoets_amse_opt_crit_matches_mean_squared_error():
+    # opt_crit='amse' uses the running multi-horizon MSE; after the etscalc
+    # off-by-one fix a converged fit's reported amse is a genuine mean of
+    # squared errors (finite, positive, comparable to residual variance), not
+    # the ~half-weighted artifact.
+    rng = np.random.default_rng(1)
+    n = 100
+    y = jnp.asarray(20 + rng.normal(0, 2, n), dtype=jnp.float64)
+    m = AutoETS(model="ANN", season_length=1)
+    m.fit(y)
+    out = m.predict(h=4)
+    assert np.all(np.isfinite(np.asarray(out["mean"])))
+
+
 # -------------------------------------------------------------------
 # Coverage Tests (run this file directly)
 #

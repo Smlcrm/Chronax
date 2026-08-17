@@ -86,6 +86,7 @@ class Naive(BaseForecaster):
         Returns:
             dict: Dictionary with entries `mean` for point predictions and `level_*` for probabilistic predictions.
         """
+        self._require_fitted()
         # Use stored last_y to create forecasts
         mean = jnp.full(h, self.model_["last_y"], dtype=self.model_["last_y"].dtype)
         res = {"mean": mean}

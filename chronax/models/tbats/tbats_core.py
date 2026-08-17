@@ -213,16 +213,15 @@ def find_harmonics(y: jnp.ndarray, m: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
     y = jnp.asarray(y, dtype=jnp.float64)
     n = len(y)
 
-    # Rolling mean via cumsum (replaces pandas)
+    # Rolling mean via cumsum; positions before a full window use the
+    # expanding mean (the reference's min_periods=1 behaviour), which also
+    # covers n < 2m with no special case.
     window_size = 2 * m
-    if n < window_size:  # static: shape vs config
-        f_t = jnp.full(n, jnp.mean(y), dtype=jnp.float64)
-    else:
-        cumsum = jnp.cumsum(jnp.concatenate([jnp.zeros(1, dtype=jnp.float64), y]))
-        indices = jnp.arange(n)
-        lo = jnp.maximum(0, indices + 1 - window_size)
-        hi = indices + 1
-        f_t = (cumsum[hi] - cumsum[lo]) / (hi - lo)
+    cumsum = jnp.cumsum(jnp.concatenate([jnp.zeros(1, dtype=jnp.float64), y]))
+    indices = jnp.arange(n)
+    lo = jnp.maximum(0, indices + 1 - window_size)
+    hi = indices + 1
+    f_t = (cumsum[hi] - cumsum[lo]) / (hi - lo)
 
     z = y - f_t  # detrend
 
@@ -243,10 +242,12 @@ def find_harmonics(y: jnp.ndarray, m: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
         _select_harmonics_fast(z, fourier, max_harmonics, 2), 1
     ).astype(jnp.int32)
 
-    # Deseasonalise with the chosen harmonics (masked columns, static shape)
+    # Deseasonalise: betas are fit on the detrended z, but the returned
+    # series is y minus the SEASONAL fit only (trend intact — the next
+    # period's search re-detrends with its own rolling mean).
     col_mask = (jnp.arange(2 * max_harmonics) < 2 * num_harmonics).astype(fourier.dtype)
     X_best = fourier * col_mask
-    z_deseasonalised = z - X_best @ _ridge_solve(X_best, z, ridge=1e-8)
+    z_deseasonalised = y - X_best @ _ridge_solve(X_best, z, ridge=1e-8)
 
     return num_harmonics, z_deseasonalised
 
@@ -662,7 +663,10 @@ def _run_lbfgs_optim(
 
         if use_trend:
             beta_opt = theta[idx]; idx += 1
-            phi_opt = (theta[idx] if use_damped_trend and idx < theta.size else 1.0)
+            # Damping is admissible only in [0.8, 1] (the reference's box);
+            # clip projects the unconstrained coordinate into it.
+            phi_opt = (jnp.clip(theta[idx], 0.8, 1.0)
+                       if use_damped_trend and idx < theta.size else 1.0)
             if use_damped_trend and idx < theta.size:
                 idx += 1
         else:
@@ -681,9 +685,13 @@ def _run_lbfgs_optim(
 
         if use_boxcox:
             # bc_disabled (non-positive data): fit the RAW series with the raw
-            # seed. Both transform inputs here are finite regardless, so the
-            # unselected branch stays NaN-free and gradients are clean.
-            x0_opt = jnp.where(bc_disabled, x0_hat, _boxcox_raw(x0_utp, lam_opt))
+            # seed. The transform input is swapped to a safe constant on the
+            # disabled lane so the UNSELECTED branch cannot inject NaN into
+            # gradients through the where; on the enabled lane a lambda that
+            # makes a seed component non-transformable yields a NaN -> 1e20
+            # objective and the optimizer backs away from that region.
+            x0_safe = jnp.where(bc_disabled, jnp.ones_like(x0_utp), x0_utp)
+            x0_opt = jnp.where(bc_disabled, x0_hat, _boxcox_raw(x0_safe, lam_opt))
             y_opt = jnp.where(bc_disabled, y_fit, _boxcox_raw(y_pos, lam_opt))
         else:
             x0_opt = x0_hat
@@ -864,9 +872,12 @@ def tbats_model_generator(
 
     # ── Pre-compute quantities for optimiser ───────────────────────────
     if use_boxcox:
-        # lam_init (finite) keeps this seed transform NaN-free; when Box-Cox
-        # is disabled the optimizer bypasses it via the bc_disabled selects.
-        x0_untransformed_pos = _ensure_pos(_inv_boxcox(x0_hat, lam_init))
+        # Raw roundtrip: at lam_init this is exactly the pre-transform seed
+        # (a negative trend slope stays negative). A lambda that later makes
+        # any seed component non-transformable yields a NaN objective, which
+        # the finite-guard scores 1e20 — the optimizer avoids that region
+        # rather than fitting a sign-flipped seed.
+        x0_untransformed_pos = _inv_boxcox(x0_hat, lam_init)
         y_pos_log_sum = jnp.where(
             bc_disabled,
             jnp.asarray(0.0, dtype=dtype),
@@ -916,7 +927,7 @@ def tbats_model_generator(
     if use_trend:
         optim_beta = optim_params[idx]; idx += 1
         if use_damped_trend and idx < optim_params.size:
-            optim_phi = optim_params[idx]; idx += 1
+            optim_phi = jnp.clip(optim_params[idx], 0.8, 1.0); idx += 1
         else:
             optim_phi = jnp.asarray(1.0, dtype=dtype)
     else:
@@ -936,7 +947,9 @@ def tbats_model_generator(
                        optim_ar, optim_ma, p, q, tau, dtype)
 
     if use_boxcox:
-        x0_final = jnp.where(bc_disabled, x0_hat, _boxcox_raw(x0_untransformed_pos, optim_lambda_raw))
+        x0_safe_f = jnp.where(bc_disabled, jnp.ones_like(x0_untransformed_pos),
+                              x0_untransformed_pos)
+        x0_final = jnp.where(bc_disabled, x0_hat, _boxcox_raw(x0_safe_f, optim_lambda_raw))
         y_fit_final = jnp.where(bc_disabled, y, _boxcox_raw(y_pos, optim_lambda_raw))
     else:
         x0_final = x0_hat
@@ -950,8 +963,10 @@ def tbats_model_generator(
     log_likelihood = n_eff * jnp.log(sigma2 + 1e-12)
     if use_boxcox:
         # y_pos_log_sum is already zeroed when the transform is disabled; the
-        # where is belt-and-braces. lam_candidate (not the optimized lambda)
-        # preserves the historical AIC definition on positive data.
+        # where is belt-and-braces. lam_candidate (the Guerrero-init lambda,
+        # not the optimized one) is retained deliberately: the optimized-lambda
+        # form is SF-faithful but the A/B showed it regresses airline/co2-class
+        # holdout selection (IC != holdout) — parked, documented divergence.
         bc_adjustment = 2.0 * (lam_candidate - 1.0) * y_pos_log_sum
         log_likelihood = log_likelihood - jnp.where(bc_disabled, 0.0, bc_adjustment)
 
@@ -1022,6 +1037,28 @@ def tbats_model(
 # Model Selection
 # ═══════════════════════════════════════════════════════════════════════
 
+def _trend_grid(use_trend, use_damped_trend):
+    """Trend/damped candidate combinations. None on either axis means "search
+    both". ⚠ The default (both None) deliberately OMITS the (True, True)
+    damped candidate: A/B on the benchmark showed adding it regresses
+    airline/synth-multi holdout (chronax's damped fit underperforms SF's
+    there) while its AIC wins selection — the IC != holdout class. The
+    damped candidate is only searched when the caller asks for it."""
+    if use_trend is None:
+        if use_damped_trend is None:
+            return [(False, False), (True, False)]
+        if use_damped_trend:
+            return [(True, True)]
+        return [(True, False), (False, False)]
+    if use_trend:
+        if use_damped_trend is None:
+            return [(True, False), (True, True)]
+        if use_damped_trend:
+            return [(True, True)]
+        return [(True, False)]
+    return [(False, False)]
+
+
 def tbats_selection(
     y: jnp.ndarray,
     seasonal_periods: Sequence[int],
@@ -1088,14 +1125,7 @@ def tbats_selection(
     else:
         B = [False]
 
-    if use_trend is None:
-        T = ([(False, False), (True, False)] if use_damped_trend is None
-             else ([(True, True)] if use_damped_trend else [(True, False), (False, False)]))
-    elif use_trend:
-        T = ([(True, False), (True, True)] if use_damped_trend is None
-             else ([(True, True)] if use_damped_trend else [(True, False)]))
-    else:
-        T = [(False, False)]
+    T = _trend_grid(use_trend, use_damped_trend)
 
     combos = [(bcx, t, use_arma_errors) for bcx in B for t in T]
 
@@ -1247,12 +1277,15 @@ def _compute_sigmah_core(
     var0 = jnp.asarray(1.0, dtype=F.dtype)
 
     def body(carry: tuple[jnp.ndarray, jnp.ndarray], _: jnp.ndarray) -> tuple[tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
-        """Accumulate one additional forecast-variance step."""
+        """Accumulate one additional forecast-variance step.
+
+        c_j = w' F^(j-1) g (De Livera et al. 2011): the j-th tail term reads
+        the CURRENT power of F (starting at F^0 = I), then advances it.
+        """
         Fpow, var_acc = carry
-        Fpow_next = F @ Fpow
-        cj = jnp.dot(jnp.dot(w, Fpow_next), g)
+        cj = jnp.dot(jnp.dot(w, Fpow), g)
         var_next = var_acc + cj * cj
-        return (Fpow_next, var_next), var_next
+        return (F @ Fpow, var_next), var_next
 
     init = (jnp.eye(F.shape[1], dtype=F.dtype), var0)
     _, var_tail = lax.scan(body, init, jnp.arange(h - 1))
