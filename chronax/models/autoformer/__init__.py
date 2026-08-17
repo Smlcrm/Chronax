@@ -1,4 +1,14 @@
 """Chronax Autoformer — JAX/Flax/Optax univariate forecaster."""
+import flax
+
+# Pinned to flax 0.10.x — linen TrainState / Module APIs have churned across
+# minor versions. Loud failure here beats silent miscompilation on a newer flax.
+if not flax.__version__.startswith("0.10"):
+    raise ImportError(
+        f"chronax.models.Autoformer is pinned to flax==0.10.x; got flax {flax.__version__}. "
+        f"The linen training loop and TrainState wiring will likely need updates "
+        f"on a newer flax."
+    )
 
 from chronax.models.autoformer.data import (
     RobustScaler,
@@ -8,7 +18,7 @@ from chronax.models.autoformer.data import (
     pad_sequence,
     split_train_val_windows,
 )
-from chronax.models.autoformer.forecaster import AutoformerForecaster
+from chronax.models.autoformer.forecaster import Autoformer, AutoformerForecaster
 from chronax.models.autoformer.loss import (
     LOSSES,
     LossFn,
@@ -38,20 +48,18 @@ from chronax.models.autoformer.train import (
     eval_step,
     eval_window_step,
     make_lr_schedule,
+    predict_step,
     sample_batch_indices,
     should_stop_early,
+    train,
     train_loop,
     train_step,
     train_window_step,
 )
 
-# Public alias expected by the chronax.models registry
-# (`from .autoformer import Autoformer`), matching the iTransformer naming
-# convention where the user-facing class is the bare model name.
-Autoformer = AutoformerForecaster
-
 __all__ = [
     "Autoformer",
+    "AutoformerForecaster",  # deprecated alias
     # Config + model
     "AutoformerConfig",
     "AutoformerModel",
@@ -65,8 +73,6 @@ __all__ = [
     "moving_avg",
     "series_decomp",
     "auto_correlation",
-    # High-level forecaster
-    "AutoformerForecaster",
     # Data utilities
     "RobustScaler",
     "build_windows",
@@ -91,6 +97,8 @@ __all__ = [
     "train_window_step",
     "eval_window_step",
     "train_loop",
+    "train",
+    "predict_step",
     "make_lr_schedule",
     "sample_batch_indices",
     "should_stop_early",

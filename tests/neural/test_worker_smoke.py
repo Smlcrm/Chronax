@@ -12,9 +12,11 @@ from pathlib import Path
 
 import pytest
 
+from benchmarks.neural import resolve_nf_venv_py
+
 REPO = Path(__file__).resolve().parents[2]
 WORKER = REPO / "benchmarks" / "neural" / "worker.py"
-NF_VENV_PY = REPO / "benchmarks" / ".venv-nf" / "bin" / "python"
+NF_VENV_PY = resolve_nf_venv_py(REPO)
 
 
 def _tiny_config(tmp_path):
