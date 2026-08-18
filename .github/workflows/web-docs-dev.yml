@@ -23,7 +23,12 @@ permissions:
   id-token: write
 
 concurrency:
-  group: web-docs-chronax-dev
+  # Serialises doc publishes from this repo. Named after the WORKFLOW, not a
+  # Cloud Run service: the old name was "web-docs-chronax-dev", which named a
+  # per-product docs service that no longer exists — this repo has published
+  # into Smlcrm/web-docs rather than deploying its own service since the
+  # unified-docs migration, and that service was decommissioned.
+  group: web-docs-publish-chronax
   cancel-in-progress: true
 
 env:
