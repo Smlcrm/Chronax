@@ -133,3 +133,7 @@ CLAUDE.md
 
 # Cursor
 .cursor/
+# The agent platform wiring is tracked; everything else under .claude/ stays local.
+!.claude/
+.claude/*
+!.claude/settings.json
