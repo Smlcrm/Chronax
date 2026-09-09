@@ -1,9 +1,10 @@
-# Generate the Chronax docs and publish them into the aggregated docs repo.
+# Generate the Chronax docs and publish them into the website repo.
 #
-# This repo no longer builds or deploys a docs image. All products are served
-# from one Cloud Run service at one hostname, where each product is a path
-# (docs.smlcrm.com/chronax), so the built site is pushed into the chronax/
-# folder of Smlcrm/web-docs and that repo builds and deploys.
+# This repo no longer builds or deploys a docs image. The documentation is part
+# of the marketing site now: Smlcrm/web-website serves it at www.smlcrm.com/docs
+# from one Cloudflare Pages project, so the built site is pushed into that
+# repository's public/docs/chronax/ rather than into a documentation repository
+# of its own.
 #
 # Generation stays here: the Vertex ADC federation and the per-project GCS
 # cache both belong with the source they document.
@@ -26,7 +27,7 @@ concurrency:
   # Serialises doc publishes from this repo. Named after the WORKFLOW, not a
   # Cloud Run service: the old name was "web-docs-chronax-dev", which named a
   # per-product docs service that no longer exists — this repo has published
-  # into Smlcrm/web-docs rather than deploying its own service since the
+  # into Smlcrm/web-website rather than deploying its own service since the
   # unified-docs migration, and that service was decommissioned.
   group: web-docs-publish-chronax
   cancel-in-progress: true
@@ -34,7 +35,7 @@ concurrency:
 env:
   PROJECT_SLUG: chronax
   # Where the built site lands. The branch mirrors this one: dev -> dev.
-  DOCS_REPO: Smlcrm/web-docs
+  DOCS_REPO: Smlcrm/web-website
   DOCS_BRANCH: dev
   # Recreated in sml-website-dev, the original died with sml-web-doc-gen-dev
   # on 2026-08-02. The first run after that is a cold build: every module
@@ -111,45 +112,86 @@ jobs:
       - name: Save the doc cache
         run: gsutil -m rsync -d -r .docgen-cache "${CACHE_BUCKET}"
 
-      - name: Publish the site into the docs repo
+      - name: Publish the site into the website repo
         env:
           DOCS_TOKEN: ${{ secrets.DOCGEN_TOKEN }}
         run: |
           set -euo pipefail
           if [ -z "${DOCS_TOKEN:-}" ]; then
-            echo "::error::DOCGEN_TOKEN is not set. It needs contents:write on ${DOCS_REPO}."
+            echo "::error::DOCGEN_TOKEN is not set. It needs Contents: Read and write AND Pull requests: Read and write on ${DOCS_REPO}."
             exit 1
           fi
 
-          CLONE="${RUNNER_TEMP}/web-docs"
+          CLONE="${RUNNER_TEMP}/web-website"
           git clone --depth 1 --branch "${DOCS_BRANCH}" \
             "https://x-access-token:${DOCS_TOKEN}@github.com/${DOCS_REPO}.git" "${CLONE}"
 
           # --delete so pages removed from the source disappear from the site
           # instead of lingering as orphans nothing links to.
-          rsync -a --delete site/ "${CLONE}/${PROJECT_SLUG}/"
+          rsync -a --delete site/ "${CLONE}/public/docs/${PROJECT_SLUG}/"
+
+          # Fail here, in the repository that produced the tree, rather than in
+          # web-website's CI after a commit has landed. Same five rules its own
+          # npm run verify:docs-site enforces; standard library only, so this
+          # runner installs nothing. Read from the clone rather than vendored
+          # here because this workflow checks out a RELEASE TAG, and a vendored
+          # copy would be whatever that tag carried, or absent on a backfill.
+          python3 "${CLONE}/scripts/verify-publishable.py" "${CLONE}/public/docs"
 
           cd "${CLONE}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A "${PROJECT_SLUG}"
+          git add -A "public/docs/${PROJECT_SLUG}"
           if git diff --cached --quiet; then
             echo "No documentation changes to publish."
             exit 0
           fi
-          git commit -q -m "docs(${PROJECT_SLUG}): sync from ${GITHUB_REPOSITORY}@${GITHUB_SHA}"
+          MSG="docs(${PROJECT_SLUG}): sync from ${GITHUB_REPOSITORY}@${GITHUB_SHA}"
+          git commit -q -m "${MSG}"
 
-          # Both product repos push to the same branch, so a concurrent publish
-          # can land first. Rebase and retry rather than failing a good build.
-          for i in 1 2 3 4 5; do
-            if git push origin "${DOCS_BRANCH}"; then
-              echo "Published ${PROJECT_SLUG} docs to ${DOCS_REPO}@${DOCS_BRANCH}"
-              exit 0
+          # A pull request rather than a push to the branch. web-website builds
+          # and deploys from its branches within about a minute, so a push puts
+          # an unchecked tree in front of users; a pull request runs its
+          # build-and-test (which includes verify:docs-site over the WHOLE
+          # public/docs tree) before anything lands.
+          #
+          # The old rebase-and-retry loop existed because both products pushed
+          # to one branch and could race. Branches remove the race: each run has
+          # its own, and the two products write disjoint subtrees.
+          BRANCH="docs/${PROJECT_SLUG}-${GITHUB_RUN_ID}"
+          git checkout -q -b "${BRANCH}"
+          git commit -q -m "${MSG}"
+          git push -q origin "${BRANCH}"
+
+          export GH_TOKEN="${DOCS_TOKEN}"
+          PR=$(gh pr create --repo "${DOCS_REPO}" --base "${DOCS_BRANCH}" --head "${BRANCH}" \
+                 --title "${MSG}" \
+                 --body "Generated documentation from ${GITHUB_REPOSITORY}@${GITHUB_SHA}. Opened by ${GITHUB_WORKFLOW}: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} - merged automatically once this repository's checks pass.")
+          echo "opened ${PR}"
+
+          # Wait for the checks ourselves. web-website's prod branch carries no
+          # required status check, so --auto would merge the moment the pull
+          # request was mergeable and the gate would be decorative.
+          # A pull_request check does not exist the instant the pull request
+          # does, and `gh pr checks` exits non-zero while none are reported. So
+          # retry that specific case, and treat anything else as a real failure.
+          CHECKS_OK=0
+          for attempt in 1 2 3 4 5 6; do
+            sleep 15
+            if gh pr checks "${PR}" --repo "${DOCS_REPO}" --watch --interval 20; then
+              CHECKS_OK=1
+              break
             fi
-            echo "push rejected (attempt ${i}), rebasing onto the latest ${DOCS_BRANCH}"
-            git fetch origin "${DOCS_BRANCH}"
-            git rebase "origin/${DOCS_BRANCH}"
-            sleep $((i * 3))
+            if gh pr checks "${PR}" --repo "${DOCS_REPO}" 2>&1 | grep -qi "no checks"; then
+              echo "no checks registered yet (attempt ${attempt}); waiting"
+              continue
+            fi
+            break
           done
-          echo "::error::could not push to ${DOCS_REPO} after 5 attempts"
-          exit 1
+          if [ "${CHECKS_OK}" != "1" ]; then
+            echo "::error::checks did not pass for ${PR}. It is left OPEN and unmerged so the tree can be inspected; nothing was published."
+            exit 1
+          fi
+
+          gh pr merge "${PR}" --repo "${DOCS_REPO}" --squash --delete-branch
+          echo "Published ${PROJECT_SLUG} docs to ${DOCS_REPO}@${DOCS_BRANCH} via ${PR}"
