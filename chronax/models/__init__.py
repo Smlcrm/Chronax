@@ -91,6 +91,13 @@ try:
 except ImportError:
     NLinear = None
 
+# TimesNet depends on flax NNX (pinned 0.10.x — see chronax/models/timesnet/__init__.py);
+# same guard and trade-off as NLinear above.
+try:
+    from .timesnet import TimesNet
+except ImportError:
+    TimesNet = None
+
 # XLinear depends on flax NNX (pinned 0.10.x — see chronax/models/xlinear/__init__.py).
 # Guard like NLinear so an incompatible flax degrades this model to None instead of
 # crashing the entire chronax.models namespace; the pin's informative ImportError is
@@ -270,6 +277,7 @@ __all__ = [
     "Informer",
     "KAN",
     "NLinear",
+    "TimesNet",
     "XLinear",
     "DLinear",
     "RMoK",
