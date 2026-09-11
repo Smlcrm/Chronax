@@ -3,7 +3,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import jax.numpy as jnp
-from chronax.models import ETS
+from chronax.models import ETS, AutoETS
 from chronax.utils import ConformalIntervals
 # -------------------------------------------------------------------
 # Coverage Tests (run this file directly)
