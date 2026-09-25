@@ -128,7 +128,12 @@ jobs:
 
           # --delete so pages removed from the source disappear from the site
           # instead of lingering as orphans nothing links to.
-          rsync -a --delete site/ "${CLONE}/public/docs/${PROJECT_SLUG}/"
+          # Into <product>/next/, beside the release directories and never on top of
+          # them. A flat tree at the product folder's own level sits on the paths
+          # prod's per-release layout deletes, and every refresh of it made the next
+          # web-website test -> prod promotion conflict (web-website#73). --delete
+          # stays inside next/, so the releases next to it are never touched.
+          rsync -a --delete site/ "${CLONE}/public/docs/${PROJECT_SLUG}/next/"
 
           # Fail here, in the repository that produced the tree, rather than in
           # web-website's CI after a commit has landed. Same five rules its own
