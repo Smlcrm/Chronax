@@ -234,8 +234,11 @@ jobs:
           # to one branch and could race. Branches remove the race: each run has
           # its own, and the two products write disjoint subtrees.
           BRANCH="docs/${PROJECT_SLUG}-${GITHUB_RUN_ID}"
+          # The commit above is already on this branch: checkout -b keeps HEAD.
+          # A second `git commit` here found nothing to commit and exited 1
+          # under `set -e`, so every run since publishing moved to pull
+          # requests stopped here, with the docs generated and never published.
           git checkout -q -b "${BRANCH}"
-          git commit -q -m "${MSG}"
           git push -q origin "${BRANCH}"
 
           export GH_TOKEN="${DOCS_TOKEN}"
