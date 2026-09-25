@@ -171,9 +171,18 @@ jobs:
           git push -q origin "${BRANCH}"
 
           export GH_TOKEN="${DOCS_TOKEN}"
+          # A newer run replaces an older one still waiting for review: close the
+          # older pull requests this product opened into this branch.
+          gh pr list --repo "${DOCS_REPO}" --base "${DOCS_BRANCH}" --state open --json number,headRefName \
+              --jq ".[] | select(.headRefName | startswith(\"docs/${PROJECT_SLUG}-\")) | .number" |
+            while read -r OLD; do
+              gh pr close "${OLD}" --repo "${DOCS_REPO}" --delete-branch \
+                --comment "Replaced by a newer docs run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+                && echo "closed the older docs pull request #${OLD}"
+            done
           PR=$(gh pr create --repo "${DOCS_REPO}" --base "${DOCS_BRANCH}" --head "${BRANCH}" \
                  --title "${MSG}" \
-                 --body "Generated documentation from ${GITHUB_REPOSITORY}@${GITHUB_SHA}. Opened by ${GITHUB_WORKFLOW}: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} - merged automatically once this repository's checks pass.")
+                 --body "Generated documentation from ${GITHUB_REPOSITORY}@${GITHUB_SHA}. Opened by ${GITHUB_WORKFLOW}: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} - merged automatically once its checks pass and a person approves it.")
           echo "opened ${PR}"
 
           # Wait for the checks ourselves. web-website's prod branch carries no
@@ -214,5 +223,13 @@ jobs:
             exit 1
           fi
 
-          gh pr merge "${PR}" --repo "${DOCS_REPO}" --squash --delete-branch
-          echo "Published ${PROJECT_SLUG} docs to ${DOCS_REPO}@${DOCS_BRANCH} via ${PR}"
+          # web-website dev requires one approving review, and this token is not exempt
+          # from it (operator decision, 2026-09-26: no bypass for a long-lived token that
+          # can write the branch). --auto merges now if the branch allows it, or queues
+          # the merge for the moment a person approves. The checks above have passed.
+          gh pr merge "${PR}" --repo "${DOCS_REPO}" --squash --delete-branch --auto
+          if [ "$(gh pr view "${PR}" --repo "${DOCS_REPO}" --json state --jq .state)" = MERGED ]; then
+            echo "Published ${PROJECT_SLUG} docs to ${DOCS_REPO}@${DOCS_BRANCH} via ${PR}"
+          else
+            echo "::notice::${PR} passed its checks and merges itself once a person approves it."
+          fi
