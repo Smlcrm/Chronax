@@ -250,21 +250,35 @@ jobs:
           # Wait for the checks ourselves. web-website's prod branch carries no
           # required status check, so --auto would merge the moment the pull
           # request was mergeable and the gate would be decorative.
-          # A pull_request check does not exist the instant the pull request
-          # does, and `gh pr checks` exits non-zero while none are reported. So
-          # retry that specific case, and treat anything else as a real failure.
+          # THE WAIT READS ACTIONS RUNS, NOT `gh pr checks`. DOCGEN_TOKEN is a fine-grained
+          # token, and GitHub offers fine-grained tokens no Checks permission, so the check-run
+          # rollup `gh pr checks` reads answered "Resource not accessible by personal access
+          # token" and every run stopped here (2026-09-25). The token has Actions: read, so this
+          # reads the workflow runs web-website started for the pushed commit, build-and-test and
+          # the guardrails scan among them. It passes once every run has finished without failing
+          # on two polls in a row with the same count, so a run that registers late is still
+          # waited for. Any failed, cancelled or blocked run stops it.
+          HEAD_SHA="$(git rev-parse HEAD)"
           CHECKS_OK=0
-          for attempt in 1 2 3 4 5 6; do
-            sleep 15
-            if gh pr checks "${PR}" --repo "${DOCS_REPO}" --watch --interval 20; then
-              CHECKS_OK=1
-              break
-            fi
-            if gh pr checks "${PR}" --repo "${DOCS_REPO}" 2>&1 | grep -qi "no checks"; then
-              echo "no checks registered yet (attempt ${attempt}); waiting"
+          LAST=""
+          for attempt in $(seq 1 60); do
+            sleep 20
+            if ! RUNS="$(gh api "repos/${DOCS_REPO}/actions/runs?head_sha=${HEAD_SHA}&per_page=100" \
+                  --jq '[.workflow_runs[] | [.status, (.conclusion // "")]]')"; then
+              echo "could not read the runs for ${HEAD_SHA} (attempt ${attempt}); waiting"
               continue
             fi
-            break
+            TOTAL="$(printf '%s' "${RUNS}" | jq 'length')"
+            OPEN="$(printf '%s' "${RUNS}" | jq '[.[] | select(.[0] != "completed")] | length')"
+            BAD="$(printf '%s' "${RUNS}" | jq '[.[] | select(.[0] == "completed" and ((.[1] == "success" or .[1] == "skipped" or .[1] == "neutral") | not))] | length')"
+            echo "runs for ${HEAD_SHA}: ${TOTAL}, still running ${OPEN}, failed ${BAD}"
+            [ "${BAD}" = 0 ] || break
+            if [ "${TOTAL}" != 0 ] && [ "${OPEN}" = 0 ]; then
+              [ "${LAST}" = "${TOTAL}" ] && { CHECKS_OK=1; break; }
+              LAST="${TOTAL}"
+            else
+              LAST=""
+            fi
           done
           if [ "${CHECKS_OK}" != "1" ]; then
             echo "::error::checks did not pass for ${PR}. It is left OPEN and unmerged so the tree can be inspected; nothing was published."
