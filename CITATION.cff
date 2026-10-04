@@ -1,0 +1,25 @@
+# Maintained by the simulacrum-readme skill. Keep title, version and
+# repository-code identical to the BibTeX entry in README.md.
+# Omit `version` and `date-released` when the repository has no release.
+# Never add `doi` unless a DOI has actually been minted.
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata from this file."
+type: software
+title: "Chronax"
+abstract: "A JAX time-series forecasting library: statistical forecasting models behind one fit / predict interface."
+authors:
+  - name: "Simulacrum, Inc."
+    website: "https://smlcrm.com"
+version: "0.1.0"
+date-released: "2026-03-09"
+repository-code: "https://github.com/Smlcrm/Chronax"
+url: "https://smlcrm.com"
+license: "MIT"
+keywords:
+  - "simulacrum"
+  - "python"
+  - "jax"
+  - "time-series"
+  - "forecasting"
+  - "arima"
+  - "exponential-smoothing"
