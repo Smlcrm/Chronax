@@ -1,4 +1,4 @@
-# Maintained by the simulacrum-readme skill. Keep title, version and
+# Keep title, version and
 # repository-code identical to the BibTeX entry in README.md.
 # Omit `version` and `date-released` when the repository has no release.
 # Never add `doi` unless a DOI has actually been minted.
