@@ -16,7 +16,10 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 ORDER = ["header", "badges", "overview", "quickstart", "links", "citation", "license"]
-PLACEHOLDERS = [r"\{\{\s*[A-Z][A-Z0-9_]*\s*\}\}", r"\bTODO\b", r"\bTBD\b", r"\bFIXME\b", r"lorem ipsum",
+# The template token pattern is case-sensitive even under re.I: BibTeX protects a
+# one-word title or an entity author with double braces ({{Chronax}}), which is not
+# a placeholder.
+PLACEHOLDERS = [r"(?-i:\{\{\s*[A-Z][A-Z0-9_]*\s*\}\})", r"\bTODO\b", r"\bTBD\b", r"\bFIXME\b", r"lorem ipsum",
                 r"\[path to", r"<placeholder", r"XXXX", r"\bREPLACE_ME\b", r"example\.com"]
 
 errors = []
