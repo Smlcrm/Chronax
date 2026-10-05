@@ -130,7 +130,7 @@ y = jnp.array([112, 118, 132, 129, 121, 135, 148, 148, 136, 119, 104, 118,
                115, 126, 141, 135, 125, 149, 170, 170, 158, 133, 114, 140])
 
 # Fit
-model = AutoARIMA(season_length=12)
+model = AutoARIMA(period=12)
 model = model.fit(y)
 
 # Forecast 6 steps ahead
@@ -155,6 +155,9 @@ print("95% upper:", forecast['hi-95'])
 Retrieve the model's in-sample predictions after fitting:
 
 ```python
+from chronax.models import AutoETS
+
+model = AutoETS(season_length=12).fit(y)
 insample = model.predict_in_sample()
 print("Fitted values:", insample['fitted'])
 ```
@@ -177,7 +180,7 @@ print("Forecast:", result['mean'])
 from chronax.models import AutoARIMA, AutoETS, AutoTheta
 
 models = {
-    "AutoARIMA": AutoARIMA(season_length=12),
+    "AutoARIMA": AutoARIMA(period=12),
     "AutoETS": AutoETS(season_length=12),
     "AutoTheta": AutoTheta(season_length=12),
 }
