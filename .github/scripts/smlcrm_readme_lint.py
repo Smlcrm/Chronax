@@ -13,6 +13,7 @@ Exit 0 when every check passes, 1 with one line per failure otherwise.
 import re
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
 ORDER = ["header", "badges", "overview", "quickstart", "links", "citation", "license"]
 PLACEHOLDERS = [r"\{\{\s*[A-Z][A-Z0-9_]*\s*\}\}", r"\bTODO\b", r"\bTBD\b", r"\bFIXME\b", r"lorem ipsum",
@@ -63,7 +64,7 @@ def check_badges(body):
     imgs = re.findall(r"!\[([^\]]*)\]\(([^)\s]+)", body)
     imgs += [(a, s) for a, s in re.findall(r'<img\b[^>]*?alt="([^"]*)"[^>]*?src="([^"]+)"', body)]
     for label in ("License", "Release", "Language"):
-        if not any(a.startswith(label) and "img.shields.io/" in s for a, s in imgs):
+        if not any(a.startswith(label) and urlparse(s).hostname == "img.shields.io" for a, s in imgs):
             fail(f"badges: no shields.io badge with alt text starting '{label}'")
     if not (any(a.startswith("Build") for a, _ in imgs) or "smlcrm:no-ci" in body):
         fail("badges: no 'Build' status badge and no <!-- smlcrm:no-ci --> note saying why")
