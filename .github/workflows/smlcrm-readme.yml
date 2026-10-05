@@ -7,7 +7,7 @@ name: readme-standard
 on:
   pull_request:
   push:
-    branches: [main, dev]
+    branches: [main, master, dev, test, prod]
   workflow_dispatch:
 
 permissions:

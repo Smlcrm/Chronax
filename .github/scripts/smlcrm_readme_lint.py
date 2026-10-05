@@ -133,6 +133,9 @@ def check_license(body):
         fail("license: no contact address")
 
 
+_UNPARSED = object()
+
+
 def load_cff(path):
     text = path.read_text()
     try:
@@ -145,7 +148,7 @@ def load_cff(path):
         return data, text
     except Exception as e:  # yaml.YAMLError
         fail(f"CITATION.cff: does not parse as YAML: {e}")
-        return None, text
+        return _UNPARSED, text
 
 
 def check_cff(root, bib):
@@ -154,7 +157,10 @@ def check_cff(root, bib):
         fail("CITATION.cff: missing")
         return
     data, text = load_cff(path)
-    if data is None:
+    if data is _UNPARSED:
+        return
+    if not isinstance(data, dict):
+        fail("CITATION.cff: empty or not a YAML mapping")
         return
     if str(data.get("cff-version")) != "1.2.0":
         fail("CITATION.cff: cff-version is not 1.2.0")

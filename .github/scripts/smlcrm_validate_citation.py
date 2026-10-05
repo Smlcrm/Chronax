@@ -24,9 +24,12 @@ def main():
     except ImportError:
         print("pybtex is not installed: python3 -m pip install pybtex")
         sys.exit(3)
-    m = re.search(r"```bibtex\n(.*?)```", (root / "README.md").read_text(), re.S)
+    text = (root / "README.md").read_text()
+    # Validate the managed citation, not an older hand-written block elsewhere.
+    sec = re.search(r"<!--\s*smlcrm:begin citation\s*-->(.*?)<!--\s*smlcrm:end citation\s*-->", text, re.S)
+    m = re.search(r"```bibtex\n(.*?)```", sec.group(1) if sec else text, re.S)
     if not m:
-        print("BibTeX: no ```bibtex block in README.md")
+        print("BibTeX: no ```bibtex block in the README citation section")
         sys.exit(1)
     try:
         db = parse_string(m.group(1), "bibtex")
@@ -41,7 +44,9 @@ def main():
     except Exception as e:
         print(f"BibTeX: does not compile: {e}")
         ok = False
-    cff = shutil.which("cffconvert")
+    # Prefer the cffconvert next to this interpreter, so a venv works unactivated.
+    local = Path(sys.executable).parent / "cffconvert"
+    cff = str(local) if local.exists() else shutil.which("cffconvert")
     if not cff:
         print("cffconvert is not installed: python3 -m pip install cffconvert")
         sys.exit(3)
