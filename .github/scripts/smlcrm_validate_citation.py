@@ -4,7 +4,7 @@ with pybtex (what "compiles" means without a TeX install), and CITATION.cff
 passes `cffconvert --validate` against the CFF 1.2.0 schema.
 
 Usage: validate_citation.py [REPO_DIR]
-Needs: pip install pybtex cffconvert   (the CI workflow installs both)
+Needs: pip install pybtex 'setuptools<81' cffconvert   (the CI workflow installs them)
 
 Exit 0 when both pass, 1 otherwise, 3 when a tool is not installed.
 """
@@ -21,8 +21,9 @@ def main():
     try:
         from pybtex.database import parse_string  # noqa: PLC0415
         from pybtex.plugin import find_plugin  # noqa: PLC0415
-    except ImportError:
-        print("pybtex is not installed: python3 -m pip install pybtex")
+    except ImportError as e:
+        # pybtex 0.24 imports pkg_resources, which comes from setuptools<81.
+        print(f"pybtex cannot be imported ({e}): python3 -m pip install pybtex 'setuptools<81'")
         sys.exit(3)
     text = (root / "README.md").read_text()
     # Validate the managed citation, not an older hand-written block elsewhere.

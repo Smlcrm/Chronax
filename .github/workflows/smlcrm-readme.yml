@@ -28,8 +28,10 @@ jobs:
         with:
           python-version: "3.12"
 
+      # pybtex 0.24 imports pkg_resources, which setuptools 81 removed and
+      # Python 3.12 no longer installs by default.
       - name: Install citation validators
-        run: python -m pip install --disable-pip-version-check --quiet pybtex==0.24.0 cffconvert==2.0.0 pyyaml
+        run: python -m pip install --disable-pip-version-check --quiet pybtex==0.24.0 'setuptools<81' cffconvert==2.0.0 pyyaml
 
       - name: Required sections, order, placeholders
         run: python .github/scripts/smlcrm_readme_lint.py .
