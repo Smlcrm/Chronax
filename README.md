@@ -74,18 +74,6 @@ hi-95: [170.3, 182.6, 192.2, 200.2, 207.3, 213.7]
 ```
 <!-- smlcrm:end quickstart -->
 
-![Simulacrum Logo](https://github.com/Smlcrm/smlcrm-brand-assets/blob/main/Asset%201@4x-8.png?raw=true "Simulacrum — Chronax")
-
-# Chronax
-
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.11](https://img.shields.io/badge/python-3.11-blue.svg)](https://www.python.org/downloads/)
-[![PyPI](https://img.shields.io/pypi/v/chronax.svg)](https://pypi.org/project/chronax/)
-
-A high-performance, JAX-accelerated time-series forecasting library. `chronax` provides a comprehensive suite of classical and modern forecasting models — including AutoARIMA, AutoETS, AutoTheta, TBATS, MFLES, GARCH, and more — with a unified `fit` / `predict` interface and hardware-accelerated execution via JAX.
-
----
-
 ## Features
 
 - ⚡ **JAX-accelerated** — JIT-compiled model fitting and forecasting on CPU, GPU, or TPU
@@ -99,13 +87,7 @@ A high-performance, JAX-accelerated time-series forecasting library. `chronax` p
 
 ## Installation
 
-### From PyPI (recommended)
-
-> Requires Python ≥ 3.11
-
-```bash
-pip install chronax
-```
+The release from PyPI is in the [Quickstart](#quickstart). Other ways to install:
 
 ### From TestPyPI (pre-release testing)
 
@@ -118,14 +100,14 @@ pip install -i https://test.pypi.org/simple/ --extra-index-url https://pypi.org/
 Install directly from the latest commit:
 
 ```bash
-pip install git+https://github.com/Smlcrm/ml-library-chronax.git
+pip install git+https://github.com/Smlcrm/Chronax.git
 ```
 
 For local development:
 
 ```bash
-git clone https://github.com/Smlcrm/ml-library-chronax.git
-cd ml-library-chronax
+git clone https://github.com/Smlcrm/Chronax.git
+cd Chronax
 python -m venv .venv
 source .venv/bin/activate  # On Windows use: .venv\Scripts\activate
 pip install -e .
@@ -374,27 +356,6 @@ python benchmarks/benchmark_suite.py
 | `chronax.utils.*` | Utilities — loss functions, plotting, conformal intervals |
 
 Explore inline docstrings for detailed parameter and return-type information.
-
----
-
-## Citation
-
-If you use `chronax` in your research, please cite the library using the following BibTeX entry:
-
-```bibtex
-@software{chronax,
-  title = {Chronax: High-performance, JAX-accelerated time-series forecasting},
-  author = {Simulacrum},
-  url = {https://github.com/Smlcrm/Chronax},
-  year = {2026}
-}
-```
-
----
-
-## License
-
-MIT © Simulacrum, Inc.
 
 <!-- smlcrm:begin links -->
 ## Links
