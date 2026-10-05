@@ -39,7 +39,7 @@ Chronax implements classical forecasting models in JAX: ARIMA, ETS, Theta, TBATS
 <!-- smlcrm:begin quickstart -->
 ## Quickstart
 
-<!-- smlcrm:tested 2026-10-05 macOS 26.6 (arm64), Python 3.11.14, fresh venv, chronax 0.1.1 and jax 0.10.2 from PyPI -->
+<!-- smlcrm:tested 2026-10-05 macOS 26.6 (arm64), Python 3.11.14, fresh venvs, chronax 0.1.0 (cited) and 0.1.1 with jax 0.10.2 from PyPI, same output -->
 Requires Python 3.11 or later.
 
 ```bash
