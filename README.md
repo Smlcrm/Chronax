@@ -1,14 +1,78 @@
-![Simulacrum Logo](https://github.com/Smlcrm/smlcrm-brand-assets/blob/main/Asset%201@4x-8.png?raw=true "Simulacrum — Chronax")
+<!-- smlcrm:begin header -->
+<!-- Logo: Smlcrm/design-system assets/logo/logo-digital-1.svg @ adc00ff. Light fill #2121a5 = token product.logo-ink; dark fill #ffffff = token brand-book.brand-white. -->
+<p align="center">
+  <a href="https://smlcrm.com">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset=".github/assets/smlcrm-logo-dark.svg">
+      <img alt="Simulacrum" src=".github/assets/smlcrm-logo-light.svg" width="300">
+    </picture>
+  </a>
+</p>
 
-# Chronax
+<h1 align="center">Chronax</h1>
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.11](https://img.shields.io/badge/python-3.11-blue.svg)](https://www.python.org/downloads/)
-[![PyPI](https://img.shields.io/pypi/v/chronax.svg)](https://pypi.org/project/chronax/)
+<p align="center">A JAX time-series forecasting library: statistical forecasting models behind one fit / predict interface.</p>
 
-A high-performance, JAX-accelerated time-series forecasting library. `chronax` provides a comprehensive suite of classical and modern forecasting models — including AutoARIMA, AutoETS, AutoTheta, TBATS, MFLES, GARCH, and more — with a unified `fit` / `predict` interface and hardware-accelerated execution via JAX.
+<p align="center"><a href="https://smlcrm.com">smlcrm.com</a></p>
+<!-- smlcrm:end header -->
 
----
+<!-- smlcrm:begin badges -->
+<!-- Badge colours: 2121a5 = token brand-book.brand-dark-blue (license, language); 3483fa = token brand-book.brand-bright-blue (release). -->
+<p align="center">
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/github/license/Smlcrm/Chronax?color=2121a5"></a>
+  <a href="https://github.com/Smlcrm/Chronax/releases"><img alt="Release: latest GitHub release" src="https://img.shields.io/github/v/release/Smlcrm/Chronax?color=3483fa"></a>
+  <!-- smlcrm:no-ci: the repository has no build or test workflow (web-docs-prod.yml only publishes documentation) -->
+  <a href="pyproject.toml"><img alt="Language: Python 3.11 or later" src="https://img.shields.io/badge/python-%E2%89%A53.11-2121a5"></a>
+</p>
+<!-- smlcrm:end badges -->
+
+<!-- smlcrm:begin overview -->
+## Overview
+
+Chronax implements classical forecasting models in JAX: ARIMA, ETS, Theta, TBATS, MFLES, MSTL and STL, GARCH, exponential smoothing, intermittent-demand methods (Croston, ADIDA, IMAPA, TSB) and simple baselines, with automatic model selection for ARIMA, ETS, Theta, TBATS, MFLES and CES. Every model is fitted with `fit(y)` and forecasts with `predict(h)`, which returns a dictionary of JAX arrays, and adds native or conformal prediction intervals when you pass `level`. Fitting and forecasting run under JAX, so the same code runs on CPU, GPU or TPU. The package also contains early neural forecasters (Autoformer, iTransformer, KAN) that the model tables below do not cover yet.
+
+**Who it is for.** Python developers and researchers who forecast univariate time series and want statistical models that run inside a JAX workflow.
+
+**What it does not do.** It forecasts one univariate series per model; it does not load data frames or manage panels of series for you. It ships no pretrained foundation models and is not a hosted forecasting service. The benchmark suite's comparison libraries (statsforecast, pandas) are not installed with the package.
+<!-- smlcrm:end overview -->
+
+<!-- smlcrm:begin quickstart -->
+## Quickstart
+
+<!-- smlcrm:tested 2026-10-05 macOS 26.6 (arm64), Python 3.11.14, fresh venvs, chronax 0.1.0 (cited) and 0.1.1 with jax 0.10.2 from PyPI, same output -->
+Requires Python 3.11 or later.
+
+```bash
+pip install chronax
+```
+
+Save this as `forecast.py` and run `python forecast.py`. It fits an automatically selected ETS model to two years of monthly data and forecasts six months with a 95% interval. The first run takes longer while JAX compiles.
+
+```python
+import jax.numpy as jnp
+from chronax.models import AutoETS
+
+# Monthly airline passengers, first two years
+y = jnp.array([112, 118, 132, 129, 121, 135, 148, 148, 136, 119, 104, 118,
+               115, 126, 141, 135, 125, 149, 170, 170, 158, 133, 114, 140],
+              dtype=jnp.float32)
+
+model = AutoETS(season_length=12).fit(y)
+forecast = model.predict(h=6, level=[95])
+
+print("mean: ", [round(v, 1) for v in forecast["mean"].tolist()])
+print("lo-95:", [round(v, 1) for v in forecast["lo-95"].tolist()])
+print("hi-95:", [round(v, 1) for v in forecast["hi-95"].tolist()])
+```
+
+Expected output:
+
+```text
+mean:  [139.5, 139.5, 139.5, 139.5, 139.5, 139.5]
+lo-95: [108.7, 96.3, 86.8, 78.8, 71.7, 65.2]
+hi-95: [170.3, 182.6, 192.2, 200.2, 207.3, 213.7]
+```
+<!-- smlcrm:end quickstart -->
 
 ## Features
 
@@ -23,13 +87,7 @@ A high-performance, JAX-accelerated time-series forecasting library. `chronax` p
 
 ## Installation
 
-### From PyPI (recommended)
-
-> Requires Python ≥ 3.11
-
-```bash
-pip install chronax
-```
+The release from PyPI is in the [Quickstart](#quickstart). Other ways to install:
 
 ### From TestPyPI (pre-release testing)
 
@@ -42,14 +100,14 @@ pip install -i https://test.pypi.org/simple/ --extra-index-url https://pypi.org/
 Install directly from the latest commit:
 
 ```bash
-pip install git+https://github.com/Smlcrm/ml-library-chronax.git
+pip install git+https://github.com/Smlcrm/Chronax.git
 ```
 
 For local development:
 
 ```bash
-git clone https://github.com/Smlcrm/ml-library-chronax.git
-cd ml-library-chronax
+git clone https://github.com/Smlcrm/Chronax.git
+cd Chronax
 python -m venv .venv
 source .venv/bin/activate  # On Windows use: .venv\Scripts\activate
 pip install -e .
@@ -72,7 +130,7 @@ y = jnp.array([112, 118, 132, 129, 121, 135, 148, 148, 136, 119, 104, 118,
                115, 126, 141, 135, 125, 149, 170, 170, 158, 133, 114, 140])
 
 # Fit
-model = AutoARIMA(season_length=12)
+model = AutoARIMA(period=12)
 model = model.fit(y)
 
 # Forecast 6 steps ahead
@@ -97,6 +155,9 @@ print("95% upper:", forecast['hi-95'])
 Retrieve the model's in-sample predictions after fitting:
 
 ```python
+from chronax.models import AutoETS
+
+model = AutoETS(season_length=12).fit(y)
 insample = model.predict_in_sample()
 print("Fitted values:", insample['fitted'])
 ```
@@ -119,7 +180,7 @@ print("Forecast:", result['mean'])
 from chronax.models import AutoARIMA, AutoETS, AutoTheta
 
 models = {
-    "AutoARIMA": AutoARIMA(season_length=12),
+    "AutoARIMA": AutoARIMA(period=12),
     "AutoETS": AutoETS(season_length=12),
     "AutoTheta": AutoTheta(season_length=12),
 }
@@ -299,23 +360,37 @@ python benchmarks/benchmark_suite.py
 
 Explore inline docstrings for detailed parameter and return-type information.
 
----
+<!-- smlcrm:begin links -->
+## Links
 
+- Documentation: [smlcrm.com/docs/chronax](https://www.smlcrm.com/docs/chronax/)
+- Package: [chronax on PyPI](https://pypi.org/project/chronax/)
+- Issues: [Smlcrm/Chronax/issues](https://github.com/Smlcrm/Chronax/issues)
+- Releases: [Smlcrm/Chronax/releases](https://github.com/Smlcrm/Chronax/releases)
+- Website: [smlcrm.com](https://smlcrm.com)
+- Related repositories: [Smlcrm/TempusBench](https://github.com/Smlcrm/TempusBench), the time-series forecasting benchmark whose metrics Chronax's benchmark suite uses
+<!-- smlcrm:end links -->
+
+<!-- smlcrm:begin citation -->
 ## Citation
 
-If you use `chronax` in your research, please cite the library using the following BibTeX entry:
+If you use Chronax in your work, cite it as below. GitHub's "Cite this repository" button reads the same data from [`CITATION.cff`](CITATION.cff).
 
 ```bibtex
-@software{chronax,
-  title = {Chronax: High-performance, JAX-accelerated time-series forecasting},
-  author = {Simulacrum},
-  url = {https://github.com/Smlcrm/Chronax},
-  year = {2026}
+@software{smlcrm_chronax,
+  title   = {Chronax},
+  author  = {{Simulacrum, Inc.}},
+  year    = {2026},
+  version = {0.1.0},
+  url     = {https://github.com/Smlcrm/Chronax}
 }
 ```
+<!-- smlcrm:end citation -->
 
----
+<!-- smlcrm:begin license -->
+## License and contact
 
-## License
+Released under the MIT license. See [LICENSE](LICENSE).
 
-MIT © Simulacrum, Inc.
+Contact: [support@smlcrm.com](mailto:support@smlcrm.com) · [smlcrm.com](https://smlcrm.com) · [github.com/Smlcrm](https://github.com/Smlcrm)
+<!-- smlcrm:end license -->
