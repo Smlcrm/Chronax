@@ -64,6 +64,8 @@ from .deepar import DeepARForecaster as DeepAR
 from .nbeats import NBEATSForecaster as NBEATS
 from .tide import TiDEForecaster as TiDE
 from .tsmixer import TSMixerForecaster as TSMixer
+from .nbeatsx import NBEATSxForecaster as NBEATSx
+from .tsmixerx import TSMixerxForecaster as TSMixerx
 
 try:
     from .kan import KAN
@@ -293,6 +295,8 @@ __all__ = [
     "NBEATS",
     "TiDE",
     "TSMixer",
+    "NBEATSx",
+    "TSMixerx",
 ]
 
 

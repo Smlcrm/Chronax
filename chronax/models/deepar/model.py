@@ -311,16 +311,70 @@ def forecast_mc(
                    if x_f_future is not None else xf_dec_safe)     # [H, 2]
 
     model_cls = type(model)
-    hT, cT    = model.apply(params, y_enc, xf_enc_final, x_static, method=model_cls.encode)
+    # Encode all but the last step; decode starts from y_enc[-1] (no double-feed).
+    hT, cT = model.apply(
+        params, y_enc[:-1], xf_enc_final[:-1], x_static, method=model_cls.encode
+    )
 
     path_keys = random.split(random.PRNGKey(seed), N)
     sample_fn = _get_forecast_fn(model, H)
-    paths     = sample_fn(params, path_keys, y_hist[-1], hT, cT,
+    paths     = sample_fn(params, path_keys, y_enc[-1], hT, cT,
                           buf_init, xf_fut_safe, x_static)
 
     if scaler is not None:
         paths = paths * y_std + y_mean
     return paths
+
+
+def forecast_point(
+    params,
+    model: DeepAR_EncDec,
+    y_hist: jnp.ndarray,
+    x_f_hist: jnp.ndarray = None,
+    x_f_future: jnp.ndarray = None,
+    x_static: jnp.ndarray = None,
+    H: int = 24,
+    scaler=None,
+    input_size: int = None,
+) -> jnp.ndarray:
+    """Deterministic μ-feedback forecast (MAE-aligned point estimate) [H]."""
+    if scaler is not None:
+        y_mean, y_std = scaler
+        y_hist = (y_hist - y_mean) / y_std
+
+    enc_len = input_size if input_size is not None else y_hist.shape[0]
+    y_enc = y_hist[-enc_len:]
+    xf_enc, xf_dec_safe, buf_init = _forecast_lags(y_hist, enc_len, H)
+
+    xf_enc_hist = (x_f_hist[-enc_len:] if (x_f_hist is not None and input_size is not None)
+                   else x_f_hist)
+    xf_enc_final = (jnp.concatenate([xf_enc_hist, xf_enc], -1)
+                    if xf_enc_hist is not None else xf_enc)
+    xf_fut_safe = (jnp.concatenate([x_f_future, xf_dec_safe], -1)
+                   if x_f_future is not None else xf_dec_safe)
+
+    model_cls = type(model)
+    hT, cT = model.apply(
+        params, y_enc[:-1], xf_enc_final[:-1], x_static, method=model_cls.encode
+    )
+
+    def step_fn(carry, xf_safe):
+        y_prev, h, c, buf = carry
+        lag1 = buf[-2]
+        lag7 = buf[0]
+        xf = jnp.concatenate([jnp.array([lag1, lag7]), xf_safe])
+        mu, _sigma, h_new, c_new = model.apply(
+            params, y_prev, xf, x_static, h, c, True, method=model_cls.one_step
+        )
+        buf_new = jnp.concatenate([buf[1:], mu[None]])
+        return (mu, h_new, c_new, buf_new), mu
+
+    (_y, _h, _c, _buf), path = jax.lax.scan(
+        step_fn, (y_enc[-1], hT, cT, buf_init), xf_fut_safe
+    )
+    if scaler is not None:
+        path = path * y_std + y_mean
+    return path
 
 
 def quantiles(paths: jnp.ndarray, qs=(0.1, 0.5, 0.9)):

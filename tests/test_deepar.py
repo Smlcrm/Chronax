@@ -30,17 +30,18 @@ def test_1_basic_shapes():
     """Test 1: Verify model output shapes are correct."""
     print("\n=== Test 1: Basic Shape Checking ===")
     
-    model = DeepAR_EncDec(hidden=32, dropout_rate=0.0)
-    
+    n_layers = 2
+    model = DeepAR_EncDec(hidden=32, n_layers=n_layers, dropout_rate=0.0)
+
     # Setup
     T = 50
     d_f = 3
     d_s = 2
-    
+
     y_hist = jnp.ones((T,), dtype=jnp.float32)
     x_f_all = jnp.ones((T, d_f), dtype=jnp.float32)
     x_static = jnp.ones((d_s,), dtype=jnp.float32)
-    
+
     key = random.PRNGKey(0)
     params = model.init(
         {'params': key, 'dropout': key},
@@ -49,14 +50,14 @@ def test_1_basic_shapes():
         x_static=x_static,
         training=False,
     )
-    
-    # Test encoder output shape
+
+    # encode() returns [n_layers, hidden] per state
     hT, cT = model.apply(params, y_hist=y_hist, futr_exog=x_f_all, x_static=x_static, method=DeepAR_EncDec.encode)
-    assert hT.shape == (1, 32), f"Expected h shape (1, 32), got {hT.shape}"
-    assert cT.shape == (1, 32), f"Expected c shape (1, 32), got {cT.shape}"
+    assert hT.shape == (n_layers, 32), f"Expected h shape ({n_layers}, 32), got {hT.shape}"
+    assert cT.shape == (n_layers, 32), f"Expected c shape ({n_layers}, 32), got {cT.shape}"
     print(f"[SUCCESS] Encoder output shapes: h={hT.shape}, c={cT.shape}")
-    
-    # Test one_step output
+
+    # Test one_step output — h_all/c_all are [n_layers, hidden]
     mu, sigma, h_new, c_new = model.apply(
         params,
         jnp.array(1.0, dtype=jnp.float32),
@@ -70,6 +71,7 @@ def test_1_basic_shapes():
     assert mu.shape == (), f"Expected scalar mu, got {mu.shape}"
     assert sigma.shape == (), f"Expected scalar sigma, got {sigma.shape}"
     assert sigma > 0, f"Sigma should be positive, got {sigma}"
+    assert h_new.shape == (n_layers, 32), f"Expected h_new shape ({n_layers}, 32), got {h_new.shape}"
     print(f"[SUCCESS] One-step output shapes: mu={mu.shape}, sigma={sigma.shape}, σ={float(sigma):.4f}")
     
     # Test model.__call__ output
@@ -107,11 +109,12 @@ def test_2_synthetic_sine_wave():
     print(f"Training on {T} points of noisy sine wave...")
     
     # Train model
-    model, params, losses = train_model(
+    model, params, losses, _ = train_model(
         y_hist,
         x_f_all=None,
         x_static=None,
         hidden=32,
+        n_layers=1,
         lr=1e-3,
         steps=200,
         dropout=0.0,
@@ -182,11 +185,12 @@ def test_3_with_covariates():
     
     print(f"Training with future covariates (d_f={d_f}) and static covariates (d_s={d_s})...")
     
-    model, params, losses = train_model(
+    model, params, losses, _ = train_model(
         y_hist,
         x_f_all=x_f_all,
         x_static=x_static,
         hidden=32,
+        n_layers=1,
         lr=1e-3,
         steps=150,
         dropout=0.1,
@@ -282,37 +286,32 @@ def test_5_forecaster_api():
     H = 20
     y_series = [jnp.sin(jnp.arange(T, dtype=jnp.float32) * 0.1) + 0.1 * random.normal(random.PRNGKey(i), (T,)) for i in range(3)]
     
-    # Initialize forecaster
-    forecaster = DeepARForecaster(h=H, hidden_size=32, seed=42)
-    
-    print("Training forecaster...")
-    forecaster.fit(
-        y_series=y_series,
-        input_size=50,
-        num_steps=100,
-        batch_size=1,
-        verbose=False,
+    # Initialize forecaster with new API (h, input_size, max_steps in __init__)
+    forecaster = DeepARForecaster(
+        h=H, input_size=50, hidden_size=32, num_lstm_layers=1,
+        max_steps=100, batch_size=32, random_seed=42,
     )
+
+    print("Training forecaster...")
+    forecaster.fit(y_series, verbose=False)
     print("[SUCCESS] Model fitted successfully")
-    
-    # Test prediction
-    y_test = y_series[0]
-    forecast = forecaster.forecast(y_test)
-    
-    assert "median" in forecast, "Forecast should have 'median' key"
-    assert "lower" in forecast, "Forecast should have 'lower' key"
-    assert "upper" in forecast, "Forecast should have 'upper' key"
-    
-    assert forecast["median"].shape == (H,), f"Expected shape ({H},), got {forecast['median'].shape}"
-    assert forecast["lower"].shape == (H,), f"Expected shape ({H},), got {forecast['lower'].shape}"
-    assert forecast["upper"].shape == (H,), f"Expected shape ({H},), got {forecast['upper'].shape}"
-    
-    # Verify upper > median > lower
-    assert jnp.all(forecast["upper"] >= forecast["median"]), "Upper bound should be >= median"
-    assert jnp.all(forecast["median"] >= forecast["lower"]), "Median should be >= lower bound"
-    
-    print(f"[SUCCESS] Forecast shapes: median={forecast['median'].shape}")
-    print(f"[SUCCESS] Forecast bounds valid: lower < median < upper")
+
+    # predict() returns {"mean": array} — (3, H) for 3 fitted series
+    result = forecaster.predict()
+    assert "mean" in result, "predict() should return {'mean': ...}"
+    assert result["mean"].shape == (3, H), f"Expected shape (3, {H}), got {result['mean'].shape}"
+    assert jnp.all(jnp.isfinite(result["mean"])), "Predictions should be finite"
+    print(f"[SUCCESS] predict() shape: {result['mean'].shape}")
+
+    # Single-series fit → predict() returns (H,)
+    forecaster_single = DeepARForecaster(
+        h=H, input_size=50, hidden_size=32, num_lstm_layers=1,
+        max_steps=50, batch_size=16, random_seed=0,
+    )
+    forecaster_single.fit(y_series[0], verbose=False)
+    single_result = forecaster_single.predict()
+    assert single_result["mean"].shape == (H,), f"Expected ({H},), got {single_result['mean'].shape}"
+    print(f"[SUCCESS] single-series predict() shape: {single_result['mean'].shape}")
     
     print("✅ Test 5 PASSED\n")
 
