@@ -17,8 +17,9 @@
 <!-- smlcrm:end header -->
 
 <!-- smlcrm:begin badges -->
-<!-- Badge colours: 2121a5 = token brand-book.brand-dark-blue (license, language); 3483fa = token brand-book.brand-bright-blue (release). -->
+<!-- Badge colours: 2121a5 = token brand-book.brand-dark-blue (arXiv, license, language); 3483fa = token brand-book.brand-bright-blue (release). -->
 <p align="center">
+  <a href="https://arxiv.org/abs/2604.16719"><img alt="arXiv: 2604.16719" src="https://img.shields.io/badge/arXiv-2604.16719-2121a5"></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/github/license/Smlcrm/Chronax?color=2121a5"></a>
   <a href="https://github.com/Smlcrm/Chronax/releases"><img alt="Release: latest GitHub release" src="https://img.shields.io/github/v/release/Smlcrm/Chronax?color=3483fa"></a>
   <!-- smlcrm:no-ci: the repository has no build or test workflow (web-docs-prod.yml only publishes documentation) -->
@@ -374,7 +375,20 @@ Explore inline docstrings for detailed parameter and return-type information.
 <!-- smlcrm:begin citation -->
 ## Citation
 
-If you use Chronax in your work, cite it as below. GitHub's "Cite this repository" button reads the same data from [`CITATION.cff`](CITATION.cff).
+If you use Chronax in your work, cite the paper, [arXiv:2604.16719](https://arxiv.org/abs/2604.16719), and the software you used. GitHub's "Cite this repository" button reads the same data from [`CITATION.cff`](CITATION.cff) and offers the paper first.
+
+```bibtex
+@misc{smlcrm_chronax_paper,
+  title         = {Chronax: A Jax Library for Univariate Statistical Forecasting and Conformal Inference},
+  author        = {Carey, Xan and Deshmukh, Yash and Huang, Aileen and Jadhav, Sunit and Tekawade, Omkar and Yang, Lorraine and Tiwary, Anvesha and Riano, Gerardo and Greenwald, Amy and Goktas, Denizalp},
+  year          = {2026},
+  eprint        = {2604.16719},
+  archivePrefix = {arXiv},
+  url           = {https://arxiv.org/abs/2604.16719}
+}
+```
+
+The software:
 
 ```bibtex
 @software{smlcrm_chronax,
