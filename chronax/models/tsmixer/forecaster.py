@@ -4,14 +4,16 @@ TSMixer is a multivariate model — all N series must be provided together as a
 single ``[T, N]`` array (or a list of N equal-length 1-D arrays). A single
 shared model processes all channels simultaneously.
 
-Normalisation strategy — per-window:
-    For each extracted window the insample mean/std are computed and both the
-    insample and outsample portions of that window are normalised with those
-    statistics.  This matches NeuralForecast's ``scaler_type="standard"``
-    pipeline and ensures the model always sees consistently scaled input
-    regardless of where in the series the window falls.  During inference the
-    context window is normalised with its own mean/std; predictions are
-    denormalised with the same statistics before returning.
+Normalisation strategy — per-window (optional, off by default):
+    When ``scale=True``, the insample mean/std of each extracted window is
+    computed and both the insample and outsample portions of that window are
+    normalised with those statistics (matches NeuralForecast's
+    ``scaler_type="standard"``), ensuring the model always sees consistently
+    scaled input regardless of where in the series the window falls. During
+    inference the context window is normalised with its own mean/std;
+    predictions are denormalised with the same statistics before returning.
+    Default ``scale=False`` matches NF's actual default ``scaler_type="identity"``
+    — no external scaling, relying solely on the model's internal RevIN.
 """
 
 from __future__ import annotations
@@ -126,7 +128,7 @@ class TSMixerForecaster(BaseForecaster):
         random_seed: int = 0,
         alias: str = "TSMixer",
         loss: Union[str, LossFn] = "mae",
-        scale: bool = True,
+        scale: bool = False,
         grad_clip: float = 0.0,
         use_lr_schedule: bool = False,
         weight_decay: float = 0.0,

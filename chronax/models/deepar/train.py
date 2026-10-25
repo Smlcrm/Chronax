@@ -45,7 +45,7 @@ class TrainState:
 # ---------------------------------------------------------------------------
 
 
-def make_loss_fn(model: nn.Module) -> Callable:
+def make_loss_fn(model: nn.Module, h: int) -> Callable:
     """Return a loss function ``(params, batch, rng) -> scalar``.
 
     The batch dict contains:
@@ -55,10 +55,10 @@ def make_loss_fn(model: nn.Module) -> Callable:
         futr_exog:    [B, L+h, F] or None
         stat_exog:    [B, S] or None
 
-    During training we pass the *history window* of futr_exog (first L
-    steps) to training_roll as the ``futr_exog`` argument, so the decoder
-    can use futr_exog[t+1] as an auxiliary input when predicting y[t+1].
+    Lag features (lag-1/7/h/2h) are always concatenated onto ``futr_exog`` so
+    the ``/proj`` input width matches :func:`forecast_mc` (1 + F + 4).
     """
+    from .model import _build_lag_features
 
     def loss_fn(params: dict, batch: dict, rng: jnp.ndarray) -> jnp.ndarray:
         y_hist = batch["insample_y"]      # [B, L, 1]
@@ -74,17 +74,20 @@ def make_loss_fn(model: nn.Module) -> Callable:
         mask_seq = jnp.concatenate([avail_mask, sample_mask], axis=1) # [B, L+h, 1]
 
         def single_series_loss(y_s, mask_s, futr_s, stat_s):
-            # y_s: [L+h, 1], mask_s: [L+h, 1], futr_s: [L+h, F], stat_s: [S]
-            y_in = y_s[:-1, 0] # [L+h-1]
-            y_target = y_s[1:] # [L+h-1, 1]
-            m_target = mask_s[1:] # [L+h-1, 1]
-            
-            f_in = futr_s[1:] if futr_s is not None else None # [L+h-1, F]
-            
+            # y_s: [L+h, 1], mask_s: [L+h, 1], futr_s: [L+h, F] or None, stat_s: [S]
+            y_full = y_s[:, 0]  # [L+h]
+            lags = _build_lag_features(y_full, h)  # [L+h, 4]
+            xf = lags if futr_s is None else jnp.concatenate([futr_s, lags], -1)
+
+            y_in = y_full[:-1]  # [L+h-1]
+            y_target = y_s[1:]  # [L+h-1, 1]
+            m_target = mask_s[1:]  # [L+h-1, 1]
+            f_in = xf[1:]  # [L+h-1, F+4]
+
             mu, sigma = model.apply(
                 params,
                 y_in,
-                f_in,    # futr_exog
+                f_in,    # futr_exog (+ lags)
                 stat_s,
                 True,    # training
                 rngs={"dropout": rng},
@@ -207,7 +210,7 @@ def train(
     )
     state = TrainState(params, tx.init(params), tx)
 
-    loss_fn = make_loss_fn(model)
+    loss_fn = make_loss_fn(model, h=h)
     train_step_fn = make_train_step(model, loss_fn)
 
     train_losses: List[float] = []

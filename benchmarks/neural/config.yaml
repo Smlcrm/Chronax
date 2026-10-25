@@ -74,6 +74,12 @@ overrides:
   DeepNPTS:
     nf_params: { scaler_type: identity, batch_norm: false }
 
+  # NF DeepAR with loss=MAE() still runs trajectory_samples=100 MC samples per
+  # step to compute MAE — 100× slowdown vs 1 sample. Fix: trajectory_samples=1.
+  # windows_batch_size=32 matches Chronax's batch_size=32 default.
+  DeepAR:
+    nf_params: { trajectory_samples: 1, windows_batch_size: 32 }
+
   # Autoformer/FEDformer: pin NF to the Chronax port protocol (not NF shipped
   # defaults of max_steps=5000 / windows_batch_size=1024 / identity scaler).
   Autoformer:
