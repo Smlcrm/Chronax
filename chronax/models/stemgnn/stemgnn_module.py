@@ -1,17 +1,20 @@
 """Flax NNX modules for the StemGNN forecaster (port of neuralforecast's StemGNN).
 
-A latent correlation layer (GRU over the NODE axis + additive attention) learns
+A latent correlation layer (a gated recurrent unit (GRU) over the NODE axis + additive attention) learns
 a graph over series; a 4-term Chebyshev expansion of its normalized Laplacian
 forms the graph Fourier transform ("GFT"); and each ``StockBlockLayer`` runs the
-Spe-Seq cell — a 4-point DFT over the CHEBYSHEV-ORDER axis (not time), GLU stacks
-on the real/imag parts, an ``irfft`` back — followed by a per-order graph-conv
+Spe-Seq cell, a 4-point discrete Fourier transform (DFT) over the CHEBYSHEV-ORDER
+axis (not time), gated linear unit (GLU) stacks
+on the real/imag parts, an ``irfft`` back, followed by a per-order graph-conv
 kernel and sigmoid-gated forecast/backcast heads over two residual stacks.
 
-The 4-point DFT/IDFT are materialized as CONSTANT-MATRIX GEMMs rather than
+The 4-point DFT/IDFT are materialized as CONSTANT-MATRIX general matrix
+multiplies (GEMMs) rather than
 ``jnp.fft`` primitives. For length 4 the forward twiddles are exactly
 ``{0, ±1}`` and the ``irfft(n=4)`` linear map is exact quarters, so the GEMMs
 equal the FFT to float rounding, and keeping the transform as a matmul stays on
-the XLA-CPU fast path inside the ``lax.scan`` training body (FFT primitives
+the XLA (Accelerated Linear Algebra) CPU (central processing unit) fast path
+inside the ``lax.scan`` training body (FFT primitives
 there are heavily pessimized). ``irfft(n=4)`` consumes only the first
 ``n//2+1 = 3`` complex bins and ignores the imaginary parts of bins 0 and 2
 (DC/Nyquist); ``_IRFFT4`` reproduces that map exactly, top-frequency bin
@@ -44,7 +47,7 @@ import numpy as np
 from flax import nnx
 
 # ---------------------------------------------------------------------------
-# Exact 4-point DFT / IRFFT as constant matrices (module-level numpy globals —
+# Exact 4-point DFT / IRFFT as constant matrices (module-level numpy globals,
 # NEVER module attributes: plain arrays on an nnx.Module land in the static
 # GraphDef (unhashable), and nnx.Param would train them).
 # ---------------------------------------------------------------------------
@@ -133,7 +136,7 @@ class _XavierUniformInit:
         bound = self.gain * math.sqrt(6.0 / (self.fan_in + self.fan_out))
         return jax.random.uniform(key, shape, dtype, minval=-bound, maxval=bound)
 
-    def __eq__(self, other):  # value equality — see _TorchLinearInit
+    def __eq__(self, other):  # value equality, see _TorchLinearInit
         return (type(other) is type(self) and other.fan_in == self.fan_in
                 and other.fan_out == self.fan_out and other.gain == self.gain)
 
@@ -156,7 +159,7 @@ class _XavierNormalInit:
         std = self.gain * math.sqrt(2.0 / (self.fan_in + self.fan_out))
         return std * jax.random.normal(key, shape, dtype)
 
-    def __eq__(self, other):  # value equality — see _TorchLinearInit
+    def __eq__(self, other):  # value equality, see _TorchLinearInit
         return (type(other) is type(self) and other.fan_in == self.fan_in
                 and other.fan_out == self.fan_out and other.gain == self.gain)
 
@@ -184,7 +187,7 @@ class GLU(nnx.Module):
     """Gated linear unit: ``linear_left(x) * sigmoid(linear_right(x))``.
 
     The two linear maps are fused into one ``Linear(in, 2*out)`` whose output is
-    split — identical math (concatenated output columns), same init law (both
+    split, identical math (concatenated output columns), same init law (both
     halves drawn from ``U(±1/sqrt(in))``), and half the GEMM dispatches on the
     hot path.
     """
@@ -208,7 +211,7 @@ class TorchGRU(nnx.Module):
     Parameters mirror torch exactly for pure-copy weight transplant:
     ``w_ih [3H, I]``, ``w_hh [3H, H]``, separate ``b_ih [3H]``/``b_hh [3H]``,
     gates packed ``r|z|n``. The candidate gate keeps ``b_hn`` INSIDE the reset
-    product — ``n = tanh(i_n + b_in + r * (h_n + b_hn))`` — which is why flax's
+    product, ``n = tanh(i_n + b_in + r * (h_n + b_hn))``, which is why flax's
     ``nnx.GRUCell`` (fused single bias) is NOT transplant-exact and is not used.
     All params init ``U(±1/sqrt(H))`` (torch GRU default).
     """
@@ -225,7 +228,7 @@ class TorchGRU(nnx.Module):
         """x: ``[seq, B, I]`` -> full output sequence ``[seq, B, H]``; ``h0 = 0``.
 
         StemGNN runs the sequence over the NODE axis (seq = n_series), so this
-        scan has length N — a single step in the univariate wrapper.
+        scan has length N, a single step in the univariate wrapper.
         """
         w_ih = self.w_ih.value
         w_hh = self.w_hh.value
@@ -393,7 +396,7 @@ class StemGNNNet(nnx.Module):
                  deterministic: bool = True) -> jnp.ndarray:
         """insample_z: ``[B, L, N]`` scaled -> ``[B, h, mult * N]`` scaled.
 
-        ``deterministic=True`` (inference/eval) needs no key — dropout is off.
+        ``deterministic=True`` (inference/eval) needs no key, dropout is off.
         Training passes a per-step dropout key.
         """
         x = insample_z.astype(jnp.float32)

@@ -1,7 +1,8 @@
 """Gated primitives and selection/attention layers for TFT (flax.nnx).
 
 Faithful port of the building blocks in ``neuralforecast/models/tft.py``:
-GLU, the Gated Residual Network (GRN), the Variable Selection Network, the
+the gated linear unit (GLU), the gated residual network (GRN), the variable
+selection network, the
 continuous embedding, and the interpretable multi-head attention. ``float32``
 throughout; all ``nnx.Linear`` use torch-style init for trajectory parity.
 """
@@ -26,7 +27,7 @@ class _TorchLinearInit:
         bound = 1.0 / math.sqrt(self.fan_in)
         return jax.random.uniform(key, shape, dtype, minval=-bound, maxval=bound)
 
-    def __eq__(self, other):  # I2 value equality — see informer_layers._TorchLinearInit
+    def __eq__(self, other):  # I2 value equality, see informer_layers._TorchLinearInit
         return type(other) is type(self) and other.fan_in == self.fan_in
 
     def __hash__(self):
@@ -45,7 +46,7 @@ _GRN_ACTIVATIONS = {
 
 
 def _resolve_grn_activation(name: str):
-    """Map a GRN activation name (NF ``grn_activation``) to a callable. Default ELU."""
+    """Map a GRN activation name (neuralforecast ``grn_activation``) to a callable. Default ELU."""
     key = name.upper()
     if key not in _GRN_ACTIVATIONS:
         raise ValueError(
@@ -74,7 +75,7 @@ class GLU(nnx.Module):
 
 
 class GRN(nnx.Module):
-    """Gated Residual Network (NF GRN).
+    """Gated Residual Network (neuralforecast GRN).
 
     ``y = MaybeLayerNorm(residual + GLU(lin_i(act(lin_a(a) + lin_c(c)))))``,
     where ``residual = a`` (or ``out_proj(a)`` when ``output_size`` is given) and
@@ -126,7 +127,7 @@ class GRN(nnx.Module):
 
 
 class VariableSelectionNetwork(nnx.Module):
-    """Selects and combines ``num_inputs`` embedded variables (NF VSN).
+    """Selects and combines ``num_inputs`` embedded variables (neuralforecast VSN).
 
     A joint GRN over the flattened variable embeddings (plus optional static
     context) produces softmax selection weights; each variable is transformed by
@@ -145,7 +146,7 @@ class VariableSelectionNetwork(nnx.Module):
         rngs: nnx.Rngs,
     ):
         self.num_inputs = num_inputs
-        # NF parity: the joint/selection GRN takes NO dropout — only the per-variable
+        # neuralforecast parity: the joint/selection GRN takes NO dropout, only the per-variable
         # GRNs do. Regularizing the selection logits under-commits the target channel
         # on seasonal series, leaving weight on constant inputs.
         self.joint_grn = GRN(
@@ -171,7 +172,7 @@ class VariableSelectionNetwork(nnx.Module):
 
 
 class ContinuousEmbedding(nnx.Module):
-    """Per-feature continuous embedding (NF TFTEmbedding, continuous path).
+    """Per-feature continuous embedding (neuralforecast TFTEmbedding, continuous path).
 
     Each scalar feature ``j`` maps to ``x[..., j, None] * vec[j] + bias[j]``
     with learned ``vec, bias`` of shape ``[num_features, hidden]``. ``float32``.
@@ -182,7 +183,7 @@ class ContinuousEmbedding(nnx.Module):
         self.hidden_size = hidden_size
         if num_features > 0:
             k = rngs.params()
-            # NF parity: torch.nn.init.xavier_normal_ on the [num_features, hidden]
+            # neuralforecast parity: torch.nn.init.xavier_normal_ on the [num_features, hidden]
             # vectors, std = sqrt(2/(num_features+hidden)). A fixed small std (e.g.
             # normal*0.02) starts the input coupling far weaker and costs accuracy on
             # seasonal data within a fixed step budget.
@@ -226,15 +227,15 @@ class InterpretableMultiHeadAttention(nnx.Module):
             kernel_init=_TorchLinearInit(self.d_head), rngs=rngs,
         )
         self.attn_dropout = nnx.Dropout(rate=attn_dropout, rngs=rngs)
-        # NF parity: a second dropout at rate `dropout` (not attn_dropout) after
+        # neuralforecast parity: a second dropout at rate `dropout` (not attn_dropout) after
         # the output projection.
         self.out_dropout = nnx.Dropout(rate=dropout, rngs=rngs)
 
     def __call__(self, x: jnp.ndarray, deterministic: bool = True, query_start: int = 0):
         """Compute attention only for query rows ``>= query_start``.
 
-        A deliberate schedule deviation from NF, which computes all T query rows and
-        discards all but the last h in the decoder — most of that work is wasted at
+        A deliberate schedule deviation from neuralforecast, which computes all T query rows and
+        discards all but the last h in the decoder, most of that work is wasted at
         long input lengths. Per-row math is identical (row-wise softmax/dot); the
         deterministic path matches compute-then-slice to ~1 ULP of f32 reassociation
         (guarded by test_imha_query_slice_matches_compute_then_slice). Training

@@ -1,26 +1,29 @@
-"""High-level ETS (Exponential Smoothing) model-selection and fitting API in JAX.
+"""High-level exponential smoothing (ETS) model-selection and fitting application programming interface (API) in JAX.
 
 This module wires together the following components into a single entry-point
 (:func:`ets_f`) that performs automatic or fixed-specification ETS fitting:
 
-* **Low-level kernels** — state update, forecast, and rollout routines from
+* **Low-level kernels**: state update, forecast, and rollout routines from
   :mod:`ets_backend` (imported as ``_ets``).
-* **Parameter initialisation** — :func:`initparam` picks sensible starting
+* **Parameter initialisation**: :func:`initparam` picks sensible starting
   values for (α, β, γ, φ) and adjusts box bounds.
-* **State initialisation** — :func:`initstate` seeds level / trend / seasonal
-  states via OLS regression, Fourier decomposition, or seasonal averages.
-* **Admissibility** — :func:`check_param` and :func:`admissible` enforce
+* **State initialisation**: :func:`initstate` seeds level / trend / seasonal
+  states via ordinary least squares (OLS) regression, Fourier decomposition,
+  or seasonal averages.
+* **Admissibility**: :func:`check_param` and :func:`admissible` enforce
   classical ETS constraints and characteristic-polynomial root checks.
-* **Model selection** — :func:`ets_f` fits every candidate
+* **Model selection**: :func:`ets_f` fits every candidate
   (error, trend, season, damped) tuple via :func:`etsmodel` and selects the
-  winner by AICc (or AIC / BIC) with a NaN/validity-masked ``jnp.argmin``.
-* **Forecasting** — :func:`forecast_ets` / :func:`pegelsfcast_C` produce
+  winner by an information criterion (IC) with a NaN/validity-masked
+  ``jnp.argmin``: the corrected Akaike information criterion (AICc) by
+  default, or the Akaike (AIC) / Bayesian (BIC) information criterion.
+* **Forecasting**: :func:`forecast_ets` / :func:`pegelsfcast_C` produce
   mean paths, while :func:`_compute_pred_intervals` adds analytical or
   simulation-based prediction intervals.
 
 vmap contract: ``ets_f`` and the point-forecast path
 (:func:`ets_point_forecast`, :func:`ets_forward_stacked`) are natively
-traceable under ``jax.vmap`` — candidate structure is *config/shape-static*
+traceable under ``jax.vmap``: candidate structure is *config/shape-static*
 (a Python loop over static specs), while the winner is a traced
 ``jnp.argmin`` index resolved with ``jnp.take``. Only the *native-interval*
 machinery (:func:`_compute_pred_intervals`, :func:`ets_winner_view` with
@@ -57,18 +60,18 @@ _PHI_UPPER = 0.98
 EPS = 1e-3
 
 # Largest seasonal period chronax fits in the AUTO grid; above it, seasonal
-# candidates are pruned (non-seasonal fallback). This is a chronax CRASH-SAFETY,
-# NOT a faithfulness choice: chronax's seasonal initparam is inadmissible
-# (check_param raise) at ~m>=60 (universal across datasets; m<=58 fits fine). 52
-# (= weekly seasonality) sits safely below that, so every allowed seasonal
-# candidate is fittable, while very-large m (e.g. cgm's 288, ~5 cycles) is pruned
-# to avoid the inadmissible-init raise.
-# NB: StatsForecast's AutoETS does NOT prune the SELECTION grid at m>24 — it fits
-# genuine seasonal periods and lets AICc pick non-seasonal. Its `m>24 return` lives
-# in `etssimulate`, the interval SIMULATION path (hardcoded 24-length state), which
-# chronax's `_etssimulate_jit` guard below mirrors. Applying that interval-sim limit
-# to selection would over-prune genuine sub-annual periods into a degenerate
-# non-seasonal fallback, so this threshold is set by the fit limit instead.
+# candidates are pruned (non-seasonal fallback). This is a chronax crash-safety
+# limit, not a faithfulness choice: the seasonal initparam start values become
+# inadmissible (check_param raise) at roughly m >= 60. 52 (weekly seasonality)
+# sits below that, so every allowed seasonal candidate is fittable, while very
+# large m is pruned to avoid the inadmissible-init raise.
+# statsforecast's AutoETS does not prune the SELECTION grid at m > 24; it fits
+# genuine seasonal periods and lets AICc pick non-seasonal. Its `m > 24 return`
+# lives in `etssimulate`, the interval SIMULATION path (hardcoded 24-length
+# state), which chronax's `_etssimulate_jit` guard below mirrors. Applying that
+# interval-sim limit to selection would over-prune genuine sub-annual periods
+# into a degenerate non-seasonal fallback, so this threshold is set by the fit
+# limit instead.
 _MAX_SEASONAL_M = 52
 EPS_PURE = 2e-2
 
@@ -78,14 +81,12 @@ def _aicc(aic: float, n: int, k: int) -> float:
 
     Unconditional Hyndman AICc: ``AIC + 2k(k+1)/(n-k-1)``, ``inf`` when the
     correction denominator ``n-k-1 <= 0``. Matches R ``forecast::ets``,
-    StatsForecast, :func:`chronax.utils.calculate_information_criteria`, and
-    AutoARIMA (``auto_arima.py``).
+    statsforecast, :func:`chronax.utils.calculate_information_criteria`, and
+    AutoARIMA.
 
-    No gating on ``n/k`` and no ad-hoc tiny-dataset penalty: an extra term of the
-    form ``k*(150-n)/150`` has no literature basis and penalizes high-k SEASONAL
-    models on short series, biasing selection away from a correct seasonal winner.
-    The Hyndman correction already vanishes as ``n`` grows, so a gate on ``n/k``
-    would be redundant as well.
+    No extra small-sample gating or penalty is applied: the Hyndman correction
+    already vanishes as ``n`` grows, and an ad-hoc penalty would bias
+    selection away from high-k seasonal models on short series.
 
     Parameters
     ----------
@@ -131,7 +132,7 @@ def _compute_ic(lik: jnp.ndarray, n: int, k: int) -> tuple[jnp.ndarray, jnp.ndar
     """Compute AIC, BIC, and AICc from the likelihood-style scalar *lik*.
 
     *lik* may be a traced jnp scalar (the fit runs under vmap in the
-    conformal CV path); *n* and *k* are shape/config-static ints, so all
+    conformal cross-validation (CV) path); *n* and *k* are shape/config-static ints, so all
     branching happens on statics and the returned ICs stay traced.
 
     Parameters
@@ -157,11 +158,10 @@ def _compute_ic(lik: jnp.ndarray, n: int, k: int) -> tuple[jnp.ndarray, jnp.ndar
 def _inv_sigmoid_scaled(val: float, low: float, high: float) -> float:
     """Inverse of the legacy scaled-sigmoid transform: constrained → unconstrained.
 
-    Pure host math on concrete start values (session-2 lever 3a): the eager
-    x0 build runs once per candidate per fit, and each jnp op here was a
-    dispatch + device sync. The inputs are data-independent start values
-    (proven concrete even under the CV vmap — a tracer would crash the
-    ``float()``), so Python floats are exact and free.
+    Pure host math on concrete start values. The inputs are data-independent
+    start values, so they are concrete even under the CV vmap (a tracer would
+    crash the ``float()``) and Python floats are exact and free of device
+    dispatch.
     """
     z = (float(val) - low) / (high - low)
     z = min(max(z, 1e-4), 1.0 - 1e-4)
@@ -377,15 +377,13 @@ def initparam(
 ) -> tuple[dict[str, float], jnp.ndarray, jnp.ndarray]:
     """Memoized front for :func:`_initparam_impl`.
 
-    Every input is pure config — no ``y`` anywhere — yet the eager impl pays
-    several ``.at[].set`` scatter dispatches plus ``float()`` device syncs
-    per call, and the auto grid calls it once per candidate per fit
-    (~0.3-0.5 ms/candidate, n-independent). Key the results on host floats
-    (NaN normalized to None — NaN != NaN would miss the cache forever) and
-    the bounds as tuples. Inputs are provably concrete here: the impl's own
-    ``float()`` casts would crash on a tracer, and the conformal CV vmap has
-    exercised this path since the S-wave, so caching on host values cannot
-    change traceability. The returned dict is copied per call so a caller
+    Every input is pure config (no ``y`` anywhere), while the eager impl pays
+    several ``.at[].set`` scatter dispatches plus ``float()`` device syncs per
+    call, once per candidate per fit. Results are keyed on host floats (NaN
+    normalized to None, since NaN != NaN would miss the cache forever) and
+    the bounds as tuples. Inputs are concrete here: the impl's own ``float()``
+    casts would crash on a tracer, so caching on host values cannot change
+    traceability. The returned dict is copied per call so a caller
     mutation cannot poison the cache; the jnp bounds arrays are immutable.
     """
     key_vals = []
@@ -507,7 +505,7 @@ def admissible(alpha: float, beta: float, gamma: float, phi: float, m: int) -> b
     Check ETS smoothing parameters against standard admissibility conditions.
 
     Includes classical ETS constraints and a seasonal stability check via the
-    characteristic polynomial’s roots (|root| <= 1).
+    characteristic polynomial's roots (``|root| <= 1``).
 
     Returns
     -------
@@ -539,7 +537,7 @@ def admissible(alpha: float, beta: float, gamma: float, phi: float, m: int) -> b
         # host memo: `_admissible_root_ok` builds the monic polynomial and runs
         # `jnp.linalg.eigvals` + a float() sync once per SEASONAL candidate per
         # fit, on purely config-derived inputs (start values + default bounds),
-        # so the memo lets repeat fits skip an identical verdict. The <= 1+1e-10
+        # so the memo lets repeat fits skip an identical check. The <= 1+1e-10
         # boundary is complement-exact for non-NaN moduli; a NaN modulus (LAPACK
         # non-convergence or NaN params, unreachable from finite start values)
         # maps to inadmissible, the safer direction. maxsize bounds growth if
@@ -623,7 +621,7 @@ def _admissible_root_ok(
     jnp mirror of the characteristic-polynomial root test inside
     :func:`admissible`. The polynomial is monic by construction (leading
     coefficient 1.0), so no trailing-zero trimming is needed and the
-    companion matrix has a static shape — safe under jit/vmap.
+    companion matrix has a static shape, safe under jit/vmap.
     """
     P = jnp.zeros((m + 2,), dtype=jnp.float64)
     P = P.at[0].set(phi * (1.0 - alpha - gamma))
@@ -775,7 +773,7 @@ def initstate(y: jnp.ndarray, m: int, trendtype: str, seasontype: str) -> jnp.nd
         X = X.at[:, 1].set(jnp.arange(1, n + 1, dtype=jnp.float64))
         (l, b), *_ = jnp.linalg.lstsq(X[:maxn], y_sa[:maxn], rcond=-1.0)
         # The remaining safeguards branch on regression *values* (traced under
-        # vmap) — expressed as jnp.where chains that preserve the original
+        # vmap), expressed as jnp.where chains that preserve the original
         # sequential-mutation order exactly.
         if trendtype == "A":
             degenerate = jnp.abs(l + b) < 1e-8
@@ -875,9 +873,9 @@ def pegelsresid_C(
     Routes through ``_ets._calc_roll_nohist`` (with
     ``clip_multiplicative_errors=False``, whose static-False selects make it
     expression-identical to ``_calc_roll``) rather than ``_ets.calc_full``. A full
-    (n+1, n_states) state history would be scattered per step, but every consumer —
-    forecast seeding, native intervals, the stacked CV refit, ``ets_f``'s
-    ``cand_last_state`` — reads only ``states[-1]``. ``states`` is therefore the
+    (n+1, n_states) state history would be scattered per step, but every consumer
+    (forecast seeding, native intervals, the stacked CV refit, ``ets_f``'s
+    ``cand_last_state``) reads only ``states[-1]``. ``states`` is therefore the
     final snapshot only, shape ``(1, n_states)``, and all ``[-1]`` consumers are
     indexing-identical. ``e``/``amse``/``lik`` are the same expressions in the same
     order (in-carry likelihood accumulation).
@@ -919,8 +917,8 @@ def pegelsresid_C(
         fcst_h=nmse,
     )
     # Legacy NA sentinel (-99999) → NaN, branch-free: if lik is already NaN the
-    # comparison is False and NaN propagates unchanged (same as the old
-    # eager double-if, but traceable under vmap).
+    # comparison is False and NaN propagates unchanged; the form is branch-free
+    # so it traces under vmap.
     lik = jnp.where(jnp.abs(lik + 99999.0) < _ets.TOL, jnp.nan, lik)
     return amse, e, last_state[None, :], lik
 
@@ -993,7 +991,7 @@ def optimize_ets_target_fn(
     Returns
     -------
     results(...)
-        A small namedtuple-like object compatible with your test harness.
+        A small namedtuple-like object holding the fitted parameters and states.
     """
     par_alpha = par.get("alpha", jnp.nan)
     alpha = par_noopt["alpha"] if math.isnan(par_alpha) else par_alpha
@@ -1046,7 +1044,7 @@ def optimize_ets_target_fn(
     def _pad_for_jit(
         y_arr: jnp.ndarray, pad_to_val: Optional[int], bucket_size_val: Optional[int]
     ) -> tuple[jnp.ndarray, int]:
-        """Pad the series for shape-stable JIT execution when requested."""
+        """Pad the series for shape-stable just-in-time (JIT) execution when requested."""
         n_obs = int(y_arr.shape[0])
         if pad_to_val is None and bucket_size_val is None:
             return y_arr, n_obs
@@ -1129,15 +1127,12 @@ def _make_etsmodel_tail(
 ):
     """Config-keyed jitted post-optimizer tail for :func:`etsmodel`.
 
-    Everything after the optimizer would otherwise run as ~20 eager dispatches per
-    candidate (transform + validity + pegelsresid buffer builds + IC math +
-    par concat + fitted/sigma2), an n-independent ~1.3-2 ms/candidate floor
-    that dominated small-n AutoETS fits (ablation: 16 ms glue of 42.5 ms on
-    airline). One jitted call per static config fuses the lot; repeat fits
-    hit this lru_cache, so the S0 no-recompile contract holds. The values
-    are the same ops in the same f64 order — gated bit-identical end to end
-    (ICs included — a reassociated IC could flip a near-tied argmin) by
-    speed_probes/e3_gate.py across m in {1,4,11,12,52,288} x f32/f64.
+    Everything after the optimizer (transform + validity + pegelsresid buffer
+    builds + IC math + par concat + fitted/sigma2) runs as one jitted call per
+    static config, which removes an n-independent per-candidate
+    eager-dispatch floor. Repeat fits hit this lru_cache, so no recompile
+    occurs. The values are the same ops in the same f64 order as the eager
+    form, ICs included (a reassociated IC could flip a near-tied argmin).
     """
     opt_a = "alpha" in opt_names
     opt_b = "beta" in opt_names
@@ -1203,8 +1198,8 @@ def _make_etsmodel_tail(
             aux_e = jnp.where(e == -1.0, -1 + 1e-3, e)
             fits_v = jnp.asarray(y) / (1.0 + aux_e)
         sq_e = e * e
-        # Exclude infs from the sum but let NaN propagate (matches the old
-        # eager boolean-mask indexing, which cannot trace).
+        # Exclude infs from the sum but let NaN propagate (boolean-mask
+        # indexing cannot trace).
         sigma2 = jnp.sum(jnp.where(jnp.isinf(sq_e), 0.0, sq_e)) / (n - k - 1)
         return dict(
             loglik=-0.5 * lik,
@@ -1298,7 +1293,7 @@ def etsmodel(
         Optimisation objective (``"lik"`` / ``"mse"`` / ``"amse"`` /
         ``"sigma"`` / ``"mae"``).
     nmse : int
-        AMSE horizon (1–30).
+        AMSE horizon (1 to 30).
     bounds : str
         Bound mode (``"both"`` / ``"usual"`` / ``"admissible"``).
     maxit : int
@@ -1339,16 +1334,15 @@ def etsmodel(
                        jnp.asarray(lower, dtype=jnp.float64),
                        jnp.asarray(upper, dtype=jnp.float64),
                        bounds, m):
-        # The AUTO grid never reaches here for the common trigger — seasonal
+        # The AUTO grid never reaches here for the common trigger: seasonal
         # candidates with m > _MAX_SEASONAL_M are pruned in ets_f, so one bad
-        # candidate cannot kill an auto fit. This
-        # raise is only hit by a *user-fixed* seasonal spec whose initial parameters
-        # are inadmissible at this m (e.g. ETS(A,A,A) at m=288 on some data). A
-        # vmap-safe silent degrade to non-seasonal is not possible (dropping the
-        # seasonal component changes the state shape, and forecast() re-fits under
-        # the CV vmap where shapes must be static), so — matching the plan's "keep
-        # genuine user-input raises" — we surface a clear, actionable error rather
-        # than crash opaquely or return NaNs.
+        # candidate cannot kill an auto fit. This raise is only hit by a
+        # *user-fixed* seasonal spec whose initial parameters are inadmissible
+        # at this m (e.g. ETS(A,A,A) at m=288 on some data). A vmap-safe silent
+        # degrade to non-seasonal is not possible (dropping the seasonal
+        # component changes the state shape, and forecast() re-fits under the
+        # CV vmap where shapes must be static), so a clear, actionable error
+        # is raised rather than an opaque crash or NaNs.
         raise ValueError(
             f"ETS({errortype},{trendtype},{seasontype}) is inadmissible at "
             f"season_length={m}: its initial smoothing parameters fall outside the "
@@ -1382,18 +1376,16 @@ def etsmodel(
     n_state_opt = int(init_state_full.shape[0]) if opt_init_state else 0
     np_eff = np_ + n_state_opt
     if np_eff >= len(y) - 1:
-        # Shape/config-static condition — raising is trace-safe and replaces
-        # the old inf-IC early return (whose shape differed from a real fit).
+        # Shape/config-static condition, so raising is trace-safe.
         raise ValueError(
             f"Not enough observations ({len(y)}) to estimate the "
             f"ETS({errortype},{trendtype},{seasontype}) specification."
         )
     if np_ > 0:
-        # Host-side x0 build (session-2 lever 3a): start values and bounds are
-        # concrete (a tracer would crash these float() casts — proven by the
-        # vmapped conformity path), so the former per-name jnp clip/log/minimum
-        # dispatches + device syncs are replaced by one bounds pull + Python
-        # math. Values match the old jnp ops to <=1 ULP (math.log vs XLA log).
+        # Host-side x0 build: start values and bounds are concrete (a tracer
+        # would crash these float() casts), so the per-name clip/log/minimum
+        # runs as Python math from one bounds pull instead of per-op device
+        # dispatches.
         lo_h = [float(v) for v in np.asarray(lower)]
         up_h = [float(v) for v in np.asarray(upper)]
 
@@ -1464,8 +1456,8 @@ def etsmodel(
     nstate = int(init_state_full.shape[0])
     k = np_ + n_state_opt + 1
 
-    # The whole post-optimizer tail — transform + validity + pegelsresid rollout +
-    # IC math + par concat + fitted/sigma2 — runs as ONE config-keyed jitted call
+    # The whole post-optimizer tail (transform + validity + pegelsresid rollout +
+    # IC math + par concat + fitted/sigma2) runs as ONE config-keyed jitted call
     # (see _make_etsmodel_tail), same ops in the same f64 order, which removes a
     # per-candidate eager-dispatch floor.
     # `opt_init_state and n_state_opt > 0` collapses to n_state_opt > 0
@@ -1549,12 +1541,12 @@ def ets_f(
     is expanded into a grid of candidate component types. The grid is
     *config/shape-static*: every candidate is fitted via :func:`etsmodel`
     (a static Python loop) and the winner is a NaN/validity-masked
-    ``jnp.argmin`` over the chosen information criterion — a traced index,
+    ``jnp.argmin`` over the chosen information criterion, a traced index,
     never a concretized value. This makes the whole function traceable under
     ``jax.vmap`` (the conformity_scores CV path).
 
     When *model* is a ``dict`` (a previously-fitted classic dict), this
-    function acts as a **forward** step — rolling the stored parameters over
+    function acts as a **forward** step, rolling the stored parameters over
     new data without re-optimisation (see :func:`forward_ets`).
 
     Parameters
@@ -1575,7 +1567,7 @@ def ets_f(
     additive_only : bool | None
         If ``True``, forbid all multiplicative component types.
     blambda, biasadj
-        *(Not implemented — Box-Cox / bias-adjustment placeholders.)*
+        *(Not implemented; Box-Cox / bias-adjustment placeholders.)*
     lower, upper : array-like | None
         Box bounds for ``[α, β, γ, φ]``; sensible defaults applied when
         ``None``.
@@ -1583,7 +1575,7 @@ def ets_f(
         Optimisation objective (``"lik"`` / ``"mse"`` / ``"amse"`` /
         ``"sigma"`` / ``"mae"``).
     nmse : int
-        AMSE tracking horizon (1–30).
+        AMSE tracking horizon (1 to 30).
     bounds : str
         Bound mode (``"both"`` / ``"usual"`` / ``"admissible"``).
     ic : str
@@ -1594,15 +1586,14 @@ def ets_f(
     allow_multiplicative_trend : bool
         Include ``"M"`` trend in the candidate grid.
     use_initial_values : bool
-        *(Reserved — not used.)*
+        *(Reserved; not used.)*
     maxit : int
         Maximum iteration budget passed to the optimiser.
     optax_steps : int | None
         Explicit optax step count (``None`` → a static table keyed on the
         series *length*, which is shape-static under vmap).
-    early_stop_patience, early_stop_min_delta, allow_extended_iterations,
-    adaptive_tol
-        *(Inert — retained for API compatibility. Early stopping and
+    early_stop_patience, early_stop_min_delta, allow_extended_iterations, adaptive_tol
+        *(Inert; retained for API compatibility. Early stopping and
         data-adaptive iteration budgets require concretizing traced values;
         the optimizer instead runs a fixed budget with monotone best-iterate
         tracking, so extra steps can never make the fit worse.)*
@@ -1624,19 +1615,19 @@ def ets_f(
     The stacked dictionary contains, with ``C`` candidates and state width
     ``S = max(nstate)``:
 
-    * static metadata — ``m``, ``n``, ``ic_name``, ``candidates``
+    * static metadata: ``m``, ``n``, ``ic_name``, ``candidates``
       (tuple of ``(error, trend, season, damped)``), ``cand_m`` /
       ``cand_nstate`` / ``cand_k`` (per-candidate ints);
-    * per-candidate stacks (axis 0 = candidate) — ``cand_par`` ``(C, 4)``,
+    * per-candidate stacks (axis 0 = candidate): ``cand_par`` ``(C, 4)``,
       ``cand_init_state`` / ``cand_last_state`` ``(C, S)`` (zero-padded),
       ``cand_fitted`` / ``cand_residuals`` ``(C, n)``, ``cand_sigma2`` /
       ``cand_loglik`` / ``cand_aic`` / ``cand_bic`` / ``cand_aicc`` /
       ``cand_mse`` / ``cand_amse`` / ``cand_valid`` ``(C,)``, and ``ic``
       (criterion values masked to ``inf`` where invalid);
-    * selection — ``best`` (traced argmin index), ``valid`` (traced "any
+    * selection: ``best`` (traced argmin index), ``valid`` (traced "any
       candidate finite" flag);
     * winner conveniences under the classic keys (``jnp.take``-selected,
-      traced) — ``fitted``, ``residuals``, ``sigma2``, ``loglik``, ``aic``,
+      traced): ``fitted``, ``residuals``, ``sigma2``, ``loglik``, ``aic``,
       ``bic``, ``aicc``, ``mse``, ``amse``, ``par`` (4,), ``n_params``.
 
     Use :func:`ets_point_forecast` for traceable point forecasts,
@@ -1645,7 +1636,7 @@ def ets_f(
     :func:`ets_forward_stacked` / :func:`forward_ets` to re-roll on new data.
 
     Multiplicative-component candidates are *masked out* (IC → ``inf``) when
-    the data are not strictly positive, instead of raising — a raise on a
+    the data are not strictly positive, instead of raising, because a raise on a
     data value cannot trace. A fixed multiplicative spec on non-positive
     data therefore yields NaN forecasts rather than an exception.
     """
@@ -1662,7 +1653,7 @@ def ets_f(
             seasontype = "N"
     if optax_steps is None:
         # Static iteration table keyed on series *length* (shape-static under
-        # vmap). The old data-adaptive estimator concretized traced values.
+        # vmap); a data-adaptive budget would concretize traced values.
         if n < 100:
             optax_steps = 50
         elif n < 200:
@@ -1829,9 +1820,8 @@ def ets_f(
         if restrict:
             # Additive error with any multiplicative component is numerically
             # unstable (forecast::ets forbids A+M-trend and A+M-season under
-            # restrict; the legacy hand-built grid never generated them, so
-            # the full static grid must exclude them here — matches the
-            # fixed-spec "Forbidden model combination" raise above).
+            # restrict), so the static grid excludes them here, matching the
+            # fixed-spec "Forbidden model combination" raise above.
             if etype == "A" and (ttype == "M" or stype == "M"):
                 return
             if etype == "M" and ttype == "M" and stype == "A":
@@ -1843,14 +1833,15 @@ def ets_f(
         if ttype == "N" and dtype:
             return
         if auto_model:
-            # Shape-static pruning heuristics — auto grid only; a user-fixed
+            # Shape-static pruning heuristics, auto grid only; a user-fixed
             # spec must never be silently dropped by a heuristic.
             # Prune seasonal candidates only above chronax's real fit limit
-            # (_MAX_SEASONAL_M — crash-safety for the check_param inadmissible-init
-            # raise at large m; see the constant's NB — NOT SF mirroring, since SF's
-            # AutoETS fits m>24 seasonal). Allowing genuine sub-annual periods avoids
-            # a degenerate non-seasonal fallback; very-large m is still pruned to
-            # dodge the raise. m is config-static.
+            # (_MAX_SEASONAL_M, crash-safety for the check_param inadmissible-init
+            # raise at large m; see the constant's note). This does not mirror
+            # statsforecast, whose AutoETS fits m > 24 seasonal candidates.
+            # Allowing genuine sub-annual periods avoids a degenerate
+            # non-seasonal fallback; very large m is still pruned to dodge the
+            # raise. m is config-static.
             if m > _MAX_SEASONAL_M and stype != "N":
                 return
             if force_additive_error and etype == "M":
@@ -1966,10 +1957,9 @@ def _make_ets_f_epilogue(
     """Config-keyed jitted selection epilogue for :func:`ets_f`.
 
     Computes the masked IC vector, argmin winner, validity flag, the eleven
-    per-candidate stacks, and the eleven winner takes in one call — the same
-    values as the old eager block (gated bit-identical by e3_gate.py; a
-    reassociated IC would risk flipping a near-tied argmin, so ICs are bit-
-    compared, not toleranced). Statics: the candidate spec tuple (drives the
+    per-candidate stacks, and the eleven winner takes in one call, with the
+    same values in the same order as the eager form (a reassociated IC could
+    flip a near-tied argmin). Statics: the candidate spec tuple (drives the
     M-flavour data-positivity masks), the IC name, per-candidate state sizes
     (drive the pad widths), and the per-candidate parameter counts.
     """
@@ -2061,7 +2051,7 @@ def ets_point_forecast(mod: dict[str, Any], h: int) -> jnp.ndarray:
     ``etsforecast`` needs *static* structure flags, so the traced winner
     index cannot be dispatched on directly. Each candidate is forecast with
     its own static config (a Python loop over config) and the winning row is
-    selected with ``jnp.take`` — the AutoCES ``_forecast_candidates`` pattern.
+    selected with ``jnp.take``.
 
     Parameters
     ----------
@@ -2097,7 +2087,7 @@ def ets_winner_view(mod: dict[str, Any]) -> dict[str, Any]:
     With a single candidate the winner index is static and this stays fully
     traceable. With multiple candidates the traced ``best`` index must be
     concretized (``int(...)``) to recover the winner's *strings* (components,
-    method) — an **eager-only** operation, acceptable because its only
+    method), an **eager-only** operation, acceptable because its only
     consumers are the native-interval formulas and display paths, which run
     on concrete post-fit values (the conformal CV path never needs strings).
 
@@ -2329,7 +2319,7 @@ def _compute_sigmah(
         """Advance the multiplicative-error variance recursion.
 
         Computes sum_{j<k} cvals[j]^2 * theta[k-1-j] with a masked
-        full-length gather — the loop index k is traced inside fori_loop,
+        full-length gather: the loop index k is traced inside fori_loop,
         so dynamic slices (cvals[:k], theta_acc[:k][::-1]) cannot compile
         (slice bounds must be static under jit).
         """
@@ -2433,8 +2423,8 @@ def _compute_pred_intervals(
     """
     Compute prediction intervals for ETS forecasts.
 
-    Uses closed-form expressions for Classes 1–3 where available, and falls
-    back to simulation for Classes 4–5 (mixtures/multiplicative trickier cases).
+    Uses closed-form expressions for classes 1 to 3 where available, and falls
+    back to simulation for classes 4 and 5 (mixtures/multiplicative trickier cases).
 
     Parameters
     ----------
@@ -2626,7 +2616,7 @@ def forecast_ets(
 def forward_ets(fitted_model: dict, y: jnp.ndarray) -> dict:
     """Roll a previously fitted ETS model forward on *new* data.
 
-    The stored model structure and smoothing parameters are reused — no
+    The stored model structure and smoothing parameters are reused; no
     re-optimisation takes place. Stacked dictionaries (from string-model
     :func:`ets_f`) are re-rolled per candidate via
     :func:`ets_forward_stacked`; classic single-model dictionaries go

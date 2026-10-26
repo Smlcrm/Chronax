@@ -1,4 +1,4 @@
-"""Chronax N-BEATS — JAX/Flax port of Nixtla NeuralForecast's NBEATS model."""
+"""Chronax N-BEATS: JAX/Flax port of Nixtla neuralforecast's NBEATS model."""
 
 from chronax.models.nbeats.data import (
     RobustScaler,

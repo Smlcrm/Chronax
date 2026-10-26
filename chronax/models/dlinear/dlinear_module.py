@@ -1,11 +1,11 @@
-"""DLinear network: moving-average decomposition + two linear heads (NF-faithful).
+"""DLinear network: moving-average decomposition + two linear heads (neuralforecast-faithful).
 
-``_series_decomp`` replicates NF's SeriesDecomp exactly: replicate-pad both ends
+``_series_decomp`` replicates neuralforecast's SeriesDecomp exactly: replicate-pad both ends
 with (k-1)//2 edge copies, then an unpadded size-k moving mean (pool padding is 0
-in NF, so the divisor is always k). Weight init replicates the *distribution* of
-torch ``nn.Linear.reset_parameters`` for BOTH heads (draws differ — JAX vs torch
+in neuralforecast, so the divisor is always k). Weight init replicates the *distribution* of
+torch ``nn.Linear.reset_parameters`` for BOTH heads (draws differ, JAX vs torch
 RNG): U(+-1/sqrt(input_size)) for weights and biases, torch layout
-(``[h, input_size]``) so NF weight transplant is a pure copy. float32 throughout,
+(``[h, input_size]``) so neuralforecast weight transplant is a pure copy. float32 throughout,
 matching torch/neuralforecast defaults.
 """
 from __future__ import annotations
@@ -18,9 +18,9 @@ from flax import nnx
 
 
 def _series_decomp(y: jnp.ndarray, kernel_size: int) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """NF SeriesDecomp math; returns ``(trend, seasonal)`` for ``y: [B, L]``.
+    """neuralforecast SeriesDecomp math; returns ``(trend, seasonal)`` for ``y: [B, L]``.
 
-    Note NF's own ``SeriesDecomp.forward`` returns ``(res, moving_mean)`` — the
+    Note neuralforecast's own ``SeriesDecomp.forward`` returns ``(res, moving_mean)``, the
     REVERSE order; values are identical, only the tuple order differs here.
     """
     pad = (kernel_size - 1) // 2
@@ -34,7 +34,7 @@ def _series_decomp(y: jnp.ndarray, kernel_size: int) -> tuple[jnp.ndarray, jnp.n
 
 class DLinearNet(nnx.Module):
     """``forecast = trend @ Wt.T + bt + seasonal @ Ws.T + bs`` (no last-value
-    add-back — that is NLinear's trick). I/O ``[B, L, 1] -> [B, h, 1]``."""
+    add-back, that is NLinear's trick). I/O ``[B, L, 1] -> [B, h, 1]``."""
 
     def __init__(self, h: int, input_size: int, moving_avg_window: int, *, rngs: nnx.Rngs):
         self.h = h

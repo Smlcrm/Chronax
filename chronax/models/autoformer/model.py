@@ -1,13 +1,13 @@
-"""JAX/Flax Autoformer — univariate direct-decoding forecaster.
+"""JAX/Flax Autoformer: univariate direct-decoding forecaster.
 
 Architecture mirrors neuralforecast's Autoformer (Wu et al., 2021) for the
 univariate, no-exogenous case:
   - Circular TokenEmbedding (k=3 Conv).
   - Auto-Correlation encoder/decoder with progressive series decomposition.
-  - Autoformer seasonal LayerNorm (subtracts time-mean after standard LN).
+  - Autoformer seasonal layer norm (subtracts time-mean after standard layer normalization (LN)).
   - Final linear projection.
 
-Pure JAX/Flax/Optax — no PyTorch, no numpy.
+Pure JAX/Flax/Optax, no PyTorch, no numpy.
 
 Reference:
     Wu, H. et al. "Autoformer: Decomposition Transformers with Auto-Correlation
@@ -42,11 +42,12 @@ class AutoformerConfig:
         moving_avg_window: Kernel size for the trend moving-average filter.
         encoder_layers: Number of stacked encoder layers.
         decoder_layers: Number of stacked decoder layers.
-        conv_hidden_size: Hidden channels for the position-wise FFN convolutions.
+        conv_hidden_size: Hidden channels for the position-wise feed-forward
+            network (FFN) convolutions.
         decoder_input_size_multiplier: Fraction of ``input_size`` used as the
             decoder start-token ("label") length; must be in ``(0, 1)``.
         dropout: Dropout rate applied throughout (training only).
-        activation: FFN nonlinearity — ``"relu"`` or ``"gelu"``.
+        activation: FFN nonlinearity, ``"relu"`` or ``"gelu"``.
     """
 
     h: int = 24
@@ -113,7 +114,7 @@ def series_decomp(x: jnp.ndarray, kernel_size: int) -> Tuple[jnp.ndarray, jnp.nd
 
 
 # ---------------------------------------------------------------------------
-# Auto-correlation (FFT period discovery + time-delay aggregation)
+# Auto-correlation (fast Fourier transform (FFT) period discovery + time-delay aggregation)
 # ---------------------------------------------------------------------------
 
 
@@ -122,7 +123,8 @@ def _time_delay_agg_training(
 ) -> jnp.ndarray:
     """Shared batch-mean top-k aggregation used during training.
 
-    Fully vectorised gather — one XLA gather op, no loop, trivial gradient.
+    Fully vectorised gather: one XLA (Accelerated Linear Algebra) gather op,
+    no loop, trivial gradient.
     """
     B, H, E, length = values.shape
     mean_value = jnp.mean(jnp.mean(corr, axis=1), axis=1)  # [B, L]
@@ -142,7 +144,7 @@ def _time_delay_agg_inference(
 ) -> jnp.ndarray:
     """Per-sample top-k aggregation used during inference.
 
-    Fully vectorised gather — one XLA gather op, no loop, trivial gradient.
+    Fully vectorised gather: one XLA gather op, no loop, trivial gradient.
     """
     B, H, E, length = values.shape
     mean_value = jnp.mean(jnp.mean(corr, axis=1), axis=1)  # [B, L]
@@ -202,7 +204,7 @@ def auto_correlation(
 
 
 class _TorchUniformInit:
-    """``U(-1/sqrt(fan_in), 1/sqrt(fan_in))`` — torch ``nn.Linear`` / ``nn.Conv1d`` default."""
+    """``U(-1/sqrt(fan_in), 1/sqrt(fan_in))``, the torch ``nn.Linear`` / ``nn.Conv1d`` default."""
 
     def __init__(self, fan_in: int) -> None:
         self.fan_in = fan_in
@@ -483,7 +485,7 @@ class AutoformerModel(fnn.Module):
         trend_init = jnp.concatenate([trend_init[:, -label_len:, :], mean], axis=1)
         seasonal_init = jnp.concatenate([seasonal_init[:, -label_len:, :], zeros], axis=1)
 
-        # Encoder (TokenEmbedding: kaiming-normal; NF override on Conv1d k=3)
+        # Encoder (TokenEmbedding: kaiming-normal; neuralforecast override on Conv1d k=3)
         enc_out = _torch_conv(
             cfg.hidden_size, 3 * c,
             kernel_size=(3,), padding="CIRCULAR", name="enc_embedding",

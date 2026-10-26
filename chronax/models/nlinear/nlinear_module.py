@@ -1,9 +1,9 @@
-"""NLinear network: one linear layer with last-value normalization (NF-faithful).
+"""NLinear network: one linear layer with last-value normalization (neuralforecast-faithful).
 
 Weight init replicates the *distribution* of torch ``nn.Linear.reset_parameters``
-(draws differ — JAX vs torch RNG): kaiming-uniform (a=sqrt(5)) on the weight —
-equivalent to U(+-1/sqrt(fan_in)) — and U(+-1/sqrt(fan_in)) on the bias. Params
-are stored in TORCH layout (weight ``[h, input_size]``) so NF weight transplant
+(draws differ, JAX vs torch RNG): kaiming-uniform (a=sqrt(5)) on the weight,
+equivalent to U(+-1/sqrt(fan_in)), and U(+-1/sqrt(fan_in)) on the bias. Params
+are stored in TORCH layout (weight ``[h, input_size]``) so neuralforecast weight transplant
 is a pure copy. float32 throughout, matching torch/neuralforecast defaults.
 """
 from __future__ import annotations

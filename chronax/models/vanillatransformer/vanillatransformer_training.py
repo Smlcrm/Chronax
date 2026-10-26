@@ -2,7 +2,7 @@
 
 Unlike the iTransformer training loop, windows are sampled *inside* the
 ``nnx.scan`` (the per-step PRNG key is the scanned input), so memory stays
-bounded to one batch even at NF defaults (``max_steps=5000``,
+bounded to one batch even at neuralforecast defaults (``max_steps=5000``,
 ``windows_batch_size=1024``). The whole loop is one ``nnx.scan`` so it remains
 ``jax.vmap``-traceable for ``BaseForecaster.conformity_scores``.
 """
@@ -52,7 +52,7 @@ def train(model: VanillaTransformerNet, y: jnp.ndarray, *, h: int, input_size: i
 
     Window sampling replicates neuralforecast's regime-dependent scheme
     (``_base_model.py`` training_step): when ``n_windows < windows_batch_size``
-    NF draws ``windows_batch_size`` indices WITH replacement; otherwise it takes a
+    neuralforecast draws ``windows_batch_size`` indices WITH replacement; otherwise it takes a
     without-replacement permutation. The branch is chosen on concrete shapes
     (Python-static), so it bakes into the scan once. Sampling happens per step
     inside the scan to keep memory bounded to one batch.

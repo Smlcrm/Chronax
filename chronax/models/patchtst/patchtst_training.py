@@ -49,18 +49,18 @@ def train(model: PatchTSTNet, y: jnp.ndarray, *, h: int, input_size: int,
     The whole loop is one ``nnx.scan`` (carry = (model, optimizer)), which keeps
     the function ``jax.vmap``-traceable for ``BaseForecaster.conformity_scores``.
     Window sampling replicates neuralforecast's REGIME-DEPENDENT scheme
-    (``_base_model.py`` training_step): when ``n_windows < windows_batch_size`` NF
-    draws ``windows_batch_size`` indices WITH replacement (oversampling with
-    duplicates — the regime every small benchmark series hits, e.g. ~24 windows
-    for AirlinePassengers or ~245 for DailyFemaleBirths, both << 1024); otherwise
-    it takes a without-replacement permutation of ``windows_batch_size`` windows.
-    Getting this branch right is load-bearing for accuracy parity, so we do NOT
-    collapse it to full-batch.
+    (``_base_model.py`` training_step): when ``n_windows < windows_batch_size``
+    neuralforecast draws ``windows_batch_size`` indices WITH replacement
+    (oversampling with duplicates, which is the regime short series fall into
+    at the default batch of 1024); otherwise it takes a without-replacement
+    permutation of ``windows_batch_size`` windows. The branch matters for
+    accuracy parity, so it is not collapsed to full-batch.
 
     Note: ``batches`` materializes a ``[max_steps, windows_batch_size, input_size+h]``
-    tensor up front (mirrors the GRU sibling's pre-sampling). At the benchmark
-    defaults that is ~1.9 GB resident — acceptable for an offline benchmark, but
-    reduce ``windows_batch_size`` or ``max_steps`` if memory-constrained.
+    tensor up front (the same pre-sampling as the ``GRU`` model). At the defaults
+    (``max_steps=5000``, ``windows_batch_size=1024``) this is on the order of
+    gigabytes; reduce ``windows_batch_size`` or ``max_steps`` if memory is
+    constrained.
     """
     windows = build_windows(y, input_size, h)
     n_windows = windows.shape[0]
@@ -69,11 +69,11 @@ def train(model: PatchTSTNet, y: jnp.ndarray, *, h: int, input_size: int,
     step_keys = jax.random.split(key, max_steps)
 
     if n_windows < windows_batch_size:
-        # NF: torch.randint(0, n_windows, size=(windows_batch_size,)) — WITH replacement.
+        # neuralforecast: torch.randint(0, n_windows, size=(windows_batch_size,)), WITH replacement.
         def sample_one(k):
             return jax.random.choice(k, n_windows, shape=(windows_batch_size,), replace=True)
     else:
-        # NF: torch.randperm(n_windows)[:windows_batch_size] — WITHOUT replacement.
+        # neuralforecast: torch.randperm(n_windows)[:windows_batch_size], WITHOUT replacement.
         def sample_one(k):
             return jax.random.permutation(k, n_windows)[:windows_batch_size]
 

@@ -1,4 +1,5 @@
-"""Per-window scalers for TCN: robust (the default) and identity.
+"""Per-window scalers for the temporal convolutional network (TCN) forecaster:
+robust (the default) and identity.
 
 Self-contained (no cross-model import). Pure functions exposing
 (stats, transform, inverse) so the same shift/scale is reused for inverse.
@@ -16,7 +17,7 @@ _EPS = 1e-6
 
 def _torch_median(x: jnp.ndarray, axis: int) -> jnp.ndarray:
     """torch ``median``/``nanmedian`` convention: the LOWER of the two middle
-    order statistics on even-length axes (``jnp.median`` averages them — a
+    order statistics on even-length axes (``jnp.median`` averages them, a
     per-window shift difference on every even window; ``input_size = 3h`` is
     even whenever h is). Axis length is static, so the index is compile-time.
     """

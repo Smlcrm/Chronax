@@ -1,57 +1,37 @@
 """
-Complex Exponential Smoothing (CES) in JAX.
+Complex exponential smoothing (CES) in JAX.
 
-This module implements Complex Exponential Smoothing, a state-space forecasting method
-that uses complex-valued components to capture trend and seasonality. CES generalizes
-exponential smoothing by allowing the state to rotate in the complex plane.
+CES is a state-space method whose level is a complex number
+``l_t + i * c_t``; the complex smoothing parameter ``α_0 + i α_1`` lets the
+state rotate in the complex plane, which captures trend without a separate
+trend component. Seasonal variants add a (possibly complex) seasonal state.
 
-**Mathematical Foundation:**
+Variants:
 
-The CES model maintains a state vector with real and imaginary components:
-- State update: s_t = s_{t-1} * (1 - α) + y_t * α_complex
-- Forecast: ŷ_{t+h} = Real(s_t * rotation^h) + seasonal_component
+- NONE (0): no seasonality
+- SIMPLE (1): seasonal lag of the level (no separate seasonal state)
+- PARTIAL (2): real seasonal state with damping ``β_0``
+- FULL (3): complex seasonal state with damping ``β_0 + i β_1``
 
-Where α_complex = α_0 + i*α_1 controls smoothing in the complex plane.
+Implementation:
 
-**Variants:**
-- NONE (0): No seasonality, trend only
-- SIMPLE (1): Simple seasonal component (lagged states)
-- PARTIAL (2): Partial seasonal damping (β_0 parameter)
-- FULL (3): Full seasonal damping (β_0, β_1 parameters)
+- ``init_state``: initial state buffer per variant
+- ``ces_update_step``: one in-sample step (forecast, then update)
+- ``ces_fit_forward``: forward pass with ``lax.scan``
+- ``ces_fit_backfit``: forward-backward-forward passes for the initial state
+- ``ces_forecast``: multi-step forecast with ``lax.fori_loop``
+- ``ces_fit_single``: Nelder-Mead fit of one variant's smoothing parameters
+- ``auto_ces``: variant selection by information criterion (the Akaike
+  information criterion (AIC), its corrected form AICc, or the Bayesian
+  information criterion (BIC))
 
-**Implementation:**
+Example::
 
-The model uses JAX for JIT compilation and efficient computation:
-- `init_state()`: Initializes state vector based on variant
-- `ces_update_step()`: Updates state with new observation using lax.cond
-- `ces_fit_forward()`: Forward pass with lax.scan
-- `ces_fit_backfit()`: Backward-forward fitting for better initialization
-- `ces_forecast()`: Multi-step ahead forecasting with lax.fori_loop
-- `auto_ces()`: Automatic model selection based on information criteria
+    model = AutoCES(season_length=12, model="Z")  # select the variant by AICc
+    model.fit(y)
+    forecast = model.predict(h=24, level=[90, 95])
 
-**Attributes:**
-
-- season_length (int): Seasonal period (m)
-- model (str): Model variant ("N", "S", "P", "F", or "Z" for auto-selection)
-- alias (str): Model name for display
-- conformal_params (ConformalIntervals): Optional conformal prediction parameters
-
-**Methods:**
-
-- fit(y, X): Fit CES model to time series
-- predict(h, X, level): Generate h-step ahead forecasts with optional prediction intervals
-- forecast(y, h, X, X_future): Alternative forecasting interface
-
-**Example:**
-```python
-model = AutoCES(season_length=12, model="Z")  # Auto-select best variant
-model.fit(y)
-forecast = model.predict(h=24, level=[90, 95])
-```
-
-**References:**
-- Svetunkov & Kourentzes (2015). "Complex Exponential Smoothing"
-- Uses pure JAX implementation with jit, lax.scan, lax.cond, lax.fori_loop
+Reference: Svetunkov and Kourentzes (2015), "Complex Exponential Smoothing".
 """
 
 from typing import Optional, Tuple, Dict, List
@@ -68,9 +48,9 @@ SIMPLE = 1
 PARTIAL = 2
 FULL = 3
 
-# Inverse of auto_ces's model_map: variant code -> single-letter selector. Used to
-# cache the eagerly-selected winner at fit so the vmapped conformity_scores CV path
-# re-fits ONLY that variant per window (the AutoETS _selected_spec pattern).
+# Inverse of auto_ces's model_map: variant code -> single-letter selector. Caches
+# the winner selected at fit so the vmapped conformity_scores cross-validation
+# (CV) path re-fits only that variant per window.
 _CODE_TO_LETTER = {NONE: "N", SIMPLE: "S", PARTIAL: "P", FULL: "F"}
 
 
@@ -163,9 +143,8 @@ def _init_state_n(y: jnp.ndarray, m: int) -> jnp.ndarray:
     # Use masking for JIT compatibility
     mask = jnp.arange(len(y)) < idx
     mean_val = jnp.sum(jnp.where(mask, y, 0.0)) / jnp.maximum(jnp.sum(mask), 1.0)
-    # Pad to (m, 4) for compatibility with other variants.
-    # Buffers follow y.dtype: hardcoded float32 caused f64->f32 downcast scatters
-    # under the repo-global x64 (a FutureWarning today, a hard error in future JAX).
+    # Pad to (m, 4) for compatibility with other variants. Buffers follow
+    # y.dtype so no f64 -> f32 downcast scatter occurs under x64.
     base_state = jnp.array([[mean_val, mean_val / 1.1]], dtype=y.dtype)
     # Replicate to (m, 2) then pad to (m, 4)
     states = jnp.tile(base_state, (m, 1))
@@ -198,18 +177,19 @@ def _sf_seasonal_factors(y: jnp.ndarray, m: int) -> jnp.ndarray:
     """Seasonal init factors with ``seasonal_decompose(y, period=m).seasonal[:m]``
     semantics, vmap-native.
 
-    Matches statsforecast's full-series centered-MA detrend plus per-phase means, and
-    is guarded by a parity test against statsmodels in the contract suite. A
-    first-cycle ``mode='same'`` detrend would instead let zero-padding bias the first
-    m/2 trend values low by up to half the series LEVEL, which at large m collapses
-    the PARTIAL/FULL fits and leaves AICc selecting NONE.
+    Matches statsforecast's full-series centered moving-average (MA) detrend
+    plus per-phase means. The centered MA uses ``mode='valid'`` only, so no
+    padded values enter; a padded detrend would bias the first m/2 trend
+    values low by up to half the series level, which at large m collapses
+    the PARTIAL/FULL fits.
 
-    Centered MA via ``mode='valid'`` ONLY (no padded values enter); even m uses the
-    (m+1)-tap [0.5, 1, ..., 1, 0.5]/m filter; per-phase MASKED means over the valid
-    positions (phase = absolute series position mod m); factors de-meaned. All shapes
-    are static in (n, m) and everything follows ``y.dtype``. Requires n >= m + 1 (odd
-    m) / m + 2 (even m); callers guard with the static n >= 2m branch. Deliberate
-    deviation from statsforecast: y.dtype precision (SF buffers float32).
+    Even m uses the (m+1)-tap ``[0.5, 1, ..., 1, 0.5]/m`` filter. Per-phase
+    means are masked over the valid positions (phase = absolute series
+    position mod m) and the factors are de-meaned. All shapes are static in
+    (n, m) and everything follows ``y.dtype``. Requires n >= m + 1 (odd m) or
+    m + 2 (even m); callers guard with the static n >= 2m branch. Deliberate
+    deviation from statsforecast: y.dtype precision (statsforecast buffers
+    float32).
     """
     n = y.shape[0]
     dt = y.dtype
@@ -254,8 +234,8 @@ def _init_state_p(y: jnp.ndarray, m: int) -> jnp.ndarray:
     states = states.at[:, 0].set(mean_val)
     states = states.at[:, 1].set(mean_val / 1.1)
 
-    # n and m are both static (y.shape + static_argnum) ⇒ static Python branch,
-    # vmap-safe; it also guards _sf_seasonal_factors' n >= m+2 requirement.
+    # n and m are both static (y.shape + static_argnum), so this is a static
+    # Python branch; it also guards _sf_seasonal_factors' n >= m+2 requirement.
     if len(y) >= 2 * m:
         seasonal = _sf_seasonal_factors(y, m)
     else:
@@ -328,11 +308,12 @@ def _ces_read(states_buffer, i, season_type, m):
     """Read the CES level (time i-1; i-m for SIMPLE) and seasonal (time i-m) states
     and form the one-step-ahead forecast ``level[0] + seasonal``.
 
-    Canonical CES (Svetunkov; matches statsforecast ``cesfcst``/``cesupdate``): the
-    complex level evolves every step and is read from ``i-1``; the complex seasonal
-    evolves every period and is read from ``i-m``. SIMPLE reads the level from ``i-m``
-    (pure seasonal lag, no separate seasonal component). Index arithmetic is on the
-    traced counter ``i`` mod the static period ``m`` — vmap-native.
+    Canonical CES (Svetunkov; matches statsforecast ``cesfcst``/``cesupdate``):
+    the complex level evolves every step and is read from ``i-1``; the complex
+    seasonal evolves every period and is read from ``i-m``. SIMPLE reads the
+    level from ``i-m`` (pure seasonal lag, no separate seasonal component).
+    Index arithmetic is on the traced counter ``i`` mod the static period
+    ``m``, so the function is vmap-native.
     """
     lvl_idx = jnp.where(season_type == SIMPLE, (i - m) % m, (i - 1) % m)
     lvl = states_buffer[lvl_idx]
@@ -372,11 +353,9 @@ def ces_update_step(
 ) -> Tuple[Tuple[jnp.ndarray, int], jnp.ndarray]:
     """One in-sample CES step: emit the pre-update one-step-ahead forecast, then update.
 
-    The forecast ``level[i-1] + seasonal[i-m]`` is emitted BEFORE consuming ``y_obs``,
-    so the residual ``y_obs - forecast`` is a genuine one-step-ahead error. (The previous
-    implementation emitted the post-update value, leaking ``y_obs`` into its own residual
-    and corrupting IC-based variant selection, and it read the seasonal component from the
-    wrong lag ``i-1`` — collapsing the seasonal variants to the non-seasonal one.)
+    The forecast ``level[i-1] + seasonal[i-m]`` is emitted before consuming
+    ``y_obs``, so the residual ``y_obs - forecast`` is a genuine one-step-ahead
+    error and the information criteria built on it are valid.
     """
     states_buffer, i = carry
     lvl, seas, forecast = _ces_read(states_buffer, i, season_type, m)
@@ -492,12 +471,12 @@ def ces_forecast(
 ) -> jnp.ndarray:
     """Generate h-step CES forecasts with static season_type, m, h, and start index.
 
-    Recursive CES forecasting (matches statsforecast ``cesfcst``): each step emits
-    ``level[i-1] + seasonal[i-m]`` and propagates the state with zero innovation (the
-    forecast feeds itself as the next "observation", so ``e == 0``). ``start_idx`` is the
-    fit length ``n`` so the ring buffer is read at the correct phase — ``final_state`` at
-    ring index ``(n-1) % m`` holds the latest level and ``(n-m) % m`` the latest seasonal
-    (the previous version hardcoded ``start_idx = m``, phase-correct only when n % m == 0).
+    Recursive CES forecasting (matches statsforecast ``cesfcst``): each step
+    emits ``level[i-1] + seasonal[i-m]`` and propagates the state with zero
+    innovation (the forecast feeds itself as the next observation, so
+    ``e == 0``). ``start_idx`` is the fit length ``n`` so the ring buffer is
+    read at the correct phase: ``final_state`` at ring index ``(n-1) % m``
+    holds the latest level and ``(n-m) % m`` the latest seasonal.
     """
     def forecast_step(i_h, carry):
         states_buffer, forecasts, current_idx = carry
@@ -516,16 +495,14 @@ def ces_forecast(
     )
     return forecasts
 
-# CES smoothing-parameter optimizer configuration. Bounds and defaults mirror
-# statsforecast (``ces.py`` ``optimize_ces_target_fn`` lower/upper + ``initparam``
-# alpha_0=1.3, alpha_1=1.0 defaults); order is [alpha_0, alpha_1, beta_0, beta_1].
+# CES smoothing-parameter optimizer configuration. Bounds and initial values
+# mirror statsforecast; order is [alpha_0, alpha_1, beta_0, beta_1].
 _CES_PAR_LO = jnp.array([0.01, 0.01, 0.01, 0.01])
 _CES_PAR_HI = jnp.array([1.8, 1.9, 1.5, 1.5])
 _CES_PAR_INIT = jnp.array([1.3, 1.0, 1.3, 1.0])
 # Active (optimized) smoothing params per variant; the rest are inert for that variant.
 _CES_N_ACTIVE = {NONE: 2, SIMPLE: 2, PARTIAL: 3, FULL: 4}
-# Nelder-Mead iteration cap: CES objectives converge by ~55 (2-param) / ~120 (4-param)
-# iterations (measured); 120 is accuracy-identical to 200 at ~40% less optimizer cost.
+# Nelder-Mead iteration cap.
 _CES_NM_MAXITER = 120
 
 
@@ -540,13 +517,13 @@ def _ces_backfit_forecasts(y, m, season_type, pvec4):
 def _get_ces_param_runner(m: int, season_type: int, max_iter: int):
     """Build (and cache) the jitted Nelder-Mead parameter fit for one static CES config.
 
-    Every argument is config-static, so the returned jitted callable keeps a stable
-    identity across calls; the inner ``jax.jit`` then compiles once per (shape, dtype).
-    Series length stays out of the key — ``_run`` derives every shape from the static
-    ``m``. Without the cache, the ``objective`` closure below is a fresh object on every fit, and
-    ``nelder_mead``'s ``while_loop`` — whose pjit cache keys on the callable's identity —
-    recompiles an identical jaxpr each call (~180 ms per variant, 4 variants per
-    ``auto_ces``). Mirrors ``ets_backend._get_optimizer_runner``.
+    Every argument is config-static, so the returned jitted callable keeps a
+    stable identity across calls and the inner ``jax.jit`` compiles once per
+    (shape, dtype). Series length stays out of the key; ``_run`` derives every
+    shape from the static ``m``. Without the cache the ``objective`` closure
+    would be a fresh object on every fit, and ``nelder_mead``'s ``while_loop``
+    (whose pjit cache keys on callable identity) would recompile an identical
+    jaxpr each call.
     """
     n_active = _CES_N_ACTIVE[season_type]
 
@@ -582,12 +559,13 @@ def ces_fit_single(
 ) -> Dict:
     """Fit a single CES variant (optimizing its smoothing params) and return metrics, fits, and state.
 
-    When ``params`` is None the active smoothing parameters for this variant are fit by
-    a vmap-native Nelder-Mead minimizer (:func:`chronax.utils.nelder_mead`) on the
-    in-sample one-step-ahead SSE — matching statsforecast, which Nelder-Mead-optimizes
-    alpha_0/alpha_1/(beta_0/beta_1) per variant. When ``params`` is given, that fixed
-    parameterization is used (no optimization). ``season_type`` is static config, so the
-    active-parameter count and IC penalty are resolved with plain Python control flow.
+    When ``params`` is None the active smoothing parameters for this variant
+    are fit by a vmap-native Nelder-Mead minimizer
+    (:func:`chronax.utils.nelder_mead`) on the in-sample one-step-ahead sum of
+    squared errors (SSE), as statsforecast does per variant. When ``params`` is
+    given, that fixed parameterization is used without optimization.
+    ``season_type`` is static config, so the active-parameter count and the
+    information-criterion penalty are resolved with plain Python control flow.
 
     Args:
         y: Time series of shape (n,).
@@ -619,7 +597,8 @@ def ces_fit_single(
     final_states, forecasts = ces_fit_backfit(y, init_state_arr, p, season_type, m)
 
     n = len(y)
-    # SF-faithful parameter count for the IC: components = 2 + (PARTIAL) + 2*(FULL); np_ = components + 1.
+    # statsforecast's parameter count for the information criteria:
+    # components = 2 + (PARTIAL) + 2*(FULL); n_params = components + 1.
     n_params = 2 + int(season_type == PARTIAL) + 2 * int(season_type == FULL) + 1
     n_residuals = n - m
 
@@ -667,10 +646,11 @@ def auto_ces(
     when n >= 2*m) and selects the fit with the lowest information criterion.
     Otherwise, fits only the specified variant.
 
-    vmap-native: the variant loop is over *config* (each variant traces the jitted
-    kernels with its own static season_type), NaN ICs are masked to +inf instead of
-    being skipped eagerly, and the winner is chosen with `jnp.argmin` — no
-    float()/int() casts, no try/except, no Python control flow on traced values.
+    vmap-native: the variant loop is over config (each variant traces the
+    jitted kernels with its own static season_type), NaN criteria are masked
+    to +inf instead of being skipped eagerly, and the winner is chosen with
+    ``jnp.argmin``; there are no host casts and no Python control flow on
+    traced values.
 
     Args:
         y: Time series of shape (n,).
@@ -684,9 +664,12 @@ def auto_ces(
         Dict with the selected fit's fields (loglik/aic/bic/aicc/mse/amse/sigma2 as
         jnp scalars; fitted/residuals/states arrays; seasontype as a jnp int scalar;
         m/n static ints) plus a candidate block used for traceable forecasting:
-            - "variants" (tuple[int]): static candidate variant codes.
-            - "candidate_states" (jnp.ndarray): stacked final states, (k, m, 4).
-            - "best" (jnp.ndarray): argmin index into the candidate axis.
+
+        - "variants" (tuple[int]): static candidate variant codes.
+        - "candidate_states" (jnp.ndarray): stacked final states, (k, m, 4).
+        - "candidate_par_vecs" (jnp.ndarray): stacked fitted parameter vectors, (k, 4).
+        - "best" (jnp.ndarray): argmin index into the candidate axis.
+        - "valid" (jnp.ndarray): whether any candidate has a finite criterion.
     """
     y = ensure_float(y)
 
@@ -697,8 +680,8 @@ def auto_ces(
         variants = [NONE] if too_short else [NONE, SIMPLE, PARTIAL, FULL]
     else:
         # A fixed seasonal spec on a too-short series collapses to the
-        # non-seasonal N model (SF's rule) — a seasonal fit is unidentifiable
-        # and would shape-error in _init_state_s when n < m.
+        # non-seasonal N model (statsforecast's rule): a seasonal fit is
+        # unidentifiable and would shape-error in _init_state_s when n < m.
         variants = [NONE if too_short else model_map.get(model, NONE)]
 
     fits = [ces_fit_single(y, m, variant) for variant in variants]
@@ -706,8 +689,8 @@ def auto_ces(
     ic_values = jnp.stack([jnp.asarray(fit[ic]) for fit in fits])
     ic_values = jnp.where(jnp.isnan(ic_values), jnp.inf, ic_values)
     best = jnp.argmin(ic_values)
-    # Raising on all-invalid ICs is impossible under trace; expose a flag instead
-    # (argmin over all-inf silently picks index 0 and the winner's fields are NaN).
+    # Raising on all-invalid criteria is impossible under trace; expose a flag
+    # instead (argmin over all-inf picks index 0 and the winner's fields are NaN).
     valid = jnp.isfinite(ic_values).any()
 
     def _select(key):
@@ -748,7 +731,7 @@ def _forecast_candidates(mod: Dict, h: int) -> jnp.ndarray:
         h: Forecast horizon (static).
 
     Returns:
-        Point forecasts of shape (h,) for the IC-selected variant.
+        Point forecasts of shape (h,) for the selected variant.
     """
     m = mod['m']
     par_vecs = mod['candidate_par_vecs']
@@ -765,28 +748,28 @@ def _forecast_candidates(mod: Dict, h: int) -> jnp.ndarray:
 
 
 class AutoCES(BaseForecaster):
-    """Complex Exponential Smoothing model with optional automatic variant selection.
+    """Complex exponential smoothing (CES) with optional automatic variant selection.
 
-    Wraps `auto_ces` / `ces_fit_single` in the BaseForecaster interface.
-    When model="Z", selects the best variant (NONE/SIMPLE/PARTIAL/FULL) by AICc.
-    All JAX core functions are JIT-compiled; the class itself is a thin orchestrator.
+    Wraps ``auto_ces`` and ``ces_fit_single`` in the ``BaseForecaster``
+    interface. With ``model="Z"`` the variant (NONE/SIMPLE/PARTIAL/FULL) is
+    selected by AICc. Prediction intervals are conformal only.
 
     Args:
-        season_length (int): Seasonal period m. Use 1 for non-seasonal data.
-            Default is 1.
-
-        model (str): Variant selector passed to auto_ces(). "Z" for automatic
-            selection; "N", "S", "P", or "F" to fix the variant. Default is "Z".
-
-        alias (str): Model name for display / repr. Default is "CES".
-
-        conformal_params (Optional[ConformalIntervals]): Conformal prediction
-            configuration for generating prediction intervals. Default is None.
+        season_length (int | str): Seasonal period m, or ``"auto"`` to infer
+            it from the training series at ``fit`` (resolved once and cached).
+            Use 1 for non-seasonal data. Default is 1.
+        model (str): Variant selector passed to ``auto_ces``: ``"Z"`` for
+            automatic selection, or ``"N"``, ``"S"``, ``"P"``, ``"F"`` to fix
+            the variant. Default is ``"Z"``.
+        alias (str): Custom name of the model. Default is ``"CES"``.
+        conformal_params (Optional[ConformalIntervals]): Configuration for
+            conformal prediction intervals; required for ``level``. Default
+            is None.
 
     Attributes:
-        ``model_`` (dict | None): Populated after fit(); contains fitted values,
-            residuals, states, parameters, and information criteria from
-            ces_fit_single(). None before first fit.
+        model_ (dict | None): Set by ``fit``: the selected fit's fitted values,
+            residuals, states, information criteria and the candidate block
+            from ``auto_ces``. None before the first fit.
     """
 
     uses_exog = False
@@ -798,17 +781,7 @@ class AutoCES(BaseForecaster):
         alias: str = "CES",
         conformal_params: Optional[ConformalIntervals] = None,
     ) -> None:
-        """Initialise AutoCES with model configuration.
-
-        Args:
-            season_length (int | str): Seasonal period m, or "auto" to infer it
-                from the training series at fit (via `detect_period`, resolved
-                once and cached). Default is 1.
-            model (str): Variant selector ("Z", "N", "S", "P", "F"). Default is "Z".
-            alias (str): Model name identifier. Default is "CES".
-            conformal_params (Optional[ConformalIntervals]): Conformal prediction
-                configuration. Default is None.
-        """
+        """Store the configuration; see the class docstring for parameters."""
         self.season_length = season_length
         self.model = model
         self.alias = alias
@@ -819,34 +792,37 @@ class AutoCES(BaseForecaster):
         # forecast path never re-resolves on a traced CV window (eager-only).
         self._m_eff = None
         # Winning variant letter ("N"/"S"/"P"/"F") cached at fit; None until fit.
-        # The vmapped conformity_scores CV path re-fits ONLY this variant per window
-        # (AutoETS _selected_spec pattern) instead of the full 4-variant auto_ces("Z").
+        # The vmapped conformity_scores CV path re-fits only this variant per
+        # window instead of the full 4-variant auto_ces("Z").
         self._selected_variant: Optional[str] = None
 
     def fit(self, y: jnp.ndarray, X: Optional[jnp.ndarray] = None) -> "AutoCES":
-        """Fit the CES model to a time series.
+        """Fit the CES model.
 
-        Delegates to auto_ces(), which runs variant selection and back-fitting
-        (constant series need no special casing: innovations are zero, so
-        forecasts stay flat at the series mean).
+        Delegates to ``auto_ces`` for variant selection and back-fitting, then
+        caches the selected variant and, when ``conformal_params`` is set, the
+        conformity scores for :meth:`predict`. Constant series need no special
+        casing: innovations are zero, so forecasts stay flat at the mean.
 
         Args:
-            y (jnp.ndarray): Input time series of shape (n,).
-
-            X (Optional[jnp.ndarray]): Exogenous variables (unused; kept for API
-                compatibility). Default is None.
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            X (Optional[jnp.ndarray]): Exogenous regressors, shape ``(T, F)``.
+                Only forwarded to ``conformity_scores``. Default is None.
 
         Returns:
-            AutoCES: Self (fitted model instance) for method chaining.
+            AutoCES: ``self``.
+
+        Raises:
+            ValueError: If ``season_length`` is neither an int >= 1 nor
+                ``"auto"``; if every candidate produced a non-finite
+                information criterion; or if ``conformal_params`` is set and
+                the series is too short for 2 CV windows.
         """
         y = ensure_float(y)
-        # Resolve season_length="auto" ONCE here (eager, on the full series) and
+        # Resolve season_length="auto" once, eagerly on the full series, and
         # cache it; the stateless/vmapped forecast path reuses the cached int so
         # a traced CV window never re-runs detect_period.
         self._m_eff = self._resolve_season_length(self.season_length, y)
-        # No eager constant-series special case: `jnp.std(y) < 1e-10` is Python
-        # control flow on a traced value. The normal path already yields flat
-        # forecasts on constant series (innovations are zero throughout).
         self.model_ = auto_ces(y, m=self._m_eff, model=self.model)
         if not bool(self.model_['valid']):
             raise ValueError(
@@ -854,14 +830,12 @@ class AutoCES(BaseForecaster):
                 "non-finite information criterion (check for NaN/inf or "
                 "degenerate input)."
             )
-        # Cache the eagerly-selected winning variant so the vmapped conformity_scores
-        # CV path re-fits ONLY it per window (the AutoETS _selected_spec pattern).
-        # int() here is eager/host-side (fit is never traced); forecast reads this
-        # concrete string (like self._m_eff), so no tracer leaks under the CV vmap.
+        # Cache the winning variant so the vmapped conformity_scores CV path
+        # re-fits only it per window. int() is eager here (fit is never traced)
+        # and forecast reads a concrete string, so no tracer leaks under vmap.
         self._selected_variant = _CODE_TO_LETTER[int(self.model_['seasontype'])]
-        # Pre-compute and cache conformity scores on the training series for
-        # predict() intervals (sibling convention: WindowAverage/SES/SeasWA) —
-        # avoids paying n_windows re-fits on every predict(level=...) call.
+        # Cache conformity scores on the training series for predict() so each
+        # predict(level=...) call does not pay n_windows re-fits.
         if self.conformal_params is not None:
             self._cs = self.conformity_scores(y=y, X=X)
         else:
@@ -877,36 +851,45 @@ class AutoCES(BaseForecaster):
         level: Optional[List[int]] = None,
         fitted: bool = False,
     ) -> Dict:
-        """Stateless fit+forecast: always re-fits on the passed y.
+        """Stateless fit+forecast; always re-fits on the passed ``y``.
 
-        Deliberately ignores any stored ``model_``: the base class's
-        conformity_scores vmaps this method over CV windows, and reusing
-        fitted full-series state would return identical (future-leaking)
-        forecasts for every window. Write-free on the CV/vmap path
-        (``level=None``, the base's CV call); a direct ``forecast(level=...)`` on an
-        UNFITTED instance triggers fit via ``conformity_scores`` (family-consistent).
+        Ignores any stored ``model_``: the base ``conformity_scores`` vmaps
+        this method over CV windows, and reusing full-series state would
+        leak the future into every window. The path is write-free at
+        ``level=None``. With ``level`` on an unfitted instance,
+        ``conformity_scores`` first runs ``fit``.
 
         Args:
-            y (jnp.ndarray): Input time series of shape (n,).
-            h (int): Forecast horizon (number of steps ahead).
-            X (Optional[jnp.ndarray]): Exogenous variables (unused). Default is None.
-            X_future (Optional[jnp.ndarray]): Future exogenous variables (unused). Default is None.
-            level (Optional[List[int]]): Confidence levels (0-100) for conformal
-                prediction intervals. Requires conformal_params. Default is None.
-            fitted (bool): Whether to include in-sample fitted values under the
-                "fitted" key. Default is False.
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            h (int): Forecast horizon. With ``level``, must equal
+                ``conformal_params.h``.
+            X (Optional[jnp.ndarray]): In-sample exogenous regressors, shape
+                ``(T, F)``. Only forwarded to ``conformity_scores``. Default
+                is None.
+            X_future (Optional[jnp.ndarray]): Future exogenous regressors,
+                shape ``(h, F)``. Ignored. Default is None.
+            level (Optional[List[int]]): Confidence levels in (0, 100).
+                Requires ``conformal_params``. Default is None.
+            fitted (bool): Whether to return in-sample fitted values under
+                ``"fitted"``. Default is False.
 
         Returns:
-            Dict: "mean" forecasts of shape (h,), plus "fitted" when requested and
-            "lo-{l}"/"hi-{l}" bounds when level is given.
+            Dict: ``"mean"`` (shape ``(h,)``); ``"fitted"`` (shape ``(T,)``)
+            when ``fitted``; ``"lo-{lv}"``/``"hi-{lv}"`` per level when
+            ``level`` is given.
+
+        Raises:
+            Exception: If ``level`` is given without ``conformal_params``.
+            ValueError: If ``level`` is given and ``h != conformal_params.h``,
+                or the series is too short for 2 CV windows.
         """
         y = ensure_float(y)
-        # Reuse the fit-cached resolved period under the CV vmap; only resolve
-        # here on a fresh/direct forecast (y concrete → detect_period eager-safe).
+        # Reuse the fit-cached period under the CV vmap; resolve here only on a
+        # fresh direct forecast, where y is concrete.
         m_eff = self._m_eff if self._m_eff is not None else self._resolve_season_length(self.season_length, y)
-        # Under the conformity_scores CV vmap, reuse the fit-selected variant (fits 1,
-        # not all 4); a fresh/direct forecast with no prior fit falls back to the full
-        # auto-select (self.model, typically "Z"). Concrete string ⇒ static under vmap.
+        # Under the CV vmap, reuse the fit-selected variant (fits 1, not all 4);
+        # a direct forecast with no prior fit runs the full selection
+        # (self.model). A concrete string is static under vmap.
         variant = self._selected_variant if self._selected_variant is not None else self.model
         mod = auto_ces(y, m=m_eff, model=variant)
 
@@ -929,36 +912,42 @@ class AutoCES(BaseForecaster):
         return self.add_confidence_intervals(res, cs, level, self.conformal_params.method)
 
     def conformity_scores(self, y: jnp.ndarray, X: Optional[jnp.ndarray] = None) -> jnp.ndarray:
-        """Eager variant+period selection, then the vmapped per-window param refit.
+        """Resolve the variant and period eagerly, then run the vmapped per-window refit.
 
-        The base ``conformity_scores`` vmaps ``self.forecast`` over CV windows. Two
-        things are resolved ONCE, eagerly, before that vmap, or every window re-does
-        expensive work on traced data:
+        The base ``conformity_scores`` vmaps ``self.forecast`` over CV windows.
+        Two things are resolved once, eagerly, before that vmap:
 
-        * **Variant** — a fresh ``forecast`` runs ``auto_ces(model="Z")``, fitting ALL
-          4 variants (NONE/SIMPLE/PARTIAL/FULL) and arg-min-ing their IC. Repeating
-          that per window costs 4x for negligible benefit on typical-length series: the
-          per-window winner often DIFFERS from the full-series winner, but the variants
-          are near-ties so the conformity scores (hence intervals) stay close (pooled 95%
-          coverage delta ~-0.8pt). ⚠ On VERY short series (padded CV windows < 2m) the old
-          padded CV windows would otherwise statically fit NONE-only per window while
-          this path forces the full-series winner — a variant-REGIME change rather than
-          a near-tie flip, so very short series are the worst case for coverage. The
-          winner is selected once at ``fit`` (cached ``_selected_variant``); the vmapped
-          ``forecast`` then re-fits only that variant's *parameters* per window.
-          Mirrors AutoETS ``_selected_spec``.
-        * **Period** — with ``season_length="auto"`` the vmapped ``forecast`` would
-          re-run ``detect_period`` on a *traced* window (ConcretizationError); resolving
-          ``_m_eff`` on the concrete ``y`` here fixes it.
+        * Variant: a fresh ``forecast`` would run ``auto_ces(model="Z")`` and
+          fit all four variants per window. The winner is selected once at
+          ``fit`` (cached in ``_selected_variant``) and the vmapped
+          ``forecast`` re-fits only that variant's parameters per window.
+          Very short series are the weakest case for coverage: a per-window
+          selection would fit NONE only, while this path forces the
+          full-series winner.
+        * Period: with ``season_length="auto"`` the vmapped ``forecast`` would
+          run ``detect_period`` on a traced window; ``_m_eff`` is resolved on
+          the concrete ``y`` here instead.
 
-        Both ``_selected_variant`` (str) and ``_m_eff`` (int) are concrete, so writing
-        them is benign for statelessness. Calibration caveat (shared with AutoARIMA
-        and AutoMFLES): the variant is chosen with sight of the full series incl.
-        the CV test windows — mildly optimistic; parameters are still honestly re-fit
-        per window, so scores vary across windows.
+        Both cached values are concrete Python objects, so writing them keeps
+        the estimator tracer-free. Calibration caveat: the variant is chosen
+        with sight of the full series, including the CV test windows, which
+        is mildly optimistic; the parameters are re-fit per window, so scores
+        vary across windows.
 
-        Side effect: first call on an unfitted estimator runs ``fit`` (caches the
-        selected variant + period + scores), mirroring the sibling Auto overrides.
+        Side effect: the first call on an unfitted estimator runs ``fit``,
+        which caches the variant, the period and the scores.
+
+        Args:
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            X (Optional[jnp.ndarray]): Exogenous regressors, shape ``(T, F)``.
+                Ignored by the model. Default is None.
+
+        Returns:
+            jnp.ndarray: Signed scores, shape ``(n_windows, h)``.
+
+        Raises:
+            ValueError: If ``conformal_params`` is None or the series is too
+                short for 2 CV windows.
         """
         y = ensure_float(y)
         if self._selected_variant is None:
@@ -972,30 +961,28 @@ class AutoCES(BaseForecaster):
         return super().conformity_scores(y=y, X=X)
 
     def predict(self, h: int, X: Optional[jnp.ndarray] = None, level: Optional[List[int]] = None) -> Dict:
-        """Generate h-step ahead forecasts from the fitted CES model.
+        """Predict with the fitted CES model.
 
-        Forecasts every stored candidate variant via the JIT-compiled
-        ces_forecast() and selects the IC winner's row (see _forecast_candidates).
-        Optionally adds conformal prediction intervals.
+        Forecasts every stored candidate variant with ``ces_forecast`` and
+        selects the winner's row (``_forecast_candidates``). Conformal
+        intervals use the scores cached at ``fit``.
 
         Args:
-            h (int): Forecast horizon (number of steps ahead).
-
-            X (Optional[jnp.ndarray]): Exogenous variables (unused; kept for API
-                compatibility). Default is None.
-
-            level (Optional[List[int]]): Confidence levels (0-100) for conformal
-                prediction intervals, e.g. [90, 95]. Requires conformal_params to
-                be set. Default is None.
+            h (int): Forecast horizon. With ``level``, must equal
+                ``conformal_params.h``.
+            X (Optional[jnp.ndarray]): Future exogenous regressors, shape
+                ``(h, F)``. Ignored. Default is None.
+            level (Optional[List[int]]): Confidence levels in (0, 100), e.g.
+                ``[90, 95]``. Requires ``conformal_params``. Default is None.
 
         Returns:
-            Dict: Dictionary containing:
-                - "mean": Point forecasts of shape (h,).
-                - "lo-{l}" / "hi-{l}": Conformal interval bounds for each level l
-                  (only present when level is not None and conformal_params is set).
+            Dict: ``"mean"`` (shape ``(h,)``) plus ``"lo-{lv}"``/``"hi-{lv}"``
+            per level when ``level`` is given.
 
         Raises:
-            ValueError: If called before fit().
+            ValueError: If called before ``fit``; if no conformity scores are
+                cached; or if ``h != conformal_params.h``.
+            Exception: If ``level`` is given without ``conformal_params``.
         """
         if self.model_ is None:
             raise ValueError("Model must be fitted before prediction")

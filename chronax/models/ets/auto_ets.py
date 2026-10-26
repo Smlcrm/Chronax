@@ -24,52 +24,69 @@ _PHI_LOWER = 0.8
 _PHI_UPPER = 0.98
 
 class AutoETS(BaseForecaster):
-    r"""Automatic Exponential Smoothing model.
+    r"""Automatic exponential smoothing (ETS) forecaster.
 
-    Automatically selects the best ETS (Error, Trend, Seasonality)
-    model using an information criterion. Default is Akaike Information Criterion (AICc), while particular models are estimated using maximum likelihood.
-    The state-space equations can be determined based on their $M$ multiplicative, $A$ additive,
-    $Z$ optimized or $N$ ommited components. The `model` string parameter defines the ETS equations:
-    E in [$M, A, Z$], T in [$N, A, M, Z$], and S in [$N, A, M, Z$].
+    Selects the best ETS (Error, Trend, Seasonality) model with an
+    information criterion (IC), the corrected Akaike information criterion
+    (AICc) by default; each candidate is estimated by maximum likelihood.
+    The three-character ``model`` string gives the error, trend and season
+    components: ``A`` additive, ``M`` multiplicative, ``N`` omitted, ``Z``
+    selected automatically.  Allowed codes are E in ``{M, A, Z}``, T in
+    ``{N, A, M, Z}`` and S in ``{N, A, M, Z}``.  ``model="ANN"`` fits only
+    simple exponential smoothing; ``model="ZZZ"`` searches the full grid.
 
-    For example when model='ANN' (additive error, no trend, and no seasonality), ETS will
-    explore only a simple exponential smoothing.
-
-    If the component is selected as 'Z', it operates as a placeholder to ask the AutoETS model
-    to figure out the best parameter.
-
-    vmap contract: every candidate in the (config/shape-static) grid is fitted
-    and the winner is a traced ``jnp.argmin`` over information criteria, so
-    ``fit``/``forecast`` trace natively under ``jax.vmap`` — the base class's
-    ``conformity_scores`` CV path. ``forecast()`` is fully stateless (never
-    reads or writes ``model_``). Only the *native-interval* branch of
-    ``predict``/``forecast``/``forward`` is eager-only, because the interval
-    formulas dispatch on the winner's class string; conformal intervals are
-    fully supported under the base-class contract.
+    Every candidate in the config/shape-static grid is fitted and the winner
+    is a traced ``jnp.argmin`` over the IC, so ``fit`` and ``forecast`` trace
+    natively under ``jax.vmap`` (the base class's ``conformity_scores``
+    cross-validation (CV) path).  ``forecast()`` is stateless and never reads
+    or writes ``model_``.  Only the native-interval branch of ``predict``,
+    ``forecast`` and ``forward`` is eager-only, because the interval formulas
+    dispatch on the winner's class string.  Conformal intervals follow the
+    base-class contract.
 
     Args:
-        season_length (int, default=1): Number of observations per unit of time. Ex: 24 Hourly data.
-            Config-only — array shapes derive from it, so it is never inferred from the data.
-        model (str, default="ZZZ"): Controlling state-space-equations.
-        damped (bool, optional): A parameter that 'dampens' the trend.
-        phi (float, optional): Smoothing parameter for trend damping. Only used when `damped=True`.
-        max_iter (int, optional): Optimizer step budget; ``None`` derives a
-            static budget from the series length.
-        optax_lr (float, default=7e-2): Learning rate for the Adam warm-up phase.
-        optax_clip (float, default=5.0): Retained for API compatibility.
-        early_stop_patience (int): *Inert* — early stopping would require
+        season_length (int): Number of observations per seasonal cycle, e.g.
+            ``24`` for hourly data.  Config-only: array shapes derive from it,
+            so it is never inferred from the data.  Defaults to ``1``.
+        model (str): Three-character ETS specification, see above.  Defaults
+            to ``"ZZZ"``.
+        damped (bool | None): Whether the trend is damped.  ``None`` tries
+            both damped and undamped candidates.  Defaults to ``None``.
+        phi (float | None): Fixed damping parameter in ``[0.8, 0.98]``; only
+            used with a damped trend.  ``None`` optimises it.  Defaults to
+            ``None``.
+        max_iter (int | None): Optimizer step budget.  ``None`` selects a
+            static budget from a table keyed on the series length.  Defaults
+            to ``None``.
+        optax_lr (float): Learning rate for the Adam warm-up phase.  Defaults
+            to ``7e-2``.
+        optax_clip (float): Accepted for application programming interface
+            (API) compatibility; the optimizer does not clip gradients.
+            Defaults to ``5.0``.
+        early_stop_patience (int): Inert.  Early stopping would require
             concretizing traced losses; the optimizer runs a fixed budget with
-            monotone best-iterate tracking instead.
-        early_stop_min_delta (float): *Inert* — see ``early_stop_patience``.
-        alias (str, default="AutoETS"): Custom name of the model.
-        prediction_intervals (Optional[ConformalIntervals], optional): Information to compute conformal prediction intervals. By default, the model will compute the native prediction intervals.
+            monotone best-iterate tracking instead.  Defaults to ``10``.
+        early_stop_min_delta (float): Inert, see ``early_stop_patience``.
+            Defaults to ``1e-5``.
+        alias (str): Display name of the model.  Defaults to ``"AutoETS"``.
+        prediction_intervals (ConformalIntervals | None): Configuration for
+            conformal prediction intervals.  When ``None`` the model returns
+            native Gaussian ETS intervals.  Defaults to ``None``.
 
-    Notes:
-        This implementation is a mirror of Hyndman's [forecast::ets](https://github.com/robjhyndman/forecast).
+    Raises:
+        ValueError: If *phi* is not a float or lies outside ``[0.8, 0.98]``.
+
+    Note:
+        This implementation mirrors Hyndman's ``forecast::ets``
+        (https://github.com/robjhyndman/forecast).
 
     References:
-        - [Rob J. Hyndman, Yeasmin Khandakar (2008). "Automatic Time Series Forecasting: The forecast package for R"](https://www.jstatsoft.org/article/view/v027i03).
-        - [Hyndman, Rob, et al (2008). "Forecasting with exponential smoothing: the state space approach"](https://robjhyndman.com/expsmooth/).
+        Rob J. Hyndman, Yeasmin Khandakar (2008). "Automatic Time Series
+        Forecasting: The forecast package for R".
+        https://www.jstatsoft.org/article/view/v027i03
+
+        Hyndman, Rob, et al (2008). "Forecasting with exponential smoothing:
+        the state space approach". https://robjhyndman.com/expsmooth/
     """
 
     @staticmethod
@@ -117,8 +134,8 @@ class AutoETS(BaseForecaster):
         max_iter: Optional[int] = None,
         optax_lr: float = 7e-2,
         optax_clip: float = 5.0,
-        early_stop_patience: int = 10,  # inert — see class docstring
-        early_stop_min_delta: float = 1e-5,  # inert — see class docstring
+        early_stop_patience: int = 10,  # inert; see class docstring
+        early_stop_min_delta: float = 1e-5,  # inert; see class docstring
         alias: str = "AutoETS",
         prediction_intervals: Optional[ConformalIntervals] = None,
     ) -> None:
@@ -142,8 +159,8 @@ class AutoETS(BaseForecaster):
         self.optax_steps = self.max_iter
         # Eagerly-selected winning (E,T,S,damped) spec, cached at fit so the
         # vmapped conformity_scores CV path re-fits only that fixed spec per
-        # window (the AutoARIMA/AutoMFLES eager-select-once pattern). None until
-        # fit; None also means "fresh/direct forecast -> full ZZZ grid".
+        # window. None until fit; None also means "fresh/direct forecast ->
+        # full ZZZ grid".
         self._selected_spec: Optional[tuple] = None
         self._cs: Optional[jnp.ndarray] = None
 
@@ -154,11 +171,11 @@ class AutoETS(BaseForecaster):
 
         When *spec* is a concrete ``(etype, ttype, stype, damped)`` tuple (the
         eagerly-selected winner cached at fit), only that single candidate is
-        fitted — a fully-traceable one-candidate ``ets_f`` (``n_cand == 1`` ->
+        fitted: a fully-traceable one-candidate ``ets_f`` (``n_cand == 1`` ->
         static winner index). This is what the vmapped
         ``conformity_scores`` CV path uses, so each window re-fits the SELECTED
-        spec's parameters instead of re-running the ~12-candidate ZZZ grid (the
-        O(candidates x n_windows) scalability wall). With
+        spec's parameters instead of re-running the full ZZZ grid (which would
+        cost O(candidates x n_windows) fits). With
         *spec=None* the full ``self.model`` grid is fitted (fresh/direct use).
         """
         steps = self.max_iter if self.max_iter is not None else self._default_optax_steps(len(y))
@@ -193,17 +210,23 @@ class AutoETS(BaseForecaster):
         y: jnp.ndarray,
         X: Optional[jnp.ndarray] = None,
     ) -> "AutoETS":
-        r"""Fit the Exponential Smoothing model.
+        r"""Fit the AutoETS model to a univariate series.
 
-        Fit an Exponential Smoothing model to a time series (numpy array) `y`
-        and optionally exogenous variables (numpy array) `X`.
+        Fits every candidate of the configured grid, stores the stacked result
+        in ``model_``, caches the winning ``(E, T, S, damped)`` spec for the
+        CV path and, when ``prediction_intervals`` is set, caches the
+        conformity scores.
 
         Args:
-            y (numpy.array): Clean time series of shape (t, ).
-            X (array-like, optional): Optional exogenous of shape (t, n_x).
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            X (jnp.ndarray | None): Ignored by the model; only passed through
+                to ``conformity_scores``.
 
         Returns:
-            AutoETS: Exponential Smoothing fitted model.
+            AutoETS: ``self``, fitted.
+
+        Raises:
+            ValueError: If ``len(y) < max(season_length, 3)``.
         """
         y = ensure_float(y)
         self._validate_series_length(y)
@@ -218,8 +241,8 @@ class AutoETS(BaseForecaster):
         cands = self.model_["candidates"]
         best_idx = 0 if len(cands) == 1 else int(self.model_["best"])
         self._selected_spec = tuple(cands[best_idx])
-        # Cache conformity scores on the training series (sibling convention);
-        # forecast() below is write-free on the fitted fast path, so the vmapped
+        # Cache conformity scores on the training series; forecast() below is
+        # write-free on the fitted fast path, so the vmapped
         # CV re-fits inside conformity_scores cannot leak tracers onto self.
         if self.conformal_params is not None:
             self._cs = self.conformity_scores(y=y, X=X)
@@ -230,28 +253,31 @@ class AutoETS(BaseForecaster):
     def conformity_scores(
         self, y: jnp.ndarray, X: Optional[jnp.ndarray] = None
     ) -> jnp.ndarray:
-        """Conformity scores with eager spec selection, vmapped per-window refit.
+        """Conformity scores with eager spec selection and vmapped per-window refit.
 
-        The base implementation vmaps ``self.forecast`` over CV windows. Full
-        ZZZ model selection (fitting ~12 candidates and argmin-ing their IC) is
-        far too expensive to repeat inside every window — the
-        O(candidates x n_windows x optax_steps x n) wall that made AutoETS
-        ``TIMEOUT`` on long series. So the winning
-        ``(E,T,S,damped)`` spec is selected ONCE, eagerly, on the full series
-        here (via ``fit``); the vmapped ``forecast`` then re-fits only that
-        fixed spec's parameters per window through the one-candidate ``ets_f``
-        fast path (``_fit_stacked(spec=...)``) — mirroring the AutoARIMA
-        (``auto_arima.py``) and AutoMFLES (``auto_mfles.py``) overrides.
+        The base implementation vmaps ``self.forecast`` over CV windows.
+        Repeating full ZZZ model selection inside every window would cost
+        O(candidates x n_windows x optax_steps x n), so the winning
+        ``(E, T, S, damped)`` spec is selected once, eagerly, on the full
+        series (via ``fit``); the vmapped ``forecast`` then re-fits only that
+        spec's parameters per window through the one-candidate ``ets_f`` fast
+        path (``_fit_stacked(spec=...)``).
 
-        Calibration caveat (shared with AutoARIMA and AutoMFLES): the SPEC is
-        chosen with sight of the full series, including the CV test
-        windows — mildly optimistic. Parameters are still honestly re-fit per
-        window, so scores vary across windows.
+        Calibration caveat: the spec is chosen with sight of the full series,
+        including the CV test windows, which is mildly optimistic.  Parameters
+        are still re-fit per window, so scores vary across windows.
 
-        Side Effects:
-            First call on an unfitted estimator runs ``fit`` (caches the
-            selected spec + scores) — mirroring ``forecast``'s first-call
-            behaviour and the sibling Auto overrides.
+        Args:
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            X (jnp.ndarray | None): Ignored; forwarded to the base
+                implementation.
+
+        Returns:
+            jnp.ndarray: Residuals of shape ``(n_windows, h)``.
+
+        Note:
+            The first call on an unfitted estimator runs ``fit``, which caches
+            the selected spec and the scores.
         """
         if self._selected_spec is None:
             self.fit(y, X)
@@ -264,15 +290,25 @@ class AutoETS(BaseForecaster):
     def predict(
         self, h: int, X: Optional[jnp.ndarray] = None, level: Optional[List[int]] = None
     ) -> dict[str, jnp.ndarray]:
-        r"""Predict with fitted Exponential Smoothing.
+        r"""Forecast ``h`` steps ahead from the fitted model.
 
         Args:
-            h (int): Forecast horizon.
-            X (array-like, optional): Optional exogenous of shape (h, n_x).
-            level (List[float], optional): Confidence levels (0-100) for prediction intervals.
+            h (int): Forecast horizon, a positive integer.
+            X (jnp.ndarray | None): Ignored; present for API compatibility.
+            level (list[int] | None): Confidence levels in ``(0, 100)``, e.g.
+                ``[80, 95]``.  Conformal intervals when ``prediction_intervals``
+                is set, native Gaussian ETS intervals otherwise.
 
         Returns:
-            dict: Dictionary with entries `mean` for point predictions and `level_*` for probabilistic predictions.
+            dict: ``"mean"`` of shape ``(h,)`` plus ``"lo-{lv}"``/``"hi-{lv}"``
+            of shape ``(h,)`` per level when *level* is given.
+
+        Raises:
+            ValueError: If called before :meth:`fit`; if *h* is not a positive
+                ``int``; if *level* is not a list of numbers in ``[0, 100]``;
+                if conformal intervals are requested but no conformity scores
+                are cached; or if *h* differs from ``prediction_intervals.h``
+                on the conformal path.
         """
         self._require_fitted()
         self._validate_h(h)
@@ -309,13 +345,21 @@ class AutoETS(BaseForecaster):
         return res
 
     def predict_in_sample(self, level: Optional[List[int]] = None) -> dict[str, jnp.ndarray]:
-        r"""Access fitted Exponential Smoothing insample predictions.
+        r"""Return in-sample fitted values with optional intervals.
 
         Args:
-            level (List[float], optional): Confidence levels (0-100) for prediction intervals.
+            level (list[int] | None): Confidence levels in ``(0, 100)``, e.g.
+                ``[80, 95]``.  When given, symmetric ±z·σ intervals from the
+                residual standard error are appended.
 
         Returns:
-            dict: Dictionary with entries `fitted` for point predictions and `level_*` for probabilistic predictions.
+            dict: ``"fitted"`` of shape ``(T,)`` plus
+            ``"fitted-lo-{lv}"``/``"fitted-hi-{lv}"`` per level when *level*
+            is given.
+
+        Raises:
+            AttributeError: If called before :meth:`fit` (``model_`` is not
+                set).
         """
         res = {"fitted": self.model_["fitted"]}
         if level is not None:
@@ -367,26 +411,42 @@ class AutoETS(BaseForecaster):
         level: Optional[List[int]] = None,
         fitted: bool = False,
     ) -> dict[str, Any]:
-        r"""Memory Efficient Exponential Smoothing predictions.
-
-        This method avoids memory burden due from object storage.
-        It is analogous to `fit_predict` without storing information.
-        It assumes you know the forecast horizon in advance.
+        r"""Stateless fit-and-forecast in one call.
 
         Stateless by contract: the base class's ``conformity_scores`` vmaps
-        this method over CV windows, so it never reads or writes ``model_``
-        (stored state would leak tracers and future information).
+        this method over CV windows, so the point-forecast path never reads or
+        writes ``model_`` (stored state would leak tracers and future
+        information).  On a fitted estimator only the cached winning spec is
+        re-fitted; on a fresh estimator the full ``model`` grid is searched.
+        One exception: on an unfitted estimator with ``prediction_intervals``
+        set and *level* given, ``conformity_scores`` fits the estimator first
+        (writing ``model_``, the selected spec and the cached scores).
 
         Args:
-            y (numpy.array): Clean time series of shape (n, ).
-            h (int): Forecast horizon.
-            X (array-like, optional): Optional insample exogenpus of shape (t, n_x).
-            X_future (array-like, optional): Optional exogenous of shape (h, n_x).
-            level (List[float], optional): Confidence levels (0-100) for prediction intervals.
-            fitted (bool, default=False): Whether or not returns insample predictions.
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            h (int): Forecast horizon, a positive integer.
+            X (jnp.ndarray | None): Ignored by the model; only passed through
+                to ``conformity_scores``.
+            X_future (jnp.ndarray | None): Ignored; present for API
+                compatibility.
+            level (list[int] | None): Confidence levels in ``(0, 100)``, e.g.
+                ``[80, 95]``.  Conformal intervals when ``prediction_intervals``
+                is set, native Gaussian ETS intervals otherwise.
+            fitted (bool): If ``True``, include ``"fitted"`` (shape ``(T,)``)
+                and, with *level*, ``"fitted-lo-{lv}"``/``"fitted-hi-{lv}"``.
+                Defaults to ``False``.
 
         Returns:
-            dict: Dictionary with entries `mean` for point predictions and `level_*` for probabilistic predictions.
+            dict: ``"mean"`` of shape ``(h,)``; ``"lo-{lv}"``/``"hi-{lv}"`` per
+            level when *level* is given; ``"fitted"`` and its interval keys
+            when *fitted* is ``True``.
+
+        Raises:
+            ValueError: If *h* is not a positive ``int``; if *level* is not a
+                list of numbers in ``[0, 100]``; if
+                ``len(y) < max(season_length, 3)``; or if
+                ``prediction_intervals`` is set, *level* is given and *h*
+                differs from ``prediction_intervals.h``.
         """
         y = ensure_float(y)
         self._validate_h(h)
@@ -407,22 +467,38 @@ class AutoETS(BaseForecaster):
         level: Optional[List[int]] = None,
         fitted: bool = False,
     ) -> dict[str, Any]:
-        r"""Apply fitted Exponential Smoothing model to a new time series.
+        r"""Apply the fitted model to a new series without re-optimisation.
 
-        Reuses the fitted candidates' structures and smoothing parameters
-        (no re-optimisation) and keeps the fit-time winner; each candidate is
-        re-rolled on *y* via ``forward_ets``.
+        Reuses the fitted candidates' structures and smoothing parameters and
+        keeps the fit-time winner; each candidate is re-rolled on *y* via
+        ``forward_ets``.
 
         Args:
-            y (numpy.array): Clean time series of shape (n, ).
-            h (int): Forecast horizon.
-            X (array-like, optional): Optional insample exogenpus of shape (t, n_x).
-            X_future (array-like, optional): Optional exogenous of shape (h, n_x).
-            level (List[float], optional): Confidence levels for prediction intervals.
-            fitted (bool, default=False): Whether or not to return insample predictions.
+            y (jnp.ndarray): New univariate series, shape ``(T,)``.
+            h (int): Forecast horizon, a positive integer.
+            X (jnp.ndarray | None): Ignored by the model; only passed through
+                to ``conformity_scores``.
+            X_future (jnp.ndarray | None): Ignored; present for API
+                compatibility.
+            level (list[int] | None): Confidence levels in ``(0, 100)``, e.g.
+                ``[80, 95]``.  Conformal intervals when ``prediction_intervals``
+                is set, native Gaussian ETS intervals otherwise.
+            fitted (bool): If ``True``, include ``"fitted"`` (shape ``(T,)``)
+                and, with *level*, ``"fitted-lo-{lv}"``/``"fitted-hi-{lv}"``.
+                Defaults to ``False``.
 
         Returns:
-            dict: Dictionary with entries `mean` for point predictions and `level_*` for probabilistic predictions.
+            dict: ``"mean"`` of shape ``(h,)``; ``"lo-{lv}"``/``"hi-{lv}"`` per
+            level when *level* is given; ``"fitted"`` and its interval keys
+            when *fitted* is ``True``.
+
+        Raises:
+            Exception: If called before :meth:`fit`.
+            ValueError: If *h* is not a positive ``int``; if *level* is not a
+                list of numbers in ``[0, 100]``; if
+                ``len(y) < max(season_length, 3)``; or if
+                ``prediction_intervals`` is set, *level* is given and *h*
+                differs from ``prediction_intervals.h``.
         """
         if not hasattr(self, "model_"):
             raise Exception("You have to use the `fit` method first")
@@ -632,8 +708,8 @@ def test_stateless_forecast_with_conformal_intervals() -> None:
     """
     Stateless forecast with conformal intervals; series long enough that the
     internal rolling windows used for conformity scores are also large.
-    The forecast horizon must match conformal_params.h — scores cover
-    exactly h steps (guarded with a ValueError, sibling convention).
+    The forecast horizon must match conformal_params.h; scores cover
+    exactly h steps (guarded with a ValueError).
     """
     n = 36
     t = np.arange(n, dtype=np.float64)

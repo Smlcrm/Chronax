@@ -30,10 +30,10 @@ class _TorchLinearInit:
     torch draws both weight and bias from ``U(-1/sqrt(fan_in), 1/sqrt(fan_in))``
     (Kaiming-uniform with ``a=sqrt(5)`` reduces to this bound). Flax's
     ``nnx.Linear`` defaults to ``lecun_normal`` instead, so matching torch here is
-    what makes training trajectories — and thus accuracy — comparable to
+    what makes training trajectories, and thus accuracy, comparable to
     neuralforecast. ``fan_in`` is the layer's ``in_features`` (the bias shares the
     weight's fan_in). A 1-D conv with ``kernel_size=1`` has ``fan_in = in_channels``,
-    so the same initializer applies to the pointwise-conv FFN.
+    so the same initializer applies to the pointwise-conv feed-forward network (FFN).
     """
 
     __slots__ = ("fan_in",)
@@ -109,7 +109,7 @@ class RevIN(nnx.Module):
 class DataEmbeddingInverted(nnx.Module):
     """Inverted embedding: each variate's lookback becomes a token.
 
-    Mirrors NF ``DataEmbedding_inverted``: permute ``[B, L, N] -> [B, N, L]`` then
+    Mirrors neuralforecast ``DataEmbedding_inverted``: permute ``[B, L, N] -> [B, N, L]`` then
     ``Linear(input_size -> hidden_size)`` (the lookback length is the feature dim),
     followed by dropout. Exogenous/time marks are not supported (univariate, no
     covariates), so the ``x_mark`` concat path is omitted.
@@ -132,12 +132,12 @@ class DataEmbeddingInverted(nnx.Module):
 class AttentionLayer(nnx.Module):
     """Multi-head full (softmax dot-product) self-attention over the token axis.
 
-    Folds NF's ``AttentionLayer`` + ``FullAttention`` into one module: q/k/v/out
+    Folds neuralforecast's ``AttentionLayer`` + ``FullAttention`` into one module: q/k/v/out
     projections (``Linear(hidden -> n_heads*d_k)``, torch init) and a frozen scale
-    ``d_k**-0.5`` applied pre-softmax (NF ``scale = 1/sqrt(E)``). Dropout is applied
-    to the attention weights (NF ``FullAttention(attention_dropout=dropout)``); the
+    ``d_k**-0.5`` applied pre-softmax (neuralforecast ``scale = 1/sqrt(E)``). Dropout is applied
+    to the attention weights (neuralforecast ``FullAttention(attention_dropout=dropout)``); the
     output projection carries no dropout (the residual dropout lives in the encoder
-    layer). No causal mask (NF ``mask_flag=False``), no residual-attention threading.
+    layer). No causal mask (neuralforecast ``mask_flag=False``), no residual-attention threading.
     """
 
     def __init__(self, *, hidden_size, n_heads, attn_dropout, rngs: nnx.Rngs):
@@ -174,7 +174,7 @@ class AttentionLayer(nnx.Module):
 class TransEncoderLayer(nnx.Module):
     """One iTransformer encoder layer (post-norm).
 
-    NF ``TransEncoderLayer.forward``::
+    neuralforecast ``TransEncoderLayer.forward``::
 
         new_x = attention(x, x, x)
         x = x + dropout(new_x)
@@ -185,7 +185,7 @@ class TransEncoderLayer(nnx.Module):
 
     The two ``Conv1d(kernel_size=1)`` layers are mathematically pointwise linear
     maps over the channel axis, so they are implemented as ``nnx.Linear`` (no
-    transpose needed). ``activation`` is exact GELU (NF passes ``F.gelu``).
+    transpose needed). ``activation`` is exact GELU (neuralforecast passes ``F.gelu``).
     """
 
     def __init__(self, *, hidden_size, n_heads, d_ff, dropout,
@@ -215,7 +215,8 @@ class TransEncoderLayer(nnx.Module):
 
 
 class TransEncoder(nnx.Module):
-    """Stack of ``e_layers`` encoder layers plus a final LayerNorm (NF ``norm_layer``)."""
+    """Stack of ``e_layers`` encoder layers plus a final LayerNorm (neuralforecast
+    ``norm_layer``)."""
 
     def __init__(self, *, e_layers, hidden_size, n_heads, d_ff, dropout,
                  activation="gelu", rngs: nnx.Rngs):

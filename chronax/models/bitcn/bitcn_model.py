@@ -53,19 +53,47 @@ def _select_boxcox_lambda(y: jnp.ndarray) -> float:
 class BiTCN(BaseForecaster):
     """Univariate BiTCN forecaster (JAX/Flax-NNX port of neuralforecast.BiTCN).
 
-    Maintenance Status:
-        Active univariate forecaster. Integrates with the ``BaseForecaster``
-        interface, including conformal prediction intervals via ``predict(level=...)``,
-        pickle round-trip, and ``forecast(fitted=True)``.
+    Bidirectional Temporal Convolutional Network (Sprangers, Schelter & de
+    Rijke, 2023). For the univariate, no-exogenous case only the backward
+    dilated temporal convolutional network (TCN) is used: the lookback window
+    is projected to ``hidden_size``, passed through ``ceil(log2(input_size))``
+    dilated causal-conv cells (``kernel_size=2``, dilation ``2**i``)
+    accumulating a residual state and a skip signal, then two temporal dense
+    layers map to the horizon and a final linear projects to one channel.
+    neuralforecast's default ``scaler_type="identity"`` is mirrored (trained in
+    raw scale) with Optax ``adam`` and a pluggable point loss. ``float32``
+    throughout.
 
-    Bidirectional Temporal Convolutional Network (Sprangers, Schelter & de Rijke,
-    2023). For the univariate, no-exogenous case only the *backward* dilated TCN
-    is used: the lookback window is projected to ``hidden_size``, passed through
-    ``ceil(log2(input_size))`` dilated causal-conv cells (``kernel_size=2``,
-    dilation ``2**i``) accumulating a residual state and a skip signal, then two
-    temporal dense layers map to the horizon and a final linear projects to one
-    channel. NF default ``scaler_type="identity"`` is mirrored (trained in raw
-    scale) with Optax ``adam`` and a pluggable point loss. ``float32`` throughout.
+    Maintenance status:
+        Active univariate forecaster. Integrates with the ``BaseForecaster``
+        interface, including conformal prediction intervals via
+        ``predict(level=...)``, pickle round-trip, and ``forecast(fitted=True)``.
+
+    Args:
+        h (int): Forecast horizon.
+        input_size (int): Input window length. Any value ``< 1`` (default
+            ``-1``) resolves to ``3 * h``.
+        hidden_size (int): Channel width of the TCN. Default ``16``.
+        dropout (float): Dropout rate. Default ``0.5``.
+        use_boxcox (bool): Box-Cox transform the series before modelling
+            (lambda chosen once at fit by profile likelihood) and invert the
+            forecast, as :class:`chronax.models.TBATS` does. Requires strictly
+            positive values. Default ``False``.
+        max_steps (int): Number of Adam steps. Default ``1000``.
+        learning_rate (float | Callable[[int], float]): Adam learning rate, a
+            scalar or an ``optax`` schedule. Default ``1e-3``.
+        windows_batch_size (int): Rolling windows sampled per step. Default
+            ``1024``.
+        random_seed (int): Seed for parameter init, dropout and window
+            sampling. Default ``1``.
+        alias (str): Display name. Default ``"BiTCN"``.
+        loss (str | LossFn): Registry name (``"mae"``, ``"mse"``, ``"huber"``)
+            or a callable. Default ``"mae"``.
+
+    Note:
+        A callable ``loss`` or ``learning_rate`` must itself be picklable for
+        the fitted estimator to pickle. An unknown ``loss`` name raises
+        ``ValueError`` at ``fit`` time.
     """
 
     uses_exog = False
@@ -132,7 +160,33 @@ class BiTCN(BaseForecaster):
         )
 
     def fit(self, y: jnp.ndarray, X: jnp.ndarray | None = None) -> "BiTCN":
-        """Fit the network on a 1-D series of length ``>= input_size + h``."""
+        """Fit the network on a 1-D series.
+
+        Builds the network and runs ``max_steps`` Adam steps over rolling
+        windows of length ``input_size + h``, sampled per step the way
+        neuralforecast does.
+
+        When ``use_boxcox=True`` the series is Box-Cox transformed first (the
+        lambda is chosen once by profile likelihood) and the raw series is kept
+        for the conformal path.
+
+        Args:
+            y (jnp.ndarray): Univariate series, shape ``(T,)`` with
+                ``T >= input_size + h``.
+            X (jnp.ndarray | None): Exogenous regressors. Not supported; must
+                be ``None``.
+
+        Returns:
+            BiTCN: ``self`` with ``model_`` populated.
+
+        Raises:
+            NotImplementedError: If ``X`` is not ``None``.
+            ValueError: If ``y`` is not 1-D, if it is shorter than
+                ``input_size + h``, if ``use_boxcox=True`` and ``y`` contains a
+                value ``<= 0``, or if ``loss`` is an unknown registry name.
+            RuntimeError: If a non-finite training loss is observed (the
+                training run diverged).
+        """
         if X is not None:
             raise NotImplementedError("Exogenous variables are not supported.")
         y = jnp.asarray(y, dtype=jnp.float32)
@@ -170,7 +224,33 @@ class BiTCN(BaseForecaster):
         X: jnp.ndarray | None = None,
         level: list[int | float] | None = None,
     ) -> dict:
-        """Forecast ``h`` steps (``1 <= h <= self.h``) from the fitted context."""
+        """Forecast ``h`` steps from the fitted context.
+
+        The network is direct-decoded for ``self.h`` steps and the first ``h``
+        are returned.
+        Forecasts are mapped back from the Box-Cox space when
+        ``use_boxcox=True``.
+
+        Args:
+            h (int): Forecast horizon, ``1 <= h <= self.h``.
+            X (jnp.ndarray | None): Exogenous regressors. Ignored.
+            level (list[int | float] | None): Confidence levels in (0, 100),
+                e.g. ``[80, 95]``. When given, conformal intervals come from
+                ``BaseForecaster.conformity_scores``, which re-fits the model on
+                every cross-validation (CV) window under ``vmap``; requires
+                ``self.conformal_params``. Expect minutes per call on this
+                model, scaling with ``n_windows`` and ``max_steps``.
+
+        Returns:
+            dict: ``"mean"`` (shape ``(h,)``) plus ``"lo-{lv}"`` and
+            ``"hi-{lv}"`` (shape ``(h,)``) for each level when ``level`` is
+            given.
+
+        Raises:
+            RuntimeError: If called before ``fit``.
+            ValueError: If ``h < 1``, if ``h > self.h``, or if ``level`` is
+                given while ``self.conformal_params`` is ``None``.
+        """
         if self.model_ is None or self._context is None:
             raise RuntimeError("Call fit(y) before predict(h).")
         if h < 1:
@@ -210,7 +290,33 @@ class BiTCN(BaseForecaster):
         level: list[int | float] | None = None,
         fitted: bool = False,
     ) -> dict:
-        """Stateless fit-then-predict on ``y``. Optionally add ``"fitted"``."""
+        """Fit on ``y`` and forecast ``h`` steps in one call.
+
+        Equivalent to ``self.fit(y).predict(h=h, level=level)``; the fitted
+        state stays on the estimator.
+
+        Args:
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            h (int): Forecast horizon, ``1 <= h <= self.h``.
+            X (jnp.ndarray | None): Exogenous regressors. Not supported; must
+                be ``None``.
+            X_future (jnp.ndarray | None): Future exogenous regressors. Not
+                supported; must be ``None``.
+            level (list[int | float] | None): Confidence levels; see
+                ``predict``.
+            fitted (bool): If ``True``, add a ``"fitted"`` key with
+                one-step-ahead in-sample predictions, shape ``(T,)``; the first
+                ``input_size`` entries are NaN.
+
+        Returns:
+            dict: ``"mean"`` (shape ``(h,)``), the interval keys when ``level``
+            is given, and ``"fitted"`` when ``fitted=True``.
+
+        Raises:
+            NotImplementedError: If ``X`` or ``X_future`` is not ``None``.
+            ValueError: Forwarded from ``fit`` and ``predict``.
+            RuntimeError: Forwarded from ``fit`` and ``predict``.
+        """
         if X is not None or X_future is not None:
             raise NotImplementedError("Exogenous variables are not supported.")
         self.fit(y)

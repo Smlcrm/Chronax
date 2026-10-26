@@ -4,14 +4,15 @@ Self-contained -- no imports from other chronax models.
 
 All long-lived state lives in a ``flax.training.train_state.TrainState`` and all
 randomness is threaded explicitly through ``jax.random.PRNGKey`` (functional --
-no hidden global RNG), which is what lets the steps be ``jax.jit``-compiled.
+no hidden global random number generator (RNG)), which is what lets the steps
+be ``jax.jit``-compiled.
 
-Two interchangeable training paradigms are provided:
+Two interchangeable training loops are provided:
 
 1. **Window-based** (``train_window_step`` / ``eval_window_step``):
    Accepts raw ``[B, input_size + h]`` windows, applies a per-window
    ``RobustScaler`` *inside* the step, then optimises ``mae`` / ``mse``. This is
-   what :class:`FEDformerForecaster` uses (mirrors neuralforecast's recipe).
+   what :class:`FEDformer` uses (mirrors neuralforecast's recipe).
 
 2. **Batch-based** (``train_step`` / ``eval_step`` / ``train_loop``):
    Accepts pre-scaled ``{insample_y, outsample_y, sample_mask}`` dicts and
@@ -19,7 +20,7 @@ Two interchangeable training paradigms are provided:
 
 Schedule / control helpers mirror common neuralforecast knobs:
     ``make_lr_schedule``   -- StepLR-style gamma=0.5 per decay.
-    ``sample_batch_indices`` -- NF-style window sampling (with/without replacement).
+    ``sample_batch_indices`` -- neuralforecast-style window sampling (with/without replacement).
     ``should_stop_early``  -- patience-based early-stop check.
 """
 from __future__ import annotations
@@ -74,7 +75,7 @@ def _get_optimizer(
             # Match torch.optim.Adam defaults (b1=0.9, b2=0.999, eps=1e-8).
             base_opt = optax.adam(learning_rate=lr_schedule, b1=0.9, b2=0.999, eps=1e-8)
         if grad_clip > 0.0:
-            # Global-norm clipping stabilises the FFT-heavy gradients.
+            # Global-norm clipping stabilises the fast Fourier transform (FFT) heavy gradients.
             optimizer = optax.chain(optax.clip_by_global_norm(grad_clip), base_opt)
         else:
             optimizer = base_opt
@@ -126,10 +127,10 @@ def sample_batch_indices(
     batch_size: int,
     n_steps: int,
 ) -> jax.Array:
-    """Sample ``[n_steps, batch_size]`` window indices (NF-style).
+    """Sample ``[n_steps, batch_size]`` window indices (neuralforecast-style).
 
-    With replacement when ``n_train < batch_size`` (NF ``torch.randint``);
-    without replacement via permutation slice otherwise (NF ``randperm[:B]``).
+    With replacement when ``n_train < batch_size`` (neuralforecast ``torch.randint``);
+    without replacement via permutation slice otherwise (neuralforecast ``randperm[:B]``).
     """
     keys = jax.random.split(key, n_steps)
     if n_train < batch_size:
@@ -171,7 +172,7 @@ def create_train_state(
     """Initialise model parameters and optimiser state.
 
     Args:
-        rng: PRNG key for parameter initialisation.
+        rng: Pseudo-random number generator (PRNG) key for parameter initialisation.
         config: Model architecture config.
         learning_rate: Peak learning rate.
         weight_decay: If > 0 use ``optax.adamw``, else ``optax.adam``.
@@ -290,7 +291,7 @@ def _window_forward_loss(
     The history and target are scaled by the *history's* statistics so the model
     never sees the target's scale (no leakage); the loss is computed in scaled
     space, which keeps the gradient magnitudes comparable across windows.
-    Padded horizon steps (NF right-pad) are excluded via ``masks``.
+    Padded horizon steps (neuralforecast right-pad) are excluded via ``masks``.
     """
     insample = windows[:, :input_size]   # [B, L]
     target = windows[:, input_size:]     # [B, h]

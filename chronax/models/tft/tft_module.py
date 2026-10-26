@@ -1,7 +1,7 @@
 """TFT encoders, fusion decoder, and the top-level network (flax.nnx).
 
-Ports ``StaticCovariateEncoder``, ``TemporalCovariateEncoder`` (LSTM/GRU
-seq2seq), ``TemporalFusionDecoder``, and the top-level ``TFTNet`` from
+Ports ``StaticCovariateEncoder``, ``TemporalCovariateEncoder`` (long short-term
+memory (LSTM) or gated recurrent unit (GRU) seq2seq), ``TemporalFusionDecoder``, and the top-level ``TFTNet`` from
 ``neuralforecast/models/tft.py``. The recurrence runs as ``nnx.scan`` over an
 ``nnx.LSTMCell``/``GRUCell`` with the initial carry supplied by the static
 covariate encoder -- carry order is ``(c, h)`` for LSTM (verified). All paths
@@ -65,7 +65,7 @@ class StaticCovariateEncoder(nnx.Module):
         )
         n_states = 2 if rnn_type == "lstm" else 1
         self.n_context = 2 + n_states * n_rnn_layers
-        # NF hardcodes ELU for the 2+2L context GRNs regardless of grn_activation
+        # neuralforecast hardcodes ELU for the 2+2L context GRNs regardless of grn_activation
         # (only the VSN GRNs follow the configured activation).
         self.context_grns = [
             GRN(hidden_size, hidden_size, dropout=dropout, activation="ELU", rngs=rngs)
@@ -96,7 +96,7 @@ class TemporalCovariateEncoder(nnx.Module):
     ``cs``), the encoder recurrence runs over history from the static initial
     carry ``(cc, ch)``, the decoder recurrence runs over the future continuing
     from the encoder's final carry, and the concatenated outputs are GLU-gated
-    with a residual + LayerNorm (NF ``input_gate``).
+    with a residual + LayerNorm (neuralforecast ``input_gate``).
     """
 
     def __init__(self, hidden_size, num_hist_vars, num_futr_vars, dropout, activation,
@@ -144,7 +144,7 @@ class TemporalFusionDecoder(nnx.Module):
     """Static enrichment -> masked interpretable attention -> position-wise GRN.
 
     Each block is gated (GLU) with a residual + LayerNorm. After attention the
-    encoder steps are discarded, keeping only the ``h`` horizon steps (NF slices
+    encoder steps are discarded, keeping only the ``h`` horizon steps (neuralforecast slices
     ``[input_size:]``).
     """
 
@@ -183,7 +183,7 @@ class TemporalFusionDecoder(nnx.Module):
 class TFTNet(nnx.Module):
     """Full TFT backbone: embed -> static contexts -> seq2seq -> fusion decoder -> head.
 
-    I/O mirrors NF ``TFT.forward`` but with explicit kwargs instead of a
+    I/O mirrors neuralforecast ``TFT.forward`` but with explicit kwargs instead of a
     ``windows_batch`` dict. ``__call__`` returns ``[B, h, outputsize_multiplier]``.
     """
 
@@ -233,7 +233,7 @@ class TFTNet(nnx.Module):
         B = insample_y.shape[0]
         L = self.input_size
 
-        if self.futr_exog_size == 0:                            # NF: repeat last value over L+h
+        if self.futr_exog_size == 0:                            # neuralforecast: repeat last value over L+h
             futr = jnp.broadcast_to(insample_y[:, -1:, :], (B, L + self.h, 1))
         else:
             futr = futr_exog
@@ -250,7 +250,7 @@ class TFTNet(nnx.Module):
             ch = jnp.zeros((self.n_rnn_layers, B, self.hidden_size), jnp.float32)
             cc = jnp.zeros((self.n_rnn_layers, B, self.hidden_size), jnp.float32)
 
-        parts = []                                              # NF order: [hist, futr, target]
+        parts = []                                              # neuralforecast order: [hist, futr, target]
         if self.hist_exog_size > 0:
             parts.append(self.hist_embedding(hist_exog)[:, :L])
         parts.append(futr_emb[:, :L])

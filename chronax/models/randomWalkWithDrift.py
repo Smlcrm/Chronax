@@ -1,35 +1,12 @@
 """
-The RandomWalkWithDrift class implements statsforecast's random walk with drift forecasting model.
+Random walk with drift: the naive forecast plus a linear drift.
 
-A variation of the naive method that allows forecasts to change over time by extrapolating
-a linear trend between the first and last observations.
-
-This JAX implementation provides complete compatibility with statsforecast's RandomWalkWithDrift class, including:
-- fit(): Trains the model and stores parameters (slope, last_y, sigma, fitted values)
-- predict(): Makes forecasts using fitted model (stateful) with confidence intervals
-- predict_in_sample(): Returns fitted values from training with confidence intervals
-- forecast(): Stateless prediction (fit + predict in one step) with confidence intervals
-
-Core computation is handled by _rwd_core() which computes forecasts, fitted values, slope, and residual statistics.
-
-Confidence Intervals:
-- Native intervals: Uses residual standard error with drift-adjusted variance formula
-- Conformal intervals: Uses base_forecaster's conformal prediction methods when conformal_params is provided
-
-Mathematical Formula:
-ŷ[t+h] = y[T] + h * slope, where slope = (y[T] - y[1]) / (T-1)
-
-Instance Attributes:
-1. All instance attributes in the parent class base_forecaster
-2. model_: Dict containing fitted parameters (slope, last_y, sigma, fitted values, n)
-
-Class Attributes:
-- Inherits from base_forecaster
-
-Methods:
-- All statsforecast RandomWalkWithDrift methods implemented with JAX operations
-- Full confidence interval support (both native and conformal)
-- Proper integration with base_forecaster's conformal prediction framework
+Port of statsforecast's ``RandomWalkWithDrift``. The forecast is
+``y[T] + h * slope`` with ``slope = (y[T] - y[1]) / (T - 1)``. ``_rwd_core``
+computes the forecasts, fitted values, slope and residual standard error.
+Native intervals use the drift-adjusted variance ``h * (1 + h / (n - 1))``;
+conformal intervals come from ``BaseForecaster`` when ``conformal_params`` is
+set.
 """
 
 import jax
@@ -39,6 +16,21 @@ from chronax.utils import ConformalIntervals
 from chronax import utils
 
 class RandomWalkWithDrift(BaseForecaster):
+    """Random walk with drift model.
+
+    Args:
+        alias (str): Custom name of the model. Defaults to ``"RWD"``.
+        conformal_params (ConformalIntervals | None): Configuration for
+            conformal prediction intervals. When ``None``, native intervals
+            (drift-adjusted residual standard error, normal quantiles) are
+            used. Defaults to ``None``.
+
+    Note:
+        Two signature quirks relative to ``BaseForecaster``: ``forecast``
+        takes ``(h, y, ...)`` in that order, and ``predict`` has no ``X``
+        parameter. Call ``forecast`` with keyword arguments.
+    """
+
     def __init__(
         self,
         alias: str = "RWD",
@@ -50,29 +42,28 @@ class RandomWalkWithDrift(BaseForecaster):
 
     @staticmethod
     def _rwd_core(y: jnp.ndarray, h: int) -> dict:
-        """Core Random Walk with Drift computation.
+        """Core random walk with drift computation.
 
         Args:
-            y: Time series array
-            h: Forecast horizon
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            h (int): Forecast horizon.
 
         Returns:
-            dict: Contains mean forecasts, fitted values, slope, last_y, and sigma
+            dict: ``"mean"``, ``"fitted"``, ``"slope"``, ``"last_y"``,
+            ``"sigma"`` and ``"n"``.
         """
-        # Calculate slope as linear trend between first and last observation
         slope = (y[-1] - y[0]) / (y.size - 1)
 
-        # Generate forecasts: y_T + h * slope for h = 1, 2, ..., H
+        # y_T + k * slope for k = 1, ..., h
         forecast_steps = jnp.arange(1, h + 1, dtype=y.dtype)
         forecasts = y[-1] + slope * forecast_steps
 
-        # Calculate fitted values: slope + y[t-1] for t = 2, ..., T
+        # fitted[t] = y[t-1] + slope; the first value is NaN
         fitted_vals = jnp.concatenate([
-            jnp.array([jnp.nan]),  # First fitted value is NaN
-            slope + y[:-1]         # Remaining fitted values
+            jnp.array([jnp.nan]),
+            slope + y[:-1]
         ])
 
-        # Calculate residuals and sigma
         residuals = y - fitted_vals
         sigma = utils.calculate_sigma(residuals, len(residuals) - 1)
 
@@ -86,18 +77,18 @@ class RandomWalkWithDrift(BaseForecaster):
         }
         return dictionary
 
-    # JIT-compiled version for performance
     _rwd_core_jit = jax.jit(_rwd_core.__func__, static_argnums=(1,))
 
     def fit(self, y: jnp.ndarray, X: jnp.ndarray | None = None):
         """Fit the RandomWalkWithDrift model.
 
         Args:
-            y: Clean time series of shape (t,)
-            X: Optional exogenous variables (not used, for API compatibility)
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            X (jnp.ndarray | None): Exogenous regressors, shape ``(T, F)``.
+                Ignored. Defaults to ``None``.
 
         Returns:
-            self: Fitted RandomWalkWithDrift model
+            RandomWalkWithDrift: ``self``.
         """
         y = utils.ensure_float(y)
         mod = RandomWalkWithDrift._rwd_core_jit(y, h=1)
@@ -106,17 +97,25 @@ class RandomWalkWithDrift(BaseForecaster):
         return self
 
     def predict(self, h: int, level: list[int] | None = None):
-        """Predict with fitted RandomWalkWithDrift.
+        """Predict with the fitted RandomWalkWithDrift model.
+
+        This method has no ``X`` parameter.
 
         Args:
-            h: Forecast horizon
-            level: Confidence levels (0-100) for prediction intervals
+            h (int): Forecast horizon.
+            level (list[int] | None): Confidence levels in (0, 100), e.g.
+                ``[80, 95]``. Defaults to ``None``.
 
         Returns:
-            dict: Dictionary with entries `mean` for point predictions and `level_*` for probabilistic predictions
+            dict: ``"mean"`` (shape ``(h,)``) plus ``"lo-{lv}"``/``"hi-{lv}"``
+            per level when ``level`` is given.
+
+        Raises:
+            ValueError: If called before ``fit``, or if the conformal path
+                finds the training series too short for 2 cross-validation
+                (CV) windows.
         """
         self._require_fitted()
-        # Generate forecasts using stored slope and last_y
         forecast_steps = jnp.arange(1, h + 1, dtype=self.model_["last_y"].dtype)
         mean = self.model_["last_y"] + self.model_["slope"] * forecast_steps
         res = {"mean": mean}
@@ -140,13 +139,16 @@ class RandomWalkWithDrift(BaseForecaster):
         return res
 
     def predict_in_sample(self, level: list[int] | None = None):
-        """Access fitted RandomWalkWithDrift insample predictions.
+        """Return the in-sample fitted values of the fitted model.
 
         Args:
-            level: Confidence levels (0-100) for prediction intervals
+            level (list[int] | None): Confidence levels in (0, 100). Defaults
+                to ``None``.
 
         Returns:
-            dict: Dictionary with entries `fitted` for point predictions
+            dict: ``"fitted"`` (shape ``(T,)``, first value NaN) plus
+            ``"fitted-lo-{lv}"``/``"fitted-hi-{lv}"`` per level when ``level``
+            is given.
         """
         res = {"fitted": self.model_["fitted"]}
         if level is not None:
@@ -163,22 +165,32 @@ class RandomWalkWithDrift(BaseForecaster):
         level: list[int] | None = None,
         fitted: bool = False,
     ):
-        """Memory Efficient RandomWalkWithDrift predictions.
+        """Stateless fit+predict in one call.
 
-        This method avoids memory burden due from object storage.
-        It is analogous to `fit_predict` without storing information.
-        It assumes you know the forecast horizon in advance.
+        Takes ``h`` before ``y``, the reverse of the ``BaseForecaster``
+        signature; call with keyword arguments.
 
         Args:
-            h: Forecast horizon
-            y: Clean time series of shape (n,)
-            X: Optional insample exogenous of shape (t, n_x) (not used, for API compatibility)
-            X_future: Optional exogenous of shape (h, n_x) (not used, for API compatibility)
-            level: Confidence levels (0-100) for prediction intervals
-            fitted: Whether or not to return insample predictions
+            h (int): Forecast horizon.
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            X (jnp.ndarray | None): In-sample exogenous regressors, shape
+                ``(T, F)``. Ignored. Defaults to ``None``.
+            X_future (jnp.ndarray | None): Future exogenous regressors, shape
+                ``(h, F)``. Ignored. Defaults to ``None``.
+            level (list[int] | None): Confidence levels in (0, 100). Defaults
+                to ``None``.
+            fitted (bool): Whether to return in-sample fitted values under
+                ``"fitted"``. Defaults to ``False``.
 
         Returns:
-            dict: Dictionary with entries `mean` for point predictions and `level_*` for probabilistic predictions
+            dict: ``"mean"`` (shape ``(h,)``); ``"fitted"`` (shape ``(T,)``)
+            when ``fitted``; ``"lo-{lv}"``/``"hi-{lv}"`` per level when
+            ``level`` is given, plus ``"fitted-lo-{lv}"``/``"fitted-hi-{lv}"``
+            when both are set.
+
+        Raises:
+            ValueError: If the conformal path finds the series too short for
+                2 CV windows.
         """
         y = utils.ensure_float(y)
         out = RandomWalkWithDrift._rwd_core_jit(y=y, h=h)
@@ -211,16 +223,14 @@ class RandomWalkWithDrift(BaseForecaster):
         z_scores = jnp.array([utils._jax_norm_ppf(0.5 + lv / 200) for lv in level])
         mean = res["mean"]
 
-        # Vectorized computation of all intervals at once
-        z_lower = z_scores[::-1]  # Reverse for lower bounds
+        z_lower = z_scores[::-1]  # lower bounds use reversed level order
         z_upper = z_scores
 
-        # Broadcasting: mean (h,) with z_scores (n_levels,) -> (h, n_levels)
+        # mean (h,) x z_scores (n_levels,) -> (h, n_levels)
         lower_bounds = mean[:, None] - z_lower * sigmah[:, None]
         upper_bounds = mean[:, None] + z_upper * sigmah[:, None]
 
         intervals = {}
-        # Lower bounds (reversed level order)
         for i, lv in enumerate(reversed(level)):
             intervals[f"lo-{lv}"] = lower_bounds[:, i]
 

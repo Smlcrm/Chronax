@@ -1,15 +1,15 @@
-"""Functional data pipeline for the Chronax RNN model.
+"""Functional data pipeline for the Chronax recurrent neural network (RNN) model.
 
-The pipeline is intentionally minimal — no PyTorch / Lightning / DataLoader
+The pipeline is intentionally minimal: no PyTorch / Lightning / DataLoader
 dependencies, and no NumPy: every array is a ``jnp.ndarray`` throughout, so
 the pipeline stays JIT- and grad-friendly end to end.
 
 The two masks come from Nixtla's vocabulary:
 
-* ``available_mask`` — 1 where the *historic* target is real data, 0 where it
+* ``available_mask``: 1 where the *historic* target is real data, 0 where it
   is padding. Used by the model to ignore padded steps when needed and by the
   evaluator to know what was actually provided.
-* ``sample_mask``    — 1 on horizon steps that should contribute to the loss
+* ``sample_mask``: 1 on horizon steps that should contribute to the loss
   (e.g. drop holidays / outliers). Produced from the user's per-series
   outsample mask, defaults to all-ones.
 """

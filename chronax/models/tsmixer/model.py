@@ -1,16 +1,16 @@
-"""JAX/Flax TSMixer — multivariate time-series forecasting.
+"""JAX/Flax TSMixer: multivariate time-series forecasting.
 
 Faithful port of Nixtla NeuralForecast's TSMixer to JAX/Flax/Optax.
 
 Normalisation:
-  * TemporalMixing: ``fnn.BatchNorm(axis=1)`` on ``[B, N, L]`` — normalises
-    over the B×L axes per N channel, exactly matching PyTorch's
-    ``BatchNorm1d(n_series)`` with running_mean/running_var accumulated over
-    all training steps for stable inference statistics.
-  * FeatureMixing: ``fnn.BatchNorm(axis=-1)`` on ``[B, L, N]`` — normalises
-    over B×L per N channel (same semantics on the feature axis).
+  * TemporalMixing: ``fnn.BatchNorm(axis=1)`` on ``[B, N, L]`` normalises
+    over the B and L axes per N channel, the semantics of PyTorch's
+    ``BatchNorm1d(n_series)``, with running_mean/running_var accumulated over
+    all training steps for inference.
+  * FeatureMixing: ``fnn.BatchNorm(axis=-1)`` on ``[B, L, N]`` normalises
+    over B and L per N channel (same semantics on the feature axis).
   * RevIN: optional per-channel instance normalisation computed inline
-    (no mutable state — pure functional).
+    (no mutable state, pure functional).
 
 All shapes follow ``[B, L, N]`` (batch, sequence, n_series) throughout.
 TSMixer returns a plain ``[B, h, N]`` array (no hidden-state tuple).
@@ -59,8 +59,8 @@ class TSMixerConfig:
     revin_affine: bool = True
     temporal_norm_momentum: float = 0.05
     feature_norm_momentum: float = 0.05
-    use_batchnorm: bool = True  # False → LayerNorm (better for large datasets)
-    use_global_skip: bool = False  # direct input→output skip (helps small seasonal datasets)
+    use_batchnorm: bool = True  # False selects LayerNorm in the mixing blocks
+    use_global_skip: bool = False  # add a direct Dense(L -> h) skip from the normalised input
 
 
 # ---------------------------------------------------------------------------
@@ -69,12 +69,12 @@ class TSMixerConfig:
 
 
 class TemporalMixing(fnn.Module):
-    """Time-axis MLP with normalisation and residual connection.
+    """Time-axis multilayer perceptron (MLP) with normalisation and residual connection.
 
-    When ``use_batchnorm=True``: BatchNorm(axis=1) on [B, N, L] — normalises
-    over B×L per N channel, matching PyTorch's BatchNorm1d(n_series).
-    When ``use_batchnorm=False``: LayerNorm (last-axis) — normalises per
-    (B, N) instance over L values; better for large datasets.
+    When ``use_batchnorm=True``: BatchNorm(axis=1) on [B, N, L] normalises
+    over B and L per N channel, the semantics of PyTorch's BatchNorm1d(n_series).
+    When ``use_batchnorm=False``: LayerNorm (last axis) normalises each
+    (B, N) instance over its L values.
     """
 
     dropout: float
@@ -107,10 +107,10 @@ class TemporalMixing(fnn.Module):
 class FeatureMixing(fnn.Module):
     """Feature-axis two-layer MLP with normalisation and residual connection.
 
-    When ``use_batchnorm=True``: BatchNorm(axis=-1) on [B, L, N] — normalises
-    over B×L per N channel, matching PyTorch's BatchNorm1d(n_series).
-    When ``use_batchnorm=False``: LayerNorm (last-axis) — normalises per
-    (B, L) instance over N features; better for large datasets.
+    When ``use_batchnorm=True``: BatchNorm(axis=-1) on [B, L, N] normalises
+    over B and L per N channel, the semantics of PyTorch's BatchNorm1d(n_series).
+    When ``use_batchnorm=False``: LayerNorm (last axis) normalises each
+    (B, L) instance over its N features.
     """
 
     ff_dim: int
@@ -168,7 +168,7 @@ class MixingLayer(fnn.Module):
 
 
 class TSMixer(fnn.Module):
-    """JAX/Flax TSMixer — multivariate time-series forecasting model.
+    """JAX/Flax TSMixer: multivariate time-series forecasting model.
 
     Accepts a batch of multivariate windows ``[B, L, N]`` and returns
     ``[B, h, N]`` forecasts. Carries ``batch_stats`` (running BatchNorm

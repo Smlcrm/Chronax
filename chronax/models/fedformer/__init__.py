@@ -6,7 +6,7 @@ use and testing. ``FEDformerForecaster`` remains as a deprecated config-based al
 """
 import flax
 
-# Pinned to flax 0.10.x — linen TrainState / Module APIs have churned across
+# Pinned to flax 0.10.x: linen TrainState / Module APIs have churned across
 # minor versions. Loud failure here beats silent miscompilation on a newer flax.
 if not flax.__version__.startswith("0.10"):
     raise ImportError(

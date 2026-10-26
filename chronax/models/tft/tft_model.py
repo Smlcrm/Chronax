@@ -27,7 +27,60 @@ def _nearest_q_index(quantiles, target: float) -> int:
 
 
 class TFT(BaseForecaster):
-    """Temporal Fusion Transformer (flax.nnx port of neuralforecast.TFT)."""
+    """Temporal Fusion Transformer (TFT; flax.nnx port of neuralforecast.TFT).
+
+    Lim et al., 2021: https://arxiv.org/abs/1912.09363. Static, historical
+    and future-known covariates are embedded per variable and passed through
+    variable selection networks; a recurrent encoder (long short-term memory
+    (LSTM) or gated recurrent unit (GRU)) over the ``input_size + h`` span
+    is followed by static enrichment, interpretable multi-head attention and
+    a position-wise gated residual network; only the last ``h`` positions
+    reach the output head. All three exog kinds are supported
+    (``uses_exog = True``). Point or multi-quantile losses; conformal or
+    native quantile intervals. ``float32`` throughout.
+
+    Args:
+        h (int): Forecast horizon the network is trained for.
+        input_size (int): Encoder window length ``L``. ``-1`` (default)
+            resolves to ``3 * h``.
+        hidden_size (int): Width of every embedding, gated residual network
+            and recurrent state. Default ``128``.
+        n_head (int): Attention heads; must divide ``hidden_size``.
+            Default ``4``.
+        attn_dropout (float): Dropout on attention weights. Default ``0.0``.
+        dropout (float): Dropout in gated residual networks and after
+            attention. Default ``0.1``.
+        grn_activation (str): Activation of the variable-selection gated
+            residual networks, matched case-insensitively against ``"ELU"``,
+            ``"ReLU"``, ``"Softplus"``, ``"Tanh"``, ``"SELU"``,
+            ``"LeakyReLU"``, ``"Sigmoid"``. The static-context networks always
+            use ELU. Default ``"ELU"``. Unknown names raise ``ValueError`` at
+            ``fit``.
+        rnn_type (str): ``"lstm"`` selects LSTM cells; any other value
+            selects GRU cells (no validation). Default ``"lstm"``.
+        n_rnn_layers (int): Stacked recurrent layers. Default ``1``.
+        max_steps (int): Optimizer steps. Default ``1000``.
+        learning_rate (float): Adam learning rate (constant). Default ``1e-3``.
+        windows_batch_size (int): Training windows per step. Default ``1024``.
+        scaler_type (str | Scaler): Per-window scaler, ``"identity"`` or
+            ``"robust"`` (median / mean absolute deviation), or a ``Scaler``
+            instance. Default ``"robust"``. Resolved at ``fit``.
+        loss (str | callable | MultiQuantileLoss): ``"mae"``, ``"mse"``,
+            ``"huber"``, a callable ``(pred, target) -> scalar``, or a
+            :class:`~chronax.models.tft.tft_losses.MultiQuantileLoss` for
+            native quantile intervals. Default ``"mae"``. Unknown names raise
+            ``ValueError`` at ``fit``.
+        quantile_sort (bool): Sort quantile outputs so they do not cross.
+            Default ``True``.
+        random_seed (int): Seed for parameter init, batch sampling and
+            dropout. Default ``1``.
+        alias (str): Display name. Default ``"TFT"``.
+
+    Note:
+        Set ``conformal_params`` to a :class:`~chronax.utils.ConformalIntervals`
+        to enable conformal intervals on a point-loss model. ``model_`` holds
+        the trained network after ``fit``.
+    """
 
     uses_exog = True
 
@@ -92,11 +145,32 @@ class TFT(BaseForecaster):
 
     # ---- fit -----------------------------------------------------------------
     def fit(self, y, X=None, *, futr_exog=None, stat_exog=None) -> "TFT":
+        """Train a fresh network on ``y`` and store the tail contexts.
+
+        Args:
+            y (jnp.ndarray): Univariate series, shape ``(T,)`` with
+                ``T >= input_size + 1``.
+            X (jnp.ndarray | None): Historical exog aligned with ``y``,
+                shape ``(T, F_hist)``; known over the input span only.
+            futr_exog (jnp.ndarray | None): Future-known exog aligned with
+                ``y``, shape ``(T, F_futr)``. Its horizon values must then be
+                passed to ``predict``.
+            stat_exog (jnp.ndarray | None): Static covariates of the series,
+                shape ``(S,)``.
+
+        Returns:
+            TFT: ``self``, with ``model_`` set.
+
+        Raises:
+            ValueError: ``y`` is not 1-D, ``T < input_size + 1``, ``X`` /
+                ``futr_exog`` has a different length than ``y``, or ``loss`` /
+                ``scaler_type`` / ``grn_activation`` is an unknown name.
+        """
         y = jnp.asarray(y, dtype=jnp.float32)
         if y.ndim != 1:
             raise ValueError(f"y must be 1-D; got shape {y.shape}.")
         if y.shape[0] < self.input_size + 1:
-            # NF trains on h-padded partial windows, so one window (T >= L+1) suffices.
+            # neuralforecast trains on h-padded partial windows, so one window (T >= L+1) suffices.
             raise ValueError(
                 f"Series length {y.shape[0]} too short for input_size={self.input_size} "
                 f"(need at least input_size+1)."
@@ -148,6 +222,36 @@ class TFT(BaseForecaster):
         )
 
     def predict(self, h, X=None, *, futr_exog=None, level=None) -> dict:
+        """Forecast the first ``h`` steps of the trained horizon.
+
+        Args:
+            h (int): Steps to return, ``1 <= h <= self.h``.
+            X (None): Ignored; historical exog is read from the ``fit`` call.
+            futr_exog (jnp.ndarray | None): Horizon values of the
+                future-known exog, shape ``(self.h, F_futr)``. Required when
+                ``fit`` received ``futr_exog``; ignored otherwise.
+            level (list[int] | None): Confidence levels in (0, 100), e.g.
+                ``[80, 95]``. With a point loss the intervals are conformal
+                (``conformal_params`` required); with a
+                ``MultiQuantileLoss`` they are read from the trained
+                quantiles.
+
+        Returns:
+            dict: ``"mean"`` (shape ``(h,)``; the 0.5-quantile head for a
+            quantile loss) plus ``"lo-{lv}"`` / ``"hi-{lv}"`` (shape ``(h,)``)
+            per level when ``level`` is given.
+
+        Raises:
+            RuntimeError: Called before ``fit``.
+            ValueError: ``h < 1`` or ``h > self.h``; ``futr_exog`` missing
+                or not ``(self.h, F_futr)`` on a model fit with future exog;
+                ``level`` with a point loss while the model was fit with
+                historical or future exog, or while ``conformal_params`` is
+                ``None``; ``level`` with a quantile loss whose quantiles do
+                not contain ``(100 - lv) / 200`` and ``1 - (100 - lv) / 200``.
+                The conformal path also raises the base-class ``ValueError``
+                when the series is too short for two cross-validation windows.
+        """
         if self.model_ is None or self._context is None:
             raise RuntimeError("Call fit(y) before predict(h).")
         if h < 1:
@@ -203,8 +307,31 @@ class TFT(BaseForecaster):
     # ---- forecast ------------------------------------------------------------
     def forecast(self, y, h, X=None, X_future=None, *, futr_exog=None, stat_exog=None,
                  level=None, fitted=False) -> dict:
-        """Stateless fit-then-predict. ``X`` = historical exog over ``y``; ``X_future`` =
-        future-known exog for the horizon ``(h, F)``; ``futr_exog`` = its history ``(T, F)``."""
+        """Stateless fit-then-predict.
+
+        Args:
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            h (int): Steps to return, ``1 <= h <= self.h``.
+            X (jnp.ndarray | None): Historical exog aligned with ``y``,
+                shape ``(T, F_hist)``.
+            X_future (jnp.ndarray | None): Future-known exog for the horizon,
+                shape ``(self.h, F_futr)``; required when ``futr_exog`` is
+                given.
+            futr_exog (jnp.ndarray | None): Future-known exog history aligned
+                with ``y``, shape ``(T, F_futr)``.
+            stat_exog (jnp.ndarray | None): Static covariates, shape ``(S,)``.
+            level (list[int] | None): Confidence levels in (0, 100).
+            fitted (bool): Also return one-step-ahead in-sample predictions.
+
+        Returns:
+            dict: As :meth:`predict`, plus ``"fitted"`` (shape ``(T,)``, the
+            first ``input_size`` entries ``NaN``) when ``fitted=True``.
+
+        Raises:
+            NotImplementedError: ``fitted=True`` on a model fit with any exog
+                (historical, future or static).
+            ValueError: Any ``fit`` or ``predict`` error.
+        """
         self.fit(y, X=X, futr_exog=futr_exog, stat_exog=stat_exog)
         result = self.predict(h=h, futr_exog=X_future, level=level)
         if fitted:

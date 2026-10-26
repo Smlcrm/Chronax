@@ -7,19 +7,20 @@ trend parts top-down (coarse -> fine) through small Linear+GELU chains, and a
 per-scale predictor head maps each mixed scale onto the horizon before the
 scale outputs are summed and denormalized.
 
-Convolutions are expressed as shifted GEMMs rather than ``lax.conv`` primitives
-(the XLA CPU backend pessimizes conv primitives inside the training scan while
+Convolutions are expressed as shifted general matrix multiplies (GEMMs) rather
+than ``lax.conv`` primitives (the XLA (Accelerated Linear Algebra) CPU (central
+processing unit) backend pessimizes conv primitives inside the training scan while
 matmuls keep their fast dot path): the k=3 circular token embedding is three
 rolled matmuls, and the optional stride-2 conv downsampler is three strided
 gathers + matmuls. ``input_size`` must be divisible by
-``down_sampling_window ** down_sampling_layers`` — the reference's mixed
+``down_sampling_window ** down_sampling_layers``, the reference's mixed
 floor/ceil width expressions coincide exactly under that constraint (and its
 torch layers error out when they don't).
 
 Unreachable reference paths are not ported: the future-temporal-mark machinery
 (the reference never receives future exogenous features), the never-applied
 positional embedding, and the frozen sinusoidal temporal embedding. The
-reference's per-block LayerNorm is constructed but never applied — kept here,
+reference's per-block LayerNorm is constructed but never applied, kept here,
 unused, so parameter inventories line up. The reference builds its ``conv``
 downsampling filter inside the forward pass, leaving it untrained and
 resampled per call; here it is a proper trained parameter. ``float32``
@@ -62,7 +63,7 @@ class _TorchLinearInit:
 
 class _KaimingNormalConvInit:
     """Picklable initializer matching ``nn.init.kaiming_normal_(mode='fan_in',
-    nonlinearity='leaky_relu')`` with a=0 — draws from ``N(0, 2/fan_in)``."""
+    nonlinearity='leaky_relu')`` with a=0, draws from ``N(0, 2/fan_in)``."""
 
     __slots__ = ("fan_in",)
 
@@ -109,7 +110,7 @@ def _torch_linear(n_in: int, n_out: int, *, rngs: nnx.Rngs) -> nnx.Linear:
 
 def _moving_avg(x: jnp.ndarray, kernel_size: int) -> jnp.ndarray:
     """Trend extraction: replicate-pad ``(k-1)//2`` on both ends of the time
-    axis, then a stride-1 windowed mean via cumulative-sum differences —
+    axis, then a stride-1 windowed mean via cumulative-sum differences,
     two slices per call instead of a k-term add chain (the chain dominated
     the training step at the default k=25, which runs at ~10 decomposition
     sites per forward). No conv primitive. x: [B, T, N]. Even kernels would
@@ -135,7 +136,7 @@ def _series_decomp(x: jnp.ndarray, kernel_size: int) -> tuple[jnp.ndarray, jnp.n
 
 
 def _dft_decomp(x: jnp.ndarray, top_k: int) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """DFT decomposition, expression-verbatim from the reference: rfft over the
+    """Discrete Fourier transform (DFT) decomposition, expression-verbatim from the reference: rfft over the
     LAST axis, magnitudes with the first leading-axis entry zeroed, a single
     GLOBAL threshold at the minimum of the per-position top-k magnitudes, and
     bins at or below the threshold suppressed before the inverse transform.
@@ -173,10 +174,10 @@ class TokenEmbedding(nnx.Module):
 class RevIN(nnx.Module):
     """Reversible instance normalization with optional learnable affine.
 
-    Per-window mean over time (``subtract_last`` unsupported here — the
+    Per-window mean over time (``subtract_last`` unsupported here, the
     reference instantiates TimeMixer's copies with the default mean mode),
     population variance, ``sqrt(var + eps)`` scale. The affine inverse divides
-    by ``gamma + eps**2`` — eps squared, an inherited reference quirk. With
+    by ``gamma + eps**2``, eps squared, an inherited reference quirk. With
     ``non_norm=True`` both directions pass through unchanged while the affine
     parameters still exist (reference parity: it constructs them regardless).
     Statistics are returned explicitly so the module stays pure and
@@ -283,10 +284,10 @@ class MultiScaleTrendMixing(nnx.Module):
 
 
 class PastDecomposableMixing(nnx.Module):
-    """One PDM block: per-scale decomposition, optional channel-crossing MLP,
+    """One PDM block: per-scale decomposition, optional channel-crossing multilayer perceptron (MLP),
     season/trend mixing, and (channel-independent mode only) a residual through
     the output-crossing MLP. The reference also constructs a LayerNorm it never
-    applies — kept here, unused, for parameter-inventory parity."""
+    applies, kept here, unused, for parameter-inventory parity."""
 
     def __init__(self, *, widths: list[int], d_model: int, d_ff: int, dropout: float,
                  channel_independence: int, decomp_method: str, moving_avg: int,
@@ -439,7 +440,7 @@ class TimeMixerNet(nnx.Module):
             return x[:, : T // w * w].reshape(B, T // w, w, N).mean(axis=2)
         if self.down_sampling_method == "max":
             return x[:, : T // w * w].reshape(B, T // w, w, N).max(axis=2)
-        # conv: k=3, stride w, circular pad 1 — three strided gathers + GEMMs.
+        # conv: k=3, stride w, circular pad 1, three strided gathers + GEMMs.
         wgt = self.down_conv_weight.value                     # [N, N, 3]
         xc = jnp.concatenate([x[:, -1:], x, x[:, :1]], axis=1)  # [B, T+2, N]
         t_out = T // w

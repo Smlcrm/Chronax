@@ -1,8 +1,8 @@
-"""TCN forecaster: BaseForecaster wrapper around the flax.nnx backbone.
+"""Temporal convolutional network (TCN) forecaster: BaseForecaster wrapper around the flax.nnx backbone.
 
 Univariate point and multi-quantile forecasting with future-known and
-historical exogenous inputs, via a dilated causal convolution encoder and an
-MLP decoder. Exog size is inferred at fit; intervals come from the conformal
+historical exogenous inputs, via a dilated causal convolution encoder and a
+multilayer perceptron (MLP) decoder. Exog size is inferred at fit; intervals come from the conformal
 path (point loss, no temporal exog) or natively from the quantile heads.
 ``float32`` throughout.
 """
@@ -29,10 +29,10 @@ def _nearest_q_index(quantiles, target: float) -> int:
 
 
 class TCN(BaseForecaster):
-    """TCN: Temporal Convolution Network with MLP decoder
-    (flax.nnx port of neuralforecast.TCN).
+    """Temporal convolutional network (TCN) with a multilayer perceptron
+    (MLP) decoder (flax.nnx port of neuralforecast.TCN).
 
-    Lea et al., 2016 -- https://arxiv.org/abs/1608.08242. The historical
+    Lea et al., 2016: https://arxiv.org/abs/1608.08242. The historical
     encoder is a stack of dilated causal 1-D convolutions (exponentially
     increasing dilations give an exponentially large receptive field), a
     context adapter ``Linear(input_size -> h)`` maps the encoded history onto
@@ -43,8 +43,52 @@ class TCN(BaseForecaster):
     the input span and residual-concatenates its horizon slice before the
     decoder, while historical exog joins the encoder channels only (it has no
     horizon values). Static exog is not modeled. ``context_size`` is accepted
-    for neuralforecast API parity but is unused. Point or multi-quantile losses;
-    conformal or native quantile intervals. ``float32`` throughout.
+    for neuralforecast interface parity but is unused. Point or
+    multi-quantile losses; conformal or native quantile intervals.
+    ``float32`` throughout.
+
+    Args:
+        h (int): Forecast horizon the network is trained for.
+        input_size (int): Encoder window length ``L``. ``-1`` (default)
+            resolves to ``3 * h``.
+        kernel_size (int): Convolution kernel width. Default ``2``.
+        dilations (Sequence[int] | None): Dilation of each encoder layer, one
+            layer per entry. ``None`` (default) resolves to
+            ``(1, 2, 4, 8, 16)``.
+        encoder_hidden_size (int): Channels of every encoder layer.
+            Default ``128``.
+        encoder_activation (str): Activation after each convolution,
+            ``"ReLU"`` or ``"Tanh"``. Default ``"ReLU"``.
+        context_size (int): Accepted for neuralforecast interface parity;
+            unused. Default ``10``.
+        decoder_hidden_size (int): Width of the decoder MLP's hidden layers.
+            Default ``128``.
+        decoder_layers (int): Linear layers in the decoder MLP (ReLU between
+            them). Default ``2``.
+        max_steps (int): Optimizer steps. Default ``1000``.
+        learning_rate (float): Adam learning rate (constant). Default ``1e-3``.
+        windows_batch_size (int): Training windows per step. Default ``128``.
+        scaler_type (str | Scaler): Per-window scaler, ``"identity"`` or
+            ``"robust"`` (median / mean absolute deviation), or a ``Scaler``
+            instance. Default ``"robust"``. Resolved at ``fit``.
+        loss (str | callable | MultiQuantileLoss): ``"mae"``, ``"mse"``,
+            ``"huber"``, a callable ``(pred, target) -> scalar``, or a
+            :class:`~chronax.models.tcn.tcn_losses.MultiQuantileLoss` for
+            native quantile intervals. Default ``"mae"``. Unknown names raise
+            ``ValueError`` at ``fit``.
+        quantile_sort (bool): Sort quantile outputs so they do not cross.
+            Default ``True``.
+        random_seed (int): Seed for parameter init and batch sampling.
+            Default ``1``.
+        alias (str): Display name. Default ``"TCN"``.
+
+    Note:
+        Set ``conformal_params`` to a :class:`~chronax.utils.ConformalIntervals`
+        to enable conformal intervals on a point-loss model. ``model_`` holds
+        the trained network after ``fit``.
+
+    Raises:
+        ValueError: ``encoder_activation`` not ``"ReLU"``/``"Tanh"``.
     """
 
     uses_exog = True
@@ -66,7 +110,7 @@ class TCN(BaseForecaster):
         self.dilations = (1, 2, 4, 8, 16) if dilations is None else tuple(dilations)
         self.encoder_hidden_size = encoder_hidden_size
         self.encoder_activation = encoder_activation
-        self.context_size = context_size          # accepted for API parity; unused
+        self.context_size = context_size          # accepted for interface parity; unused
         self.decoder_hidden_size = decoder_hidden_size
         self.decoder_layers = decoder_layers
         self.max_steps = max_steps
@@ -113,6 +157,25 @@ class TCN(BaseForecaster):
 
     # ---- fit -----------------------------------------------------------------
     def fit(self, y, X=None, *, futr_exog=None) -> "TCN":
+        """Train a fresh network on ``y`` and store the tail contexts.
+
+        Args:
+            y (jnp.ndarray): Univariate series, shape ``(T,)`` with
+                ``T >= input_size + 1``.
+            X (jnp.ndarray | None): Historical exog aligned with ``y``,
+                shape ``(T, F_hist)``; known over the input span only.
+            futr_exog (jnp.ndarray | None): Future-known exog aligned with
+                ``y``, shape ``(T, F_futr)``. Its horizon values must then be
+                passed to ``predict``.
+
+        Returns:
+            TCN: ``self``, with ``model_`` set.
+
+        Raises:
+            ValueError: ``y`` is not 1-D, ``T < input_size + 1``, ``X`` /
+                ``futr_exog`` has a different length than ``y``, or ``loss`` /
+                ``scaler_type`` is an unknown name.
+        """
         y = jnp.asarray(y, dtype=jnp.float32)
         if y.ndim != 1:
             raise ValueError(f"y must be 1-D; got shape {y.shape}.")
@@ -168,6 +231,36 @@ class TCN(BaseForecaster):
         )
 
     def predict(self, h, X=None, *, futr_exog=None, level=None) -> dict:
+        """Forecast the first ``h`` steps of the trained horizon.
+
+        Args:
+            h (int): Steps to return, ``1 <= h <= self.h``.
+            X (None): Ignored; historical exog is read from the ``fit`` call.
+            futr_exog (jnp.ndarray | None): Horizon values of the
+                future-known exog, shape ``(self.h, F_futr)``. Required when
+                ``fit`` received ``futr_exog``; ignored otherwise.
+            level (list[int] | None): Confidence levels in (0, 100), e.g.
+                ``[80, 95]``. With a point loss the intervals are conformal
+                (``conformal_params`` required); with a
+                ``MultiQuantileLoss`` they are read from the trained
+                quantiles.
+
+        Returns:
+            dict: ``"mean"`` (shape ``(h,)``; the 0.5-quantile head for a
+            quantile loss) plus ``"lo-{lv}"`` / ``"hi-{lv}"`` (shape ``(h,)``)
+            per level when ``level`` is given.
+
+        Raises:
+            RuntimeError: Called before ``fit``.
+            ValueError: ``h < 1`` or ``h > self.h``; ``futr_exog`` missing
+                or not ``(self.h, F_futr)`` on a model fit with future exog;
+                ``level`` with a point loss while the model was fit with
+                historical or future exog, or while ``conformal_params`` is
+                ``None``; ``level`` with a quantile loss whose quantiles do
+                not contain ``(100 - lv) / 200`` and ``1 - (100 - lv) / 200``.
+                The conformal path also raises the base-class ``ValueError``
+                when the series is too short for two cross-validation windows.
+        """
         if self.model_ is None or self._context is None:
             raise RuntimeError("Call fit(y) before predict(h).")
         if h < 1:
@@ -223,10 +316,29 @@ class TCN(BaseForecaster):
     # ---- forecast ------------------------------------------------------------
     def forecast(self, y, h, X=None, X_future=None, *, futr_exog=None,
                  level=None, fitted=False) -> dict:
-        """Stateless fit-then-predict. ``X`` = historical exog ``(T, F)`` (known
-        only over the input span); ``X_future`` = future-known exog for the
-        horizon ``(h, F)``; ``futr_exog`` = the future-known exog history
-        ``(T, F)``."""
+        """Stateless fit-then-predict.
+
+        Args:
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            h (int): Steps to return, ``1 <= h <= self.h``.
+            X (jnp.ndarray | None): Historical exog aligned with ``y``,
+                shape ``(T, F_hist)``.
+            X_future (jnp.ndarray | None): Future-known exog for the horizon,
+                shape ``(self.h, F_futr)``; required when ``futr_exog`` is
+                given.
+            futr_exog (jnp.ndarray | None): Future-known exog history aligned
+                with ``y``, shape ``(T, F_futr)``.
+            level (list[int] | None): Confidence levels in (0, 100).
+            fitted (bool): Also return one-step-ahead in-sample predictions.
+
+        Returns:
+            dict: As :meth:`predict`, plus ``"fitted"`` (shape ``(T,)``, the
+            first ``input_size`` entries ``NaN``) when ``fitted=True``.
+
+        Raises:
+            NotImplementedError: ``fitted=True`` on a model fit with exog.
+            ValueError: Any ``fit`` or ``predict`` error.
+        """
         self.fit(y, X=X, futr_exog=futr_exog)
         result = self.predict(h=h, futr_exog=X_future, level=level)
         if fitted:
@@ -234,10 +346,26 @@ class TCN(BaseForecaster):
         return result
 
     def conformity_scores(self, y, X=None) -> jnp.ndarray:
+        """Walk-forward conformity scores (see the base class).
+
+        Args:
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            X (None): Historical exog is refused here; conformal intervals
+                need an exog-free fit.
+
+        Returns:
+            jnp.ndarray: Signed residuals, shape ``(n_windows, h)``.
+
+        Raises:
+            ValueError: ``X`` is not ``None``; ``conformal_params`` is
+                ``None``; or the series is too short for two
+                cross-validation windows.
+        """
         if X is not None:
             # Temporal exog (hist here) -> native (quantile) intervals, not
-            # conformal — same refusal as _add_conformal. Guarding here keeps a
-            # passed X out of the base CV vmap, where it could not raise under trace.
+            # conformal, same refusal as _add_conformal. Guarding here keeps a
+            # passed X out of the base cross-validation vmap, where it could
+            # not raise under trace.
             raise ValueError(
                 "Conformal intervals are not supported with temporal (historical/future) exog. "
                 "Use loss=MultiQuantileLoss([...]) for native intervals, or omit level."

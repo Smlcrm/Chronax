@@ -1,4 +1,4 @@
-"""High-level fit/forecast adapter around the Chronax RNN.
+"""High-level fit/forecast adapter around the Chronax recurrent neural network (RNN).
 
 The low-level building blocks in :mod:`chronax.models.rnn.{model,train,data}`
 expose JAX-native primitives (``RNN.apply``, ``train_step``,
@@ -11,7 +11,7 @@ This module provides exactly that. It is intentionally thin: all training
 happens through :func:`chronax.models.rnn.train.train_step`, all inference
 through :func:`chronax.models.rnn.model.autoregressive_predict` (recurrent)
 or a single ``model.apply`` (direct), and all batching through
-:mod:`chronax.models.rnn.data`. No NumPy — every array is a ``jnp.ndarray``.
+:mod:`chronax.models.rnn.data`. No NumPy: every array is a ``jnp.ndarray``.
 
 Both univariate (a single 1D ``jnp.ndarray``) and panel (a list of 1D arrays)
 modes are supported. Panel mode trains a *single shared model* over the
@@ -58,7 +58,7 @@ def _as_series_list(y: SeriesLike) -> List[jnp.ndarray]:
     """Normalise ``y`` to a ``list[jnp.ndarray]`` of 1D float32 arrays.
 
     Anything that isn't a ``list``/``tuple`` of series (e.g. a plain
-    ``jax.numpy`` array, as passed by the benchmark harness) is treated as a
+    ``jax.numpy`` array) is treated as a
     single univariate series.
     """
     if not isinstance(y, (list, tuple)):
@@ -73,14 +73,16 @@ def _build_window_cache(
 ) -> tuple:
     """Pre-extract every valid sliding window from all series.
 
-    Avoids 128 Python ``_sample_window`` calls + ``create_batch`` overhead
-    per training step. After calling once at the start of ``fit``, each step
-    is a cheap fancy-index into an already-stacked device array.
+    Called once at the start of ``fit``; each training step then indexes
+    into the stacked device arrays instead of slicing series in Python.
+    A series shorter than ``input_size + h`` contributes one left-padded
+    window.
 
     Returns:
-        insample   [N, input_size] float32  — history windows
-        outsample  [N, h]          float32  — horizon targets
-        avail_mask [N, input_size] float32  — 1 = real data, 0 = padded
+        Tuple ``(insample, outsample, avail_mask)``: ``insample``
+        ``[N, input_size]`` float32 history windows, ``outsample`` ``[N, h]``
+        float32 horizon targets, ``avail_mask`` ``[N, input_size]`` float32
+        with 1 for real data and 0 for padding.
     """
     total = input_size + h
     all_ins: List[jnp.ndarray] = []
@@ -119,7 +121,8 @@ def _build_window_cache(
 
 
 def _scaler_fit(y_list: List[jnp.ndarray]) -> List[tuple]:
-    """Per-series robust (median/IQR) scaling matching NeuralForecast's scaler_type='robust'."""
+    """Per-series robust scaling (median / interquartile range, IQR), as in
+    neuralforecast's ``scaler_type='robust'``."""
     stats = []
     for s in y_list:
         if s.size == 0:
@@ -170,38 +173,96 @@ def _sample_window(
 class RNNForecaster(BaseForecaster):
     """High-level fit/forecast wrapper around :class:`chronax.models.rnn.RNN`.
 
-    Args:
-        h: forecast horizon.
-        input_size: history window length; -1 (default) uses ``3 * h``.
-        encoder_hidden_size, encoder_n_layers, encoder_activation,
-        encoder_bias, encoder_dropout, decoder_hidden_size, decoder_layers,
-        futr_exog_size, hist_exog_size, stat_exog_size, output_size,
-        recurrent, cell_type, layer_norm: forwarded to :class:`RNNConfig`.
-        max_steps: number of optimiser steps performed by :meth:`fit`.
-        learning_rate: Adam learning rate.
-        batch_size: number of windows per training step.
-        random_seed: PRNG seed for parameter init and training shuffling.
-        alias: display name for external reporting.
-        loss: registered name (``"mae"``, ``"mse"``) from
-            :mod:`chronax.models.rnn.loss` or a callable ``(y, y_hat) -> scalar``.
-        scale: if True, standardise each series before training and undo the
-            scaling on the forecast. Strongly recommended for raw real-world
-            data (e.g. airline passengers, hourly temperature).
-        grad_clip: global gradient-norm clip threshold (0 = disabled).
-        window_sampling: if True, each training step samples a random
-            ``input_size + h`` window. When no exogenous variables are
-            present, all valid windows are pre-extracted into a device cache
-            at the start of ``fit``; each step then becomes a cheap fancy-
-            index instead of 128 Python ``_sample_window`` calls.
-        use_lr_schedule: if True, wrap Adam with a warmup + cosine-decay
-            schedule decaying to 1 % of ``learning_rate``. Set False to use
-            a constant learning rate (matches NeuralForecast's default
-            optimizer behaviour).
+    Port of neuralforecast's ``RNN`` training and inference flow. Trains one
+    shared model over a single series or a panel of series. Point forecasts
+    only: :meth:`predict` refuses ``level`` and :meth:`forecast` returns a
+    bare array rather than the :class:`BaseForecaster` dict, so the base
+    conformal machinery is not available for this model.
 
-    Notes:
-        ``forecast(h)`` ignores the ``h`` argument when set; the model's
-        configured ``config.h`` is always used. We accept ``h=None`` for
-        symmetry with NeuralForecast's ``predict(h=...)`` API.
+    Args:
+        h (int): Forecast horizon.
+        input_size (int): History window length; ``-1`` (default) uses
+            ``3 * h``.
+        encoder_hidden_size (int): Hidden units per encoder layer.
+            Default ``128``.
+        encoder_n_layers (int): Number of stacked encoder layers.
+            Default ``2``.
+        encoder_activation (str): Activation of the Elman cell, ``"tanh"``
+            or ``"relu"``. Ignored when ``cell_type="gru"``. Default
+            ``"tanh"``.
+        encoder_bias (bool): Use bias terms in the recurrent cells.
+            Default ``True``.
+        encoder_dropout (float): Dropout rate between encoder layers.
+            Default ``0.0``.
+        decoder_hidden_size (int): Hidden width of the multilayer perceptron
+            (MLP) decoder (direct mode only). Default ``128``.
+        decoder_layers (int): Number of MLP decoder layers (direct mode
+            only). Default ``2``.
+        futr_exog_size (int): Number of future exogenous features ``F``.
+            Default ``0``.
+        hist_exog_size (int): Number of historic exogenous features ``X``.
+            Default ``0``.
+        stat_exog_size (int): Number of static exogenous features ``S``.
+            Default ``0``.
+        output_size (int): Outputs per step; only channel 0 is returned by
+            :meth:`forecast`. Default ``1``.
+        recurrent (bool): ``True`` projects each encoder step to one output
+            and rolls the horizon out autoregressively; ``False`` (default)
+            decodes the last ``h`` encoder states directly with an MLP.
+        cell_type (str): ``"elman"`` (default) or ``"gru"`` (gated recurrent
+            unit).
+        layer_norm (bool): Apply LayerNorm between encoder layers.
+            Default ``False``.
+        max_steps (int): Number of optimiser steps performed by :meth:`fit`.
+            Default ``1000``.
+        learning_rate (float): Adam peak learning rate. Default ``1e-3``.
+            When the training set holds fewer windows than ``batch_size``,
+            :meth:`fit` trains at ``3 * learning_rate``.
+        batch_size (int): Windows per training step; on the cached path it
+            is capped at the number of training windows. Default ``32``.
+        random_seed (int): PRNG seed for parameter init and window
+            sampling. Default ``0``.
+        alias (str): Display name for external reporting. Default
+            ``"RNN"``.
+        loss (str | LossFn): Registered name (``"mae"``, ``"mse"``) from
+            :mod:`chronax.models.rnn.loss` or a callable
+            ``(y, y_hat) -> scalar``. Default ``"mae"``.
+        scale (bool): Normalise targets before training and invert the
+            scaling on the forecast. On the exog-free cached path each
+            window is scaled by its own median and median absolute deviation
+            (MAD), the convention of neuralforecast's robust ``TemporalNorm``;
+            when exogenous inputs are given or ``window_sampling=False``,
+            each series is scaled by its median and interquartile range
+            (IQR).
+            Default ``True``.
+        grad_clip (float): Global gradient-norm clip threshold
+            (``0`` = disabled). Default ``1.0``.
+        window_sampling (bool): When ``True`` (default) and no exogenous
+            inputs are given, every valid ``input_size + h`` window is
+            pre-extracted into a device cache and steps draw from it in
+            shuffled epochs; with exogenous inputs each step samples one
+            random window per series. When ``False``, whole series are
+            batched and ``create_batch`` keeps the last ``input_size + h``
+            points.
+        use_lr_schedule (bool): Wrap Adam in a linear-warmup, cosine-decay
+            schedule ending at ``0.01 * learning_rate``; warmup is
+            ``max_steps // 10`` steps (``max_steps // 100`` on the small
+            training sets described under ``learning_rate``). ``False``
+            uses a constant rate, as neuralforecast does by default.
+            Default ``True``.
+        weight_decay (float): AdamW weight decay (``0`` = plain Adam).
+            Default ``0.0``.
+        val_fraction (float): Fraction of the latest windows held out for
+            validation on the cached path (``0`` = none). The best
+            validation checkpoint is restored at the end of :meth:`fit`.
+            Default ``0.1``.
+        val_check_steps (int): Evaluate the validation loss every this many
+            steps. Default ``100``.
+
+    Note:
+        ``forecast(h=...)`` must match ``config.h``; a different value raises
+        ``ValueError``. ``h=None`` is accepted for symmetry with
+        neuralforecast's ``predict(h=...)`` interface.
     """
 
     def __init__(
@@ -311,12 +372,20 @@ class RNNForecaster(BaseForecaster):
         """Train the model in-place on ``y``.
 
         Args:
-            y: a single 1D series or a list of 1D series (panel).
-            hist_exog: per-series ``[T_i, X]`` historic covariates, or None.
-            futr_exog: per-series ``[T_i + h, F]`` future covariates that
-                cover both history and the forecast horizon, or None.
-            stat_exog: per-series ``[S]`` static covariates, or None.
-            verbose: print loss every ``max(1, max_steps // 10)`` steps.
+            y (jnp.ndarray | Sequence[jnp.ndarray]): A single 1-D series of
+                shape ``(T,)`` or a list of 1-D series (panel mode).
+            hist_exog (Sequence[jnp.ndarray] | None): Per-series ``[T_i, X]``
+                historic covariates, or ``None``.
+            futr_exog (Sequence[jnp.ndarray] | None): Per-series
+                ``[T_i + h, F]`` future covariates covering both history and
+                the forecast horizon, or ``None``.
+            stat_exog (Sequence[jnp.ndarray] | None): Per-series ``[S]``
+                static covariates, or ``None``.
+            verbose (bool): Print the training loss every
+                ``max(1, max_steps // 10)`` steps. Default ``False``.
+
+        Returns:
+            RNNForecaster: ``self``.
         """
         y_list = _as_series_list(y)
         self._n_series = len(y_list)
@@ -333,14 +402,11 @@ class RNNForecaster(BaseForecaster):
         init_rng, rng = random.split(rng)
         warmup = max(1, self.max_steps // 10)
 
-        # Adaptive LR + warmup: estimate dataset size before the cache build so
-        # we can configure the optimizer appropriately.
-        # Small datasets (n_train < batch_size, e.g. AirlinePassengers with 23
-        # windows): per-window normalized targets can be 1–7 MAD units above
-        # zero. With standard LR=1e-3, Adam moves the output bias ~1 unit in
-        # 1000 steps — not enough to converge. 3× LR reaches ~3 units (the
-        # mean training target). Also shorten warmup so fewer steps are spent
-        # at near-zero LR.
+        # Small training sets (n_train < batch_size) get 3x the learning rate
+        # and a shorter warmup: per-window normalised targets can sit several
+        # MAD units from zero, and the output bias must travel that far
+        # within max_steps. The window count is estimated before the cache
+        # build so the optimizer can be configured up front.
         _total = self.config.input_size + self.config.h
         _prelim_wins = sum(
             max(0, y.shape[0] - _total + 1) for y in y_list
@@ -352,7 +418,7 @@ class RNNForecaster(BaseForecaster):
         _prelim_ntrain = max(1, _prelim_wins - _prelim_nval)
         _is_small = _prelim_ntrain < self.batch_size
         effective_lr = self.learning_rate * (3.0 if _is_small else 1.0)
-        # Shorter warmup for small datasets: 100→10 steps
+        # Warmup max_steps // 100 instead of max_steps // 10 for small sets.
         effective_warmup = (
             max(1, self.max_steps // 100) if _is_small
             else warmup
@@ -372,24 +438,20 @@ class RNNForecaster(BaseForecaster):
         log_every = max(1, self.max_steps // 10)
 
         # ---- window cache (fast path) ----------------------------------------
-        # Pre-extract all valid windows once and move the whole cache to the
-        # JAX device. Each training step then does only a random-index
-        # selection followed by a device-side JAX gather — eliminating the
-        # per-step host-to-device transfer that dominated step time when using
-        # jnp.array(...) inside the loop.
+        # All valid windows are extracted once and kept on device; each step
+        # is then an index selection plus a device-side gather, with no
+        # per-step host-to-device transfer.
         _has_exog = hist_exog is not None or futr_exog is not None or stat_exog is not None
         if self.window_sampling and not _has_exog:
-            # Build cache from raw (unscaled) series, then apply per-window
-            # local normalization. Each window is centered and scaled by its
-            # own input-window mean/std — matching NF's window-level Scaler.
-            # This removes local level differences (trend, regime shifts) so
-            # the model learns shape, not absolute value.
+            # The cache is built from the raw series; each window is then
+            # centred and scaled by its own input-window statistics, which
+            # removes local level differences (trend, regime shifts).
             _ins_dev, _out_dev, _ = _build_window_cache(
                 y_list, self.config.input_size, self.config.h
             )
             if self.scale:
-                # Robust per-window normalization: median + MAD.
-                # Matches NF's TemporalNorm(scaler_type='robust').
+                # Robust per-window normalisation: median + MAD, the
+                # convention of neuralforecast's TemporalNorm(scaler_type='robust').
                 _win_med = jnp.median(_ins_dev, axis=1)          # [N]
                 _win_mad = jnp.median(
                     jnp.abs(_ins_dev - _win_med[:, None]), axis=1
@@ -404,8 +466,7 @@ class RNNForecaster(BaseForecaster):
             _use_cache = True
 
             # Hold out the last val_fraction of windows (time-ordered) for
-            # validation + best-checkpoint tracking. This mirrors the implicit
-            # regularisation NF gets from val_check_steps during Lightning training.
+            # validation and best-checkpoint tracking.
             _n_val = (
                 max(1, int(_n_wins * self.val_fraction))
                 if self.val_fraction > 0 and _n_wins > 1
@@ -441,10 +502,8 @@ class RNNForecaster(BaseForecaster):
             _has_val = False
             _n_train = n  # unused in non-cache path but satisfies type checker
 
-        # Adaptive effective batch: for small datasets (n_train < batch_size),
-        # use all training windows per step (full-batch gradient). This matches
-        # NF's effective gradient quality — NF uses windows_batch_size=128 which
-        # covers nearly all windows for a 23-window dataset — at lower compute cost.
+        # When n_train < batch_size every step uses all training windows
+        # (full-batch gradient).
         _effective_batch = min(self.batch_size, _n_train) if _use_cache else self.batch_size
         _ones_mask = jnp.ones((_effective_batch, self.config.h, 1), dtype=jnp.float32)
 
@@ -558,19 +617,35 @@ class RNNForecaster(BaseForecaster):
         futr_exog: Optional[Sequence[jnp.ndarray]] = None,
         stat_exog: Optional[Sequence[jnp.ndarray]] = None,
     ) -> jnp.ndarray:
-        """Produce horizon predictions.
+        """Produce point forecasts for the series in ``y``.
+
+        Uses the fitted parameters; does not re-fit. The last ``input_size``
+        observations of each series form the conditioning window. Unlike the
+        :class:`BaseForecaster` contract this returns a bare array, not a
+        dict.
 
         Args:
-            y: optional series to forecast for. If None, uses the same series
-                fit() was last called with — currently unsupported (the
-                forecaster does not retain training data); pass it explicitly.
-            h: optional explicit horizon. If None, uses ``self.config.h``.
-                (We do not yet support changing the horizon at predict time;
-                this argument is accepted for API symmetry only.)
+            y (jnp.ndarray | Sequence[jnp.ndarray] | None): Series to
+                forecast, shape ``(T,)`` or a list of 1-D series. Required;
+                ``None`` raises because training data is not retained here
+                (:meth:`predict` reuses the series passed to :meth:`fit`).
+            h (int | None): Horizon; must equal ``config.h`` when given.
+                Accepted for interface symmetry only.
+            hist_exog (Sequence[jnp.ndarray] | None): Per-series ``[T_i, X]``
+                historic covariates, or ``None``.
+            futr_exog (Sequence[jnp.ndarray] | None): Per-series
+                ``[T_i + h, F]`` future covariates, or ``None``.
+            stat_exog (Sequence[jnp.ndarray] | None): Per-series ``[S]``
+                static covariates, or ``None``.
 
         Returns:
-            ``jnp.ndarray`` of shape ``[h]`` for univariate input or
-            ``[n_series, h]`` for panel input.
+            jnp.ndarray: Shape ``(h,)`` for a single series or
+            ``(n_series, h)`` for panel input.
+
+        Raises:
+            RuntimeError: If called before :meth:`fit`.
+            ValueError: If ``y`` is ``None``, or ``h`` differs from
+                ``config.h``.
         """
         if not self.fitted:
             raise RuntimeError("Call .fit() before .forecast().")
@@ -586,9 +661,8 @@ class RNNForecaster(BaseForecaster):
         squeeze = not isinstance(y, (list, tuple))
 
         if self._use_window_scale:
-            # Per-window robust normalization: median + MAD of the context
-            # window, matching what fit() did to each training window so the
-            # model sees the same input distribution at inference time.
+            # Per-window robust normalisation: median + MAD of the context
+            # window, the same transform fit() applied to each training window.
             win_means: List[float] = []
             win_stds:  List[float] = []
             y_scaled: List[jnp.ndarray] = []
@@ -615,7 +689,7 @@ class RNNForecaster(BaseForecaster):
 
         # ``create_batch`` reserves the last ``h`` points of each input series
         # as the outsample target, so to forecast *into the future* we append
-        # ``h`` zero placeholders. They are discarded — only the model output
+        # ``h`` zero placeholders. They are discarded; only the model output
         # is used.
         y_padded = [
             jnp.concatenate([s, jnp.zeros(self.config.h, dtype=jnp.float32)]) for s in y_scaled
@@ -669,17 +743,25 @@ class RNNForecaster(BaseForecaster):
     ) -> dict:
         """Forecast from the series passed to :meth:`fit`.
 
-        Satisfies the ``BaseForecaster`` contract: unlike :meth:`forecast`,
-        this does not take ``y`` explicitly — it reuses the series cached at
-        fit time.
+        Unlike :meth:`forecast`, this does not take ``y``; it reuses the
+        series cached at fit time. Exogenous inputs given to :meth:`fit` are
+        not reused.
 
         Args:
-            h: Forecast horizon. Defaults to ``config.h`` when None.
-            X: Reserved for future exogenous regressors; unused.
-            level: Not yet supported for this model.
+            h (int | None): Forecast horizon; must equal ``config.h`` when
+                given. Defaults to ``config.h``.
+            X (jnp.ndarray | None): Accepted for interface parity; ignored.
+            level (list[int] | None): Not supported; any value raises.
 
         Returns:
-            dict: ``{"mean": jnp.ndarray}``.
+            dict: ``{"mean": jnp.ndarray}`` with ``"mean"`` of shape ``(h,)``
+            for a single series or ``(n_series, h)`` for panel input. No
+            interval keys are ever emitted.
+
+        Raises:
+            RuntimeError: If called before :meth:`fit`.
+            NotImplementedError: If ``level`` is not ``None``.
+            ValueError: If ``h`` differs from ``config.h``.
         """
         if not self.fitted:
             raise RuntimeError("Call .fit() before .predict().")

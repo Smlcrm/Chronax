@@ -4,22 +4,21 @@ mLSTM/sLSTM-based deep recurrent forecaster with the standard Chronax
 model contract: extend :class:`BaseForecaster`, expose ``fit``/``predict``
 /``forecast``, integrate with the conformal-intervals framework.
 
-The constructor exposes both the vanilla mLSTM recipe (current defaults)
-and an xLSTMTime-INSPIRED profile (Alharthi & Mahmood 2024) behind opt-in
-kwargs. ⚠ This is a deliberate TIME-AXIS adaptation, not a port: canonical
-xLSTMTime runs its recurrence over the CHANNEL axis (a univariate series
-would degenerate to a single recurrent step) and its released training
-pipeline is unsound (test-split checkpoint selection), so parity with it is a
-non-goal. The validation instrument is instead an NF-paired empirical gate,
-which the sLSTM+RevIN+decomposition+direct profile passes. Opt-in kwargs:
+The constructor exposes the vanilla mLSTM recipe (the defaults) and an
+xLSTMTime-inspired profile (Alharthi & Mahmood 2024) behind opt-in kwargs.
+The recurrence runs over the TIME axis of the univariate series. Canonical
+xLSTMTime runs its recurrence over the channel axis of a multivariate panel
+(a univariate series would degenerate to a single recurrent step); that
+channel-axis formulation and its training pipeline are not reproduced here.
+Opt-in kwargs:
 
-  - ``block_types`` — per-layer ``"mlstm"`` or ``"slstm"``.
-  - ``use_revin`` — reversible instance normalization (per-series stats).
-  - ``use_decomposition`` — learnable moving-average trend / seasonal split.
-  - ``decode_mode`` — ``"ar"`` (autoregressive) or ``"direct"`` (linear D→H head).
+  - ``block_types``: per-layer ``"mlstm"`` or ``"slstm"``.
+  - ``use_revin``: reversible instance normalization (per-series stats).
+  - ``use_decomposition``: learnable moving-average trend / seasonal split.
+  - ``decode_mode``: ``"ar"`` (autoregressive, AR) or ``"direct"`` (linear D -> H head).
 
-Defaults reproduce the original vanilla XLSTM behavior (``("mlstm",)*L``,
-RevIN off, decomposition off, AR decode), so existing tests pass unchanged.
+The defaults (``("mlstm",) * num_layers``, RevIN off, decomposition off, AR
+decode) give the vanilla mLSTM forecaster.
 
 Conformal note
 --------------
@@ -47,79 +46,115 @@ from .xlstm_functions import xlstm_f, forecast_xlstm, _get_decoder
 class XLSTM(BaseForecaster):
     """xLSTM / xLSTMTime forecaster.
 
+    A stack of mLSTM/sLSTM blocks trained on sliding windows of a z-scored
+    univariate series. Exogenous regressors are not supported
+    (``uses_exog = False``); ``X`` is accepted and ignored. Prediction
+    intervals are conformal and need ``conformal_params`` at construction:
+    the scores are computed at ``fit`` time with the trained parameters held
+    fixed across walk-forward windows and cached in ``model_["_cs"]``.
+
     Parameters
     ----------
-    ctx_len, horizon_train : int
-        Sliding-window context length and training horizon (AR mode).
-    num_layers, embed_dim, num_heads : int
-        Stack depth and per-block width. ``embed_dim`` must be divisible
-        by ``num_heads``.
-    n_epochs, batch_size, lr, weight_decay : training hyperparameters.
-    gate_clip : float
-        Pre-gate clipping bound on input/forget gate logits.
-    seed : int
-        PRNG seed for parameter initialisation and batch sampling.
-    alias : str
-        Identifier used by :meth:`__repr__`.
+    ctx_len : int, default 64
+        Sliding-window context length. Must be ``>= 4``. Shrunk automatically
+        at ``fit`` when ``T < ctx_len + horizon_train + 1`` (AR mode) or
+        ``T < ctx_len + horizon + 1`` (direct mode).
+    horizon_train : int, default 8
+        Training horizon in AR mode. Must be ``>= 1``.
+    num_layers : int, default 2
+        Number of blocks. Must be ``>= 1``.
+    embed_dim : int, default 64
+        Block width ``D``. Must be a positive multiple of ``num_heads``.
+    num_heads : int, default 4
+        Number of heads per block.
+    n_epochs : int, default 100
+        Training epochs; the step budget is ``n_epochs * (n_windows //
+        batch_size)`` unless ``max_steps`` is given. Must be ``>= 1``.
+    batch_size : int, default 32
+        Windows per optimizer step. Must be ``>= 1``.
+    lr : float, default 1e-3
+        Peak learning rate (warmup + cosine schedule).
+    weight_decay : float, default 1e-5
+        AdamW weight decay.
+    gate_clip : float, default 8.0
+        Clipping bound on the input/forget gate pre-activations.
+    seed : int, default 0
+        Pseudo-random number generator (PRNG) seed for parameter initialisation and batch sampling.
+    alias : str, default "XLSTM"
+        Display name.
     conformal_params : ConformalIntervals, optional
-        If provided, conformity scores are computed and cached at fit time.
-
-    xLSTMTime extensions
-    --------------------
+        Conformal configuration. When given, conformity scores are computed
+        and cached at ``fit``; ``predict(level=...)`` needs them. In direct
+        mode ``conformal_params.h`` must equal ``horizon``.
     block_types : tuple[str, ...], optional
-        Per-layer block type; ``None`` (default) -> ``("mlstm",) * num_layers``.
-        Each entry must be ``"mlstm"`` or ``"slstm"``.
-    use_revin : bool
-        Reversible instance normalization. When True, the outer z-score in
-        ``fit`` is skipped (RevIN handles per-instance stats internally).
-    revin_affine : bool
+        Per-layer block type, each ``"mlstm"`` or ``"slstm"``; length must
+        equal ``num_layers``. ``None`` means ``("mlstm",) * num_layers``.
+    use_revin : bool, default False
+        Reversible instance normalization inside the model. When True the
+        outer z-score in ``fit`` is skipped.
+    revin_affine : bool, default True
         Whether RevIN has learnable affine ``gamma``/``beta``.
-    use_decomposition : bool
+    use_decomposition : bool, default False
         Learnable moving-average trend + seasonal split, processed through
         shared-weight branches and summed.
-    decomp_kernel : int
-        Moving-average kernel size. Paper default 25.
-    decode_mode : {"ar", "direct"}
-        ``"ar"`` -> autoregressive decode (per-position next-step head).
-        ``"direct"`` -> direct linear head ``D -> horizon`` (xLSTMTime canonical).
+    decomp_kernel : int, default 25
+        Moving-average kernel size of the decomposition.
+    decode_mode : {"ar", "direct"}, default "ar"
+        ``"ar"``: autoregressive decode from a per-position next-step head,
+        any ``h``. ``"direct"``: linear head ``D -> horizon`` emitting all
+        steps at once; every ``h`` passed to ``predict``/``forecast`` and
+        ``conformal_params.h`` must equal ``horizon``.
     horizon : int, optional
-        Required when ``decode_mode == "direct"``. Caller's forecast ``h`` must
-        equal this value.
-    use_conv1d_in_slstm : bool
-        Apply causal Conv1D before sLSTM recurrence.
-    conv1d_kernel : int
+        Direct-head output length. Required when ``decode_mode == "direct"``.
+    use_conv1d_in_slstm : bool, default False
+        Apply a causal depthwise Conv1D before each sLSTM recurrence.
+    conv1d_kernel : int, default 4
         Causal-Conv1D kernel size.
-    slstm_forget_gate : {"exp", "sigmoid"}
-        sLSTM forget-gate form. ``"exp"`` (default) preserves the original
-        Chronax behavior; ``"sigmoid"`` matches the log-sigmoid forget gate of
-        the FlashRNN/xLSTM equations (Eq. 13-15, arXiv 2412.07752) — the GATE
-        only: the ``max(|n|,1)`` normalizer floor and ``gate_clip`` remain
-        deliberate deviations from the NX-AI reference (see the backend module
-        docstring). sLSTM blocks only.
-    slstm_stabilizer : {"per_head", "per_cell"}
-        sLSTM log-space stabilizer granularity. ``"per_head"`` (default) keeps
-        the original collapsed stabilizer; ``"per_cell"`` matches the paper
-        (Eq. 15) for the STABILIZER only (floor/clip deviations remain).
-    compute_dtype : {"float32", "bfloat16"}
-        Forward/backward compute dtype (master params stay float32).
-        ``"float32"`` default — bfloat16 is several times SLOWER on XLA-CPU for
-        a prediction drift around 0.1% of scale; keep ``"bfloat16"`` for GPU
-        work only.
-
-    NF-convention aliases
-    ---------------------
-    h, input_size, random_seed : int, optional
-        Aliases for ``horizon``, ``ctx_len`` and ``seed``, matching the
-        constructor convention of the other neural forecasters and the neural
-        benchmark harness (``benchmarks/neural/worker.py``). ``h`` raises on an
-        unequal explicit ``horizon``; ``input_size``/``random_seed`` take
-        precedence over ``ctx_len``/``seed`` when given.
+    slstm_forget_gate : {"exp", "sigmoid"}, default "exp"
+        sLSTM forget-gate form. ``"exp"`` uses the raw pre-activation in the
+        log-space recurrence; ``"sigmoid"`` uses the log-sigmoid forget gate
+        of the xLSTM equations (Eq. 13-15, arXiv 2412.07752). The
+        ``max(|n|, 1)`` normalizer floor and ``gate_clip`` apply in both
+        forms (see the backend module docstring). sLSTM blocks only.
+    slstm_stabilizer : {"per_head", "per_cell"}, default "per_head"
+        sLSTM log-space stabilizer granularity: one scalar per head, or one
+        per cell as in Eq. 15 of the paper.
+    compute_dtype : {"float32", "bfloat16"}, default "float32"
+        Forward/backward compute dtype; master parameters stay float32.
+        ``"bfloat16"`` is intended for graphics processing units (GPU); XLA (Accelerated Linear
+        Algebra) on the central processing unit (CPU) has no fast bf16 path.
+    h : int, optional
+        Alias for ``horizon`` (neuralforecast convention). Raises if an
+        explicit ``horizon`` differs.
+    input_size : int, optional
+        Alias for ``ctx_len``; takes precedence when given.
+    random_seed : int, optional
+        Alias for ``seed``; takes precedence when given.
     max_steps : int, optional
-        Exact total optimizer step count (NF semantics). Overrides the
-        epochs-derived budget ``n_epochs * (n_windows // batch_size)``, making
-        training compute independent of series length.
+        Exact total optimizer step count, overriding the epochs-derived
+        budget so training compute is independent of series length.
+        Must be ``>= 1``.
     learning_rate : float, optional
         Alias for ``lr``; takes precedence when given.
+
+    Raises
+    ------
+    ValueError
+        If ``h`` conflicts with ``horizon``; if ``max_steps``, ``ctx_len``,
+        ``horizon_train``, ``num_layers``, ``n_epochs`` or ``batch_size`` is
+        below its minimum; if ``embed_dim`` is not a positive multiple of
+        ``num_heads``; if ``block_types`` has the wrong length or an unknown
+        entry; if ``decode_mode``, ``slstm_forget_gate``, ``slstm_stabilizer``
+        or ``compute_dtype`` is not one of its allowed values; or if
+        ``decode_mode == "direct"`` without ``horizon``.
+
+    Attributes
+    ----------
+    model_ : dict
+        Empty before ``fit``. After ``fit``: ``"params"``, ``"cfg"``
+        (:class:`XLSTMConfig`), ``"mu"``/``"std"`` (z-score stats, ``0``/``1``
+        under RevIN), ``"z_tail"`` (last ``ctx_len`` normalised values),
+        ``"losses"`` and, when ``conformal_params`` is set, ``"_cs"``.
     """
 
     uses_exog = False
@@ -152,7 +187,7 @@ class XLSTM(BaseForecaster):
         slstm_forget_gate: str = "exp",
         slstm_stabilizer: str = "per_head",
         compute_dtype: str = "float32",
-        # ── NF-convention aliases (see docstring) ─────────────────────────────
+        # ── neuralforecast-convention aliases (see docstring) ────────────────
         h: Optional[int] = None,
         input_size: Optional[int] = None,
         random_seed: Optional[int] = None,
@@ -291,6 +326,36 @@ class XLSTM(BaseForecaster):
         )
 
     def fit(self, y: jnp.ndarray, X: jnp.ndarray | None = None) -> "XLSTM":
+        """Train on a univariate series and cache the decode state.
+
+        Without RevIN the series is z-scored with its full-sample mean and
+        standard deviation; with RevIN the raw series is passed through.
+        ``ctx_len`` is shrunk (to at least 4) when the series is too short.
+        When ``conformal_params`` is set, conformity scores are computed and
+        stored in ``model_["_cs"]``.
+
+        Parameters
+        ----------
+        y : jnp.ndarray
+            Univariate series, shape ``(T,)``. Non-float input is cast to
+            float32.
+        X : jnp.ndarray or None
+            Ignored.
+
+        Returns
+        -------
+        XLSTM
+            Self, with ``model_`` populated.
+
+        Raises
+        ------
+        ValueError
+            In direct mode, if ``conformal_params.h != horizon``; if the
+            series is still too short after the context shrink
+            (``T <= ctx_len + horizon_train`` in AR mode, ``T < ctx_len +
+            horizon`` in direct mode); or, with ``conformal_params`` set, if
+            fewer than two conformal windows fit.
+        """
         y_f = utils.ensure_float(y)
         cfg = self._build_cfg(int(y_f.shape[0]))
 
@@ -336,20 +401,35 @@ class XLSTM(BaseForecaster):
     def conformity_scores(self, y: jnp.ndarray, X: jnp.ndarray | None = None) -> jnp.ndarray:
         """Walk-forward conformity scores.
 
-        Fitted fast path: the base implementation hands ``forecast`` a
-        fixed-size edge-masked series, so window i's context tail ends in
-        ``(n_windows-1-i)*h`` CONSTANT values, which badly inflates scores on
-        trending data. Here we slice each window's TRUE tail
-        ``y[train_end-ctx : train_end]`` (left-edge-padded when
-        ``train_end < ctx`` — in that short-series regime the padded
-        fixed-length tail deliberately differs from what
-        ``forecast(y[:train_end])`` would decode from its shorter unpadded
-        tail) and vmap the cached decoder over the window axis. No CONTEXT
-        value at index >= train_end enters a window's forecast; the fitted
-        params and (non-RevIN) mu/std remain full-series artifacts, which is a
-        documented params-reuse trade (mildly optimistic calibration). Unfitted
-        instances fall back to the base implementation (stateless fit-per-window
-        under vmap), preserving the contract-suite invariants.
+        Fitted instances use the trained parameters for every window: each
+        window's true context tail ``y[train_end - ctx_len : train_end]``
+        (left-padded with ``y[0]`` when ``train_end < ctx_len``) is decoded
+        ``h`` steps with the cached decoder, vmapped over the window axis.
+        No value at index ``>= train_end`` enters a window's forecast, but
+        the parameters and the (non-RevIN) ``mu``/``std`` are full-series
+        quantities, so calibration is mildly optimistic relative to a
+        per-window re-fit. Unfitted instances fall back to the base
+        implementation, which re-fits per window under ``vmap``.
+
+        Parameters
+        ----------
+        y : jnp.ndarray
+            Univariate series, shape ``(T,)``.
+        X : jnp.ndarray or None
+            Ignored.
+
+        Returns
+        -------
+        jnp.ndarray
+            Residuals ``y_test - forecast`` of shape ``(n_windows, h)`` with
+            ``n_windows = min(conformal_params.n_windows, (T - 1) // h)``.
+
+        Raises
+        ------
+        ValueError
+            If ``conformal_params`` is ``None``; in direct mode if
+            ``conformal_params.h != horizon``; or if fewer than two windows
+            fit (``T < 2 * h + 1``).
         """
         if not self.model_:
             return super().conformity_scores(y, X=X)
@@ -374,7 +454,7 @@ class XLSTM(BaseForecaster):
         base_train_end = n - n_windows * h
 
         tails, tests = [], []
-        for i in range(n_windows):  # static Python ints — vmap/jit-safe
+        for i in range(n_windows):  # static Python ints; vmap/jit-safe
             train_end = base_train_end + i * h
             start = max(0, train_end - ctx)
             tail = y_f[start:train_end]
@@ -421,6 +501,31 @@ class XLSTM(BaseForecaster):
         X: jnp.ndarray | None = None,
         level: list[int | float] | None = None,
     ) -> dict:
+        """Forecast ``h`` steps from the cached context tail.
+
+        Parameters
+        ----------
+        h : int
+            Forecast horizon. In direct mode it must equal ``horizon``.
+        X : jnp.ndarray or None
+            Ignored.
+        level : list[int | float] or None
+            Confidence levels in (0, 100), e.g. ``[80, 95]``. Uses the
+            conformity scores cached at ``fit``.
+
+        Returns
+        -------
+        dict
+            ``"mean"`` of shape ``(h,)``, plus ``"lo-{lv}"`` and ``"hi-{lv}"``
+            of shape ``(h,)`` per level when ``level`` is given.
+
+        Raises
+        ------
+        ValueError
+            If called before ``fit``; in direct mode if ``h != horizon``; if
+            ``level`` is given while ``conformal_params`` is ``None`` or no
+            scores were cached at ``fit``.
+        """
         if not self.model_:
             raise ValueError("Model must be fitted before predict().")
         cfg: XLSTMConfig = self.model_["cfg"]
@@ -454,16 +559,42 @@ class XLSTM(BaseForecaster):
         level: list[int | float] | None = None,
         fitted: bool = False,
     ) -> dict:
-        """h-step forecast.
+        """h-step forecast from ``y``.
 
-        Fast path: when ``self.model_`` is populated (e.g. inside conformal
-        walk-forward), reuses trained params + decodes from the last
-        ``ctx_len`` of ``y``. Slow path (no prior fit): fits a temporary
-        model on ``y`` then predicts.
+        When ``model_`` is populated, the trained parameters are reused and
+        the forecast is decoded from the last ``ctx_len`` values of ``y``;
+        intervals then use the conformity scores cached at ``fit``. When
+        unfitted, a clone is fitted on ``y`` and its ``predict`` is returned.
 
-        ``level`` on the fitted fast path uses the conformity scores cached
-        at fit (params-reuse calibration). ``fitted=True`` raises —
-        XLSTM has no in-sample fitted-values path.
+        Parameters
+        ----------
+        y : jnp.ndarray
+            Univariate series, shape ``(T,)``.
+        h : int
+            Forecast horizon. In direct mode it must equal ``horizon``.
+        X : jnp.ndarray or None
+            Ignored.
+        X_future : jnp.ndarray or None
+            Ignored.
+        level : list[int | float] or None
+            Confidence levels in (0, 100). Requires ``conformal_params``.
+        fitted : bool
+            Must be ``False``; in-sample fitted values are not available.
+
+        Returns
+        -------
+        dict
+            ``"mean"`` of shape ``(h,)``, plus ``"lo-{lv}"`` and ``"hi-{lv}"``
+            of shape ``(h,)`` per level when ``level`` is given.
+
+        Raises
+        ------
+        NotImplementedError
+            If ``fitted=True``.
+        ValueError
+            In direct mode if ``h != horizon``; if ``level`` is given while
+            ``conformal_params`` is ``None`` or no scores are cached; on the
+            unfitted path, anything ``fit`` raises.
         """
         y_f = utils.ensure_float(y)
         if fitted:

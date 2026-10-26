@@ -1,8 +1,8 @@
-"""Pluggable losses for the MLP forecaster.
+"""Pluggable losses for the multilayer perceptron (MLP) forecaster.
 
 Point losses keep the shared signature ``(pred, target) -> scalar`` and
 reduce by mean. ``MultiQuantileLoss`` is the multi-quantile (pinball) loss.
-``GMM`` is a Gaussian-mixture distribution loss (port of neuralforecast's
+``GMM`` is a Gaussian mixture model distribution loss (port of neuralforecast's
 ``GMM``): the network head emits distribution parameters instead of point
 predictions, the training objective is the mixture's negative log-likelihood,
 and predictive quantiles come from Monte-Carlo samples. Every loss carries an
@@ -44,7 +44,7 @@ class MultiQuantileLoss:
     """Multi-quantile (pinball) loss. ``__call__(pred[...,h,Q], target[...,h])``.
 
     ``QL(y, y_hat, q) = q*(y-y_hat)+ + (1-q)*(y_hat-y)+``, SUMMED over quantiles
-    and averaged over all other elements — neuralforecast's effective reduction
+    and averaged over all other elements, neuralforecast's effective reduction
     (its ``1/len(quantiles)`` factor is dead); the trainer's masked inline
     branch computes the same reduction. Quantiles are sorted, must lie in (0, 1), and must include
     0.5 (the median / ``"mean"`` head). Picklable (holds a plain tuple).
@@ -63,7 +63,7 @@ class MultiQuantileLoss:
         q = jnp.asarray(self.quantiles, dtype=pred.dtype)        # [Q]
         err = target[..., None] - pred                            # [..., h, Q]
         ql = jnp.maximum(q * err, (q - 1.0) * err)                # pinball
-        return jnp.mean(jnp.sum(ql, axis=-1))                     # NF: sum over Q, mean elsewhere
+        return jnp.mean(jnp.sum(ql, axis=-1))                     # neuralforecast: sum over Q, mean elsewhere
 
     def __eq__(self, other):  # value equality: same-quantile instances are
         return type(other) is type(self) and other.quantiles == self.quantiles
@@ -76,7 +76,7 @@ def weighted_average(x: jnp.ndarray, weights: jnp.ndarray | None = None, axis=No
     """Weighted average with zero-weight masking, matching neuralforecast's
     ``weighted_average``: cells with weight 0 contribute exactly 0 (so garbage
     or NaN values under a zero mask never leak in), and the denominator is
-    ``max(sum(weights), 1.0)`` — clamped to one, not to an epsilon.
+    ``max(sum(weights), 1.0)``, clamped to one, not to an epsilon.
     """
     if weights is None:
         return jnp.mean(x, axis=axis)
@@ -104,7 +104,7 @@ class GMM:
     (``means*scale + loc``, ``stds = (softplus(stds) + eps) * scale``): the
     network optimizes in the scaler's normalized space while the likelihood is
     evaluated in original units. The ``eps`` floor applies whenever an anchor is
-    given — the identity scaler anchors with real 0/1 tensors, so the floor is
+    given, the identity scaler anchors with real 0/1 tensors, so the floor is
     active there too, matching the reference exactly.
 
     ``sample`` draws ``num_samples`` Monte-Carlo paths directly from the mixture
@@ -116,11 +116,11 @@ class GMM:
     The point forecast surface uses :meth:`analytic_mean` (the exact mixture
     mean) rather than the Monte-Carlo mean of the samples.
 
-    ``return_params`` is accepted for API parity but not supported.
+    ``return_params`` is accepted for interface parity but not supported.
 
     References:
         Olivares et al., "Probabilistic Hierarchical Forecasting with Deep
-        Poisson Mixtures" — https://arxiv.org/abs/2110.13179
+        Poisson Mixtures": https://arxiv.org/abs/2110.13179
     """
 
     is_distribution_output = True
@@ -242,7 +242,7 @@ def outputsize_multiplier(loss) -> int:
 
 
 def resolve(loss: "str | LossFn | MultiQuantileLoss | GMM"):
-    """Return a loss object from a registry string, a callable, an MQ instance,
+    """Return a loss object from a registry string, a callable, a multi-quantile (MQ) instance,
     or a GMM instance."""
     if isinstance(loss, GMM) or callable(loss):
         return loss

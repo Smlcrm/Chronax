@@ -7,7 +7,7 @@ Self-contained -- no imports from other chronax models. Three concerns:
 2. Window building -- ``build_windows`` / ``split_train_val_windows`` slice a
    1-D numpy series into the sliding windows the window-based loop consumes.
 3. Batch construction -- ``pad_sequence`` / ``create_batch`` / ``batch_generator``
-   produce padded, masked JAX batches for the masked-loss training paradigm.
+   produce padded, masked JAX batches for the masked-loss training loop.
 
 WHY scale per window?
     Long series can drift in level and variance. Normalising each window by its
@@ -37,7 +37,7 @@ def _torch_median(x: jnp.ndarray, axis: int = 1, keepdims: bool = True) -> jnp.n
 
     ``jnp.median`` averages the two central elements for even lengths; PyTorch
     takes index ``(n-1)//2`` after sorting. RobustScaler windows use even
-    ``input_size`` (72), so this matters for NF parity.
+    ``input_size`` (72), so this matters for neuralforecast parity.
     """
     x_sorted = jnp.sort(x, axis=axis)
     idx = (x.shape[axis] - 1) // 2
@@ -101,10 +101,10 @@ class RobustScaler:
 def build_windows(
     y: np.ndarray, input_size: int, h: int
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """NF-style rolling windows with right-padding (``ConstantPad1d((0, h))``).
+    """neuralforecast-style rolling windows with right-padding (``ConstantPad1d((0, h))``).
 
     Right-pads ``y`` with ``h`` zeros before unfolding, yielding
-    ``len(y) - input_size`` windows of length ``input_size + h`` — including
+    ``len(y) - input_size`` windows of length ``input_size + h``, including
     partial-horizon windows whose context reaches the end of the series.
     Returns ``(windows, mask)`` where ``mask`` is 1 on real points and 0 on the
     padded tail so the loss can drop padded horizon steps.
@@ -114,7 +114,7 @@ def build_windows(
     """
     y = np.asarray(y, dtype=np.float32).ravel()
     n_real = len(y)
-    n = n_real - input_size  # NF keeps windows with >=1 valid outsample
+    n = n_real - input_size  # neuralforecast keeps windows with >=1 valid outsample
     if n < 1:
         raise ValueError(
             f"Series length {n_real} is too short for "

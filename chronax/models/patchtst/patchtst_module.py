@@ -19,7 +19,7 @@ class _TorchLinearInit:
     torch draws both weight and bias from ``U(-1/sqrt(fan_in), 1/sqrt(fan_in))``
     (Kaiming-uniform with ``a=sqrt(5)`` reduces to this bound). Flax's
     ``nnx.Linear`` defaults to ``lecun_normal`` instead, so matching torch here
-    is what makes training trajectories — and thus accuracy — comparable to
+    is what makes training trajectories, and thus accuracy, comparable to
     neuralforecast. ``fan_in`` is the Linear's ``in_features`` (passed explicitly
     because the bias shares the weight's fan_in).
     """
@@ -83,9 +83,9 @@ class RevIN(nnx.Module):
 
 
 def compute_patch_num(input_size: int, patch_len: int, stride: int) -> int:
-    """Number of patches after end-padding by ``stride`` (NF padding_patch='end').
+    """Number of patches after end-padding by ``stride`` (neuralforecast padding_patch='end').
 
-    Mirrors NF's ``int((input_size - patch_len) / stride + 1) + 1`` exactly
+    Mirrors neuralforecast's ``int((input_size - patch_len) / stride + 1) + 1`` exactly
     (truncation toward zero, not Python floor) so it stays correct even if called
     with an unclamped ``patch_len``; callers normally pass the clamped
     ``patch_len = min(input_size + stride, patch_len)``.
@@ -121,8 +121,8 @@ class _UniformPos:
 class PatchEmbedding(nnx.Module):
     """Linear patch projection + learnable positional encoding + residual dropout.
 
-    Mirrors NF's ``W_P`` (``Linear(patch_len -> hidden_size)``) plus
-    ``positional_encoding(pe='zeros', learn_pe=True)`` — a learnable
+    Mirrors neuralforecast's ``W_P`` (``Linear(patch_len -> hidden_size)``) plus
+    ``positional_encoding(pe='zeros', learn_pe=True)``, a learnable
     ``[patch_num, hidden_size]`` parameter initialized ``Uniform(-0.02, 0.02)``.
     Receives pre-cut patches; patchify lives in ``PatchTSTNet``.
     """
@@ -144,10 +144,10 @@ class PatchEmbedding(nnx.Module):
 class MultiHeadAttention(nnx.Module):
     """Multi-head self-attention with Realformer residual-attention threading.
 
-    Faithful to NF's ``res_attention=True`` path: pre-softmax scores are added
+    Faithful to neuralforecast's ``res_attention=True`` path: pre-softmax scores are added
     across layers via ``prev`` and the scaling factor ``d_k**-0.5`` is a frozen
-    constant (NF uses ``lsa=False``). Hand-rolled (not
-    ``jax.nn.dot_product_attention``) because that fused path only matches NF's
+    constant (neuralforecast uses ``lsa=False``). Hand-rolled (not
+    ``jax.nn.dot_product_attention``) because that fused path only matches neuralforecast's
     ``res_attention=False`` branch.
     """
 
@@ -187,9 +187,9 @@ class MultiHeadAttention(nnx.Module):
 
 
 def _resolve_activation(name: str):
-    """Map an activation name to a callable. NF uses EXACT (erf) GELU by default —
-    ``jax.nn.gelu`` defaults to the tanh approximation, which diverges ~1e-3 per
-    call and would fail the weight-parity gate, so pass ``approximate=False``.
+    """Map an activation name to a callable. neuralforecast uses the exact (erf)
+    GELU by default; ``jax.nn.gelu`` defaults to the tanh approximation, which
+    does not reproduce neuralforecast's outputs, so pass ``approximate=False``.
     """
     if name == "gelu":
         return lambda z: jax.nn.gelu(z, approximate=False)  # == torch nn.GELU()
@@ -199,15 +199,16 @@ def _resolve_activation(name: str):
 
 
 class TSTEncoderLayer(nnx.Module):
-    """One transformer encoder layer: residual MHA + BatchNorm, then FFN + BatchNorm.
+    """One transformer encoder layer: residual multi-head attention (MHA) +
+    BatchNorm, then feed-forward network (FFN) + BatchNorm.
 
-    Post-norm (NF default ``pre_norm=False``). BatchNorm with ``axis=-1`` over
-    ``[B, patch_num, hidden]`` matches NF's transpose/BatchNorm1d sandwich;
-    ``momentum=0.9`` matches torch BatchNorm1d's ``momentum=0.1`` running-stat
-    decay. (flax updates running-var with the biased/ddof=0 batch variance vs
-    torch's unbiased/ddof=1 — negligible at the benchmark's effective batch size
-    of thousands, and irrelevant to the parity gate, which loads NF's stats and
-    only runs eval.)
+    Post-norm (neuralforecast default ``pre_norm=False``). BatchNorm with
+    ``axis=-1`` over ``[B, patch_num, hidden]`` matches neuralforecast's
+    transpose/BatchNorm1d sandwich; ``momentum=0.9`` matches torch
+    BatchNorm1d's ``momentum=0.1`` running-stat decay. flax updates the running
+    variance with the biased (ddof=0) batch variance where torch uses the
+    unbiased (ddof=1) one; the difference is negligible at batch sizes in the
+    thousands and does not affect inference from loaded running statistics.
     """
 
     def __init__(self, *, hidden_size, n_heads, linear_hidden_size, dropout,
@@ -267,12 +268,12 @@ class TSTEncoder(nnx.Module):
 class FlattenHead(nnx.Module):
     """Flatten and project to the horizon (univariate).
 
-    NF flattens its encoder output ``[B, hidden, patch_num]`` with
-    ``nn.Flatten(start_dim=-2)`` — HIDDEN-major (hidden is the slow axis). Our
-    encoder produces ``[B, patch_num, hidden]``, so we transpose to
-    ``[B, hidden, patch_num]`` BEFORE flattening, otherwise the linear-head weight
-    columns are permuted relative to NF and the parity gate fails (measured:
-    ~1.8 patch-major vs <1e-4 hidden-major — the gate passes only hidden-major).
+    neuralforecast flattens its encoder output ``[B, hidden, patch_num]`` with
+    ``nn.Flatten(start_dim=-2)``, hidden-major (hidden is the slow axis). This
+    encoder produces ``[B, patch_num, hidden]``, so it is transposed to
+    ``[B, hidden, patch_num]`` before flattening; otherwise the linear-head
+    weight columns would be permuted relative to neuralforecast and a copied
+    neuralforecast head would not reproduce its outputs.
     """
 
     def __init__(self, *, hidden_size, patch_num, h, head_dropout, rngs: nnx.Rngs):
@@ -289,18 +290,18 @@ class FlattenHead(nnx.Module):
 class PatchTSTNet(nnx.Module):
     """Full PatchTST backbone: RevIN -> patchify -> embed -> encoder -> head -> denorm.
 
-    I/O mirrors the GRU network: ``__call__(x: [B, L, 1]) -> [B, h, 1]``.
+    I/O mirrors the ``GRU`` model's network: ``__call__(x: [B, L, 1]) -> [B, h, 1]``.
     """
 
     def __init__(self, *, h, input_size, patch_len, stride, hidden_size, n_heads,
                  encoder_layers, linear_hidden_size, dropout, fc_dropout,
                  head_dropout, attn_dropout, revin, revin_affine,
                  revin_subtract_last, activation="gelu", rngs: nnx.Rngs):
-        # fc_dropout is accepted for NF-signature parity but inert: NF uses it only
+        # fc_dropout is accepted for neuralforecast-signature parity but inert: neuralforecast uses it only
         # in the disabled pretrain head; the active residual dropout is `dropout`.
         self.h = h
         self.input_size = input_size
-        self.patch_len = min(input_size + stride, patch_len)  # NF clamp
+        self.patch_len = min(input_size + stride, patch_len)  # neuralforecast clamp
         self.stride = stride
         self.revin_enabled = revin
         patch_num = compute_patch_num(input_size, self.patch_len, stride)
@@ -309,7 +310,7 @@ class PatchTSTNet(nnx.Module):
                                affine=revin_affine, rngs=rngs)
         self.embedding = PatchEmbedding(
             patch_len=self.patch_len, hidden_size=hidden_size, patch_num=patch_num,
-            dropout=dropout, rngs=rngs,   # NF residual/positional dropout uses the main `dropout`
+            dropout=dropout, rngs=rngs,   # neuralforecast residual/positional dropout uses the main `dropout`
         )
         self.encoder = TSTEncoder(
             n_layers=encoder_layers, hidden_size=hidden_size, n_heads=n_heads,

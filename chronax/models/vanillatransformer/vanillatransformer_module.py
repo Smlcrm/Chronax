@@ -1,7 +1,7 @@
 """Flax NNX modules for the VanillaTransformer forecaster.
 
 Univariate JAX/Flax-NNX port of ``neuralforecast.VanillaTransformer`` (classic
-encoder-decoder Transformer with full softmax attention — the Informer baseline,
+encoder-decoder Transformer with full softmax attention, the Informer baseline,
 Zhou et al. 2021). The encoder embeds the lookback window (token conv +
 sinusoidal positional embedding) and runs full self-attention; the decoder
 embeds ``concat(last label_len of input, zeros for h)`` and runs full
@@ -11,7 +11,7 @@ projection to one channel.
 Parity with neuralforecast (PyTorch): torch ``nn.Linear`` default init
 (``_TorchLinearInit``), torch ``Conv1d`` kaiming-normal init for the token conv
 (``_KaimingConvInit``), exact (erf) GELU, fixed sinusoidal positional embedding,
-and NO causal mask anywhere (NF runs ``output_attention=False`` with
+and NO causal mask anywhere (neuralforecast runs ``output_attention=False`` with
 ``attn_mask=None``). ``float32`` throughout.
 """
 from __future__ import annotations
@@ -43,7 +43,7 @@ class _TorchLinearInit:
 class _KaimingConvInit:
     """Picklable init matching torch ``kaiming_normal_(fan_in, leaky_relu)``.
 
-    NF ``TokenEmbedding`` initializes its ``Conv1d`` with
+    neuralforecast ``TokenEmbedding`` initializes its ``Conv1d`` with
     ``kaiming_normal_(mode="fan_in", nonlinearity="leaky_relu")``: gain
     ``sqrt(2 / (1 + 0.01**2))`` and ``fan_in = in_channels * kernel_size``.
     For the flax ``nnx.Conv`` kernel of shape ``(*kernel_size, in, out)``,
@@ -62,7 +62,7 @@ class _KaimingConvInit:
 
 
 def _resolve_activation(name: str):
-    """Map an activation name to a callable. NF passes ``F.gelu`` (EXACT erf
+    """Map an activation name to a callable. neuralforecast passes ``F.gelu`` (EXACT erf
     GELU); ``jax.nn.gelu`` defaults to the tanh approximation, so pass
     ``approximate=False``.
     """
@@ -76,9 +76,9 @@ def _resolve_activation(name: str):
 def _positional_embedding(length: int, hidden_size: int) -> jnp.ndarray:
     """Fixed sinusoidal positional embedding ``[1, length, hidden_size]``.
 
-    Mirrors NF ``PositionalEmbedding``: ``sin`` on even channels, ``cos`` on odd.
+    Mirrors neuralforecast ``PositionalEmbedding``: ``sin`` on even channels, ``cos`` on odd.
     Computed as a constant (no parameters). Assumes ``hidden_size`` is even
-    (NF default 128); odd sizes are unsupported, as in NF.
+    (neuralforecast default 128); odd sizes are unsupported, as in neuralforecast.
     """
     position = jnp.arange(length, dtype=jnp.float32)[:, None]
     div_term = jnp.exp(
@@ -94,7 +94,7 @@ def _positional_embedding(length: int, hidden_size: int) -> jnp.ndarray:
 class TokenEmbedding(nnx.Module):
     """Circular k=3 Conv mapping the univariate channel to ``hidden_size``.
 
-    NF ``TokenEmbedding`` is ``Conv1d(c_in=1, hidden, kernel_size=3, padding=1,
+    neuralforecast ``TokenEmbedding`` is ``Conv1d(c_in=1, hidden, kernel_size=3, padding=1,
     padding_mode='circular', bias=False)`` over ``[B, C, L]``. flax ``nnx.Conv``
     is channels-last, so the input ``[B, L, 1]`` is consumed directly with
     ``padding='CIRCULAR'``; no permute needed.
@@ -118,7 +118,7 @@ class TokenEmbedding(nnx.Module):
 class DataEmbedding(nnx.Module):
     """Token conv + fixed sinusoidal positional embedding + dropout.
 
-    Mirrors NF ``DataEmbedding`` for the univariate, no-exogenous case
+    Mirrors neuralforecast ``DataEmbedding`` for the univariate, no-exogenous case
     (``temporal_embedding`` omitted; ``pos_embedding=True``).
     """
 
@@ -138,7 +138,7 @@ class DataEmbedding(nnx.Module):
 class AttentionLayer(nnx.Module):
     """Multi-head full (softmax dot-product) attention, self- or cross-.
 
-    Folds NF ``AttentionLayer`` + ``FullAttention`` (``output_attention=False``,
+    Folds neuralforecast ``AttentionLayer`` + ``FullAttention`` (``output_attention=False``,
     no mask) into one module. ``q`` is projected from ``q_in``; ``k``/``v`` from
     ``kv_in`` (equal for self-attention). Scale ``d_k**-0.5``; dropout on the
     attention weights; torch ``nn.Linear`` init.
@@ -178,7 +178,7 @@ class AttentionLayer(nnx.Module):
 
 
 class TransEncoderLayer(nnx.Module):
-    """One encoder layer (post-norm), matching NF ``TransEncoderLayer``.
+    """One encoder layer (post-norm), matching neuralforecast ``TransEncoderLayer``.
 
     ``new_x = attn(x, x); x = x + drop(new_x); y = x = norm1(x);
     y = drop(act(conv1(y))); y = drop(conv2(y)); return norm2(x + y)``.
@@ -233,7 +233,7 @@ class TransEncoder(nnx.Module):
 
 
 class TransDecoderLayer(nnx.Module):
-    """One decoder layer, matching NF ``TransDecoderLayer`` (no causal mask).
+    """One decoder layer, matching neuralforecast ``TransDecoderLayer`` (no causal mask).
 
     ``x = x + drop(self_attn(x, x)); x = norm1(x);
     x = x + drop(cross_attn(x, cross)); y = x = norm2(x);
@@ -303,7 +303,7 @@ class TransDecoder(nnx.Module):
 class VanillaTransformerNet(nnx.Module):
     """Full encoder-decoder backbone: ``[B, input_size, 1] -> [B, h, 1]``.
 
-    Identity scaling (NF default): operates in raw scale. During training pass
+    Identity scaling (neuralforecast default): operates in raw scale. During training pass
     ``deterministic=False``; ``nnx.Rngs`` supplies the dropout stream.
     """
 

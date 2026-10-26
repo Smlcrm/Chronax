@@ -14,18 +14,60 @@ from chronax.models.kan.kan_training import predict_step, train
 
 
 class KAN(BaseForecaster):
-    """Univariate Kolmogorov-Arnold Network forecaster (JAX/Flax-NNX port of
-    neuralforecast.KAN). An MLP whose layers learn per-edge B-spline activations.
+    """Univariate Kolmogorov-Arnold Network (KAN) forecaster (JAX/Flax-NNX port
+    of neuralforecast.KAN).
 
-    Maintenance Status:
+    A multilayer perceptron (MLP) whose layers learn per-edge B-spline
+    activations. With the default identity scaler the splines see raw-scale
+    data and stay inactive, as in neuralforecast; the ``"robust"`` scaler
+    normalizes each window into the spline grid so the B-splines engage.
+    ``float32`` throughout.
+
+    Maintenance status:
         Active univariate forecaster. Integrates with the ``BaseForecaster``
         interface, including conformal prediction intervals via
         ``predict(level=...)``, pickle round-trip, and ``forecast(fitted=True)``.
 
-    ``scaler`` selects the per-window input scaling: ``"identity"`` (default,
-    matches neuralforecast — splines inactive on raw-scale data) or ``"robust"``
-    (median/MAD; normalizes into the spline grid so the B-splines engage).
-    ``float32`` throughout.
+    Args:
+        h (int): Forecast horizon.
+        input_size (int): Input window length. Any value ``< 1`` (default
+            ``-1``) resolves to ``3 * h``; neuralforecast requires an explicit
+            value.
+        grid_size (int): Number of spline grid intervals. Default ``5``.
+        spline_order (int): B-spline order. Default ``3``.
+        scale_noise (float): Scale of the noise used to initialize the spline
+            weights. Default ``0.1``.
+        scale_base (float): Scale of the base (SiLU) weight init. Default
+            ``1.0``.
+        scale_spline (float): Scale of the spline weight init. Default ``1.0``.
+        enable_standalone_scale_spline (bool): Learn a separate spline scaler
+            parameter per edge. Default ``True``.
+        grid_eps (float): Accepted for neuralforecast-signature parity; unused,
+            because the grid update it feeds is not implemented. Default
+            ``0.02``.
+        grid_range (tuple): ``(low, high)`` of the spline grid. Default
+            ``(-1.0, 1.0)``.
+        n_hidden_layers (int): Number of hidden KAN layers. Default ``1``.
+        hidden_size (int): Width of each hidden layer. Default ``512``.
+        max_steps (int): Number of Adam steps. Default ``1000``.
+        learning_rate (float | Callable[[int], float]): Adam learning rate, a
+            scalar or an ``optax`` schedule. Default ``1e-3``.
+        windows_batch_size (int): Rolling windows sampled per step. Default
+            ``1024``.
+        loss (str | LossFn): Registry name (``"mae"``, ``"mse"``, ``"huber"``)
+            or a callable ``(pred, target, mask=None) -> scalar``. Default
+            ``"mae"``.
+        scaler (str | Scaler): Per-window scaler: ``"identity"`` (default,
+            matches neuralforecast), ``"robust"`` (median and median absolute
+            deviation, MAD), or a ``Scaler`` instance.
+        random_seed (int): Seed for parameter init and window sampling.
+            Default ``1``.
+        alias (str): Display name. Default ``"KAN"``.
+
+    Note:
+        A callable ``loss`` or ``learning_rate`` must itself be picklable for
+        the fitted estimator to pickle. Unknown ``loss`` or ``scaler`` names
+        raise ``ValueError`` at ``fit`` time.
     """
 
     uses_exog = False
@@ -47,7 +89,7 @@ class KAN(BaseForecaster):
         self.scale_base = scale_base
         self.scale_spline = scale_spline
         self.enable_standalone_scale_spline = enable_standalone_scale_spline
-        self.grid_eps = grid_eps  # accepted for NF-signature parity; only feeds the (unused) update_grid
+        self.grid_eps = grid_eps  # accepted for neuralforecast-signature parity; only feeds the (unused) update_grid
         self.grid_range = grid_range
         self.n_hidden_layers = n_hidden_layers
         self.hidden_size = hidden_size
@@ -81,8 +123,29 @@ class KAN(BaseForecaster):
         )
 
     def fit(self, y: jnp.ndarray, X: jnp.ndarray | None = None) -> "KAN":
-        """Fit on a 1-D series. Raises NotImplementedError on exog; ValueError if
-        y is not 1-D or shorter than input_size+h; RuntimeError on divergence."""
+        """Fit the network on a 1-D series.
+
+        Builds the network and runs ``max_steps`` Adam steps over rolling
+        windows of length ``input_size + h``, sampled per step the way
+        neuralforecast does.
+
+        Args:
+            y (jnp.ndarray): Univariate series, shape ``(T,)`` with
+                ``T >= input_size + h``.
+            X (jnp.ndarray | None): Exogenous regressors. Not supported; must
+                be ``None``.
+
+        Returns:
+            KAN: ``self`` with ``model_`` populated.
+
+        Raises:
+            NotImplementedError: If ``X`` is not ``None``.
+            ValueError: If ``y`` is not 1-D, if it is shorter than
+                ``input_size + h``, or if ``loss`` or ``scaler`` is an unknown
+                registry name.
+            RuntimeError: If a non-finite training loss is observed (the
+                training run diverged).
+        """
         if X is not None:
             raise NotImplementedError("Exogenous variables are not supported.")
         y = jnp.asarray(y, dtype=jnp.float32)
@@ -102,7 +165,30 @@ class KAN(BaseForecaster):
 
     def predict(self, h: int, X: jnp.ndarray | None = None,
                 level: list[int | float] | None = None) -> dict:
-        """Forecast h steps (1 <= h <= self.h). ``level`` -> inherited conformal path."""
+        """Forecast ``h`` steps from the fitted context.
+
+        The network is direct-decoded for ``self.h`` steps and the first ``h``
+        are returned.
+
+        Args:
+            h (int): Forecast horizon, ``1 <= h <= self.h``.
+            X (jnp.ndarray | None): Exogenous regressors. Ignored.
+            level (list[int | float] | None): Confidence levels in (0, 100),
+                e.g. ``[80, 95]``. When given, conformal intervals come from
+                ``BaseForecaster.conformity_scores``, which re-fits the model on
+                every cross-validation (CV) window under ``vmap``; requires
+                ``self.conformal_params``.
+
+        Returns:
+            dict: ``"mean"`` (shape ``(h,)``) plus ``"lo-{lv}"`` and
+            ``"hi-{lv}"`` (shape ``(h,)``) for each level when ``level`` is
+            given.
+
+        Raises:
+            RuntimeError: If called before ``fit``.
+            ValueError: If ``h < 1``, if ``h > self.h``, or if ``level`` is
+                given while ``self.conformal_params`` is ``None``.
+        """
         if self.model_ is None or self._context is None:
             raise RuntimeError("Call fit(y) before predict(h).")
         if h < 1:
@@ -128,7 +214,33 @@ class KAN(BaseForecaster):
     def forecast(self, y: jnp.ndarray, h: int, X: jnp.ndarray | None = None,
                  X_future: jnp.ndarray | None = None, level: list[int | float] | None = None,
                  fitted: bool = False) -> dict:
-        """Stateless fit-then-predict; ``fitted=True`` adds one-step-ahead fitted values."""
+        """Fit on ``y`` and forecast ``h`` steps in one call.
+
+        Equivalent to ``self.fit(y).predict(h=h, level=level)``; the fitted
+        state stays on the estimator.
+
+        Args:
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            h (int): Forecast horizon, ``1 <= h <= self.h``.
+            X (jnp.ndarray | None): Exogenous regressors. Not supported; must
+                be ``None``.
+            X_future (jnp.ndarray | None): Future exogenous regressors. Not
+                supported; must be ``None``.
+            level (list[int | float] | None): Confidence levels; see
+                ``predict``.
+            fitted (bool): If ``True``, add a ``"fitted"`` key with
+                one-step-ahead in-sample predictions, shape ``(T,)``; the first
+                ``input_size`` entries are NaN.
+
+        Returns:
+            dict: ``"mean"`` (shape ``(h,)``), the interval keys when ``level``
+            is given, and ``"fitted"`` when ``fitted=True``.
+
+        Raises:
+            NotImplementedError: If ``X`` or ``X_future`` is not ``None``.
+            ValueError: Forwarded from ``fit`` and ``predict``.
+            RuntimeError: Forwarded from ``fit`` and ``predict``.
+        """
         if X is not None or X_future is not None:
             raise NotImplementedError("Exogenous variables are not supported.")
         self.fit(y)

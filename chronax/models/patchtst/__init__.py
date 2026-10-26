@@ -1,7 +1,7 @@
 """PatchTST forecasting model (univariate, JAX/Flax-NNX port of neuralforecast.PatchTST)."""
 import flax
 
-# Pinned to flax 0.10.x — NNX is pre-1.0 and the scan / Optimizer / BatchNorm
+# Pinned to flax 0.10.x, NNX is pre-1.0 and the scan / Optimizer / BatchNorm
 # APIs have churned across minor versions. Loud failure here beats silent
 # miscompilation on a newer flax.
 if not flax.__version__.startswith("0.10"):

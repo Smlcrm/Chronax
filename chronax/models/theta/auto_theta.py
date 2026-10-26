@@ -1,9 +1,11 @@
 """
-AutoTheta and Theta — JAX-accelerated Theta method classes.
+AutoTheta and Theta: JAX-accelerated Theta method classes.
 
-``AutoTheta`` automatically selects the best Theta model variant
-(STM, OTM, DSTM, DOTM) by fitting all four and choosing by MSE.
-``Theta`` is a convenience wrapper that always uses STM.
+``AutoTheta`` fits the four Theta model variants, the standard Theta method
+(STM), the optimized Theta method (OTM), the dynamic standard Theta method
+(DSTM) and the dynamic optimized Theta method (DOTM), and keeps the one with
+the lowest mean squared error (MSE). ``Theta`` is a convenience wrapper that
+always uses STM.
 
 Both support additive and multiplicative seasonal decomposition,
 Monte Carlo prediction intervals, and conformal prediction intervals.
@@ -36,8 +38,12 @@ __all__ = ['AutoTheta', 'Theta']
 class AutoTheta(BaseForecaster):
     r"""AutoTheta model.
 
-    Automatically selects the best Theta model variant (STM, OTM, DSTM, DOTM)
-    using MSE.
+    Fits the Theta model variants (STM, OTM, DSTM, DOTM) and keeps the one
+    with the lowest MSE. When ``season_length >= 4``, the series has at least
+    two full seasons and it tests as seasonal, the series is deseasonalised
+    before fitting and the forecast is reseasonalised. Prediction intervals come from Monte Carlo simulation of
+    the fitted model, or from conformal scores when ``prediction_intervals``
+    is set. The model ignores exogenous regressors.
 
     Parameters
     ----------
@@ -46,15 +52,24 @@ class AutoTheta(BaseForecaster):
     decomposition_type : str, default 'multiplicative'
         Seasonal decomposition type: 'multiplicative' or 'additive'.
     model : str or None, default None
-        Controlling theta model variant. None searches the best model.
+        Theta variant to fit: 'STM', 'OTM', 'DSTM' or 'DOTM'. None fits all
+        four and keeps the one with the lowest MSE.
     alias : str, default 'AutoTheta'
         Custom name of the model.
     prediction_intervals : ConformalIntervals or None, default None
-        Configuration for conformal prediction intervals.
+        When set, ``fit`` computes conformal scores, and ``predict`` and
+        ``forecast`` return conformal intervals in place of the Monte Carlo
+        intervals. The window layout comes from ``conformal_params``.
     conformal_params : ConformalIntervals or None, default None
-        Parameters for conformal prediction intervals.
+        Window configuration for the base-class ``conformity_scores`` path.
+        None uses ``ConformalIntervals()`` with its defaults.
     n_samples : int, default 200
-        Number of Monte Carlo samples for prediction intervals.
+        Number of Monte Carlo sample paths for prediction intervals.
+
+    Raises
+    ------
+    TypeError
+        If ``conformal_params`` is not a ``ConformalIntervals`` instance.
     """
 
     def __init__(
@@ -86,14 +101,24 @@ class AutoTheta(BaseForecaster):
         Parameters
         ----------
         y : jnp.ndarray
-            Clean time series of shape (t,).
+            Univariate time series of shape ``(T,)``.
         X : jnp.ndarray or None, default None
-            Optional exogenous of shape (t, n_x).
+            Ignored by the model. Forwarded only to the conformal
+            cross-validation splitter when ``prediction_intervals`` is set.
 
         Returns
         -------
         AutoTheta
-            Fitted model instance.
+            Fitted model instance (``self``).
+
+        Raises
+        ------
+        ValueError
+            If ``model`` is not one of 'STM', 'OTM', 'DSTM', 'DOTM'.
+        NotImplementedError
+            If the series has 3 or fewer observations.
+        Exception
+            If no variant produces a finite MSE.
         """
         y = ensure_float(y)
         self.model_ = _auto_theta(
@@ -114,21 +139,29 @@ class AutoTheta(BaseForecaster):
         X: jnp.ndarray | None = None,
         level: list | None = None,
     ) -> dict:
-        r"""Predict with fitted AutoTheta.
+        r"""Predict with the fitted AutoTheta model.
 
         Parameters
         ----------
         h : int
             Forecast horizon.
         X : jnp.ndarray or None, default None
-            Optional exogenous of shape (h, n_x).
-        level : list of float or None, default None
-            Confidence levels (0-100) for prediction intervals.
+            Ignored.
+        level : list of int or None, default None
+            Confidence levels in (0, 100), e.g. ``[80, 95]``.
 
         Returns
         -------
         dict
-            Keys: 'mean' and optionally 'lo-{lv}', 'hi-{lv}'.
+            ``'mean'`` of shape ``(h,)``, plus ``'lo-{lv}'`` and
+            ``'hi-{lv}'`` of shape ``(h,)`` per level when ``level`` is given
+            (Monte Carlo intervals, or conformal intervals when
+            ``prediction_intervals`` is set).
+
+        Raises
+        ------
+        ValueError
+            If called before ``fit``.
         """
         self._require_fitted()
         fcst = _forecast_from_model(self.model_, h=h, level=level, n_samples=self.n_samples)
@@ -137,17 +170,20 @@ class AutoTheta(BaseForecaster):
         return fcst
 
     def predict_in_sample(self, level: list | None = None) -> dict:
-        r"""Access fitted AutoTheta in-sample predictions.
+        r"""Return in-sample fitted values of the fitted AutoTheta model.
+
+        Requires a prior ``fit``.
 
         Parameters
         ----------
-        level : list of float or None, default None
-            Confidence levels (0-100) for prediction intervals.
+        level : list of int or None, default None
+            Confidence levels in (0, 100), e.g. ``[80, 95]``.
 
         Returns
         -------
         dict
-            Keys: 'fitted' and optionally 'lo-{lv}', 'hi-{lv}'.
+            ``'fitted'`` of shape ``(T,)``, plus ``'fitted-lo-{lv}'`` and
+            ``'fitted-hi-{lv}'`` per level when ``level`` is given.
         """
         res = {"fitted": self.model_["fitted"]}
         if level is not None:
@@ -164,29 +200,42 @@ class AutoTheta(BaseForecaster):
         level: list | None = None,
         fitted: bool = False,
     ) -> dict:
-        r"""Memory-efficient AutoTheta predictions.
+        r"""Stateless fit and forecast in one call.
 
-        Fits and forecasts without storing model state.
+        Fits on ``y`` and forecasts without storing model state on ``self``.
+        This is the method the base-class ``conformity_scores`` maps over
+        cross-validation windows.
 
         Parameters
         ----------
         y : jnp.ndarray
-            Clean time series of shape (t,).
+            Univariate time series of shape ``(T,)``.
         h : int
             Forecast horizon.
         X : jnp.ndarray or None, default None
-            Optional exogenous of shape (t, n_x).
+            Ignored by the model. Forwarded only to the conformal
+            cross-validation splitter when ``prediction_intervals`` is set.
         X_future : jnp.ndarray or None, default None
-            Optional future exogenous of shape (h, n_x).
-        level : list of float or None, default None
-            Confidence levels (0-100) for prediction intervals.
+            Ignored.
+        level : list of int or None, default None
+            Confidence levels in (0, 100), e.g. ``[80, 95]``.
         fitted : bool, default False
-            Whether to return in-sample predictions.
+            If True, also return in-sample fitted values.
 
         Returns
         -------
         dict
-            Keys: 'mean', and optionally 'fitted', 'lo-{lv}', 'hi-{lv}'.
+            ``'mean'`` of shape ``(h,)``; ``'lo-{lv}'`` and ``'hi-{lv}'`` per
+            level when ``level`` is given; ``'fitted'`` of shape ``(T,)``
+            when ``fitted`` is True; ``'fitted-lo-{lv}'`` and
+            ``'fitted-hi-{lv}'`` when both are given.
+
+        Raises
+        ------
+        ValueError
+            If ``model`` is not one of 'STM', 'OTM', 'DSTM', 'DOTM'.
+        NotImplementedError
+            If the series has 3 or fewer observations.
         """
         y = ensure_float(y)
         mod = _auto_theta(
@@ -218,29 +267,36 @@ class AutoTheta(BaseForecaster):
         level: list | None = None,
         fitted: bool = False,
     ) -> dict:
-        r"""Apply fitted AutoTheta model to a new time series.
+        r"""Apply the fitted AutoTheta model to a new time series.
 
-        Uses the model type and parameters from the original fit.
+        Re-fits on ``y`` with the model variant and parameters of the
+        original fit, then forecasts.
 
         Parameters
         ----------
         y : jnp.ndarray
-            Clean time series of shape (n,).
+            Univariate time series of shape ``(T,)``.
         h : int
             Forecast horizon.
         X : jnp.ndarray or None, default None
-            Optional exogenous of shape (n, n_x).
+            Ignored by the model. Forwarded only to the conformal
+            cross-validation splitter when ``prediction_intervals`` is set.
         X_future : jnp.ndarray or None, default None
-            Optional future exogenous of shape (h, n_x).
-        level : list of float or None, default None
-            Confidence levels (0-100) for prediction intervals.
+            Ignored.
+        level : list of int or None, default None
+            Confidence levels in (0, 100), e.g. ``[80, 95]``.
         fitted : bool, default False
-            Whether to return in-sample predictions.
+            If True, also return in-sample fitted values.
 
         Returns
         -------
         dict
-            Keys: 'mean', and optionally 'fitted', 'lo-{lv}', 'hi-{lv}'.
+            Same keys as :meth:`forecast`.
+
+        Raises
+        ------
+        Exception
+            If called before ``fit``.
         """
         if not hasattr(self, "model_"):
             raise Exception("You have to use the `fit` method first")
@@ -258,9 +314,11 @@ class AutoTheta(BaseForecaster):
 
 
 class Theta(AutoTheta):
-    r"""Standard Theta Method (STM).
+    r"""Standard Theta method (STM).
 
-    A simplified version of AutoTheta that always uses the Standard Theta Model.
+    :class:`AutoTheta` with ``model='STM'`` fixed. ``fit``, ``predict``,
+    ``predict_in_sample``, ``forecast`` and ``forward`` are inherited
+    unchanged; ``conformal_params`` is always ``ConformalIntervals()``.
 
     Parameters
     ----------
@@ -271,9 +329,10 @@ class Theta(AutoTheta):
     alias : str, default 'Theta'
         Custom name of the model.
     prediction_intervals : ConformalIntervals or None, default None
-        Configuration for conformal prediction intervals.
+        When set, intervals are conformal instead of Monte Carlo (see
+        :class:`AutoTheta`).
     n_samples : int, default 200
-        Number of Monte Carlo samples for prediction intervals.
+        Number of Monte Carlo sample paths for prediction intervals.
     """
 
     def __init__(
