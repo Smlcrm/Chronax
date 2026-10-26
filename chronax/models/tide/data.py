@@ -5,12 +5,13 @@ Two training paths are provided:
 1. **Window-based** (primary path, matches NeuralForecast):
    ``build_windows`` + ``split_train_val_windows`` extract every possible
    sliding window from a 1-D series. ``RobustScaler`` applies per-window
-   median/MAD normalisation inside the JIT step. This is the path used by
+   median / median absolute deviation (MAD) normalisation inside the JIT step.
+   This is the path used by
    :class:`~chronax.models.tide.forecaster.TiDEForecaster`.
 
 2. **Batch-based** (exogenous path):
    ``create_batch`` assembles batches from pre-split series with optional
-   hist/futr/stat exogenous arrays — useful when covariates are present.
+   hist/futr/stat exogenous arrays; used when covariates are present.
 
 Batch format (both paths produce this dict shape):
 
@@ -22,7 +23,7 @@ Batch format (both paths produce this dict shape):
     futr_exog       [B, L+h, F] or None
     stat_exog       [B, S]      or None
 
-No NumPy — every array is a ``jnp.ndarray``, including the sliding-window
+No NumPy: every array is a ``jnp.ndarray``, including the sliding-window
 extraction (done via a single vectorised gather).
 """
 
@@ -35,7 +36,7 @@ from jax import random
 
 
 # ---------------------------------------------------------------------------
-# Robust per-window scaler (pure JAX — used inside JIT-compiled train steps)
+# Robust per-window scaler (pure JAX, used inside JIT-compiled train steps)
 # ---------------------------------------------------------------------------
 
 _MAD_TO_STD = 0.6744897501960817   # scipy.stats.norm.ppf(0.75), pre-computed

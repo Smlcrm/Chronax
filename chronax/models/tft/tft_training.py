@@ -20,9 +20,9 @@ from chronax.models.tft.tft_module import TFTNet
 
 
 def build_windows(y: jnp.ndarray, input_size: int, h: int) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """NF-parity rolling windows over ``y`` right-padded with ``h`` zeros.
+    """neuralforecast-parity rolling windows over ``y`` right-padded with ``h`` zeros.
 
-    NF pads the training series with ``ConstantPad1d((0, h), 0)`` before
+    neuralforecast pads the training series with ``ConstantPad1d((0, h), 0)`` before
     windowing, keeping every window with >=1 valid target point and masking the
     padded tail out of the loss. Those partial windows put the insample contexts
     ending at the very last observations into training; a full-window-only form
@@ -45,7 +45,7 @@ def build_windows(y: jnp.ndarray, input_size: int, h: int) -> tuple[jnp.ndarray,
 
 def build_exog_windows(arr: jnp.ndarray, input_size: int, h: int, n_windows: int, span: str) -> jnp.ndarray:
     """Rolling windows of an exog array ``[T, F]`` (right-padded with ``h`` zero
-    rows, mirroring `build_windows` — NF pads the whole temporal tensor, so late
+    rows, mirroring `build_windows`, neuralforecast pads the whole temporal tensor, so late
     windows see zeros in the padded region of exog channels too).
 
     ``span="input"`` -> ``[n, input_size, F]`` (encoder window); ``span="full"`` ->
@@ -64,7 +64,7 @@ def _scale_exog(windows: jnp.ndarray, scaler, stats_len: int | None = None) -> j
     """Per-channel per-window robust scaling of ``[B, T, F]`` exog.
 
     ``stats_len`` restricts the STATISTICS to the first ``stats_len`` positions
-    (the insample span) while transforming the whole window — NF's
+    (the insample span) while transforming the whole window, neuralforecast's
     ``_normalization`` masks the horizon out of the scaler stats. ``None`` keeps
     full-span stats (insample-span windows only).
     """
@@ -76,7 +76,7 @@ def _scale_exog(windows: jnp.ndarray, scaler, stats_len: int | None = None) -> j
     # SPREAD-based floor bounds |scaled| <= range/(frac*range) = 1/frac by
     # construction (the shift lies inside [min, max]). frac sits ~15x below the
     # Gaussian scale/range ratio (~0.15 at these window lengths), so ordinary
-    # covariates — including level-offset ones like temperature in Kelvin —
+    # covariates, including level-offset ones like temperature in Kelvin,
     # never trip it, while degenerate spans (scale/range ~ 1e-9) always do.
     # Covariate values are known inputs, so the bound may read the full window;
     # the CENTERING stays insample-span.
@@ -86,8 +86,8 @@ def _scale_exog(windows: jnp.ndarray, scaler, stats_len: int | None = None) -> j
                             jnp.maximum(scale, _EXOG_SCALE_FLOOR_FRAC * rng_full))
 
 
-# Elementwise forms of the registry point losses, for NF-parity masked reduction
-# (NF losses compute sum(loss*mask)/sum(mask) — `_weighted_mean`). Keyed by the
+# Elementwise forms of the registry point losses, for neuralforecast-parity masked reduction
+# (neuralforecast losses compute sum(loss*mask)/sum(mask), `_weighted_mean`). Keyed by the
 # registry function OBJECTS so a user's custom callable that happens to share a
 # name falls through to the custom branch instead of being shadowed.
 _ELEMENTWISE = {
@@ -101,8 +101,8 @@ def forward_loss(net, y_windows, target_mask=None, *, h, input_size, scaler, los
                  hist_windows=None, futr_windows=None, stat=None, deterministic=False):
     """Scale, forward, and reduce a point/quantile loss in scaled space.
 
-    ``target_mask [B, h]`` marks real target positions (0 in the NF h-padded
-    tail); the loss is the masked mean over valid elements, matching NF's
+    ``target_mask [B, h]`` marks real target positions (0 in the neuralforecast h-padded
+    tail); the loss is the masked mean over valid elements, matching neuralforecast's
     ``_weighted_mean``. ``None`` means all-valid.
     """
     insample = y_windows[:, :input_size]                # [B, L]
@@ -122,8 +122,8 @@ def forward_loss(net, y_windows, target_mask=None, *, h, input_size, scaler, los
         q = jnp.asarray(loss_fn.quantiles, dtype=pred.dtype)          # [Q]
         err = target_z[..., None] - pred                               # [B, h, Q]
         ql = jnp.maximum(q * err, (q - 1.0) * err)
-        # NF quirk kept: MQLoss's 1/len(quantiles) hits a [1,1,1,Q] tensor
-        # (len==1), so NF SUMS over quantiles and means over valid positions.
+        # neuralforecast quirk kept: MQLoss's 1/len(quantiles) hits a [1,1,1,Q] tensor
+        # (len==1), so neuralforecast SUMS over quantiles and means over valid positions.
         return jnp.sum(ql * target_mask[..., None]) / denom
     ew = _ELEMENTWISE.get(loss_fn)
     if ew is not None:
@@ -197,9 +197,9 @@ def train(net, y, *, h, input_size, max_steps, windows_batch_size, lr, seed, los
     stat_w = jnp.broadcast_to(stat_exog[None, :], (n, stat_exog.shape[0])) if stat_exog is not None else None
 
     step_keys = jax.random.split(jax.random.PRNGKey(seed), max_steps)
-    if n < windows_batch_size:                          # NF: torch.randint -> with replacement
+    if n < windows_batch_size:                          # neuralforecast: torch.randint -> with replacement
         sample = lambda k: jax.random.choice(k, n, shape=(windows_batch_size,), replace=True)
-    else:                                               # NF: torch.randperm[:B] -> without replacement
+    else:                                               # neuralforecast: torch.randperm[:B] -> without replacement
         sample = lambda k: jax.random.permutation(k, n)[:windows_batch_size]
     batch_idx = jax.vmap(sample)(step_keys)             # [max_steps, B]
 

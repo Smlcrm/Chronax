@@ -1,12 +1,12 @@
 # ets_model.py
-"""Fixed-specification ETS (Error, Trend, Seasonality) forecaster.
+"""Fixed-specification exponential smoothing (ETS) forecaster.
 
-This module provides the :class:`ETS` class — a user-facing wrapper around
+This module provides the :class:`ETS` class, a user-facing wrapper around
 the core ``ets_functions`` engine.  Unlike :class:`AutoETS` (which evaluates
 a grid of model structures), :class:`ETS` fits **exactly one** user-specified
 model string (e.g. ``"ANN"``, ``"AAN"``, ``"AAA"``).
 
-The API surface is identical to :class:`AutoETS`: ``fit``, ``predict``,
+The application programming interface (API) is identical to :class:`AutoETS`: ``fit``, ``predict``,
 ``predict_in_sample``, ``forecast``, and ``forward``.
 """
 
@@ -50,7 +50,7 @@ class ETS(BaseForecaster):
     +-----------+----------------+----------------+------------------+
     | ``M``     | Multiplicative | Multiplicative | Multiplicative   |
     +-----------+----------------+----------------+------------------+
-    | ``N``     | —              | No trend       | No seasonality   |
+    | ``N``     | n/a            | No trend       | No seasonality   |
     +-----------+----------------+----------------+------------------+
 
     For example, ``"AAN"`` = Additive error + Additive trend + No seasonality.
@@ -63,21 +63,22 @@ class ETS(BaseForecaster):
     model : str, default ``"ANN"``
         Fixed ETS specification string.  Common choices:
 
-        * ``"ANN"`` — simple exponential smoothing
-        * ``"AAN"`` — Holt's linear trend
-        * ``"AAA"`` — additive trend + additive seasonality
+        * ``"ANN"``: simple exponential smoothing
+        * ``"AAN"``: Holt's linear trend
+        * ``"AAA"``: additive trend + additive seasonality
     damped : bool or None, default ``None``
         Whether to apply trend damping.  ``None`` is treated as ``False``.
     phi : float or None, default ``None``
         Damping coefficient.  Must be in ``[0.8, 0.98]`` when provided.
     max_iter : int or None, default ``None``
-        Number of ``optax`` gradient-descent iterations.  ``None`` lets the
-        engine choose a sensible default based on data length and model
-        complexity.
+        Optimizer step budget passed to the engine as ``optax_steps``.
+        ``None`` selects a static budget from a table keyed on the series
+        length.
     optax_lr : float, default ``1e-2``
-        Learning rate for the ``optax`` Adam optimiser.
+        Learning rate for the ``optax`` Adam warm-up phase.
     optax_clip : float, default ``1.0``
-        Gradient clipping threshold.
+        Accepted and passed to the engine; the optimizer does not clip
+        gradients.
     alias : str, default ``"ETS"``
         Display name for the model.
     prediction_intervals : ConformalIntervals or None, default ``None``
@@ -88,8 +89,14 @@ class ETS(BaseForecaster):
     ----------
     model_ : dict
         Internal state dictionary produced by ``ets_f(…)`` after
-        :meth:`fit`.  Contains fitted parameters, AICc, fitted values,
-        residuals, etc.
+        :meth:`fit`.  Contains fitted parameters, the corrected Akaike
+        information criterion (AICc), fitted values, residuals, etc.
+
+    Raises
+    ------
+    ValueError
+        If *model* contains the auto-selection code ``"Z"``, if *phi* is not
+        a float, or if *phi* lies outside ``[0.8, 0.98]``.
 
     Examples
     --------
@@ -143,17 +150,17 @@ class ETS(BaseForecaster):
     ) -> "ETS":
         """Fit the ETS model to a univariate time series.
 
-        Optimises the smoothing parameters via ``optax`` gradient descent on
-        the likelihood; initial states are seeded from the data (not optimised
-        unless ``opt_init_state`` is set). Stores the full model state in
-        :attr:`model_`.
+        Optimises the smoothing parameters with ``optax`` on the likelihood;
+        initial states are seeded from the data. Stores the full model state
+        in :attr:`model_`. When ``prediction_intervals`` is set, conformity
+        scores are computed and cached for :meth:`predict`.
 
         Parameters
         ----------
         y : jnp.ndarray
-            One-dimensional time series of shape ``(n,)``.
+            Univariate series, shape ``(T,)``.
         X : jnp.ndarray or None
-            Ignored — present for API compatibility with
+            Ignored; present for API compatibility with
             :class:`BaseForecaster`.
 
         Returns
@@ -163,7 +170,7 @@ class ETS(BaseForecaster):
         """
         y = ensure_float(y)
         # A fixed spec always yields exactly one candidate, so the winner view
-        # is a static index-0 selection — no concretization, fit stays traceable.
+        # is a static index-0 selection; no concretization, fit stays traceable.
         self.model_ = ets_winner_view(ets_f(
             y,
             m=self.season_length,
@@ -176,7 +183,7 @@ class ETS(BaseForecaster):
         ))
         self.model_["actual_residuals"] = y - self.model_["fitted"]
 
-        # forecast() below is write-free, so the vmapped CV re-fits inside
+        # forecast() below is write-free, so the vmapped cross-validation (CV) re-fits inside
         # conformity_scores cannot leak tracers onto this fitted estimator.
         if self.conformal_params is not None:
             self._cs = self.conformity_scores(y=y, X=X)
@@ -197,23 +204,26 @@ class ETS(BaseForecaster):
         h : int
             Forecast horizon.
         X : jnp.ndarray or None
-            Ignored — present for API compatibility.
+            Ignored; present for API compatibility.
         level : list of int or None
-            Confidence levels in ``[0, 100]``.  When provided and
-            ``conformal_params`` is set, conformal intervals are returned;
-            otherwise native Gaussian ETS intervals are used.
+            Confidence levels in ``(0, 100)``, e.g. ``[80, 95]``.  When
+            ``prediction_intervals`` was set, conformal intervals from the
+            scores cached at :meth:`fit` are returned; otherwise native
+            Gaussian ETS intervals are used.
 
         Returns
         -------
         dict
             Always contains ``"mean"`` of shape ``(h,)``.  When *level* is
-            given, also contains ``"lo-{level}"`` and ``"hi-{level}"`` for
-            each requested level.
+            given, also contains ``"lo-{lv}"`` and ``"hi-{lv}"`` of shape
+            ``(h,)`` for each requested level.
 
         Raises
         ------
-        Exception
-            If called before :meth:`fit`.
+        ValueError
+            If called before :meth:`fit`; if conformal intervals are
+            requested but no conformity scores are cached; or if *h* differs
+            from ``prediction_intervals.h`` on the conformal path.
         """
         self._require_fitted()
         if not hasattr(self, "model_"):
@@ -240,7 +250,7 @@ class ETS(BaseForecaster):
                 fcst=out, cs=self._cs, level=level_sorted, method=self.conformal_params.method
             )
 
-        # Native intervals only when actually taken — the interval machinery
+        # Native intervals only when actually taken: the interval machinery
         # is eager-only and class-dependent, so it must not run (and possibly
         # crash) just to be discarded on the conformal path.
         fcst = forecast_ets(self.model_, h=h, level=level_sorted)
@@ -260,15 +270,16 @@ class ETS(BaseForecaster):
         Parameters
         ----------
         level : list of int or None
-            Confidence levels in ``[0, 100]``.  When provided, symmetric
-            ±z·σ intervals are appended using the residual standard error.
+            Confidence levels in ``(0, 100)``, e.g. ``[80, 95]``.  When
+            provided, symmetric ±z·σ intervals are appended using the
+            residual standard error.
 
         Returns
         -------
         dict
-            ``{"fitted": jnp.ndarray}`` of shape ``(n,)``.  When *level* is
-            given, also contains ``"fitted-lo-{level}"`` and
-            ``"fitted-hi-{level}"`` keys.
+            ``{"fitted": jnp.ndarray}`` of shape ``(T,)``.  When *level* is
+            given, also contains ``"fitted-lo-{lv}"`` and
+            ``"fitted-hi-{lv}"`` keys.
 
         Raises
         ------
@@ -304,25 +315,33 @@ class ETS(BaseForecaster):
         Parameters
         ----------
         y : jnp.ndarray
-            One-dimensional time series of shape ``(n,)``.
+            Univariate series, shape ``(T,)``.
         h : int
             Forecast horizon.
         X : jnp.ndarray or None
-            Ignored — present for API compatibility.
+            Ignored; present for API compatibility.
         X_future : jnp.ndarray or None
-            Ignored — present for API compatibility.
+            Ignored; present for API compatibility.
         level : list of int or None
-            Confidence levels in ``[0, 100]`` for prediction intervals.
+            Confidence levels in ``(0, 100)``, e.g. ``[80, 95]``.  Conformal
+            intervals when ``prediction_intervals`` is set (scores are
+            recomputed on *y*), native Gaussian ETS intervals otherwise.
         fitted : bool, default ``False``
             If ``True``, the returned dict also includes ``"fitted"``
-            (in-sample predictions of shape ``(n,)``).
+            (in-sample predictions of shape ``(T,)``).
 
         Returns
         -------
         dict
             Always contains ``"mean"`` of shape ``(h,)``.  Optionally
-            includes ``"fitted"``, ``"lo-{level}"``, ``"hi-{level}"``,
-            ``"fitted-lo-{level}"``, and ``"fitted-hi-{level}"``.
+            includes ``"fitted"``, ``"lo-{lv}"``, ``"hi-{lv}"``,
+            ``"fitted-lo-{lv}"``, and ``"fitted-hi-{lv}"``.
+
+        Raises
+        ------
+        ValueError
+            If ``prediction_intervals`` is set, *level* is given and *h*
+            differs from ``prediction_intervals.h``.
         """
         y = ensure_float(y)
         # Single-candidate winner view: static index-0 selection, traceable
@@ -391,27 +410,35 @@ class ETS(BaseForecaster):
         Parameters
         ----------
         y : jnp.ndarray
-            New time series of shape ``(n,)``.
+            New univariate series, shape ``(T,)``.
         h : int
             Forecast horizon.
         X : jnp.ndarray or None
-            Ignored — present for API compatibility.
+            Ignored; present for API compatibility.
         X_future : jnp.ndarray or None
-            Ignored — present for API compatibility.
+            Ignored; present for API compatibility.
         level : list of int or None
-            Confidence levels in ``[0, 100]`` for prediction intervals.
+            Confidence levels in ``(0, 100)``, e.g. ``[80, 95]``.  Conformal
+            intervals when ``prediction_intervals`` is set, native Gaussian
+            ETS intervals otherwise.
         fitted : bool, default ``False``
-            If ``True``, include in-sample fitted values in the output.
+            If ``True``, include ``"fitted"`` (shape ``(T,)``) in the output.
 
         Returns
         -------
         dict
-            Same structure as :meth:`forecast`.
+            ``"mean"`` of shape ``(h,)``; ``"fitted"`` when requested;
+            ``"lo-{lv}"``/``"hi-{lv}"`` per level.  ``"fitted-lo-{lv}"``/
+            ``"fitted-hi-{lv}"`` are added only on the native-interval path
+            (``prediction_intervals`` unset) when *fitted* is ``True``.
 
         Raises
         ------
         Exception
             If called before :meth:`fit`.
+        ValueError
+            If ``prediction_intervals`` is set, *level* is given and *h*
+            differs from ``prediction_intervals.h``.
         """
         if not hasattr(self, "model_"):
             raise Exception("You have to use the `fit` method first")

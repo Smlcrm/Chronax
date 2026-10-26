@@ -1,14 +1,16 @@
 """JAX/Flax N-BEATS model.
 
-Faithful port of Nixtla NeuralForecast's ``NBEATS``, extended with:
-- ``LayerNorm`` after every hidden Dense (improves gradient flow vs NF's bare FC stack).
-- Pure JAX/Flax/Optax — no PyTorch, no scipy at forward time.
+Faithful port of Nixtla neuralforecast's ``NBEATS``, extended with:
+
+- Optional ``LayerNorm`` after every hidden Dense (neuralforecast uses a bare
+  fully connected stack).
+- Pure JAX/Flax/Optax: no PyTorch, no scipy at forward time.
 - Basis matrices are pure-JAX expressions whose shapes are static Python ints;
-  XLA constant-folds them away at JIT compile time.
+  XLA (accelerated linear algebra) constant-folds them away at JIT compile time.
 - Shared-weight blocks via Flax name-scoping: blocks with the same ``name``
   share all parameters under Flax's ``@compact`` registry.
 
-Architecture (mirrors NeuralForecast NBEATS exactly for non-LayerNorm path):
+Architecture (the neuralforecast NBEATS forward pass when ``layer_norm=False``)::
 
     residuals ← flip(insample_y)          # most-recent-first convention
     forecast  ← last_obs  (Naive1 level)
@@ -49,16 +51,16 @@ class NBEATSConfig:
             ``stack_types``).
         mlp_units: Hidden dimension used in every Dense layer of every block.
         mlp_layers: Number of hidden Dense layers per block (output layer is
-            extra). Matches ``len(mlp_units)`` in NF when all units are equal.
+            extra). Matches ``len(mlp_units)`` in neuralforecast when all units are equal.
         n_harmonics: Fourier harmonics for the seasonality basis
-            (``n_harmonics=2`` gives the NF default).
+            (``n_harmonics=2`` gives the neuralforecast default).
         n_basis: Polynomial degree for the trend basis; basis size = n_basis+1.
-        basis: Trend basis type — ``"polynomial"`` matches NF's TrendBasis
+        basis: Trend basis type; ``"polynomial"`` matches neuralforecast's TrendBasis
             with ``basis="polynomial"``.  Other choices: ``"legendre"``,
             ``"chebyshev"``, ``"changepoint"``.
-        activation: Activation function name (``"relu"`` matches NF default).
+        activation: Activation function name (``"relu"`` matches the neuralforecast default).
         shared_weights: When True all blocks within a stack share parameters.
-        dropout_prob: Dropout rate (0 = disabled, matches NF default).
+        dropout_prob: Dropout rate (0 = disabled, the neuralforecast default).
         layer_norm: When True insert LayerNorm after every hidden Dense.
     """
 
@@ -127,9 +129,8 @@ _TREND_BASIS = {
     "changepoint": _changepoint_basis,
 }
 
-# He-uniform matches PyTorch's default Kaiming-uniform for ReLU layers and
-# gives ~2× larger initial weight variance than Flax's default Lecun-uniform,
-# which halves the number of near-zero activations in the first forward pass.
+# He-uniform matches PyTorch's default Kaiming-uniform for ReLU layers; its
+# initial weight variance is about twice that of Flax's default Lecun-uniform.
 _HE_UNIFORM = fnn.initializers.he_uniform()
 
 
@@ -156,7 +157,7 @@ def _seasonality_basis(
     freq_nz = jnp.arange(harmonics, harmonics + n_nz, dtype=jnp.float32) / harmonics
     freq = jnp.concatenate([jnp.zeros(1, dtype=jnp.float32), freq_nz])  # [n_freqs]
 
-    # NF normalises backcast time by forecast_size (not backcast_size)
+    # neuralforecast normalises backcast time by forecast_size (not backcast_size)
     t_back = jnp.arange(backcast_size, dtype=jnp.float32) / forecast_size
     t_fore = jnp.arange(forecast_size, dtype=jnp.float32) / forecast_size
 
@@ -175,7 +176,7 @@ def _harmonic_size(harmonics: int, h: int) -> int:
 def _n_theta(
     block_type: str, input_size: int, h: int, n_basis: int, n_harmonics: int
 ) -> int:
-    """Total MLP output size (theta) for a given block type."""
+    """Total multilayer perceptron (MLP) output size (theta) for a given block type."""
     if block_type == "identity":
         return input_size + h
     if block_type == "trend":
@@ -232,7 +233,7 @@ class NBEATSBlock(fnn.Module):
         cfg = self.config
         n_out = _n_theta(self.block_type, cfg.input_size, cfg.h, cfg.n_basis, cfg.n_harmonics)
 
-        # FC stack: input_size → (mlp_units [→ LN] → act) × mlp_layers → n_theta
+        # FC stack: input_size → (mlp_units [→ LayerNorm] → act) × mlp_layers → n_theta
         x = residuals
         for layer_idx in range(cfg.mlp_layers):
             x = fnn.Dense(cfg.mlp_units, name=f"fc_{layer_idx}", kernel_init=_HE_UNIFORM)(x)
@@ -297,8 +298,8 @@ class NBEATS(fnn.Module):
     Forward pass:
 
     1. Level init: ``forecast = broadcast(insample_y[:, -1], h)``
-       (Naive1 level — mirrors NeuralForecast exactly).
-    2. ``residuals = flip(insample_y)``  (most-recent step first, NF convention).
+       (Naive1 level, as in neuralforecast).
+    2. ``residuals = flip(insample_y)``  (most-recent step first, the neuralforecast convention).
     3. For each block: ``forecast += block_forecast``; ``residuals -= backcast``.
     4. Return ``forecast``.
 
@@ -320,12 +321,12 @@ class NBEATS(fnn.Module):
         if insample_mask is None:
             insample_mask = jnp.ones_like(insample_y)
 
-        # NF convention: residuals are processed in reversed time order
+        # neuralforecast convention: residuals are processed in reversed time order
         residuals = jnp.flip(insample_y, axis=-1)
         mask_flip = jnp.flip(insample_mask, axis=-1)
 
         # Naive1 level: mean of the last (h//2) observations rather than a
-        # single point — reduces noise sensitivity for stationary/noisy series
+        # single point, which reduces noise sensitivity for stationary/noisy series
         # while staying close to the true level for smooth or trending ones.
         # n_level is a static Python int so XLA sees it as a constant slice.
         n_level = max(1, cfg.h // 2)

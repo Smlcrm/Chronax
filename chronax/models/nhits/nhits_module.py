@@ -2,12 +2,12 @@
 
 NHITS (Challu et al. 2023, arXiv:2201.12886) stacks fully connected blocks
 with doubly residual links. Each block pools the (time-reversed) input window
-at a stack-specific rate, regresses a coefficient vector ``theta`` through an
-MLP, splits it into a backcast — subtracted from the running residual — and a
+at a stack-specific rate, regresses a coefficient vector ``theta`` through a
+multilayer perceptron (MLP), splits it into a backcast, subtracted from the running residual, and a
 small set of forecast knots, and interpolates the knots up to the full
 horizon. Multi-rate pooling and hierarchical interpolation specialize each
 stack to a frequency band. Interpolation is expressed as a constant-matrix
-GEMM (torch's ``F.interpolate`` is a fixed linear operator once sizes and
+general matrix multiply (GEMM) (torch's ``F.interpolate`` is a fixed linear operator once sizes and
 mode are known), so the forward stays a pure matmul pipeline. ``float32``
 throughout.
 """
@@ -56,7 +56,7 @@ class _TorchLinearInit:
         # Value equality. Initializer instances are static graphdef leaves; an
         # identity-based __eq__ makes same-config graphdefs UNEQUAL, so the
         # module-level @nnx.jit inference cache could never hit across nets built
-        # by a later fit — costing a full recompile on every refit->predict.
+        # by a later fit, costing a full recompile on every refit->predict.
         return type(other) is type(self) and other.fan_in == self.fan_in
 
     def __hash__(self):
@@ -74,11 +74,11 @@ def _interp_weights(n_in: int, n_out: int, mode: str) -> np.ndarray:
     interpolate`` along the last axis, so ``knots @ W`` equals the reference
     interpolation.
 
-    ``linear``: align_corners=False — source position ``(j+0.5)*n_in/n_out - 0.5``
+    ``linear``: align_corners=False, source position ``(j+0.5)*n_in/n_out - 0.5``
     clamped at zero, two taps. ``nearest``: ``floor(j * n_in/n_out)``. ``cubic``:
     the reference routes cubic through bicubic on a height-1 image and reads row
     0; every row tap then clamps to the single row (cubic weights sum to one),
-    which collapses to 1-D cubic convolution along the knot axis — Keys kernel
+    which collapses to 1-D cubic convolution along the knot axis, Keys kernel
     ``A=-0.75``, unclamped source position, border-clamped taps. Keyed on
     config-derived statics only; built in float64 once per configuration.
     """
@@ -123,7 +123,7 @@ def _interp_weights(n_in: int, n_out: int, mode: str) -> np.ndarray:
 
 def _pool1d(x: jnp.ndarray, k: int, avg: bool) -> jnp.ndarray:
     """``MaxPool1d``/``AvgPool1d(kernel_size=k, stride=k, ceil_mode=True)`` over
-    the last axis. The average divides by the in-bounds element count only —
+    the last axis. The average divides by the in-bounds element count only,
     torch excludes the ceil-mode overhang from the divisor when there is no
     explicit padding."""
     if k == 1:
@@ -243,7 +243,7 @@ class NHITSNet(nnx.Module):
 
     The scaled insample window is time-reversed once at entry; every block
     consumes and backcasts in that reversed orientation. The forecast
-    accumulator starts at the Naive1 anchor — the window's last value,
+    accumulator starts at the Naive1 anchor, the window's last value,
     broadcast onto ALL ``outputsize_multiplier`` output features (for a
     distribution head that includes the raw pre-``domain_map`` parameters;
     reference behavior, kept). ``mlp_units`` is shared whole by every block

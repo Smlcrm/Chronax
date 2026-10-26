@@ -5,7 +5,7 @@ network. Point losses; intervals via the conformal path. Normalization lives
 inside the network (non-stationary norm), so windows train in original scale;
 optional Box-Cox variance stabilization mirrors the fleet's ``use_boxcox``
 convention (off = faithful port). Exogenous inputs are not modeled in this
-port — without them the reference's cross-attention context is the endogenous
+port, without them the reference's cross-attention context is the endogenous
 variate embedding itself. ``float32`` throughout.
 """
 from __future__ import annotations
@@ -26,7 +26,7 @@ from chronax.utils import ConformalIntervals
 # variance of multiplicative / strongly-trending series before modelling, then
 # invert on the output. ``lambda = 0`` is the log transform. The lambda is
 # selected once at fit time by maximizing the Box-Cox profile log-likelihood
-# (the standard MLE), kept self-contained so this module does not depend on
+# (the standard maximum likelihood estimate, MLE), kept self-contained so this module does not depend on
 # another model's internals.
 
 _BOXCOX_LAMBDA_GRID = jnp.linspace(-1.0, 2.0, 31)  # step 0.1, includes 0.0 (log)
@@ -72,17 +72,54 @@ class TimeXer(BaseForecaster):
     """TimeXer: patch transformer with a global-token exogenous pathway
     (flax.nnx port of neuralforecast.TimeXer).
 
-    Wang et al., 2024 — https://arxiv.org/abs/2402.19072. The endogenous
+    Wang et al., 2024: https://arxiv.org/abs/2402.19072. The endogenous
     window is patch-embedded per variate with one learnable GLOBAL token
     appended; encoder layers self-attend over patch tokens while only the
     global token cross-attends to variate-level embeddings of the full window,
     and a per-variate flatten head maps the token stack onto the horizon,
     wrapped in non-stationary normalization. Historical exogenous inputs
     (``fit(y, X=(T, F))``, ``uses_exog = True``) enter that cross-attention
-    context as one raw variate token per covariate — the reference's pathway;
+    context as one raw variate token per covariate, the reference's pathway;
     it is historical-only (no future-known covariates) and static exog is not
     modeled. Point losses; conformal intervals (unavailable with historical
-    exog — no native interval head). ``float32`` throughout.
+    exog, no native interval head). ``float32`` throughout.
+
+    Args:
+        h (int): Forecast horizon the network is trained for.
+        input_size (int): Input window length ``L``; must be at least
+            ``patch_len``. ``-1`` (default) resolves to ``3 * h``.
+        patch_len (int): Patch length; the window is cut into
+            ``input_size // patch_len`` non-overlapping patches. Default ``16``.
+        hidden_size (int): Token width; must be divisible by ``n_heads``.
+            Default ``512``.
+        n_heads (int): Attention heads. Default ``8``.
+        e_layers (int): Encoder layers. Default ``2``.
+        d_ff (int): Width of the position-wise feed-forward network.
+            Default ``2048``.
+        dropout (float): Dropout rate. Default ``0.1``.
+        use_norm (bool): Apply non-stationary normalization to the target
+            window. Default ``True``.
+        use_boxcox (bool): Box-Cox transform the series before training
+            (lambda chosen by maximum likelihood at ``fit``) and invert on
+            output; requires strictly positive ``y``. Default ``False``.
+        loss (str | callable): ``"mae"``, ``"mse"``, ``"huber"`` or a
+            callable ``(pred, target) -> scalar``. Default ``"mae"``.
+            Unknown names raise ``ValueError`` at ``fit``.
+        max_steps (int): Optimizer steps. Default ``1000``.
+        learning_rate (float): Adam learning rate (constant). Default ``1e-3``.
+        windows_batch_size (int): Training windows per step. Default ``32``.
+        random_seed (int): Seed for parameter init, batch sampling and
+            dropout. Default ``1``.
+        alias (str): Display name. Default ``"TimeXer"``.
+
+    Note:
+        Set ``conformal_params`` to a :class:`~chronax.utils.ConformalIntervals`
+        to enable conformal intervals on an exog-free fit. ``model_`` holds
+        the trained network after ``fit``.
+
+    Raises:
+        ValueError: ``input_size < patch_len``, or ``hidden_size`` not
+            divisible by ``n_heads``.
     """
 
     uses_exog = True
@@ -147,6 +184,23 @@ class TimeXer(BaseForecaster):
 
     # ---- fit -----------------------------------------------------------------
     def fit(self, y, X=None) -> "TimeXer":
+        """Train a fresh network on ``y`` and keep the raw series and exog tail.
+
+        Args:
+            y (jnp.ndarray): Univariate series, shape ``(T,)`` with
+                ``T >= input_size + 1``; strictly positive when
+                ``use_boxcox=True``.
+            X (jnp.ndarray | None): Historical exog aligned with ``y``,
+                shape ``(T, F)``; fed to the network unscaled.
+
+        Returns:
+            TimeXer: ``self``, with ``model_`` set.
+
+        Raises:
+            ValueError: ``y`` is not 1-D, ``T < input_size + 1``, ``X`` has a
+                different length than ``y``, ``use_boxcox=True`` with a
+                non-positive entry in ``y``, or ``loss`` is an unknown name.
+        """
         y = jnp.asarray(y, dtype=jnp.float32)
         if y.ndim != 1:
             raise ValueError(f"y must be 1-D; got shape {y.shape}.")
@@ -156,18 +210,17 @@ class TimeXer(BaseForecaster):
                 f"(need at least input_size+1)."
             )
         # X = historical exog (T, F): known only over the input span (the
-        # reference's TimeXer is historical-only — no future-known pathway). Fed
+        # reference's TimeXer is historical-only, no future-known pathway). Fed
         # to the network raw (only the target is non-stationary-normalized).
         hist_exog = None if X is None else jnp.asarray(X, jnp.float32)
         if hist_exog is not None and hist_exog.shape[0] != y.shape[0]:
             raise ValueError(f"X (historical exog) must align with y at fit (len {y.shape[0]}); got {hist_exog.shape[0]}.")
         self._hist_size = 0 if hist_exog is None else int(hist_exog.shape[1])
         if self.use_boxcox:
-            # Validation and lambda selection are eager-surface operations: a
-            # user-facing fit re-selects lambda for its concrete series, while
-            # conformal-CV re-fits (traced windows of the already-validated
-            # series) reuse the frozen value — the fitted-params-reuse class,
-            # which keeps this whole method vmap-traceable.
+            # Validation and lambda selection need a concrete series. A
+            # user-facing fit re-selects lambda; the conformal cross-validation
+            # re-fits (traced windows of the already-validated series) reuse
+            # the frozen value, which keeps this method vmap-traceable.
             if not (self._bc_frozen and self._bc_lambda is not None):
                 if bool(jnp.any(y <= 0)):
                     raise ValueError(
@@ -187,13 +240,33 @@ class TimeXer(BaseForecaster):
         )
         self.model_ = net
         # Raw series kept so conformity_scores re-applies Box-Cox through the
-        # public forecast API. Covariates kept raw; predict reads the last L rows.
+        # public forecast method. Covariates kept raw; predict reads the last L rows.
         self._train_y = y
         self._hist_ctx = None if hist_exog is None else hist_exog[-self.input_size:]  # [L, X]
         return self
 
     # ---- predict -------------------------------------------------------------
     def predict(self, h, X=None, level=None) -> dict:
+        """Forecast the first ``h`` steps of the trained horizon.
+
+        Args:
+            h (int): Steps to return, ``1 <= h <= self.h``.
+            X (None): Ignored; historical exog is read from the ``fit`` call.
+            level (list[int] | None): Confidence levels in (0, 100), e.g.
+                ``[80, 95]``; conformal intervals, ``conformal_params``
+                required and only on an exog-free fit.
+
+        Returns:
+            dict: ``"mean"`` (shape ``(h,)``) plus ``"lo-{lv}"`` /
+            ``"hi-{lv}"`` (shape ``(h,)``) per level when ``level`` is given.
+
+        Raises:
+            RuntimeError: Called before ``fit``.
+            ValueError: ``h < 1`` or ``h > self.h``; ``level`` on a model fit
+                with ``X``; ``level`` while ``conformal_params`` is ``None``;
+                or, from the conformal path, the series is too short for two
+                cross-validation windows.
+        """
         if self.model_ is None or self._train_y is None:
             raise RuntimeError("Call fit(y) before predict(h).")
         if h < 1:
@@ -227,13 +300,30 @@ class TimeXer(BaseForecaster):
         return fcst
 
     def conformity_scores(self, y, X=None):
-        """Walk-forward conformity scores; with ``use_boxcox=True`` the CV
-        re-fits reuse the lambda frozen by the eager ``fit`` (selection cannot
-        run on traced windows)."""
+        """Walk-forward conformity scores (see the base class).
+
+        With ``use_boxcox=True`` the cross-validation re-fits reuse the
+        lambda frozen by the eager ``fit``, because selection cannot run on
+        traced windows.
+
+        Args:
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            X (None): Historical exog is refused here; conformal intervals
+                need an exog-free fit.
+
+        Returns:
+            jnp.ndarray: Signed residuals, shape ``(n_windows, h)``.
+
+        Raises:
+            ValueError: ``X`` is not ``None``; ``use_boxcox=True`` on an
+                unfitted estimator; ``conformal_params`` is ``None``; or the
+                series is too short for two cross-validation windows.
+        """
         if X is not None:
             # Historical exog uses no conformal path (TimeXer has no native
-            # interval head); guarding here keeps a passed X out of the base CV
-            # vmap, where the refusal could not raise under trace.
+            # interval head); guarding here keeps a passed X out of the base
+            # cross-validation vmap, where the refusal could not raise under
+            # trace.
             raise ValueError(
                 "Conformal intervals are not supported with historical exog. "
                 "Refit without X for conformal intervals, or omit level."
@@ -252,8 +342,27 @@ class TimeXer(BaseForecaster):
 
     # ---- forecast ------------------------------------------------------------
     def forecast(self, y, h, X=None, X_future=None, level=None, fitted=False) -> dict:
-        """Stateless fit-then-predict. ``X`` = historical exog ``(T, F)``; TimeXer
-        is historical-only, so ``X_future`` is unsupported."""
+        """Stateless fit-then-predict.
+
+        Args:
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            h (int): Steps to return, ``1 <= h <= self.h``.
+            X (jnp.ndarray | None): Historical exog aligned with ``y``,
+                shape ``(T, F)``.
+            X_future (None): Must be ``None``; TimeXer has no future-known
+                pathway.
+            level (list[int] | None): Confidence levels in (0, 100).
+            fitted (bool): Also return one-step-ahead in-sample predictions.
+
+        Returns:
+            dict: As :meth:`predict`, plus ``"fitted"`` (shape ``(T,)``, the
+            first ``input_size`` entries ``NaN``) when ``fitted=True``.
+
+        Raises:
+            NotImplementedError: ``X_future`` is not ``None``, or
+                ``fitted=True`` on a model fit with ``X``.
+            ValueError: Any ``fit`` or ``predict`` error.
+        """
         if X_future is not None:
             raise NotImplementedError("TimeXer models historical exog only (no future-known pathway); pass X=, not X_future=.")
         self.fit(y, X=X)

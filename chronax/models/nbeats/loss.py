@@ -1,6 +1,6 @@
 """Loss functions for Chronax N-BEATS.
 
-Mirrors the RNN / Autoformer loss API:
+Mirrors the recurrent neural network (RNN) / Autoformer loss interface:
   masked_mae(y, y_hat, mask=None) -> scalar
   masked_mse(y, y_hat, mask=None) -> scalar
 

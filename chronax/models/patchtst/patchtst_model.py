@@ -15,15 +15,58 @@ from chronax.models.patchtst.patchtst_training import predict_step, train
 class PatchTST(BaseForecaster):
     """Univariate PatchTST forecaster (JAX/Flax-NNX port of neuralforecast.PatchTST).
 
-    Maintenance Status:
+    The encoder patches the input window, embeds each patch, and runs a stack
+    of transformer layers (residual attention + BatchNorm + GELU feed-forward)
+    with reversible instance normalization (RevIN) applied inside the network.
+    Trained in original scale with Optax ``adam`` and a pluggable point loss.
+    ``float32`` throughout. Defaults match neuralforecast.PatchTST.
+
+    Maintenance status:
         Active univariate forecaster. Integrates with the ``BaseForecaster``
         interface, including conformal prediction intervals via
         ``predict(level=...)``, pickle round-trip, and ``forecast(fitted=True)``.
 
-    The encoder patches the input window, embeds each patch, and runs a stack of
-    transformer layers (residual attention + BatchNorm + GELU feed-forward) with
-    RevIN normalization applied inside the network. Trained in original scale
-    with Optax ``adam`` and a pluggable point loss. ``float32`` throughout.
+    Args:
+        h (int): Forecast horizon.
+        input_size (int): Input window length. Any value ``< 1`` (default
+            ``-1``) resolves to ``3 * h``.
+        patch_len (int): Patch length; clamped to ``input_size + stride`` as in
+            neuralforecast. Default ``16``.
+        stride (int): Patch stride. Default ``8``.
+        hidden_size (int): Patch embedding width. Default ``128``.
+        n_heads (int): Attention heads. Default ``16``.
+        encoder_layers (int): Encoder layers. Default ``3``.
+        linear_hidden_size (int): Feed-forward hidden width. Default ``256``.
+        dropout (float): Dropout rate in the patch embedding and encoder
+            layers. Default ``0.2``.
+        fc_dropout (float): Accepted for neuralforecast-signature parity;
+            inert, because neuralforecast uses it only in its disabled
+            pretrain head. Default ``0.2``.
+        head_dropout (float): Dropout rate on the flatten head. Default
+            ``0.0``.
+        attn_dropout (float): Dropout rate on the attention weights. Default
+            ``0.0``.
+        activation (str): ``"gelu"`` or ``"relu"``. Default ``"gelu"``.
+        revin (bool): Apply RevIN. Default ``True``.
+        revin_affine (bool): Learn an affine weight and bias inside RevIN.
+            Default ``False``.
+        revin_subtract_last (bool): Subtract the last window value instead of
+            the mean inside RevIN. Default ``True``.
+        max_steps (int): Number of Adam steps. Default ``5000``.
+        learning_rate (float | Callable[[int], float]): Adam learning rate, a
+            scalar or an ``optax`` schedule. Default ``1e-4``.
+        windows_batch_size (int): Rolling windows sampled per step. Default
+            ``1024``.
+        random_seed (int): Seed for parameter init, dropout and window
+            sampling. Default ``1``.
+        alias (str): Display name. Default ``"PatchTST"``.
+        loss (str | LossFn): Registry name (``"mae"``, ``"mse"``, ``"huber"``)
+            or a callable. Default ``"mae"``.
+
+    Note:
+        A callable ``loss`` or ``learning_rate`` must itself be picklable for
+        the fitted estimator to pickle. An unknown ``loss`` name raises
+        ``ValueError`` at ``fit`` time.
     """
 
     uses_exog = False
@@ -113,20 +156,26 @@ class PatchTST(BaseForecaster):
     def fit(self, y: jnp.ndarray, X: jnp.ndarray | None = None) -> "PatchTST":
         """Fit the network on a 1-D series.
 
-        Builds the network and runs ``max_steps`` Adam steps over rolling windows
-        of length ``input_size + h``, sampled per step the way neuralforecast does.
+        Builds the network and runs ``max_steps`` Adam steps over rolling
+        windows of length ``input_size + h``, sampled per step the way
+        neuralforecast does.
 
         Args:
-            y: 1-D series of length ``>= input_size + h``.
-            X: Reserved for exogenous regressors; must be None.
+            y (jnp.ndarray): Univariate series, shape ``(T,)`` with
+                ``T >= input_size + h``.
+            X (jnp.ndarray | None): Exogenous regressors. Not supported; must
+                be ``None``.
 
         Returns:
-            PatchTST: ``self``, with ``model_`` populated.
+            PatchTST: ``self`` with ``model_`` populated.
 
         Raises:
-            NotImplementedError: If ``X`` is provided.
-            ValueError: If ``y`` is not 1-D or is shorter than ``input_size + h``.
-            RuntimeError: If a non-finite training loss is observed (divergence).
+            NotImplementedError: If ``X`` is not ``None``.
+            ValueError: If ``y`` is not 1-D, if it is shorter than
+                ``input_size + h``, or if ``loss`` is an unknown
+                registry name.
+            RuntimeError: If a non-finite training loss is observed (the
+                training run diverged).
         """
         if X is not None:
             raise NotImplementedError("Exogenous variables are not supported.")
@@ -157,24 +206,28 @@ class PatchTST(BaseForecaster):
     ) -> dict:
         """Forecast ``h`` steps from the fitted context.
 
+        The network is direct-decoded for ``self.h`` steps and the first ``h``
+        are returned.
+
         Args:
-            h: Forecast horizon; must satisfy ``1 <= h <= self.h`` (the model is
-                direct-decoded for ``self.h`` steps and sliced).
-            X: Reserved for exogenous regressors; ignored.
-            level: Optional confidence levels (e.g. ``[80, 95]``). When set,
-                returns conformal ``lo-XX``/``hi-XX`` keys via the inherited
-                ``BaseForecaster`` path and requires ``self.conformal_params``.
-                Each call re-fits the model per CV window under ``vmap`` — on a
-                full PatchTST this costs minutes.
+            h (int): Forecast horizon, ``1 <= h <= self.h``.
+            X (jnp.ndarray | None): Exogenous regressors. Ignored.
+            level (list[int | float] | None): Confidence levels in (0, 100),
+                e.g. ``[80, 95]``. When given, conformal intervals come from
+                ``BaseForecaster.conformity_scores``, which re-fits the model on
+                every cross-validation (CV) window under ``vmap``; requires
+                ``self.conformal_params``. Expect minutes per call on this
+                model, scaling with ``n_windows`` and ``max_steps``.
 
         Returns:
-            dict: ``{"mean": jnp.ndarray of shape (h,)}`` plus interval keys when
-            ``level`` is provided.
+            dict: ``"mean"`` (shape ``(h,)``) plus ``"lo-{lv}"`` and
+            ``"hi-{lv}"`` (shape ``(h,)``) for each level when ``level`` is
+            given.
 
         Raises:
             RuntimeError: If called before ``fit``.
-            ValueError: If ``h < 1`` or ``h > self.h``, or if ``level`` is given
-                without ``self.conformal_params`` set.
+            ValueError: If ``h < 1``, if ``h > self.h``, or if ``level`` is
+                given while ``self.conformal_params`` is ``None``.
         """
         if self.model_ is None or self._context is None:
             raise RuntimeError("Call fit(y) before predict(h).")
@@ -213,25 +266,32 @@ class PatchTST(BaseForecaster):
         level: list[int | float] | None = None,
         fitted: bool = False,
     ) -> dict:
-        """Stateless fit-then-predict on ``y``.
+        """Fit on ``y`` and forecast ``h`` steps in one call.
 
-        Equivalent to ``self.fit(y).predict(h=h, level=level)``, optionally adding
-        a ``"fitted"`` key with one-step-ahead in-sample predictions.
+        Equivalent to ``self.fit(y).predict(h=h, level=level)``; the fitted
+        state stays on the estimator.
 
         Args:
-            y: 1-D training series.
-            h: Forecast horizon (``<= self.h``).
-            X / X_future: Reserved for exogenous regressors; must be None.
-            level: Optional confidence levels; see ``predict``.
-            fitted: If True, include ``"fitted"`` — one-step-ahead values over the
-                training series, NaN for the first ``input_size`` entries.
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            h (int): Forecast horizon, ``1 <= h <= self.h``.
+            X (jnp.ndarray | None): Exogenous regressors. Not supported; must
+                be ``None``.
+            X_future (jnp.ndarray | None): Future exogenous regressors. Not
+                supported; must be ``None``.
+            level (list[int | float] | None): Confidence levels; see
+                ``predict``.
+            fitted (bool): If ``True``, add a ``"fitted"`` key with
+                one-step-ahead in-sample predictions, shape ``(T,)``; the first
+                ``input_size`` entries are NaN.
 
         Returns:
-            dict: ``{"mean": ..., optional "fitted": ...}``.
+            dict: ``"mean"`` (shape ``(h,)``), the interval keys when ``level``
+            is given, and ``"fitted"`` when ``fitted=True``.
 
         Raises:
-            NotImplementedError: If ``X`` or ``X_future`` is provided.
-            ValueError / RuntimeError: Forwarded from ``fit`` / ``predict``.
+            NotImplementedError: If ``X`` or ``X_future`` is not ``None``.
+            ValueError: Forwarded from ``fit`` and ``predict``.
+            RuntimeError: Forwarded from ``fit`` and ``predict``.
         """
         if X is not None or X_future is not None:
             raise NotImplementedError("Exogenous variables are not supported.")

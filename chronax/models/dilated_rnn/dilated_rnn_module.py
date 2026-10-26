@@ -1,9 +1,11 @@
 """Flax NNX modules for the DilatedRNN forecaster.
 
 Univariate JAX/Flax-NNX port of ``neuralforecast.DilatedRNN`` (Chang et al. 2017,
-"Dilated Recurrent Neural Networks", arXiv:1710.02224).
+"Dilated Recurrent Neural Networks", arXiv:1710.02224; RNN = recurrent neural
+network).
 
-Architecture, following NF's ``DilatedRNN.forward`` exactly:
+Architecture, following neuralforecast's ``DilatedRNN.forward`` exactly (MLP =
+multilayer perceptron):
 
     [B, L, 1] --(stack of DRNN groups, residual between groups)--> [B, L, H]
              --transpose--> [B, H, L] --context_adapter Linear(L -> h)--> [B, H, h]
@@ -15,24 +17,25 @@ sequence *subsampled by its dilation rate*: at rate ``r`` the length-``T`` seque
 is split into ``r`` interleaved subsequences that are processed as ``r`` extra
 batch rows, so one cell pass covers ``T/r`` timesteps and the cell's receptive
 field grows geometrically with depth at constant cost. Between groups (not within
-one) NF adds a residual connection.
+one) neuralforecast adds a residual connection.
 
-The dilation is implemented as pure reshapes rather than NF's Python list
+The dilation is implemented as pure reshapes rather than neuralforecast's Python list
 comprehensions:
 
-* pack   ``[T, B, F] -> [T/r, r*B, F]`` (``inputs.reshape``) — column block ``i``
-  holds ``inputs[i::r]``, which is exactly NF ``_prepare_inputs``' concat;
-* unpack ``[T/r, r*B, H] -> [T, B, H]`` (``outputs.reshape``) — the row-major
-  interleave NF's ``_split_outputs`` builds by stack/transpose/reshape.
+* pack   ``[T, B, F] -> [T/r, r*B, F]`` (``inputs.reshape``), column block ``i``
+  holds ``inputs[i::r]``, which is exactly neuralforecast ``_prepare_inputs``' concat;
+* unpack ``[T/r, r*B, H] -> [T, B, H]`` (``outputs.reshape``), the row-major
+  interleave neuralforecast's ``_split_outputs`` builds by stack/transpose/reshape.
 
-Both identities are pinned by tests against a literal transcription of NF's
+Both reshapes give the same result as neuralforecast's list-comprehension
 version. Sequences whose length is not a multiple of ``r`` are zero-padded at the
-END and truncated after unpacking, as NF does.
+END and truncated after unpacking, as neuralforecast does.
 
-Five cell types are supported, matching NF: ``GRU``, ``RNN``, ``LSTM`` (torch's
+Five cell types are supported, matching neuralforecast: ``GRU`` (gated recurrent
+unit), ``RNN``, ``LSTM`` (long short-term memory) (torch's
 built-in cells, initialized ``U(-1/sqrt(H), 1/sqrt(H))`` like ``nn.GRU`` &c.), plus
-NF's own ``ResLSTM`` and ``AttentiveLSTM`` (whose parameters NF initializes with
-``torch.randn``, i.e. standard normal — reproduced here, unusual as it is, because
+neuralforecast's own ``ResLSTM`` and ``AttentiveLSTM`` (whose parameters
+neuralforecast initializes with ``torch.randn``, i.e. standard normal, reproduced here, unusual as it is, because
 it materially changes the training trajectory).
 
 ``float32`` throughout.
@@ -52,7 +55,7 @@ class _TorchLinearInit:
     torch draws both weight and bias from ``U(-1/sqrt(fan_in), 1/sqrt(fan_in))``
     (Kaiming-uniform with ``a=sqrt(5)`` reduces to this bound). Flax's
     ``nnx.Linear`` defaults to ``lecun_normal`` instead, so matching torch here is
-    what makes training trajectories — and thus accuracy — comparable to
+    what makes training trajectories, and thus accuracy, comparable to
     neuralforecast.
     """
 
@@ -70,7 +73,7 @@ class _TorchRNNInit:
     """Picklable initializer matching torch's built-in ``nn.RNN``/``GRU``/``LSTM``.
 
     ``reset_parameters`` draws EVERY weight and bias from
-    ``U(-1/sqrt(hidden_size), 1/sqrt(hidden_size))`` — note the bound depends on
+    ``U(-1/sqrt(hidden_size), 1/sqrt(hidden_size))``, note the bound depends on
     the hidden size, not on the layer's fan-in.
     """
 
@@ -87,7 +90,7 @@ class _TorchRNNInit:
 class _StandardNormalInit:
     """Picklable ``torch.randn`` initializer (standard normal, no fan-in scaling).
 
-    NF's hand-written ``LSTMCell`` / ``ResLSTMCell`` allocate every parameter with
+    neuralforecast's hand-written ``LSTMCell`` / ``ResLSTMCell`` allocate every parameter with
     ``torch.randn(...)``. That is a much wider init than torch's built-in cells
     use; it is reproduced verbatim so the ``ResLSTM`` / ``AttentiveLSTM`` cell types
     train along the same trajectory as the reference.
@@ -116,7 +119,7 @@ class _CellBase(nnx.Module):
     is_lstm: bool = False
 
     def init_carry(self, batch: int):
-        """Zero initial state, matching NF's ``torch.zeros`` hidden."""
+        """Zero initial state, matching neuralforecast's ``torch.zeros`` hidden."""
         h = jnp.zeros((batch, self.hidden_size), dtype=jnp.float32)
         return (h, h) if self.is_lstm else h
 
@@ -184,7 +187,7 @@ class LSTMCell(_CellBase):
     ``gates = x W_ih^T + b_ih + h W_hh^T + b_hh``; ``c' = f * c + i * g``;
     ``h' = o * tanh(c')``. Used both for ``cell_type="LSTM"`` (torch's built-in
     ``nn.LSTM``, hence the ``U(-1/sqrt(H))`` init) and, with a standard-normal init,
-    inside :class:`AttentiveLSTMLayer` (NF's hand-written cell).
+    inside :class:`AttentiveLSTMLayer` (neuralforecast's hand-written cell).
     """
 
     is_lstm = True
@@ -210,15 +213,15 @@ class LSTMCell(_CellBase):
 
 
 class ResLSTMCell(_CellBase):
-    """NF's residual LSTM cell (``cell_type="ResLSTM"``).
+    """neuralforecast's residual LSTM cell (``cell_type="ResLSTM"``).
 
-    Differs from a plain LSTM in three ways, per NF ``ResLSTMCell``:
+    Differs from a plain LSTM in three ways, per neuralforecast ``ResLSTMCell``:
     the input, forget and output gates each read the CELL state as well
     (``+ c W_ic^T + b_ic``); the candidate is a plain affine map of ``h`` only
-    (``W_hh h + b_hh``, no input term); and the output is residual —
+    (``W_hh h + b_hh``, no input term); and the output is residual,
     ``h' = o * (tanh(c') + x)`` when ``input_size == hidden_size``, otherwise
     ``h' = o * (tanh(c') + x W_ir^T)`` with a bias-free projection. All parameters
-    use NF's ``torch.randn`` init.
+    use neuralforecast's ``torch.randn`` init.
     """
 
     is_lstm = True
@@ -231,7 +234,7 @@ class ResLSTMCell(_CellBase):
         self.ih = nnx.Linear(hidden_size, 3 * hidden_size, kernel_init=init, bias_init=init, rngs=rngs)
         self.ic = nnx.Linear(hidden_size, 3 * hidden_size, kernel_init=init, bias_init=init, rngs=rngs)
         self.hh = nnx.Linear(hidden_size, hidden_size, kernel_init=init, bias_init=init, rngs=rngs)
-        # NF allocates weight_ir unconditionally but only applies it when the
+        # neuralforecast allocates weight_ir unconditionally but only applies it when the
         # shapes differ; mirrored so the parameter count matches either way.
         self.ir = nnx.Linear(input_size, hidden_size, use_bias=False, kernel_init=init, rngs=rngs)
 
@@ -251,11 +254,11 @@ class ResLSTMCell(_CellBase):
 
 
 class AttentiveLSTMLayer(_CellBase):
-    """NF's attentive LSTM layer (``cell_type="AttentiveLSTM"``).
+    """neuralforecast's attentive LSTM layer (``cell_type="AttentiveLSTM"``).
 
     At every step the layer scores ALL timesteps of the (dilated) input against
-    the current state and feeds the attention-weighted average — not the current
-    timestep — to an LSTM cell::
+    the current state and feeds the attention-weighted average, not the current
+    timestep, to an LSTM cell::
 
         score_t = W2 tanh(W1 [x_t, h, c])        for every t in the window
         beta    = softmax(score, over time)
@@ -263,8 +266,8 @@ class AttentiveLSTMLayer(_CellBase):
         h, c    = LSTMCell(context, (h, c))
 
     Because the scored tensor is the whole window and the loop index is otherwise
-    unused, the recurrence has no per-step input — ``run_sequence`` scans over a
-    length-``T`` dummy axis with the window closed over, which is exactly NF's
+    unused, the recurrence has no per-step input, ``run_sequence`` scans over a
+    length-``T`` dummy axis with the window closed over, which is exactly neuralforecast's
     ``for t in range(len(inputs))``.
     """
 
@@ -308,7 +311,7 @@ CELL_TYPES = ("GRU", "RNN", "LSTM", "ResLSTM", "AttentiveLSTM")
 
 
 def make_cell(cell_type: str, input_size: int, hidden_size: int, *, rngs: nnx.Rngs) -> _CellBase:
-    """Build one recurrent cell by NF's ``cell_type`` name."""
+    """Build one recurrent cell by neuralforecast's ``cell_type`` name."""
     if cell_type == "GRU":
         return GRUCell(input_size, hidden_size, rngs=rngs)
     if cell_type == "RNN":
@@ -327,7 +330,7 @@ def make_cell(cell_type: str, input_size: int, hidden_size: int, *, rngs: nnx.Rn
 # =============================================================================
 
 def pad_inputs(inputs: jnp.ndarray, rate: int) -> jnp.ndarray:
-    """Zero-pad the TIME axis up to a multiple of ``rate`` (NF ``_pad_inputs``)."""
+    """Zero-pad the TIME axis up to a multiple of ``rate`` (neuralforecast ``_pad_inputs``)."""
     n_steps = inputs.shape[0]
     remainder = (-n_steps) % rate
     if remainder == 0:
@@ -337,10 +340,10 @@ def pad_inputs(inputs: jnp.ndarray, rate: int) -> jnp.ndarray:
 
 
 def prepare_inputs(inputs: jnp.ndarray, rate: int) -> jnp.ndarray:
-    """``[T, B, F] -> [T/r, r*B, F]``; requires ``T % r == 0`` (NF ``_prepare_inputs``).
+    """``[T, B, F] -> [T/r, r*B, F]``; requires ``T % r == 0`` (neuralforecast ``_prepare_inputs``).
 
     Column block ``i`` (columns ``i*B : (i+1)*B``) carries ``inputs[i::r]``, matching
-    NF's ``torch.cat([inputs[j::rate] for j in range(rate)], 1)`` — row-major
+    neuralforecast's ``torch.cat([inputs[j::rate] for j in range(rate)], 1)``, row-major
     reshape reproduces that concat exactly, because element ``[s, i]`` of the
     ``(T/r, r)``-split time axis is timestep ``s*r + i``.
     """
@@ -351,7 +354,7 @@ def prepare_inputs(inputs: jnp.ndarray, rate: int) -> jnp.ndarray:
 
 
 def split_outputs(dilated_outputs: jnp.ndarray, rate: int) -> jnp.ndarray:
-    """``[T/r, r*B, H] -> [T, B, H]`` (NF ``_split_outputs``), the inverse interleave."""
+    """``[T/r, r*B, H] -> [T, B, H]``, the inverse interleave (neuralforecast ``_split_outputs``)."""
     n_dilated, wide_batch, hidden = dilated_outputs.shape
     if wide_batch % rate != 0:
         raise ValueError(f"batch {wide_batch} is not a multiple of rate {rate}")
@@ -371,7 +374,7 @@ def drnn_layer(cell: _CellBase, inputs: jnp.ndarray, rate: int) -> jnp.ndarray:
 class DRNN(nnx.Module):
     """One dilated-RNN group: ``len(dilations)`` stacked layers, one per rate.
 
-    Layer ``i`` consumes layer ``i-1``'s output at dilation ``dilations[i]``. NF's
+    Layer ``i`` consumes layer ``i-1``'s output at dilation ``dilations[i]``. neuralforecast's
     ``DRNN`` also returns a list of per-layer tails (``inputs[-dilation:]``); nothing
     downstream reads it, so it is not built here.
     """
@@ -390,7 +393,7 @@ class DRNN(nnx.Module):
         ]
 
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        """x: [B, T, F] (batch-first, as NF's ``batch_first=True``) -> [B, T, H]."""
+        """x: [B, T, F] (batch-first, as neuralforecast's ``batch_first=True``) -> [B, T, H]."""
         h = jnp.transpose(x, (1, 0, 2))              # -> time-first
         for cell, rate in zip(self.cells, self.dilations):
             h = drnn_layer(cell, h, rate)
@@ -398,7 +401,7 @@ class DRNN(nnx.Module):
 
 
 class MLPDecoder(nnx.Module):
-    """NF ``common._modules.MLP`` with ReLU and dropout=0.0.
+    """neuralforecast ``common._modules.MLP`` with ReLU and dropout=0.0.
 
     ``num_layers=1`` is a bare ``Linear(in -> out)`` with no activation;
     ``num_layers=n >= 2`` is ``Linear(in -> hidden)``, then ``n - 2`` hidden
@@ -471,7 +474,7 @@ class DilatedRNNNet(nnx.Module):
         """x: [B, L, in_features] -> [B, h, 1].
 
         ``deterministic`` is accepted for interface symmetry with the other neural
-        ports; DilatedRNN has no stochastic layers (NF builds its decoder with
+        ports; DilatedRNN has no stochastic layers (neuralforecast builds its decoder with
         ``dropout=0.0`` and its cells never dropout at one layer per RNN), so the
         flag changes nothing.
         """

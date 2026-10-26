@@ -1,13 +1,13 @@
-"""Flax NNX module for the MLP forecaster (port of neuralforecast.MLP).
+"""Flax NNX module for the multilayer perceptron (MLP) forecaster (port of neuralforecast.MLP).
 
-The network flattens its inputs — the scaled insample target, the
+The network flattens its inputs, the scaled insample target, the
 historical exogenous window over the input span, and the future-known
 exogenous window spanning input and horizon (each present only when its
-feature count is nonzero) — into one vector, passes it through ``num_layers``
+feature count is nonzero), into one vector, passes it through ``num_layers``
 fully connected layers with a ReLU after every one, and projects with a
 separate raw output head whose width is ``h * outputsize_multiplier`` (the
 multiplier is loss-driven: 1 for point losses, Q for multi-quantile heads,
-``(2+weighted)*K`` for the GMM distribution head). The flatten order is
+``(2+weighted)*K`` for the Gaussian mixture model (GMM) distribution head). The flatten order is
 ``[insample | hist | futr]``, matching the reference so a weight transplant
 lines up column-for-column. ``float32`` throughout.
 """
@@ -41,7 +41,7 @@ class _TorchLinearInit:
         # Value equality. Initializer instances are static graphdef leaves; an
         # identity-based __eq__ makes same-config graphdefs UNEQUAL, so the
         # module-level @nnx.jit inference cache could never hit across nets built
-        # by a later fit — costing a full recompile on every refit->predict.
+        # by a later fit, costing a full recompile on every refit->predict.
         return type(other) is type(self) and other.fan_in == self.fan_in
 
     def __hash__(self):
@@ -63,7 +63,7 @@ class MLPNet(nnx.Module):
     ``input_size``, concatenated (when the corresponding feature count is
     nonzero) with the row-major flattened historical exog window of shape
     ``[input_size, F_hist]`` and then the future-known exog window of shape
-    ``[input_size + h, F_futr]`` — hist before futr, matching the reference.
+    ``[input_size + h, F_futr]``, hist before futr, matching the reference.
     """
 
     def __init__(

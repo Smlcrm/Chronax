@@ -1,4 +1,4 @@
-"""Chronax RNN — JAX/Flax port of Nixtla NeuralForecast's RNN model."""
+"""Chronax recurrent neural network (RNN): JAX/Flax port of Nixtla neuralforecast's RNN model."""
 
 from chronax.models.rnn.data import (
     align_covariates,

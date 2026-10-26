@@ -40,17 +40,63 @@ class StemGNN(BaseForecaster):
     """StemGNN: Spectral Temporal Graph Neural Network
     (flax.nnx port of neuralforecast's StemGNN).
 
-    Cao et al., 2020 -- https://arxiv.org/abs/2103.07719. A latent correlation
-    layer (GRU over the series axis + additive attention) learns a graph over
-    series; two residual ``StockBlockLayer`` stacks apply a 4-term Chebyshev
-    "GFT" of its normalized Laplacian, a 4-point DFT over the Chebyshev-order
-    axis with GLU filtering (the Spe-Seq cell), a per-order graph-conv kernel,
-    and sigmoid-gated forecast/backcast heads; a final MLP maps to the horizon.
-    Trained with a StepLR schedule (``num_lr_decays``). This wrapper is
-    univariate (``n_series = 1`` internally — see the module docstring for the
-    N=1 degeneracy and the ``chebyshev_first_term`` escape hatch). No exogenous
-    support. Point or multi-quantile losses; conformal or native quantile
-    intervals. ``float32`` throughout.
+    Cao et al., 2020: https://arxiv.org/abs/2103.07719. A latent correlation
+    layer (a gated recurrent unit (GRU) over the series axis + additive
+    attention) learns a graph over series; two residual ``StockBlockLayer``
+    stacks apply a 4-term Chebyshev graph Fourier transform of its normalized
+    Laplacian, a 4-point discrete Fourier transform (DFT) over the
+    Chebyshev-order axis with gated linear unit (GLU) filtering (the Spe-Seq
+    cell), a per-order graph-conv kernel, and sigmoid-gated forecast/backcast
+    heads; a final multilayer perceptron (MLP) maps to the horizon. Trained
+    with a step learning-rate schedule (``num_lr_decays``). This wrapper is
+    univariate (``n_series = 1`` internally, see the module docstring for the
+    N=1 degeneracy and the ``chebyshev_first_term`` escape hatch). No
+    exogenous support. Point or multi-quantile losses; conformal or native
+    quantile intervals. ``float32`` throughout.
+
+    Args:
+        h (int): Forecast horizon the network is trained for.
+        input_size (int): Input window length ``L``. ``-1`` (default)
+            resolves to ``3 * h``.
+        n_stacks (int): Residual block stacks; only ``2`` is supported.
+            Default ``2``.
+        multi_layer (int): Width multiplier of the Spe-Seq cell (per-order
+            feature width ``multi_layer * L``). Default ``5``.
+        dropout_rate (float): Dropout on the latent-correlation attention.
+            Default ``0.5``.
+        leaky_rate (float): Negative slope of the leaky ReLU in the latent
+            correlation layer. Default ``0.2``.
+        max_steps (int): Optimizer steps. Default ``1000``.
+        learning_rate (float): Initial Adam learning rate. Default ``1e-3``.
+        num_lr_decays (int): Halve the learning rate every
+            ``max_steps // num_lr_decays`` steps (torch ``StepLR`` with
+            ``gamma=0.5``); ``<= 0`` keeps it constant. Default ``3``.
+        windows_batch_size (int): Training windows per step. Default ``32``.
+        scaler_type (str | Scaler): Per-window scaler, ``"identity"`` or
+            ``"robust"`` (median / mean absolute deviation), or a ``Scaler``
+            instance. Default ``"robust"``. Resolved at ``fit``.
+        loss (str | callable | MultiQuantileLoss): ``"mae"``, ``"mse"``,
+            ``"huber"``, a callable ``(pred, target) -> scalar``, or a
+            :class:`~chronax.models.stemgnn.stemgnn_losses.MultiQuantileLoss`
+            for native quantile intervals. Default ``"mae"``. Unknown names
+            raise ``ValueError`` at ``fit``.
+        quantile_sort (bool): Sort quantile outputs so they do not cross.
+            Default ``True``.
+        chebyshev_first_term (str): ``"nf_zero"`` (the neuralforecast
+            ``T0 = 0`` basis; degenerate at one series) or ``"identity"``
+            (the paper's ``T0 = I``). Default ``"nf_zero"``.
+        random_seed (int): Seed for parameter init, batch sampling and
+            dropout. Default ``1``.
+        alias (str): Display name. Default ``"StemGNN"``.
+
+    Note:
+        Set ``conformal_params`` to a :class:`~chronax.utils.ConformalIntervals`
+        to enable conformal intervals on a point-loss model. ``model_`` holds
+        the trained network after ``fit``.
+
+    Raises:
+        ValueError: ``n_stacks != 2``, or ``chebyshev_first_term`` not
+            ``"nf_zero"``/``"identity"``.
     """
 
     uses_exog = False
@@ -111,6 +157,21 @@ class StemGNN(BaseForecaster):
 
     # ---- fit -----------------------------------------------------------------
     def fit(self, y, X=None) -> "StemGNN":
+        """Train a fresh network on ``y`` and store the tail context.
+
+        Args:
+            y (jnp.ndarray): Univariate series, shape ``(T,)`` with
+                ``T >= input_size + 1``.
+            X (None): Exogenous inputs are not modeled; any value raises.
+
+        Returns:
+            StemGNN: ``self``, with ``model_`` set.
+
+        Raises:
+            NotImplementedError: ``X`` is not ``None``.
+            ValueError: ``y`` is not 1-D, ``T < input_size + 1``, or ``loss`` /
+                ``scaler_type`` is an unknown name.
+        """
         if X is not None:
             raise NotImplementedError("Exogenous variables are not supported.")
         y = jnp.asarray(y, dtype=jnp.float32)
@@ -136,6 +197,31 @@ class StemGNN(BaseForecaster):
 
     # ---- predict -------------------------------------------------------------
     def predict(self, h, X=None, level=None) -> dict:
+        """Forecast the first ``h`` steps of the trained horizon.
+
+        Args:
+            h (int): Steps to return, ``1 <= h <= self.h``.
+            X (None): Ignored.
+            level (list[int] | None): Confidence levels in (0, 100), e.g.
+                ``[80, 95]``. With a point loss the intervals are conformal
+                (``conformal_params`` required); with a
+                ``MultiQuantileLoss`` they are read from the trained
+                quantiles.
+
+        Returns:
+            dict: ``"mean"`` (shape ``(h,)``; the 0.5-quantile head for a
+            quantile loss) plus ``"lo-{lv}"`` / ``"hi-{lv}"`` (shape ``(h,)``)
+            per level when ``level`` is given.
+
+        Raises:
+            RuntimeError: Called before ``fit``.
+            ValueError: ``h < 1`` or ``h > self.h``; ``level`` with a point
+                loss while ``conformal_params`` is ``None``; ``level`` with a
+                quantile loss whose quantiles do not contain
+                ``(100 - lv) / 200`` and ``1 - (100 - lv) / 200``. The
+                conformal path also raises the base-class ``ValueError`` when
+                the series is too short for two cross-validation windows.
+        """
         if self.model_ is None or self._context is None:
             raise RuntimeError("Call fit(y) before predict(h).")
         if h < 1:
@@ -189,7 +275,24 @@ class StemGNN(BaseForecaster):
 
     # ---- forecast ------------------------------------------------------------
     def forecast(self, y, h, X=None, X_future=None, level=None, fitted=False) -> dict:
-        """Stateless fit-then-predict. Exogenous inputs are unsupported."""
+        """Stateless fit-then-predict.
+
+        Args:
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            h (int): Steps to return, ``1 <= h <= self.h``.
+            X (None): Must be ``None`` (refused by ``fit``).
+            X_future (None): Must be ``None``.
+            level (list[int] | None): Confidence levels in (0, 100).
+            fitted (bool): Also return one-step-ahead in-sample predictions.
+
+        Returns:
+            dict: As :meth:`predict`, plus ``"fitted"`` (shape ``(T,)``, the
+            first ``input_size`` entries ``NaN``) when ``fitted=True``.
+
+        Raises:
+            NotImplementedError: ``X`` or ``X_future`` is not ``None``.
+            ValueError: Any ``fit`` or ``predict`` error.
+        """
         if X_future is not None:
             raise NotImplementedError("Exogenous variables are not supported.")
         self.fit(y, X=X)

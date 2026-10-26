@@ -34,14 +34,14 @@ python benchmarks/neural/run.py --models GRU
 # one dataset
 python benchmarks/neural/run.py --datasets AirlinePassengers
 
-# Chronax only — no neuralforecast venv needed
+# Chronax only, no neuralforecast venv needed
 python benchmarks/neural/run.py --libs chronax
 
 # resume a crashed run
 python benchmarks/neural/run.py --resume
 ```
 
-Models are auto-discovered from `chronax.models` — any neural forecaster in the
+Models are auto-discovered from `chronax.models`: any neural forecaster in the
 library's public list is benchmarked automatically, no wiring needed. Datasets and
 run parameters (horizon, lookback, seeds, threads) are defined in
 `benchmarks/neural/config.yaml`, along with optional per-model overrides.
@@ -55,8 +55,8 @@ Each entry under `datasets:` has a `kind` (default `univariate`):
 | kind | Config fields | Evaluation |
 |------|---------------|------------|
 | `univariate` | `y_col` | 1-D target (legacy Airline / Births / RoomTemp) |
-| `multivariate` | `y_cols` (2–4) | joint targets; Chronax fits each channel independently; NF uses one `unique_id` per channel and `n_series=N` when required |
-| `covariate` | `y_col` + `hist_exog_cols` | target + exogenous; Chronax passes `X`/`futr_exog` only when `uses_exog=True`; NF sets `hist_exog_list` / `futr_exog_list` when the model accepts them |
+| `multivariate` | `y_cols` (2 to 4) | joint targets; Chronax fits each channel independently; neuralforecast uses one `unique_id` per channel and `n_series=N` when required |
+| `covariate` | `y_col` + `hist_exog_cols` | target + exogenous; Chronax passes `X`/`futr_exog` only when `uses_exog=True`; neuralforecast sets `hist_exog_list` / `futr_exog_list` when the model accepts them |
 
 Optional per-dataset `h` / `input_size` override the experiment defaults (used for short GA4 series).
 
@@ -81,7 +81,7 @@ python benchmarks/neural/import_tempus_datasets.py
 
 ## Output
 
-Results go to `benchmarks/benchmark_results/neural/` (gitignored) — per-run CSVs
+Results go to `benchmarks/benchmark_results/neural/` (gitignored): per-run CSVs
 plus a printed accuracy/speed comparison. Committed reference baselines live under
 `benchmarks/baselines/`:
 

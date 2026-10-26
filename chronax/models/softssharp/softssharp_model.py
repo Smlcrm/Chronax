@@ -63,33 +63,76 @@ def _select_boxcox_lambda(y: jnp.ndarray) -> float:
 class SOFTSSharp(BaseForecaster):
     """Univariate SOFTSSharp forecaster (JAX/Flax-NNX port of neuralforecast.SOFTSSharp).
 
-    Maintenance Status:
-        Active univariate forecaster. Integrates with the ``BaseForecaster``
-        interface, including conformal prediction intervals via ``predict(level=...)``,
-        pickle round-trip, and ``forecast(fitted=True)``.
+    SOFTSSharp (SOFTS#) extends SOFTS (Han et al. 2024, "SOFTS: Efficient
+    Multivariate Time Series Forecasting with Series-Core Fusion") with two
+    regularizers inside the STAD (STar Aggregate-Dispatch) series-core fusion
+    block:
 
-    SOFTSSharp (SOFTS#) extends SOFTS (Han et al. 2024, "SOFTS: Efficient Multivariate
-    Time Series Forecasting with Series-Core Fusion") with two regularizers inside the
-    STAD (STar Aggregate-Dispatch) series-core fusion block:
+    * a stochastic variable-position encoding: a fixed sinusoidal table
+      indexed by the variate position, scaled by a learnable ``pe_scale`` and
+      applied with probability ``pe_keep_prob`` during training, then applied
+      at its expectation (``pe_keep_prob * pe_scale``) at inference;
+    * three extra dropout layers inside STAD (after the set feed-forward
+      network (FFN) activation, on the dispatched core, and after the fusion
+      activation).
 
-    * a **stochastic variable-position encoding** — a fixed sinusoidal table indexed by
-      the *variate* position, scaled by a learnable ``pe_scale`` and applied with
-      probability ``pe_keep_prob`` during training, then applied at its expectation
-      (``pe_keep_prob * pe_scale``) at inference; and
-    * **three extra dropout layers** inside STAD (after the set-FFN activation, on the
-      dispatched core, and after the fusion activation).
-
-    The rest is SOFTS unchanged: iTransformer's inverted encoder (each variate's lookback
-    window is embedded into a token via ``Linear(input_size -> hidden_size)``) with STAD
-    in place of self-attention, keeping the encoder O(C) in the number of series instead
-    of attention's O(C^2). RevIN-style per-window mean/std normalization (``use_norm``) is
-    applied inside the network and inverted on the output. Trained in original scale with
+    The rest is SOFTS unchanged: iTransformer's inverted encoder (each
+    variate's lookback window is embedded into a token via
+    ``Linear(input_size -> hidden_size)``) with STAD in place of
+    self-attention, keeping the encoder O(C) in the number of series instead
+    of attention's O(C^2). Per-window mean/std normalization in the style of
+    reversible instance normalization (RevIN, ``use_norm``) is applied inside
+    the network and inverted on the output. Trained in original scale with
     Optax ``adam`` and a pluggable point loss. ``float32`` throughout.
 
-    The series is univariate (``n_series = 1``), so the encoder operates on a single
-    token and only row 0 of the position table is ever read; the backbone is written
-    N-generically to allow a future multivariate path, where the position encoding starts
-    to distinguish series.
+    The series is univariate (``n_series = 1``), so the encoder operates on a
+    single token and only row 0 of the position table is ever read; the
+    backbone is written N-generically to allow a future multivariate path,
+    where the position encoding starts to distinguish series.
+
+    Maintenance status:
+        Active univariate forecaster. Integrates with the ``BaseForecaster``
+        interface, including conformal prediction intervals via
+        ``predict(level=...)``, pickle round-trip, and ``forecast(fitted=True)``.
+
+    Args:
+        h (int): Forecast horizon.
+        input_size (int): Input window length. Any value ``< 1`` (default
+            ``-1``) resolves to ``3 * h``.
+        hidden_size (int): Token embedding width. Default ``512``.
+        d_core (int): Width of the global core. Default ``512``.
+        e_layers (int): Encoder layers. Default ``2``.
+        d_ff (int): Feed-forward hidden width. Default ``2048``.
+        dropout (float): Dropout rate. Default ``0.1``.
+        pe_keep_prob (float): Probability of applying the variable-position
+            encoding during training, in ``[0, 1]``; at inference the encoding
+            is scaled by this value instead. ``0.0`` disables the encoding in
+            both modes. Default ``0.5``.
+        use_norm (bool): Apply the RevIN-style normalization inside the
+            network. Default ``True``.
+        use_boxcox (bool): Box-Cox transform the series before modelling
+            (lambda chosen once at fit by profile likelihood) and invert the
+            forecast, as :class:`chronax.models.TBATS` does. Requires strictly
+            positive values. Default ``False``.
+        activation (str): ``"gelu"`` or ``"relu"``. Default ``"gelu"``.
+        max_steps (int): Number of Adam steps. Default ``1000``.
+        learning_rate (float | Callable[[int], float]): Adam learning rate, a
+            scalar or an ``optax`` schedule. Default ``1e-3``.
+        windows_batch_size (int): Rolling windows sampled per step. Default
+            ``32``.
+        random_seed (int): Seed for parameter init, dropout and window
+            sampling. Default ``1``.
+        alias (str): Display name. Default ``"SOFTSSharp"``.
+        loss (str | LossFn): Registry name (``"mae"``, ``"mse"``, ``"huber"``)
+            or a callable. Default ``"mae"``.
+
+    Raises:
+        ValueError: If ``pe_keep_prob`` is outside ``[0, 1]``.
+
+    Note:
+        A callable ``loss`` or ``learning_rate`` must itself be picklable for
+        the fitted estimator to pickle. An unknown ``loss`` name raises
+        ``ValueError`` at ``fit`` time.
     """
 
     uses_exog = False
@@ -186,20 +229,30 @@ class SOFTSSharp(BaseForecaster):
     def fit(self, y: jnp.ndarray, X: jnp.ndarray | None = None) -> "SOFTSSharp":
         """Fit the network on a 1-D series.
 
-        Builds the network and runs ``max_steps`` Adam steps over rolling windows of
-        length ``input_size + h``, sampled per step the way neuralforecast does.
+        Builds the network and runs ``max_steps`` Adam steps over rolling
+        windows of length ``input_size + h``, sampled per step the way
+        neuralforecast does.
+
+        When ``use_boxcox=True`` the series is Box-Cox transformed first (the
+        lambda is chosen once by profile likelihood) and the raw series is kept
+        for the conformal path.
 
         Args:
-            y: 1-D series of length ``>= input_size + h``.
-            X: Reserved for exogenous regressors; must be None.
+            y (jnp.ndarray): Univariate series, shape ``(T,)`` with
+                ``T >= input_size + h``.
+            X (jnp.ndarray | None): Exogenous regressors. Not supported; must
+                be ``None``.
 
         Returns:
-            SOFTSSharp: ``self``, with ``model_`` populated.
+            SOFTSSharp: ``self`` with ``model_`` populated.
 
         Raises:
-            NotImplementedError: If ``X`` is provided.
-            ValueError: If ``y`` is not 1-D or is shorter than ``input_size + h``.
-            RuntimeError: If a non-finite training loss is observed (divergence).
+            NotImplementedError: If ``X`` is not ``None``.
+            ValueError: If ``y`` is not 1-D, if it is shorter than
+                ``input_size + h``, if ``use_boxcox=True`` and ``y`` contains a
+                value ``<= 0``, or if ``loss`` is an unknown registry name.
+            RuntimeError: If a non-finite training loss is observed (the
+                training run diverged).
         """
         if X is not None:
             raise NotImplementedError("Exogenous variables are not supported.")
@@ -214,7 +267,7 @@ class SOFTSSharp(BaseForecaster):
         # Box-Cox stabilizes the variance before modelling; the network and its
         # RevIN then operate entirely in the transformed space, and predict()
         # inverts on the way out. ``_train_y`` is kept RAW so conformity_scores
-        # re-forecasts through the public API (which re-applies the transform).
+        # re-forecasts through the public ``forecast`` method, which re-applies the transform.
         y_raw = y
         if self.use_boxcox:
             if bool(jnp.any(y_raw <= 0)):
@@ -244,23 +297,30 @@ class SOFTSSharp(BaseForecaster):
     ) -> dict:
         """Forecast ``h`` steps from the fitted context.
 
+        The network is direct-decoded for ``self.h`` steps and the first ``h``
+        are returned.
+        Forecasts are mapped back from the Box-Cox space when
+        ``use_boxcox=True``.
+
         Args:
-            h: Forecast horizon; must satisfy ``1 <= h <= self.h`` (the model is
-                direct-decoded for ``self.h`` steps and sliced).
-            X: Reserved for exogenous regressors; ignored.
-            level: Optional confidence levels (e.g. ``[80, 95]``). When set, returns
-                conformal ``lo-XX``/``hi-XX`` keys via the inherited ``BaseForecaster``
-                path and requires ``self.conformal_params``. Each call re-fits the model
-                per CV window under ``vmap`` — expect minutes.
+            h (int): Forecast horizon, ``1 <= h <= self.h``.
+            X (jnp.ndarray | None): Exogenous regressors. Ignored.
+            level (list[int | float] | None): Confidence levels in (0, 100),
+                e.g. ``[80, 95]``. When given, conformal intervals come from
+                ``BaseForecaster.conformity_scores``, which re-fits the model on
+                every cross-validation (CV) window under ``vmap``; requires
+                ``self.conformal_params``. Expect minutes per call on this
+                model, scaling with ``n_windows`` and ``max_steps``.
 
         Returns:
-            dict: ``{"mean": jnp.ndarray of shape (h,)}`` plus interval keys when
-            ``level`` is provided.
+            dict: ``"mean"`` (shape ``(h,)``) plus ``"lo-{lv}"`` and
+            ``"hi-{lv}"`` (shape ``(h,)``) for each level when ``level`` is
+            given.
 
         Raises:
             RuntimeError: If called before ``fit``.
-            ValueError: If ``h < 1`` or ``h > self.h``, or if ``level`` is given without
-                ``self.conformal_params`` set.
+            ValueError: If ``h < 1``, if ``h > self.h``, or if ``level`` is
+                given while ``self.conformal_params`` is ``None``.
         """
         if self.model_ is None or self._context is None:
             raise RuntimeError("Call fit(y) before predict(h).")
@@ -302,25 +362,32 @@ class SOFTSSharp(BaseForecaster):
         level: list[int | float] | None = None,
         fitted: bool = False,
     ) -> dict:
-        """Stateless fit-then-predict on ``y``.
+        """Fit on ``y`` and forecast ``h`` steps in one call.
 
-        Equivalent to ``self.fit(y).predict(h=h, level=level)``, optionally adding a
-        ``"fitted"`` key with one-step-ahead in-sample predictions.
+        Equivalent to ``self.fit(y).predict(h=h, level=level)``; the fitted
+        state stays on the estimator.
 
         Args:
-            y: 1-D training series.
-            h: Forecast horizon (``<= self.h``).
-            X / X_future: Reserved for exogenous regressors; must be None.
-            level: Optional confidence levels; see ``predict``.
-            fitted: If True, include ``"fitted"`` — one-step-ahead values over the
-                training series, NaN for the first ``input_size`` entries.
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            h (int): Forecast horizon, ``1 <= h <= self.h``.
+            X (jnp.ndarray | None): Exogenous regressors. Not supported; must
+                be ``None``.
+            X_future (jnp.ndarray | None): Future exogenous regressors. Not
+                supported; must be ``None``.
+            level (list[int | float] | None): Confidence levels; see
+                ``predict``.
+            fitted (bool): If ``True``, add a ``"fitted"`` key with
+                one-step-ahead in-sample predictions, shape ``(T,)``; the first
+                ``input_size`` entries are NaN.
 
         Returns:
-            dict: ``{"mean": ..., optional "fitted": ...}``.
+            dict: ``"mean"`` (shape ``(h,)``), the interval keys when ``level``
+            is given, and ``"fitted"`` when ``fitted=True``.
 
         Raises:
-            NotImplementedError: If ``X`` or ``X_future`` is provided.
-            ValueError / RuntimeError: Forwarded from ``fit`` / ``predict``.
+            NotImplementedError: If ``X`` or ``X_future`` is not ``None``.
+            ValueError: Forwarded from ``fit`` and ``predict``.
+            RuntimeError: Forwarded from ``fit`` and ``predict``.
         """
         if X is not None or X_future is not None:
             raise NotImplementedError("Exogenous variables are not supported.")
@@ -359,7 +426,7 @@ class SOFTSSharp(BaseForecaster):
         """Serialize only NNX state (params). The GraphDef holds references to JAX
         ufuncs that are not pickle-stable, so we drop it and rebuild via
         ``_build_net()`` on unpickle, then reload the saved state with ``nnx.update``.
-        (SOFTSSharp uses LayerNorm, not BatchNorm, so there are no running stats —
+        (SOFTSSharp uses LayerNorm, not BatchNorm, so there are no running stats,
         only ``nnx.Param`` variables are captured, including the learnable
         ``pe_scale`` gain.)
         """

@@ -1,59 +1,34 @@
 """
-GARCH Model — JAX-accelerated implementation.
+GARCH (generalized autoregressive conditional heteroskedasticity) in JAX.
 
-Models time series with non-constant volatility where conditional variance
-depends on past squared errors and past conditional variances. Supports both
-deterministic forecasting (analytical intervals) and stochastic forecasting
-(Monte Carlo simulation paths).
+Models series with non-constant volatility: the conditional variance depends
+on past squared shocks (the autoregressive conditional heteroskedasticity, or
+ARCH, terms) and past conditional variances (the GARCH terms). Supports
+deterministic forecasts with analytical intervals and stochastic Monte Carlo
+forecasts.
 
-Features:
-- GARCH(p,q) and pure ARCH(p) models
-- Primary: jaxopt.LBFGSB with box-constrained direct parameterization
-- Fallback: Optax ADAM + L-BFGS with softplus reparameterization (lax.cond)
-- Multi-start: candidates fit via jax.lax.map (NOT jax.vmap — batching jaxopt's
-  while-loop is a ~90x CPU penalty), winner by jnp.argmin. GARCH(1,1) trims the set to
-  {acf, lo}; higher orders keep the full 4-start set
-- Optimizer objective in FLOAT64 (``_optimizer_nll_f64``) — kills the f32 line-search
-  thrash; fitted params cast to f32 for the byte-stable forecast pipeline
-- vmap-native fit/forecast: no host casts or Python control flow on traced
-  values, so conformity_scores' vmapped CV path traces end-to-end
-- O(log n) parallel variance recursion for q<=1 via associative scan (FORECAST path;
-  the optimizer uses a faster sequential scan)
-- Deterministic and stochastic (Monte Carlo) forecasting
-- Native and conformal prediction intervals
-- Padded-input support for GPU JIT reuse in cross-validation
+Implementation:
 
-Instance Attributes:
-1. p: int - ARCH order (lagged squared shocks)
-2. q: int - GARCH order (lagged variances)
-3. alias: str - Display name for the model
-4. conformal_params: ConformalIntervals | None - Conformal prediction config
-5. allow_extended_iterations: bool - Use the extended optax-fallback budget (120 vs 80)
-6. iteration_scaling: str - Deprecated/inert (formerly scaled a data-adaptive iteration count)
-7. model_: dict - Fitted model state (created after fit())
-   - omega, alpha, beta: Estimated GARCH parameters
-   - sigma2: Conditional variance series
-   - fitted: In-sample fitted values (conditional mean)
-   - residuals: Fit residuals
-   - y_mean: Training series mean
-   - y_centered_last: Last p centered observations
-   - sigma2_last: Last q conditional variances
-   - init_var: Backcast initial variance
-
-Methods:
-1. __init__() - Initialize with ARCH/GARCH orders and optimization settings
-2. fit(y, X=None) - Fit model via LBFGSB optimization
-3. predict(h, X=None, level=None, simulate=False, ...) - h-step forecast (deterministic or Monte Carlo)
-4. predict_in_sample(level=None) - Return fitted values with optional intervals
-5. forecast(y, h, ..., simulate=False, ...) - Stateless fit-and-predict (deterministic or Monte Carlo)
-
-Implementation Notes:
-- Notation: p = ARCH order, q = GARCH order (reversed from Bollerslev 1986)
-- Primary path: direct positive params with LBFGSB box bounds (omega: [1e-7, 1e4], alpha/beta: [1e-7, 0.9999])
-- Fallback path: softplus(unconstrained) + epsilon with stationarity penalty
-- Post-fit stationarity clamping at 0.999 with omega recomputation
-- Variance recursion uses O(q) circular buffer for q>1, associative scan for q<=1
-- Backcast initialization with exponential decay (tau=0.94, max window=75)
+- GARCH(p, q) and pure ARCH(p) models; p is the ARCH order and q the GARCH
+  order (reversed from Bollerslev 1986)
+- Primary fit: ``jaxopt.LBFGSB`` on directly parameterized positive
+  parameters with box bounds (omega in [1e-7, 1e4], alpha/beta in
+  [1e-7, 0.9999]); the objective runs in float64 so the Wolfe line search
+  is not evaluated on float32 rounding noise
+- Fallback fit (``lax.cond``, only when every LBFGSB start is non-finite):
+  optax Adam + L-BFGS on softplus-reparameterized parameters with a
+  stationarity penalty
+- Multi-start over config-static candidates via ``jax.lax.map``, winner by
+  ``jnp.argmin``; GARCH(1,1) uses two starts, other GARCH orders four, pure
+  ARCH(p) three
+- Post-fit stationarity clamp at persistence 0.999 with omega recomputed
+- Variance recursion: associative scan (O(log n)) for q <= 1, sequential
+  scan with a circular buffer for q > 1; the optimizer uses a sequential
+  float64 scan
+- Backcast initialization with exponential decay (0.94, window at most 75)
+- vmap-native fit and forecast, so the conformity-score path traces
+- Padded inputs (``actual_len``) for jit reuse across cross-validation (CV)
+  windows
 """
 
 import jax
@@ -81,25 +56,19 @@ _LOG_2PI = jnp.float32(jnp.log(2 * jnp.pi))
 _LBFGS_STEPS = 40
 _LBFGS_MEMORY = 15
 _LBFGS_LS_STEPS = 20
-# 50 is a flat-ridge refinement budget, not correctness-load-bearing: the f64
-# objective below reaches the MLE well inside it. Any change here must be judged at
-# the USER dtype (f64, the default for numpy input under the global x64 flip), not
-# at the harness f32 — persistence and vol-spike band widths diverge under f32
-# long before the NLL or the unconditional variance does.
 _LBFGSB_MAXITER = 50
 _LBFGSB_HISTORY = 15
 _LBFGSB_TOL = 1e-5
 _LBFGSB_MAXLS = 30
 
-# Optax-fallback iteration budgets (static, config-derived — a data-dependent
-# count cannot feed a jit static arg). Both scan phases track best-params
-# monotonically, so running the full budget converges equal-or-better than any
-# data-adaptive cutoff would.
+# Optax-fallback iteration budgets. Static and config-derived: a data-dependent
+# count cannot feed a jit static argument. Both scan phases track the best
+# parameters monotonically, so running the full budget never hurts.
 _MAX_ITER = 80
 _MAX_ITER_EXTENDED = 120
 
 # =============================================================================
-# Core Math — Module-level JIT'd functions
+# Core math: module-level jitted functions
 # =============================================================================
 
 def _compute_backcast(y: jnp.ndarray, max_window: int = 75) -> jnp.ndarray:
@@ -221,7 +190,8 @@ def _compute_sigma2_series(y: jnp.ndarray, omega: float, alpha: jnp.ndarray,
         return _compute_sigma2_parallel_q1(arch_terms, beta[0].astype(jnp.float32), init_var_f32)
     else:
         # q > 1: sequential scan with circular buffer and log-smoothed bound.
-        # dynamic_slice inside the scan fuses better in XLA than pre-computing.
+        # dynamic_slice inside the scan fuses better under the XLA compiler
+        # (accelerated linear algebra) than pre-computing the lags.
         sigma2_max = init_var_f32 * _SIGMA2_MAX_MULT
         y_squared_padded = jnp.concatenate([jnp.full(p, init_var_f32, dtype=jnp.float32), y_squared])
         beta_f32 = beta.astype(jnp.float32)
@@ -250,7 +220,7 @@ _compute_sigma2_series = jax.jit(_compute_sigma2_series, static_argnums=(4, 5))
 def _log_likelihood(params: jnp.ndarray, y: jnp.ndarray, p: int, q: int,
                     init_var: float, actual_len: jnp.ndarray,
                     sample_var: jnp.ndarray) -> jnp.ndarray:
-    """Penalized negative log-likelihood for GARCH.
+    """Penalized negative log-likelihood (NLL) for GARCH.
 
     Parameters
     ----------
@@ -343,18 +313,20 @@ _EPS64 = jnp.float64(1e-12)
 
 
 def _optimizer_nll_f64(params, y, p, q, init_var, actual_len):
-    """FLOAT64 NLL for the LBFGSB optimizer ONLY.
+    """Float64 negative log-likelihood (NLL) for the LBFGSB optimizer only.
 
     The same masked-mean objective as :func:`_log_likelihood_direct`
-    (``start_idx=max(p,q)``, direct params, no penalty), computed in f64 via a
-    SEQUENTIAL scan. Two reasons for the separate f64 path: the Wolfe line-search
-    tests are otherwise evaluated on ~1e-7 f32 rounding noise, which under-converges
-    the fit on the flat boundary-MLE ridges of no-ARCH series; and the sequential
-    scan is faster per-eval on CPU than the associative q=1 path.
+    (``start_idx=max(p,q)``, direct params, no penalty), computed in float64
+    via a sequential scan. Float64 keeps the Wolfe line-search tests off
+    float32 rounding noise, which matters on the flat boundary ridges of
+    series without ARCH effects; the sequential scan is also cheaper per
+    evaluation on a central processing unit (CPU) than the associative q=1
+    path.
 
-    Only the FITTED PARAMS are affected — the forecast/filter keeps the byte-stable
-    f32 associative :func:`_compute_sigma2_series`. The q>=2 scan carries the
-    log-smoothing bound (gradient armor; inert at q=1)."""
+    Only the fitted parameters are affected; the forecast and filter keep the
+    float32 associative :func:`_compute_sigma2_series`. The q >= 2 scan
+    carries the log-smoothing bound, which is inert at q=1.
+    """
     y = y.astype(jnp.float64)
     omega = jnp.maximum(params[0].astype(jnp.float64), _EPS64)
     alpha = jnp.maximum(params[1:1 + p].astype(jnp.float64), _EPS64)
@@ -374,11 +346,11 @@ def _optimizer_nll_f64(params, y, p, q, init_var, actual_len):
 
         def step(buf, a_t):
             s = jnp.maximum(a_t + jnp.dot(beta, jnp.flip(buf[:q])), _EPS64)
-            # Log-smoothed upper bound = GRADIENT ARMOR: inert at q=1 on real data (sigma2 <<
-            # iv*1e6, so it matches the unbounded associative q=1 path bitwise there), but at
-            # q>=2 the beta SUM is unconstrained (each beta boxed at 0.9999) so (sum beta)^t
-            # can overflow in-box — the bound caps it to a finite gradient. The f32 q>1
-            # path carries the same bound; both must keep it.
+            # Log-smoothed upper bound keeps the gradient finite: at q >= 2 the
+            # beta sum is unconstrained (each beta is boxed at 0.9999), so
+            # (sum beta)^t can overflow inside the box. Inert at q=1, where it
+            # matches the unbounded associative path. The float32 q > 1 path
+            # carries the same bound; both must keep it.
             s = jnp.where(s > sigma2_max, sigma2_max + jnp.log(s / sigma2_max), s)
             return jnp.roll(buf, -1).at[-1].set(s), s
 
@@ -418,10 +390,10 @@ def _run_lbfgsb_optimization(y: jnp.ndarray, init_var: float,
     Returns
     -------
     tuple
-        (best_params, best_loss) — optimized params and final NLL.
+        ``(best_params, best_loss)``: optimized params and final NLL.
     """
     def loss_fn(params):
-        return _optimizer_nll_f64(params, y, p, q, init_var, actual_len)  # R2: f64 objective
+        return _optimizer_nll_f64(params, y, p, q, init_var, actual_len)
 
     n_params = 1 + p + q
     # Bounds follow the candidate dtype: mixed f32 params / f64 bounds would
@@ -449,7 +421,7 @@ def _run_optax_optimization(y: jnp.ndarray, init_var: float,
                             n_iters: int,
                             actual_len: jnp.ndarray,
                             sample_var: jnp.ndarray) -> jnp.ndarray:
-    """Two-phase optimization: ADAM warm-up then L-BFGS refinement.
+    """Two-phase optimization: Adam warm-up then L-BFGS refinement.
 
     Parameters
     ----------
@@ -464,7 +436,7 @@ def _run_optax_optimization(y: jnp.ndarray, init_var: float,
     q : int
         GARCH order (static).
     n_iters : int
-        ADAM iteration count (static).
+        Adam iteration budget (static); a third of it is used.
     actual_len : jnp.ndarray
         Actual data length as JAX int32; -1 means use full array.
     sample_var : jnp.ndarray
@@ -481,7 +453,7 @@ def _run_optax_optimization(y: jnp.ndarray, init_var: float,
 
     value_and_grad_fn = jax.value_and_grad(loss_fn)
 
-    # Phase 1: Short ADAM warm-up (1/3 of budget), then L-BFGS refines
+    # Phase 1: short Adam warm-up (1/3 of the budget), then L-BFGS refines
     adam_steps = max(n_iters // 3, 10)
     schedule = optax.cosine_decay_schedule(
         init_value=0.10, decay_steps=adam_steps, alpha=0.01,
@@ -531,7 +503,7 @@ def _run_optax_optimization(y: jnp.ndarray, init_var: float,
     (_, _, lbfgs_best, lbfgs_best_loss), _ = lax.scan(
         lbfgs_step, lbfgs_carry, None, length=_LBFGS_STEPS)
 
-    # Pick best between ADAM and L-BFGS
+    # Pick the better of Adam and L-BFGS
     use_lbfgs = jnp.isfinite(lbfgs_best_loss) & (lbfgs_best_loss < adam_best_loss)
     return jnp.where(use_lbfgs, lbfgs_best, adam_best)
 
@@ -713,23 +685,22 @@ def _init_params_core(y: jnp.ndarray, p: int, q: int) -> jnp.ndarray:
     ])
 
 
-@lru_cache(maxsize=256)  # n_eff is in the key; sized like ets_backend's runner cache
+@lru_cache(maxsize=256)  # n_eff is in the key
 def _get_garch_fit_runner(p: int, q: int, n_iters: int, n_eff: int, padded: bool):
     """Build (and cache) the jitted GARCH parameter fit for one static config.
 
-    Every argument is config- or shape-derived (never value-derived),
-    so the returned jitted callable keeps a stable identity across calls and XLA
-    compiles once per (order, budget, length). Without the cache the ``lax.cond``
-    below is dispatched with two *fresh* branch closures on every fit; pjit's cache
-    keys on callable identity, so it recompiles an identical jaxpr each call — and
-    because ``cond`` stages BOTH branches, that compile includes the entire optax
-    Adam+L-BFGS fallback (~670 ms measured) even though the fallback almost never
-    fires. Mirrors ``ets_backend._get_optimizer_runner``.
+    Every argument is config- or shape-derived (never value-derived), so the
+    returned jitted callable keeps a stable identity across calls and compiles
+    once per (order, budget, length). Without the cache the ``lax.cond`` below
+    would be dispatched with two fresh branch closures on every fit; pjit's
+    cache keys on callable identity, so each call would recompile an identical
+    jaxpr, and because ``cond`` stages both branches that compile includes the
+    whole optax fallback.
     """
     def _run(y: jnp.ndarray) -> dict:
         y_actual = y[:n_eff] if padded else y
 
-        # Rescale data to normalize the loss landscape (arch library technique)
+        # Rescale the data to normalize the loss landscape
         scale = jnp.maximum(jnp.std(y_actual), 1e-6)
         y_scaled = y / scale
         y_scaled_actual = y_scaled[:n_eff] if padded else y_scaled
@@ -755,12 +726,10 @@ def _get_garch_fit_runner(p: int, q: int, n_iters: int, n_eff: int, padded: bool
                 jnp.full(p, 0.15 / p),
                 jnp.full(q, 0.70 / q),
             ])
-            # At GARCH(1,1) the NLL is effectively unimodal, so {acf, lo} reproduces the
-            # 4-start winner (acf == hi to 1e-8 — a softplus round-trip of
-            # `_init_params_core`'s target [0.05*var, 0.05, 0.90], and sf0.1 never uniquely
-            # wins here); what matters is the y/std rescaling, not multistart breadth. Higher
-            # orders keep the FULL 4-start set — sf0.1 does uniquely win some overspecified
-            # p+q>=4 fits, so the trim is valid only at (1,1).
+            # At GARCH(1,1) the NLL is close to unimodal and acf_direct equals
+            # hi_direct up to a softplus round-trip, so {acf, lo} suffices.
+            # Higher orders keep all four starts: sf_direct can win alone on
+            # overspecified p+q >= 4 fits.
             candidates = ([acf_direct, lo_direct] if (p == 1 and q == 1)
                           else [acf_direct, sf_direct, hi_direct, lo_direct])
         else:
@@ -770,12 +739,11 @@ def _get_garch_fit_runner(p: int, q: int, n_iters: int, n_eff: int, padded: bool
             ])
             candidates = [acf_direct, sf_direct, hi_direct]
 
-        # Multi-start: optimize EVERY candidate (count config-static) via lax.map, winner by
-        # NLL. ⚠ lax.map (SEQUENTIAL), NOT jax.vmap: batching jaxopt's nested while-loop
-        # with jax.vmap costs a ~90x per-iteration execution penalty on CPU at identical trip
-        # counts, and dominates the whole fit. The optimizer space is FLOAT64
-        # (`_optimizer_nll_f64`); the winner is cast to f32 for storage so the
-        # forecast/filter pipeline stays f32 and byte-stable.
+        # Multi-start: optimize every candidate (count config-static) with the
+        # sequential lax.map, winner by NLL. Not jax.vmap: batching jaxopt's
+        # nested while-loop multiplies the per-iteration cost on CPU. The
+        # optimizer space is float64 (`_optimizer_nll_f64`); the winner is cast
+        # to float32 so the forecast/filter pipeline stays float32.
         cand_stack = jnp.stack(candidates).astype(jnp.float64)
 
         def _run_one(cand):
@@ -791,13 +759,13 @@ def _get_garch_fit_runner(p: int, q: int, n_iters: int, n_eff: int, padded: bool
         init_params_f32 = init_params.astype(jnp.float32)
         empty_beta = jnp.zeros(0, dtype=jnp.float32)
 
-        # Fallback to ADAM+L-BFGS only when every LBFGSB start produced a
+        # Fall back to Adam + L-BFGS only when every LBFGSB start produced a
         # non-finite NLL. lax.cond keeps the fallback off the eager/jit fast
-        # path (under vmap batching both branches run — the cost of a fallback
-        # that stays traceable; a host `if best is None` cannot).
+        # path; under vmap batching both branches run, which is the price of a
+        # fallback that stays traceable.
         def _lbfgsb_branch(_):
-            # best_params is f64 (the optimizer space); cast to f32 for storage and to match
-            # the f32 optax-fallback branch (lax.cond requires matching output dtypes).
+            # best_params is float64 (the optimizer space); cast to float32 to
+            # match the optax branch (lax.cond requires matching output dtypes).
             bp = best_params.astype(jnp.float32)
             omega = jnp.maximum(bp[0], _EPSILON)
             alpha = jnp.maximum(bp[1:1 + p], _EPSILON)
@@ -816,17 +784,16 @@ def _get_garch_fit_runner(p: int, q: int, n_iters: int, n_eff: int, padded: bool
 
         persistence = jnp.sum(alpha) + jnp.sum(beta)
 
-        # Post-fit stationarity clamping: scale alpha+beta to 0.999 if needed.
-        # 0.999 (not 0.98) lets high-persistence financial data retain accurate MLE
-        # parameters while still preventing near-IGARCH instability. The clamp caps
-        # persistence at 0.999, so the old `persistence >= 1.0` raise was unreachable.
+        # Post-fit stationarity clamp: scale alpha + beta down to 0.999 when
+        # needed. 0.999 lets high-persistence financial data keep its
+        # maximum-likelihood parameters while preventing near-IGARCH instability.
         clamped = persistence > 0.999
         scale_factor = jnp.where(clamped, 0.999 / jnp.maximum(persistence, 1e-8), 1.0)
         alpha = alpha * scale_factor
         beta = beta * scale_factor
-        # Recompute omega so unconditional variance matches sample variance.
-        # astype keeps omega on the cond-branch dtype (f32) — sample_var_val follows
-        # y and would silently promote the select under x64.
+        # Recompute omega so the unconditional variance matches the sample
+        # variance. astype keeps omega on the cond-branch dtype (float32);
+        # sample_var_val follows y and would promote the select under x64.
         omega = jnp.where(clamped, sample_var_val.astype(omega.dtype) * (1.0 - 0.999), omega)
 
         # Compute sigma2 in scaled space, then un-scale
@@ -856,8 +823,11 @@ def _get_garch_fit_runner(p: int, q: int, n_iters: int, n_eff: int, padded: bool
 class GARCH(BaseForecaster):
     r"""GARCH model.
 
-    Models time-varying volatility where conditional variance depends on
-    past squared errors and past conditional variances.
+    Models time-varying volatility: the conditional variance depends on past
+    squared shocks and past conditional variances. The mean forecast is the
+    training mean; the variance forecast drives the intervals. Native
+    intervals use normal quantiles of the forecast variance; conformal
+    intervals come from ``BaseForecaster`` when ``conformal_params`` is set.
 
     Parameters
     ----------
@@ -866,16 +836,30 @@ class GARCH(BaseForecaster):
     q : int, default 1
         GARCH order (lagged variances), must be >= 0.
     alias : str, default 'GARCH'
-        Display name for the model.
+        Display name for the model; the orders are appended, e.g.
+        ``GARCH(1,1)`` or ``GARCH(2)`` when ``q == 0``.
     conformal_params : ConformalIntervals or None, default None
         Configuration for conformal prediction intervals.
     allow_extended_iterations : bool, default False
-        Whether to use the extended optax-fallback iteration budget
-        (120 instead of 80).
+        Use the extended optax-fallback iteration budget (120 instead of 80).
     iteration_scaling : str, default 'cubic'
-        Deprecated/inert: a data-adaptive iteration count cannot feed a jit
-        static argument, so the budget is fixed by allow_extended_iterations
-        alone. The value is still validated for API compatibility.
+        Inert: validated ('cubic' or 'quadratic') for compatibility, but
+        the budget is fixed by ``allow_extended_iterations`` alone, since a
+        data-adaptive count cannot feed a jit static argument.
+
+    Attributes
+    ----------
+    model_ : dict or None
+        Set by :meth:`fit`: ``omega``, ``alpha``, ``beta``, ``sigma2``,
+        ``fitted``, ``residuals``, ``sigma``, ``y_mean``, ``y_centered_last``,
+        ``sigma2_last``, ``init_var``, ``y_train`` and, with
+        ``conformal_params``, the cached scores ``_cs``.
+
+    Raises
+    ------
+    ValueError
+        If ``p`` is not an int >= 1, ``q`` is not an int >= 0, or
+        ``iteration_scaling`` is not 'cubic' or 'quadratic'.
     """
     uses_exog = False
 
@@ -924,7 +908,7 @@ class GARCH(BaseForecaster):
         n_iters: int | None = None, actual_len: int | None = None,
         sample_var: float = -1.0
     ) -> jnp.ndarray:
-        """Run ADAM + L-BFGS optimization via the JIT-compiled loop.
+        """Run the Adam + L-BFGS optimization via the JIT-compiled loop.
 
         Parameters
         ----------
@@ -960,7 +944,7 @@ class GARCH(BaseForecaster):
 
     def _fit_parameters(self, y: jnp.ndarray, n_iters: int | None = None,
                          actual_len: int | None = None) -> dict:
-        """Estimate GARCH parameters via LBFGSB (primary) or ADAM + L-BFGS (fallback).
+        """Estimate GARCH parameters via LBFGSB (primary) or Adam + L-BFGS (fallback).
 
         Parameters
         ----------
@@ -1005,46 +989,69 @@ class GARCH(BaseForecaster):
     def conformity_scores(self, y, X=None):
         """Sequential-window CV, overriding the base vmapped path.
 
-        Under vmap the CV windows re-import the vmap-of-jaxopt-while penalty that
-        ``lax.map`` avoids in the multistart (batched LBFGSB line-search loops), and
-        the optax fallback's ``lax.cond`` gains a batched runtime predicate — it
-        lowers to a select and EXECUTES the full Adam+L-BFGS fallback for every
-        window. Running the windows sequentially avoids both. Windows, masking, and
+        Under vmap the CV windows would batch jaxopt's LBFGSB line-search
+        loops (the cost ``lax.map`` avoids in the multistart), and the optax
+        fallback's ``lax.cond`` would gain a batched predicate, lower to a
+        select, and execute the full Adam + L-BFGS fallback for every window.
+        Running the windows sequentially avoids both. Windows, masking and
         values are identical; only the execution regime changes (base
         ``_conformity_scores_sequential``).
+
+        Parameters
+        ----------
+        y : jnp.ndarray
+            Univariate series, shape ``(T,)``.
+        X : jnp.ndarray or None, default None
+            Exogenous regressors, shape ``(T, F)``. Ignored by the model.
+
+        Returns
+        -------
+        jnp.ndarray
+            Signed scores, shape ``(n_windows, h)``.
         """
         return self._conformity_scores_sequential(y=y, X=X)
 
     def fit(self, y: jnp.ndarray, X: jnp.ndarray | None = None,
             n_iters: int | None = None,
             actual_len: int | None = None) -> 'GARCH':
-        """Fit GARCH model to data.
+        """Fit the GARCH model.
 
         Parameters
         ----------
         y : jnp.ndarray
-            Input time series (may be padded).
+            Univariate series, shape ``(T,)``; may be padded beyond
+            ``actual_len``.
         X : jnp.ndarray or None, default None
-            Exogenous variables (unused).
+            Exogenous regressors, shape ``(T, F)``. Only forwarded to
+            :meth:`conformity_scores`; otherwise ignored.
         n_iters : int or None, default None
-            Fixed optax-fallback iteration count. None uses the config-derived
-            budget (_MAX_ITER, or _MAX_ITER_EXTENDED with allow_extended_iterations).
+            Fixed optax-fallback iteration count. ``None`` uses the
+            config-derived budget (80, or 120 with
+            ``allow_extended_iterations``).
         actual_len : int or None, default None
-            Actual data length for padded inputs.
+            Real data length for padded inputs; ``None`` means the whole
+            array.
 
         Returns
         -------
         GARCH
-            Fitted model (self).
+            ``self``.
+
+        Raises
+        ------
+        ValueError
+            If the real series has fewer than ``max(p, q) + 10`` observations,
+            or if ``conformal_params`` is set and the series is too short for
+            2 CV windows.
         """
         y = utils.ensure_float(y)
         n_eff = actual_len if actual_len is not None else len(y)
         y_actual = y[:n_eff] if actual_len is not None else y
 
-        # No data-dependent validation raises here: booleans on traced values
-        # cannot branch under vmap. NaN input propagates
-        # NaN outputs; near-constant input degenerates gracefully (the internal
-        # scale is clamped at 1e-6, so forecasts collapse to the series mean).
+        # No data-dependent validation here: booleans on traced values cannot
+        # branch under vmap. NaN input propagates NaN outputs; near-constant
+        # input degenerates gracefully (the internal scale is clamped at 1e-6,
+        # so forecasts collapse to the series mean).
         y_mean = jnp.mean(y_actual)
         y_centered = y - y_mean
         result = self._fit_parameters(y_centered, n_iters=n_iters, actual_len=actual_len)
@@ -1067,7 +1074,7 @@ class GARCH(BaseForecaster):
         )
 
         if self.conformal_params is not None:
-            # Score on the REAL span only — the padded tail is not data.
+            # Score the real span only; the padded tail is not data.
             self.model_['_cs'] = self.conformity_scores(y=y_actual, X=X)
 
         return self
@@ -1087,30 +1094,43 @@ class GARCH(BaseForecaster):
         Parameters
         ----------
         h : int
-            Forecast horizon.
+            Forecast horizon (positive int). With ``level`` and
+            ``conformal_params``, must equal ``conformal_params.h``.
         X : jnp.ndarray or None, default None
-            Exogenous variables (unused).
-        level : list[int] or None, default None
-            Confidence levels for prediction intervals. When simulate=False,
-            intervals are analytical (normal quantiles). When simulate=True,
-            intervals are percentile-based from simulation paths.
+            Future exogenous regressors, shape ``(h, F)``. Ignored.
+        level : list of int or None, default None
+            Confidence levels in (0, 100). With ``simulate=False`` the
+            intervals are conformal when ``conformal_params`` is set and
+            normal-quantile otherwise; with ``simulate=True`` they are
+            percentiles of the simulated paths.
         simulate : bool, default False
-            Use Monte Carlo simulation instead of analytical forecasting.
+            Use Monte Carlo simulation instead of the analytical forecast.
         n_sims : int, default 1000
-            Number of simulation paths (only used when simulate=True).
+            Number of simulation paths (``simulate=True`` only).
         seed : int or None, default None
-            PRNG seed for reproducibility (only used when simulate=True).
+            PRNG seed (``simulate=True`` only); ``None`` means 0.
         return_paths : bool, default True
-            Include full simulation paths in output (only used when simulate=True).
+            Include the full paths in the output (``simulate=True`` only).
 
         Returns
         -------
         dict
-            When simulate=False:
-                Keys: 'mean', 'sigma2', and optionally 'lo-{lv}', 'hi-{lv}'.
-            When simulate=True:
-                Keys: 'mean', 'median', 'sigma2_mean', 'sigma2_median',
-                and optionally 'paths', 'sigma2_paths', 'lo-{lv}', 'hi-{lv}'.
+            With ``simulate=False``: ``"mean"`` and ``"sigma2"`` (shape
+            ``(h,)``), plus ``"lo-{lv}"``/``"hi-{lv}"`` per level. With
+            ``simulate=True``: ``"mean"``, ``"median"``, ``"sigma2_mean"``,
+            ``"sigma2_median"`` (shape ``(h,)``), ``"paths"`` and
+            ``"sigma2_paths"`` (shape ``(n_sims, h)``) when ``return_paths``,
+            plus ``"lo-{lv}"``/``"hi-{lv}"`` per level.
+
+        Raises
+        ------
+        RuntimeError
+            If called before :meth:`fit`.
+        ValueError
+            If ``h`` is not a positive int; if ``simulate=True`` and
+            ``n_sims`` is not a positive int, or is below 30 with ``level``;
+            or if conformal intervals are requested with
+            ``h != conformal_params.h`` or without cached scores.
         """
         if self.model_ is None:
             raise RuntimeError("Model must be fitted before prediction. Call fit() first.")
@@ -1184,17 +1204,25 @@ class GARCH(BaseForecaster):
         return res
 
     def predict_in_sample(self, level: list[int] | None = None) -> dict:
-        """Return in-sample fitted values and conditional variance.
+        """Return the in-sample fitted values and conditional variance.
 
         Parameters
         ----------
-        level : list[int] or None, default None
-            Confidence levels for fitted prediction intervals.
+        level : list of int or None, default None
+            Confidence levels in (0, 100) for fitted intervals (normal
+            quantiles of the conditional variance).
 
         Returns
         -------
         dict
-            Keys: 'fitted', 'sigma2', and optionally 'fitted-lo-{lv}', 'fitted-hi-{lv}'.
+            ``"fitted"`` and ``"sigma2"`` (shape ``(T,)``), plus
+            ``"fitted-lo-{lv}"``/``"fitted-hi-{lv}"`` per level when ``level``
+            is given.
+
+        Raises
+        ------
+        RuntimeError
+            If called before :meth:`fit`.
         """
         if self.model_ is None:
             raise RuntimeError("Model must be fitted before prediction. Call fit() first.")
@@ -1232,44 +1260,58 @@ class GARCH(BaseForecaster):
         Parameters
         ----------
         y : jnp.ndarray
-            Input time series (may be padded).
+            Univariate series, shape ``(T,)``; may be padded beyond
+            ``actual_len``.
         h : int
-            Forecast horizon.
+            Forecast horizon (positive int). With ``level`` and
+            ``conformal_params``, must equal ``conformal_params.h``.
         X : jnp.ndarray or None, default None
-            Exogenous variables (unused).
+            In-sample exogenous regressors, shape ``(T, F)``. Only forwarded
+            to :meth:`conformity_scores`; otherwise ignored.
         X_future : jnp.ndarray or None, default None
-            Future exogenous variables (unused).
-        level : list[int] or None, default None
-            Confidence levels for prediction intervals. When simulate=True,
-            forecast intervals are percentile-based from paths, while fitted
-            intervals remain analytical.
+            Future exogenous regressors, shape ``(h, F)``. Ignored.
+        level : list of int or None, default None
+            Confidence levels in (0, 100). With ``simulate=True`` the forecast
+            intervals are path percentiles while the fitted intervals stay
+            analytical.
         fitted : bool, default False
-            Whether to return in-sample fitted values.
+            Whether to return in-sample fitted values under ``"fitted"``.
         n_iters : int or None, default None
-            Fixed optax-fallback iteration count. None uses the config-derived
-            budget (_MAX_ITER, or _MAX_ITER_EXTENDED with allow_extended_iterations).
+            Fixed optax-fallback iteration count. ``None`` uses the
+            config-derived budget (80, or 120 with
+            ``allow_extended_iterations``).
         actual_len : int or None, default None
-            Actual data length for padded inputs.
+            Real data length for padded inputs; ``None`` means the whole
+            array.
         simulate : bool, default False
-            Use Monte Carlo simulation instead of analytical forecasting.
+            Use Monte Carlo simulation instead of the analytical forecast.
         n_sims : int, default 1000
-            Number of simulation paths (only used when simulate=True).
+            Number of simulation paths (``simulate=True`` only).
         seed : int or None, default None
-            PRNG seed for reproducibility (only used when simulate=True).
+            PRNG seed (``simulate=True`` only); ``None`` means 0.
         return_paths : bool, default True
-            Include full simulation paths in output (only used when simulate=True).
+            Include the full paths in the output (``simulate=True`` only).
 
         Returns
         -------
         dict
-            Keys: 'mean', 'sigma2', and optionally intervals and fitted values.
-            When simulate=True, also includes 'median', 'sigma2_mean',
-            'sigma2_median', and optionally 'paths', 'sigma2_paths'.
+            Same keys as :meth:`predict` for the chosen mode, plus
+            ``"fitted"`` (shape ``(T,)``) when ``fitted`` and
+            ``"fitted-lo-{lv}"``/``"fitted-hi-{lv}"`` when ``fitted`` and
+            ``level`` are both set.
+
+        Raises
+        ------
+        ValueError
+            If ``h`` is not a positive int; if the real series has fewer than
+            ``max(p, q) + 10`` observations; if conformal intervals are
+            requested with ``h != conformal_params.h`` or on a series too
+            short for 2 CV windows; or, with ``simulate=True``, the
+            ``n_sims`` conditions of :meth:`predict`.
         """
         if simulate:
-            # Fit a clone: forecast() is contractually stateless, and fit()
-            # attribute writes under a caller's vmap would leak tracers onto
-            # this estimator.
+            # Fit a clone: forecast() is stateless, and fit() attribute writes
+            # under a caller's vmap would leak tracers onto this estimator.
             m = self.new()
             m.fit(y, X, n_iters=n_iters, actual_len=actual_len)
             res = m.predict(h, X_future, level, simulate=True,

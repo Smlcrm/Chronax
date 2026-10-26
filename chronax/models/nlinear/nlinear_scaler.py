@@ -1,4 +1,5 @@
-"""Per-window scalers for NLinear: identity (NF default) and robust (median/MAD).
+"""Per-window scalers for NLinear: identity (neuralforecast default) and robust
+(median and median absolute deviation, MAD).
 
 Self-contained (no cross-model import). Pure functions exposing
 (stats, transform, inverse) so the same shift/scale is reused for inverse.

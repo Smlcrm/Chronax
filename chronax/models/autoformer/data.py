@@ -2,12 +2,12 @@
 
 Three concerns are separated here:
 
-1. ``RobustScaler`` — per-window median/MAD normalisation (pure JAX; used
+1. ``RobustScaler``: per-window median/MAD normalisation (pure JAX; used
    inside the training and inference loops to scale JAX device arrays).
-2. Window building — ``build_windows`` / ``split_train_val_windows`` extract
+2. Window building: ``build_windows`` / ``split_train_val_windows`` extract
    sliding windows from a 1-D numpy series for the window-based training loop.
-3. Batch construction — ``create_batch`` / ``batch_generator`` / ``pad_sequence``
-   mirror the RNN data pipeline for compatibility with the masked-loss training
+3. Batch construction: ``create_batch`` / ``batch_generator`` / ``pad_sequence``
+   mirror the recurrent neural network (RNN) data pipeline for the masked-loss training
    step (used when you want explicit ``available_mask`` / ``sample_mask``
    semantics rather than the window-scaler approach).
 """
@@ -20,7 +20,7 @@ import numpy as np
 
 
 # ---------------------------------------------------------------------------
-# Robust per-window scaler (pure JAX — used on device arrays)
+# Robust per-window scaler (pure JAX, used on device arrays)
 # ---------------------------------------------------------------------------
 
 _MAD_TO_STD = 0.6744897501960817  # scipy.stats.norm.ppf(0.75)
@@ -32,7 +32,7 @@ def _torch_median(x: jnp.ndarray, axis: int = 1, keepdims: bool = True) -> jnp.n
 
     ``jnp.median`` averages the two central elements for even lengths; PyTorch
     takes index ``(n-1)//2`` after sorting. RobustScaler windows use even
-    ``input_size`` (72), so this matters for NF parity.
+    ``input_size`` (72), so this matters for neuralforecast parity.
     """
     x_sorted = jnp.sort(x, axis=axis)
     idx = (x.shape[axis] - 1) // 2
@@ -81,17 +81,17 @@ class RobustScaler:
 
 
 # ---------------------------------------------------------------------------
-# Window building (numpy — host-side preprocessing)
+# Window building (numpy, host-side preprocessing)
 # ---------------------------------------------------------------------------
 
 
 def build_windows(
     y: np.ndarray, input_size: int, h: int
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """NF-style rolling windows with right-padding (``ConstantPad1d((0, h))``).
+    """neuralforecast-style rolling windows with right-padding (``ConstantPad1d((0, h))``).
 
     Right-pads ``y`` with ``h`` zeros before unfolding, yielding
-    ``len(y) - input_size`` windows of length ``input_size + h`` — including
+    ``len(y) - input_size`` windows of length ``input_size + h``, including
     partial-horizon windows whose context reaches the end of the series.
     Returns ``(windows, mask)`` where ``mask`` is 1 on real points and 0 on the
     padded tail so the loss can drop padded horizon steps. The insample
@@ -102,7 +102,7 @@ def build_windows(
     """
     y = np.asarray(y, dtype=np.float32).ravel()
     n_real = len(y)
-    n = n_real - input_size  # NF keeps windows with >=1 valid outsample
+    n = n_real - input_size  # neuralforecast keeps windows with >=1 valid outsample
     if n < 1:
         raise ValueError(
             f"Series length {n_real} is too short for "

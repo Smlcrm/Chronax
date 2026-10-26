@@ -1,19 +1,19 @@
 Chronax
 =======
 
-A high-performance, JAX-accelerated time-series forecasting library. Chronax provides
-a comprehensive suite of classical and neural forecasting models — including AutoARIMA,
-AutoETS, AutoTheta, TBATS, MFLES, GARCH, TFT, Informer, PatchTST, and more — with a
-unified ``fit`` / ``predict`` interface and hardware-accelerated execution via JAX.
+Chronax is a time-series forecasting library in JAX. It provides 59 classical and neural
+forecasting models, among them AutoARIMA, AutoETS, AutoTheta, TBATS, MFLES, GARCH, TFT, Informer,
+NHITS and PatchTST, behind one ``fit`` / ``predict`` interface. Fitting and forecasting run under
+JAX, so the same code runs on CPU, GPU or TPU.
 
 Features
 --------
 
-- **JAX-accelerated** — JIT-compiled model fitting and forecasting on CPU, GPU, or TPU
-- **35+ forecasting models** — classical (AutoARIMA, AutoETS, AutoTheta, TBATS, MFLES, GARCH, STL, and more) and neural (TFT, Informer, PatchTST, XLSTM, and more)
-- **Unified API** — every model follows the same ``fit()`` → ``predict()`` pattern
-- **Prediction intervals** — built-in conformal and native interval support
-- **NumPy compatible** — accepts and returns standard array types
+- **JAX-accelerated**: just-in-time (JIT) compiled model fitting and forecasting on CPU, GPU or TPU
+- **59 forecasting models**: 28 classical (AutoARIMA, AutoETS, AutoTheta, TBATS, MFLES, GARCH, STL and more) and 31 neural (TFT, Informer, PatchTST, NHITS, TiDE, XLSTM and more)
+- **Unified API**: every model follows the same ``fit()`` then ``predict()`` pattern
+- **Prediction intervals**: conformal and native interval support
+- **NumPy compatible**: accepts and returns standard array types
 
 Installation
 ------------
@@ -22,7 +22,7 @@ From PyPI::
 
    pip install chronax
 
-Quick Start
+Quick start
 -----------
 
 All Chronax models follow the same interface: instantiate, ``fit()``, then ``predict()``.
@@ -35,7 +35,7 @@ All Chronax models follow the same interface: instantiate, ``fit()``, then ``pre
    y = jnp.array([112, 118, 132, 129, 121, 135, 148, 148, 136, 119, 104, 118,
                    115, 126, 141, 135, 125, 149, 170, 170, 158, 133, 114, 140])
 
-   model = AutoARIMA(season_length=12)
+   model = AutoARIMA(period=12)
    model = model.fit(y)
 
    forecast = model.predict(h=6, level=[80, 95])

@@ -1,21 +1,18 @@
-"""JAX/Flax RNN — improved for speed and accuracy.
+"""JAX/Flax recurrent neural network (RNN) forecaster.
 
-Key improvements over v1:
-* GRU cell option (``cell_type='gru'``, default) — gating prevents vanishing
-  gradients; meaningfully more accurate than vanilla Elman RNN on most
-  time-series benchmarks.
-* Layer normalisation after each encoder layer (``layer_norm=True``, default)
-  — stabilises training, allows higher learning rates, reduces sensitivity to
-  initialisation.
-* ``autoregressive_predict`` rewritten with ``jax.lax.scan`` — the h-step
-  rollout is compiled as one XLA op instead of h separate Python-level
-  ``model.apply`` dispatches, giving a significant speedup on CPU and an even
-  larger one on GPU.
-* ``RNNConfig.recurrent`` defaults to ``False`` — direct MLP decoding avoids
-  compounding prediction errors and is faster; better for short horizons.
+Port of Nixtla neuralforecast's ``RNN`` with two extensions:
 
-Architecture unchanged for ``cell_type='elman'`` / ``layer_norm=False`` so
-existing weight transfers remain valid.
+* A gated recurrent unit (GRU) cell (``cell_type='gru'``, the
+  :class:`RNNConfig` default); ``cell_type='elman'`` keeps the vanilla
+  Elman cell and its weight layout.
+* Optional layer normalisation between encoder layers (``layer_norm``).
+
+Decoding modes: ``recurrent=False`` (the :class:`RNNConfig` default) feeds the
+last ``h`` encoder states to a multilayer perceptron (MLP) decoder;
+``recurrent=True`` projects each encoder step to one output and
+:func:`autoregressive_predict` rolls the horizon out step by step under
+``jax.lax.scan``, so the whole rollout compiles to one XLA (accelerated
+linear algebra) program.
 """
 
 from __future__ import annotations
@@ -37,12 +34,27 @@ import jax.numpy as jnp
 class RNNConfig:
     """Hyperparameters for :class:`RNN`.
 
-    New fields vs v1:
-        cell_type:  ``"gru"`` (default) or ``"elman"``.  GRU gating gives
-                    meaningfully better accuracy; use ``"elman"`` only when
-                    you need exact weight parity with a vanilla RNN checkpoint.
-        layer_norm: apply LayerNorm after each encoder layer (default True).
-                    Stabilises training especially with larger hidden sizes.
+    Attributes:
+        h: Forecast horizon.
+        input_size: History window length ``L``.
+        encoder_hidden_size: Hidden units per encoder layer.
+        encoder_n_layers: Number of stacked encoder layers.
+        encoder_activation: Elman cell activation, ``"tanh"`` or ``"relu"``
+            (ignored by the GRU cell).
+        encoder_bias: Use bias terms in the recurrent cells.
+        encoder_dropout: Dropout rate between encoder layers.
+        decoder_hidden_size: Hidden width of the MLP decoder (direct mode).
+        decoder_layers: Number of MLP decoder layers (direct mode).
+        futr_exog_size: Number of future exogenous features ``F``.
+        hist_exog_size: Number of historic exogenous features ``X``.
+        stat_exog_size: Number of static exogenous features ``S``.
+        output_size: Outputs per step.
+        recurrent: ``True`` for step-wise projection with autoregressive
+            rollout, ``False`` for direct MLP decoding of the last ``h``
+            encoder states.
+        cell_type: ``"gru"`` (default) or ``"elman"``. ``"elman"`` keeps the
+            vanilla RNN weight layout.
+        layer_norm: Apply LayerNorm between encoder layers (default True).
     """
 
     h: int = 12
@@ -94,7 +106,7 @@ class MLP(fnn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Elman RNN cell (unchanged; kept for weight-parity with legacy checkpoints)
+# Elman RNN cell (vanilla RNN weight layout)
 # ---------------------------------------------------------------------------
 
 
@@ -128,7 +140,7 @@ class ElmanRNNCell(fnn.Module):
 
 
 # ---------------------------------------------------------------------------
-# GRU cell — drop-in replacement for ElmanRNNCell
+# GRU cell: drop-in replacement for ElmanRNNCell
 # ---------------------------------------------------------------------------
 
 
@@ -143,7 +155,7 @@ class GRUCell(fnn.Module):
         h_t = (1 − z_t) ⊙ n_t + z_t ⊙ h
 
     Same ``(carry, x) -> (new_carry, output)`` interface as
-    :class:`ElmanRNNCell` — drop-in for :func:`flax.linen.scan`.
+    :class:`ElmanRNNCell`, so it is a drop-in for :func:`flax.linen.scan`.
     """
 
     hidden_size: int
@@ -264,10 +276,14 @@ class RNNEncoder(fnn.Module):
 
 
 class RNN(fnn.Module):
-    """Nixtla NeuralForecast RNN ported to Flax, with GRU and LayerNorm.
+    """Nixtla neuralforecast RNN ported to Flax, with GRU and LayerNorm options.
 
-    Forward pass is unchanged vs v1; new config fields (``cell_type``,
-    ``layer_norm``) are threaded through to :class:`RNNEncoder`.
+    ``__call__(insample_y, hist_exog, futr_exog, stat_exog, rnn_state,
+    deterministic)`` encodes ``[B, L, 1]`` targets (concatenated with any
+    exogenous inputs) through :class:`RNNEncoder` and returns
+    ``(output, final_state)`` with ``output`` of shape
+    ``[B, h, output_size]`` and ``final_state`` of shape
+    ``[num_layers, B, hidden]``.
     """
 
     config: RNNConfig
@@ -355,15 +371,15 @@ def autoregressive_predict(
 ) -> jnp.ndarray:
     """Multi-step autoregressive rollout for ``recurrent=True`` models.
 
-    The h-step rollout is implemented with ``jax.lax.scan`` so the entire
-    loop is compiled as a single XLA op — significantly faster than the
-    previous Python ``for`` loop which dispatched h separate ``model.apply``
-    calls.
+    The h-step rollout runs under ``jax.lax.scan``, so the whole loop
+    compiles to a single XLA program instead of ``h`` separate
+    ``model.apply`` dispatches.
 
     Strategy:
-    * History pass — feed the full history; capture encoder hidden state and
+
+    * History pass: feed the full history; capture encoder hidden state and
       last projected prediction.
-    * Steps 1..h-1 — scan over the horizon, feeding the previous prediction
+    * Steps 1..h-1: scan over the horizon, feeding the previous prediction
       (+ any ``futr_exog`` slice) one step at a time while threading the
       encoder hidden state.
 

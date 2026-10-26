@@ -1,10 +1,10 @@
 """High-level fit/forecast adapter around the Chronax TSMixer.
 
-TSMixer is a multivariate model — all N series must be provided together as a
+TSMixer is a multivariate model: all N series must be provided together as a
 single ``[T, N]`` array (or a list of N equal-length 1-D arrays). A single
 shared model processes all channels simultaneously.
 
-Normalisation strategy — per-window:
+Normalisation strategy, per window:
     For each extracted window the insample mean/std are computed and both the
     insample and outsample portions of that window are normalised with those
     statistics.  This matches NeuralForecast's ``scaler_type="standard"``
@@ -42,7 +42,7 @@ def _as_multivariate(y: SeriesLike) -> jnp.ndarray:
     """Normalise ``y`` to ``[T, N]`` float32.
 
     Anything that isn't a ``list``/``tuple`` of series (e.g. a plain
-    ``jax.numpy`` array, as passed by the benchmark harness) is treated as a
+    ``jax.numpy`` array) is treated as a
     single series / already-multivariate array.
     """
     if not isinstance(y, (list, tuple)):
@@ -81,28 +81,67 @@ def _normalise_windows(
 class TSMixerForecaster(BaseForecaster):
     """High-level fit/forecast wrapper around :class:`chronax.models.tsmixer.TSMixer`.
 
+    Port of neuralforecast's ``TSMixer`` training and inference flow for a
+    multivariate panel: all ``n_series`` channels are modelled jointly as one
+    ``[T, N]`` array. Point forecasts only: :meth:`predict` refuses
+    ``level`` and :meth:`forecast` returns a bare array rather than the
+    :class:`BaseForecaster` dict, so the base conformal machinery is not
+    available for this model.
+
     Args:
-        h: forecast horizon.
-        input_size: history window length; -1 (default) uses ``3 * h``.
-        n_series: number of time series (channels). Must match the number of
-            channels in the data passed to :meth:`fit`.
-        n_block, ff_dim, dropout, revin, revin_affine, temporal_norm_momentum,
-        feature_norm_momentum, use_batchnorm, use_global_skip: forwarded to
-        :class:`TSMixerConfig`.
-        max_steps: number of optimiser steps performed by :meth:`fit`.
-        learning_rate: Adam / AdamW peak learning rate.
-        batch_size: number of windows per training step.
-        random_seed: PRNG seed for parameter init and window sampling.
-        alias: display name for external reporting.
-        loss: registered name (``"mae"``, ``"mse"``) from
-            :mod:`chronax.models.tsmixer.loss` or a callable ``(y, y_hat) -> scalar``.
-        scale: if True, each training window is normalised by its own mean/std
-            (per-window, not per-series global); inference context is normalised
-            with the same convention.
-        grad_clip: global gradient-norm clipping threshold (0 = disabled).
-        use_lr_schedule: if True, wrap Adam with warmup + cosine decay
-            decaying to 1 % of ``learning_rate`` over ``max_steps``.
-        weight_decay: if > 0, use AdamW instead of Adam.
+        h (int): Forecast horizon.
+        input_size (int): History window length; ``-1`` (default) uses
+            ``3 * h``.
+        n_series (int): Number of channels ``N``. Must match the data passed
+            to :meth:`fit`. Default ``1``.
+        n_block (int): Number of stacked mixing layers. Default ``2``.
+        ff_dim (int): Hidden size of the feature-mixing feed-forward block.
+            Default ``64``.
+        dropout (float): Dropout rate after each mixing sub-block. Default
+            ``0.1``.
+        revin (bool): Apply per-channel reversible instance normalisation
+            (RevIN) before mixing and invert it after the output projection.
+            Default ``True``.
+        revin_affine (bool): Learn per-channel affine parameters inside
+            RevIN (requires ``revin=True``). Default ``True``.
+        temporal_norm_momentum (float): BatchNorm momentum of the temporal
+            mixing block. Default ``0.05``.
+        feature_norm_momentum (float): BatchNorm momentum of the feature
+            mixing block. Default ``0.05``.
+        use_batchnorm (bool): ``True`` (default) uses BatchNorm in the
+            mixing blocks; ``False`` uses LayerNorm.
+        use_global_skip (bool): Add a direct ``Dense(L -> h)`` skip from the
+            normalised input to the output. Default ``False``.
+        max_steps (int): Number of optimiser steps performed by :meth:`fit`.
+            Default ``1000``.
+        learning_rate (float): Adam or AdamW peak learning rate. Default
+            ``1e-3``.
+        batch_size (int): Windows per training step. Default ``32``.
+        random_seed (int): PRNG seed for parameter init and window sampling.
+            Default ``0``.
+        alias (str): Display name for external reporting. Default
+            ``"TSMixer"``.
+        loss (str | LossFn): Registered name (``"mae"``, ``"mse"``) from
+            :mod:`chronax.models.tsmixer.loss` or a callable
+            ``(y, y_hat) -> scalar``. Default ``"mae"``.
+        scale (bool): Normalise each training window by its own per-channel
+            insample mean and std (per window, not per series); the
+            inference context is normalised the same way and the forecast
+            is denormalised with the context statistics. Default ``True``.
+        grad_clip (float): Global gradient-norm clip threshold (``0`` =
+            disabled). Default ``0.0``.
+        use_lr_schedule (bool): ``True`` wraps the optimiser in a
+            linear-warmup (``max_steps // 10`` steps), cosine-decay schedule
+            ending at ``0.01 * learning_rate``; ``False`` (default) keeps
+            the learning rate constant.
+        weight_decay (float): AdamW weight decay; ``0`` (default) uses plain
+            Adam.
+        val_fraction (float): Fraction of the latest windows held out for
+            validation (``0`` = none). The best validation checkpoint
+            (parameters and BatchNorm statistics) is restored at the end of
+            :meth:`fit`. Default ``0.1``.
+        val_check_steps (int): Evaluate the validation loss every this many
+            steps. Default ``100``.
     """
 
     def __init__(
@@ -193,12 +232,22 @@ class TSMixerForecaster(BaseForecaster):
         *,
         verbose: bool = False,
     ) -> "TSMixerForecaster":
-        """Train the model on ``y``.
+        """Train the model in-place on ``y``.
 
         Args:
-            y: ``[T, N]`` multivariate array or list of N equal-length 1-D
-                arrays. All channels are modelled jointly.
-            verbose: print loss every ``max(1, max_steps // 10)`` steps.
+            y (jnp.ndarray | list[jnp.ndarray]): ``[T, N]`` multivariate
+                array, a ``(T,)`` array for ``n_series=1``, or a list of
+                ``N`` equal-length 1-D arrays. All channels are modelled
+                jointly.
+            verbose (bool): Print the training loss every
+                ``max(1, max_steps // 10)`` steps. Default ``False``.
+
+        Returns:
+            TSMixerForecaster: ``self``.
+
+        Raises:
+            ValueError: If the list entries differ in length, or the channel
+                count differs from ``n_series``.
         """
         y_mv = _as_multivariate(y)  # [T, N]
         self._fit_y = y
@@ -219,7 +268,7 @@ class TSMixerForecaster(BaseForecaster):
         B         = self.batch_size
 
         # Hold out the last val_fraction of windows (time-ordered) for validation
-        # and best-checkpoint tracking, matching NF's val_check_steps=100 behaviour.
+        # and best-checkpoint tracking.
         n_val = (
             max(1, int(n_windows * self.val_fraction))
             if self.val_fraction > 0 and n_windows > 1
@@ -311,15 +360,28 @@ class TSMixerForecaster(BaseForecaster):
         y: SeriesLike,
         h: Optional[int] = None,
     ) -> jnp.ndarray:
-        """Produce ``h``-step ahead forecasts.
+        """Produce ``h``-step ahead forecasts for the series in ``y``.
+
+        Uses the fitted parameters; does not re-fit. The last
+        ``config.input_size`` timesteps form the conditioning window; a
+        shorter ``y`` is left-padded with zeros. Unlike the
+        :class:`BaseForecaster` contract this returns a bare array, not a
+        dict.
 
         Args:
-            y: ``[T, N]`` series. The last ``config.input_size`` timesteps are
-                used as the conditioning window.
-            h: accepted for API symmetry; must equal ``config.h`` if provided.
+            y (jnp.ndarray | list[jnp.ndarray]): ``[T, N]`` array, ``(T,)``
+                array, or list of ``N`` equal-length 1-D arrays.
+            h (int | None): Accepted for interface symmetry; must equal
+                ``config.h`` when given.
 
         Returns:
-            ``[h, N]`` forecast array, or ``[h]`` if the input was 1-D.
+            jnp.ndarray: Shape ``(h, N)``, or ``(h,)`` when ``y`` was a 1-D
+            array.
+
+        Raises:
+            RuntimeError: If called before :meth:`fit`.
+            ValueError: If ``h`` differs from ``config.h``, or the list
+                entries differ in length.
         """
         if not self.fitted:
             raise RuntimeError("Call .fit() before .forecast().")
@@ -368,17 +430,24 @@ class TSMixerForecaster(BaseForecaster):
     ) -> dict:
         """Forecast from the series passed to :meth:`fit`.
 
-        Satisfies the ``BaseForecaster`` contract: unlike :meth:`forecast`,
-        this does not take ``y`` explicitly — it reuses the series cached at
-        fit time.
+        Unlike :meth:`forecast`, this does not take ``y``; it reuses the
+        series cached at fit time.
 
         Args:
-            h: Forecast horizon. Defaults to ``config.h`` when None.
-            X: Reserved for future exogenous regressors; unused.
-            level: Not yet supported for this model.
+            h (int | None): Forecast horizon; must equal ``config.h`` when
+                given. Defaults to ``config.h``.
+            X (jnp.ndarray | None): Accepted for interface parity; ignored.
+            level (list[int] | None): Not supported; any value raises.
 
         Returns:
-            dict: ``{"mean": jnp.ndarray}``.
+            dict: ``{"mean": jnp.ndarray}`` with ``"mean"`` of shape
+            ``(h, N)``, or ``(h,)`` when :meth:`fit` received a 1-D array.
+            No interval keys are ever emitted.
+
+        Raises:
+            RuntimeError: If called before :meth:`fit`.
+            NotImplementedError: If ``level`` is not ``None``.
+            ValueError: If ``h`` differs from ``config.h``.
         """
         if not self.fitted:
             raise RuntimeError("Call .fit() before .predict().")

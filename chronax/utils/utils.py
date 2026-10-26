@@ -1,5 +1,5 @@
 """
-utils.py — Shared utilities for all Chronax forecasting models.
+utils.py: shared utilities for all Chronax forecasting models.
 
 Sections
 --------
@@ -10,7 +10,8 @@ Sections
 4.  Conformal Interval Helpers    _add_conformal_distribution_intervals, _get_conformal_method,
                                    _conformal_method, _store_cs, _add_conformal_intervals,
                                    _add_predict_conformal_intervals
-5.  SES Core                      _ses_forecast_nan, _ses_sse, _ses_forecast,
+5.  SES Core                      (simple exponential smoothing)
+                                   _ses_forecast_nan, _ses_sse, _ses_forecast,
                                    _ses_sse_masked, _ses_forecast_last_masked,
                                    _golden_bounded_minimize,
                                    _optimized_ses_forecast, _optimized_ses_forecast_masked
@@ -19,7 +20,8 @@ Sections
                                    _expand_fitted_demand, _expand_fitted_intervals
 8.  Seasonal & Decomposition      _seasonal_naive,
                                    seasonal_decompose, _linear_extrapolate_tail
-9.  IMAPA                         _imapa_aggregate_jit, _imapa
+9.  IMAPA                         (intermittent multiple aggregation prediction
+                                   algorithm) _imapa_aggregate_jit, _imapa
 10. Miscellaneous                 is_constant, acf, calculate_information_criteria
 11. Adaptive Optimizer Suite      minimize_armijo, bounded_line_minimize,
                                    multistart_argmin, MinimizeState
@@ -27,8 +29,8 @@ Sections
 13. Seasonal Period Detection     detect_period, detect_periods,
                                    seasonal_strength
 
-Public API (imported by other modules)
----------------------------------------
+Public API (application programming interface; imported by other modules)
+--------------------------------------------------------------------------
 ensure_float, calculate_sigma, extract_demand, extract_probability,
 _repeat_val, _repeat_val_seas, _quantiles, _calculate_intervals,
 _add_fitted_pi, _add_fitted_pi_1,
@@ -60,7 +62,7 @@ import jax.random as jrandom
 from jax import jit, lax
 from jax.scipy.stats import norm
 
-# Enable float64 precision — required by the golden-section SES optimizer.
+# Enable float64 precision: required by the golden-section SES optimizer.
 # Note: this affects the entire JAX session.
 jax.config.update("jax_enable_x64", True)
 
@@ -69,17 +71,18 @@ results = namedtuple("results", "x fn nit simplex")
 
 
 # ============================================================
-# SECTION 1 — Type / Dtype Helpers
+# SECTION 1: Type / Dtype Helpers
 # ============================================================
 
 def ensure_float(y: jnp.ndarray) -> jnp.ndarray:
-    """Cast array to float32 if it is not already a floating-point dtype.
+    """Cast an array to float32 unless it already has a floating-point dtype.
 
     Args:
-        y: Input JAX array of any dtype.
+        y (jnp.ndarray): Input array of any dtype.
 
     Returns:
-        The same array if already floating-point, otherwise cast to float32.
+        jnp.ndarray: ``y`` unchanged if floating-point, otherwise ``y`` cast
+        to float32.
     """
     if not jnp.issubdtype(y.dtype, jnp.floating):
         return y.astype(jnp.float32)
@@ -88,14 +91,15 @@ def ensure_float(y: jnp.ndarray) -> jnp.ndarray:
 
 @jax.jit
 def calculate_sigma(residuals: jnp.ndarray, n: int) -> jnp.ndarray:
-    """Compute the root-mean-square of residuals (RMS sigma).
+    """Compute the root mean square (RMS) of residuals.
 
     Args:
-        residuals: Residual values as a JAX array.
-        n: Number of degrees of freedom (denominator).
+        residuals (jnp.ndarray): Residual values; NaNs are ignored in the sum.
+        n (int): Degrees of freedom used as the denominator.
 
     Returns:
-        Scalar sigma value; returns 0.0 when n <= 0.
+        jnp.ndarray: Scalar ``sqrt(nansum(residuals**2) / n)``, or 0.0 when
+        ``n <= 0``.
     """
     return jnp.where(
         n > 0,
@@ -105,9 +109,9 @@ def calculate_sigma(residuals: jnp.ndarray, n: int) -> jnp.ndarray:
 
 
 def _jax_norm_ppf(p: jnp.ndarray) -> jnp.ndarray:
-    """Inverse normal CDF (percent-point function) implemented in JAX.
+    """Inverse normal cumulative distribution function (CDF) in JAX.
 
-    Exact inverse normal CDF via jax.scipy.special.ndtri.
+    Exact percent-point function via jax.scipy.special.ndtri.
 
     Args:
         p: Probability value(s) in (0, 1).
@@ -115,9 +119,6 @@ def _jax_norm_ppf(p: jnp.ndarray) -> jnp.ndarray:
     Returns:
         Corresponding z-score(s).
     """
-    # Exact inverse normal CDF (jax.scipy.special.ndtri) — the former
-    # Beasley-Springer-Moro rational approximation carried a ~4.5e-4 z-error
-    # that biased every native prediction interval slightly.
     p = jnp.clip(p, 1e-10, 1 - 1e-10)
     return jax.scipy.special.ndtri(p)
 
@@ -139,51 +140,54 @@ def _quantiles(level: List[Union[int, float]]) -> jnp.ndarray:
 
 
 # ============================================================
-# SECTION 2 — Data Extraction Helpers
+# SECTION 2: Data Extraction Helpers
 # ============================================================
 
 def extract_demand(y: jnp.ndarray) -> jnp.ndarray:
-    """Extract positive (non-zero) demand values from a time series.
+    """Extract the positive demand values from a time series.
 
-    Used for intermittent demand models like TSB and Croston,
-    where we need to separate demand occurrences from no-demand periods.
+    Used by intermittent demand models such as Teunter-Syntetos-Babai (TSB)
+    and Croston, which separate demand occurrences from no-demand periods.
+    Not vmap-safe: the output length depends on the data.
 
     Args:
-        y: Time series array that may contain zeros.
+        y (jnp.ndarray): Time series, shape ``(T,)``, may contain zeros.
 
     Returns:
-        Array containing only positive values from y.
+        jnp.ndarray: The entries of ``y`` that are ``> 0``, in order, with
+        the dtype of ``y``.
 
     Example:
         >>> y = jnp.array([0, 5, 0, 0, 3, 2, 0])
         >>> extract_demand(y)
-        Array([5., 3., 2.], dtype=float32)
+        Array([5, 3, 2], dtype=int32)
     """
     return y[y > 0]
 
 
 def extract_probability(y: jnp.ndarray) -> jnp.ndarray:
-    """Convert time series to binary indicator (1=demand, 0=no demand).
+    """Convert a time series to a binary demand indicator (1 = demand, 0 = none).
 
-    Used for intermittent demand models like TSB to track the
-    probability of demand occurrence at each time step.
+    Used by intermittent demand models such as TSB to track the probability
+    of a demand occurrence at each step.
 
     Args:
-        y: Time series array.
+        y (jnp.ndarray): Time series, shape ``(T,)``.
 
     Returns:
-        Binary array where 1 indicates demand occurred, 0 indicates no demand.
+        jnp.ndarray: Array of shape ``(T,)`` with the dtype of ``y``; 1 where
+        ``y != 0``, else 0.
 
     Example:
         >>> y = jnp.array([0, 5, 0, 0, 3, 2, 0])
         >>> extract_probability(y)
-        Array([0., 1., 0., 0., 1., 1., 0.], dtype=float32)
+        Array([0, 1, 0, 0, 1, 1, 0], dtype=int32)
     """
     return (y != 0).astype(y.dtype)
 
 
 # ============================================================
-# SECTION 3 — Forecast Output Helpers
+# SECTION 3: Forecast Output Helpers
 # ============================================================
 
 @_partial(jax.jit, static_argnums=(1,))
@@ -210,7 +214,7 @@ def _repeat_val_seas(season_vals: jnp.ndarray, h: int) -> jnp.ndarray:
 
     Args:
         season_vals: Seasonal pattern of shape (season_length,).
-        h: Forecast horizon (static — must be known at compile time).
+        h: Forecast horizon (static, must be known at compile time).
 
     Returns:
         Tiled pattern of length h.
@@ -270,7 +274,8 @@ def _add_fitted_pi(
 ) -> dict:
     """Add in-sample prediction intervals to a fitted result dict.
 
-    Used by theta/HW/ETS models. Works with scalar or vector se via reshaping.
+    Used by the Theta, Holt-Winters and exponential smoothing (ETS) models.
+    Works with scalar or vector ``se`` via reshaping.
 
     Args:
         res: Result dict containing 'fitted'.
@@ -323,7 +328,7 @@ def _add_fitted_pi_1(
 
 
 # ============================================================
-# SECTION 4 — Conformal Interval Helpers
+# SECTION 4: Conformal Interval Helpers
 # ============================================================
 
 def _add_conformal_distribution_intervals(
@@ -514,17 +519,17 @@ def _add_predict_conformal_intervals(
 
 
 # ============================================================
-# SECTION 5 — SES Core
+# SECTION 5: SES Core
 # ============================================================
 
 @jax.jit
 def _ses_forecast_nan(x: jnp.ndarray, alpha: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """Simple Exponential Smoothing forecast with NaN-tail handling.
+    """Simple exponential smoothing (SES) forecast with NaN-tail handling.
 
     One-step-ahead fitted values over the valid prefix of a NaN-padded array
     (Croston's compact demand/interval arrays):
-    ``fitted[i] = alpha * x[i-1] + (1 - alpha) * fitted[i-1]`` — each fitted
-    value uses only PREVIOUS observations, and ``fitted[first_valid]`` is NaN.
+    ``fitted[i] = alpha * x[i-1] + (1 - alpha) * fitted[i-1]``; each fitted
+    value uses only previous observations, and ``fitted[first_valid]`` is NaN.
     When the array carries a NaN tail, the slot right after the last valid
     entry receives the out-of-sample forecast, so the Croston expansion reads
     the final level for positions after the last demand.
@@ -574,7 +579,7 @@ def _ses_forecast_nan(x: jnp.ndarray, alpha: jnp.ndarray) -> Tuple[jnp.ndarray, 
 
 @jax.jit
 def _ses_sse(alpha: jnp.ndarray, x: jnp.ndarray) -> jnp.ndarray:
-    """Residual sum of squares for simple exponential smoothing (JIT-compiled).
+    """Sum of squared errors (SSE) for SES, just-in-time (JIT) compiled.
 
     Uses lax.fori_loop for efficient JAX compilation.
 
@@ -696,13 +701,9 @@ def _ses_forecast_last_masked(
     init_forecast = x[0]
     fitted_last = lax.fori_loop(1, n, body_fun, init_forecast)
     # Final one-step-ahead update with the last valid observation x[n_eff-1].
-    # The loop above only produced the SES level from x[0..n_eff-2]; without this
-    # update it returned the in-sample fitted value, not the proper one-step
-    # forecast — which left IMAPA's SES ~10/9 too high, making IMAPA the only
-    # intermittent model behind statsforecast (Croston/TSB/ADIDA use the
-    # non-masked `_ses_forecast`, which already does this and is at SF parity).
-    # statsforecast's `_ses_forecast` ends with the same update.
-    # (n_eff is traced -> `x[last_idx]` is a gather; vmap-safe.)
+    # The loop above produces the SES level from x[0..n_eff-2] only; this step
+    # turns it into the one-step forecast, as statsforecast's `_ses_forecast`
+    # does. n_eff is traced, so `x[last_idx]` is a gather and vmap-safe.
     last_idx = jnp.maximum(n_eff.astype(jnp.int32) - 1, 0)
     forecast = alpha * x[last_idx] + complement * fitted_last
     return forecast
@@ -716,13 +717,19 @@ def _ses_associative_op(left, right):
 
 @jax.jit
 def _ses_sse_assoc(alpha: jnp.ndarray, x: jnp.ndarray, n_eff: jnp.ndarray) -> jnp.ndarray:
-    """SES SSE via `lax.associative_scan` (template: `chronax/models/garch.py:_compute_sigma2_parallel_q1`).
+    """SES sum of squared errors via ``lax.associative_scan``.
 
-    Math-equivalent to `_ses_sse_masked` (validated 0.00% relative error
-    on synthetic SES data for α ∈ {0.1, 0.3, 0.5, 0.7, 0.9} via the probe
-    at `benchmarks/probe_ses_variants.py`). Uses an associative-scan
-    primitive that runs in O(log n) wall time on GPU and shares dispatch
-    across vmap'd batches — aligned with Chronax's design philosophy.
+    Equivalent to ``_ses_sse_masked``. The associative scan has O(log n)
+    depth on a graphics processing unit (GPU) and shares dispatch across
+    vmap'd batches.
+
+    Args:
+        alpha: Smoothing parameter.
+        x: Padded time series of shape (n,).
+        n_eff: Number of effective (non-padding) elements.
+
+    Returns:
+        SSE scalar computed over the first ``n_eff`` elements.
     """
     x = ensure_float(x)
     dtype = x.dtype
@@ -792,7 +799,7 @@ def _golden_bounded_minimize(
         early_stop_patience: Iterations without improvement before stopping.
 
     Returns:
-        Tuple of (x_star, f_star) — the minimizer and its objective value.
+        Tuple of (x_star, f_star): the minimizer and its objective value.
     """
     if xatol is None:
         xatol = 1e-12 if dtype == jnp.float64 else 1e-7
@@ -910,7 +917,7 @@ def _optimized_ses_forecast(
 def _trend_strength_masked(x: jnp.ndarray, n_eff: jnp.ndarray) -> jnp.ndarray:
     """Dimensionless trend strength of x[:n_eff].
 
-    Computes OLS slope on the valid prefix, normalised by in-sample
+    Computes the ordinary least squares (OLS) slope on the valid prefix, normalised by in-sample
     residual std and scaled by length. Values ~0 indicate stationary data;
     values >>1 indicate strongly trended series (e.g. AirlinePassengers).
 
@@ -944,7 +951,7 @@ def _optimized_ses_forecast_masked(
 ) -> jnp.ndarray:
     """SES forecast over the first n_eff elements of a padded array.
 
-    Uses golden-section search to optimize alpha, then computes forecast
+    Uses golden-section search to choose alpha, then computes the forecast
     over the effective portion of the array.
 
     Args:
@@ -974,11 +981,8 @@ def _optimized_ses_forecast_masked(
         forecast_run = _ses_forecast_last_masked(x_run, alpha_star, n_eff)
         return forecast_run.astype(out_dtype)
 
-    # xatol 1e-5 matches SF's scipy minimize_scalar(bounded) default. Tighter
-    # tolerances buy decimal digits of SES-alpha resolution SF does not have, at
-    # roughly triple the golden-section evals per aggregation level — each eval an
-    # O(n) masked SSE scan. IMAPA is this helper's only consumer; ADIDA has its own
-    # SES optimizer.
+    # xatol 1e-5 matches the scipy minimize_scalar(bounded) default that
+    # statsforecast uses; each golden-section eval is an O(n) masked SSE scan.
     return lax.cond(
         prefer_fp32,
         lambda: run(jnp.float32, 1e-5),
@@ -987,7 +991,7 @@ def _optimized_ses_forecast_masked(
 
 
 # ============================================================
-# SECTION 6 — Aggregation / Chunking
+# SECTION 6: Aggregation / Chunking
 # ============================================================
 
 @_partial(jax.jit, static_argnums=(1, 2))
@@ -1201,7 +1205,7 @@ def _expand_fitted_intervals(fitted: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray
 
 
 # ============================================================
-# SECTION 8 — Seasonal & Decomposition
+# SECTION 8: Seasonal & Decomposition
 # ============================================================
 
 
@@ -1260,19 +1264,25 @@ def seasonal_decompose(
     model: str = "additive",
     period: int = 1,
 ) -> Dict[str, jnp.ndarray]:
-    """Classical seasonal decomposition using centered moving average.
+    """Classical seasonal decomposition with a centered moving average (MA).
 
-    Uses mode='valid' convolution with NaN-padding and half-weights for even
-    periods (proper centered MA), NaN-aware seasonal averaging, and correct
-    normalization.
+    The trend is a ``mode="valid"`` convolution with a centered MA kernel
+    (half-weights at both ends for an even ``period``), padded with NaN at
+    both edges. The seasonal component is the NaN-aware mean of the detrended
+    series at each period position, normalized to sum to 0 (additive) or
+    average 1 (multiplicative), then tiled to length ``T``.
 
     Args:
-        y: Input time series array.
-        model: Decomposition type, 'additive' or 'multiplicative'.
-        period: Seasonal period length.
+        y (jnp.ndarray): Input time series, shape ``(T,)``.
+        model (str): ``"additive"`` or ``"multiplicative"``. Any value other
+            than ``"additive"`` is treated as multiplicative; no validation.
+            Defaults to ``"additive"``.
+        period (int): Seasonal period length. Defaults to 1.
 
     Returns:
-        Dict with 'trend', 'seasonal', and 'resid' keys.
+        dict: ``"trend"``, ``"seasonal"`` and ``"resid"``, each of shape
+        ``(T,)``. ``"trend"`` and ``"resid"`` are NaN at the edges the
+        kernel does not cover.
     """
     n = len(y)
 
@@ -1353,7 +1363,7 @@ def _linear_extrapolate_tail(y: jnp.ndarray, tail_window: int, h: int) -> jnp.nd
 
 
 # ============================================================
-# SECTION 9 — IMAPA
+# SECTION 9: IMAPA
 # ============================================================
 
 def _repeat_val_(val: jnp.ndarray, h: int) -> jnp.ndarray:
@@ -1439,10 +1449,15 @@ def _imapa_aggregate_body(y: jnp.ndarray, max_k, upper_bound: int) -> jnp.ndarra
 def _imapa_point_jit(y: jnp.ndarray, h: int) -> jnp.ndarray:
     """JIT-compiled point-forecast core for IMAPA (no fitted-values path).
 
-    Split out from :func:`_imapa` so the hot path can cache its compiled
-    XLA kernel across warm calls; the prior implementation paid a 1-2ms
-    Python+trace overhead per call (analogous to the ADIDA jit fix at
-    `chronax/models/adida.py:_adida_point`).
+    Split out from :func:`_imapa` so the point-forecast path caches its
+    compiled kernel across calls.
+
+    Args:
+        y: Input time series.
+        h: Forecast horizon (static).
+
+    Returns:
+        Constant forecast array of length h.
     """
     y = ensure_float(y)
     dtype = y.dtype
@@ -1527,32 +1542,33 @@ def _imapa(
 
 
 # ============================================================
-# SECTION 10 — Miscellaneous
+# SECTION 10: Miscellaneous
 # ============================================================
 
 def is_constant(x: jnp.ndarray) -> jnp.ndarray:
-    """Check if all elements of an array are equal.
+    """Check whether all elements of an array equal its first element.
 
     Args:
-        x: Input array.
+        x (jnp.ndarray): Input array with at least one element.
 
     Returns:
-        Boolean scalar.
+        jnp.ndarray: Boolean scalar, True when every element equals ``x[0]``.
     """
     return jnp.all(x[0] == x)
 
 
 def acf(x: jnp.ndarray, nlags: int) -> jnp.ndarray:
-    """Compute autocorrelation function up to ``nlags`` for a 1-D array.
+    """Compute the autocorrelation function (ACF) of a 1-D array up to ``nlags``.
 
-    Equivalent to statsmodels.tsa.stattools.acf(x, nlags=nlags).
+    Equivalent to ``statsmodels.tsa.stattools.acf(x, nlags=nlags)``.
 
     Args:
-        x: Input 1-D array.
-        nlags: Number of lags to compute.
+        x (jnp.ndarray): Input series, shape ``(n,)``.
+        nlags (int): Largest lag to compute; lags at or beyond ``n`` yield 0.
 
     Returns:
-        Array of ACF values from lag 0 to nlags (length nlags+1).
+        jnp.ndarray: ACF values for lags ``0..nlags``, shape ``(nlags + 1,)``;
+        element 0 is 1.
     """
     x = x - jnp.mean(x)
     n = x.shape[0]
@@ -1567,15 +1583,21 @@ def calculate_information_criteria(
     n_params: int,
     n: int,
 ) -> Dict[str, jnp.ndarray]:
-    """Calculate AIC, BIC, and AICc from residuals (JIT-compiled).
+    """Compute AIC, BIC and AICc from residuals (JIT-compiled).
+
+    The Akaike information criterion (AIC), the Bayesian information
+    criterion (BIC) and the small-sample corrected AIC (AICc) use the
+    Gaussian log-likelihood up to a constant, ``-0.5 * n * log(SSE)``, where
+    SSE is the sum of squared residuals.
 
     Args:
-        residuals: Model residuals.
-        n_params: Number of estimated parameters.
-        n: Number of observations.
+        residuals (jnp.ndarray): Model residuals.
+        n_params (int): Number of estimated parameters.
+        n (int): Number of observations.
 
     Returns:
-        Dict with 'loglik', 'aic', 'bic', 'aicc' as JAX arrays.
+        dict: ``"loglik"``, ``"aic"``, ``"bic"`` and ``"aicc"`` as scalar JAX
+        arrays. ``"aicc"`` is ``inf`` when ``n - n_params - 1 <= 0``.
     """
     sse = jnp.sum(residuals ** 2)
     lik = n * jnp.log(sse + 1e-10)
@@ -1626,7 +1648,7 @@ def _lbfgs_two_loop(
     rho: jnp.ndarray,
     count: jnp.ndarray,
 ) -> jnp.ndarray:
-    """L-BFGS two-loop recursion yielding descent direction ``d = -H · g``.
+    """Limited-memory BFGS (L-BFGS) two-loop recursion for ``d = -H · g``.
 
     History is stored with *newest at index 0*: entries ``S[0..count-1]`` are
     valid, ordered newest → oldest. Unused rows (``i >= count``) are masked
@@ -1687,7 +1709,7 @@ def _armijo_linesearch(
 ):
     """Backtracking Armijo line search.
 
-    Starts at ``t = min(1, 1/‖d‖∞)`` — the cap keeps the initial step bounded
+    Starts at ``t = min(1, 1/‖d‖∞)``; the cap keeps the initial step bounded
     when ``d`` is an unscaled steepest-descent direction (e.g., at iter 0
     before the L-BFGS Hessian approximation has any history). Accept the first
     step satisfying ``f(x + t·d) <= f(x) + c1 · t · (g · d)``. Returns the
@@ -1746,7 +1768,7 @@ def minimize_armijo(
     near-zero work while the remaining elements finish.
 
     For bounded problems, reparametrize in caller-space (softplus, sigmoid,
-    softmax) before passing the objective — this module is deliberately
+    softmax) before passing the objective; this module is deliberately
     unconstrained so there is a single clean code path.
 
     Args:
@@ -1755,7 +1777,7 @@ def minimize_armijo(
         max_iter: Upper bound on outer iterations.
         grad_tol: Convergence tolerance on ``max(|grad|)``.
         f_tol: Convergence tolerance on relative objective change.
-        memory_size: L-BFGS history depth (typical: 5–15).
+        memory_size: L-BFGS history depth (typical: 5 to 15).
         linesearch_budget: Max backtracks per outer iter.
         linesearch_c1: Armijo sufficient-decrease constant.
         linesearch_shrink: Backtrack shrink factor (typical: 0.5).
@@ -1860,24 +1882,24 @@ def bounded_line_minimize(
     max_iter: int = 100,
     dtype: jnp.dtype = jnp.float64,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """1-D bounded minimizer with a sane ``max_iter`` default.
+    """1-D bounded golden-section minimizer with a small ``max_iter`` default.
 
-    Thin wrapper around :func:`_golden_bounded_minimize` that defaults to
-    ``max_iter=100`` (vs. the legacy 5000). Under ``jax.vmap`` the worst-case
-    iteration count syncs across the batch, so the old 5000 ceiling meant a
-    single slow series could make the whole batch spin 50× longer than
-    necessary — 100 iters is already well past double-precision convergence
-    for the 1-D searches Chronax performs (SES α, Box-Cox λ, etc.).
+    Thin wrapper around :func:`_golden_bounded_minimize`. Under ``jax.vmap``
+    the iteration count syncs across the batch to its slowest element, so a
+    small cap bounds the whole batch; 100 iterations is well past
+    double-precision convergence for the 1-D searches Chronax performs
+    (SES alpha, Box-Cox lambda).
 
     Args:
         f: 1-D scalar objective ``f(x) -> float``.
-        a, b: Lower and upper search bounds.
+        a: Lower search bound.
+        b: Upper search bound.
         tol: Absolute tolerance on the bracket width.
-        max_iter: Max iterations (default 100, vs. legacy 5000).
+        max_iter: Maximum number of iterations.
         dtype: Arithmetic dtype; default ``float64``.
 
     Returns:
-        ``(x_star, f_star)`` — the minimizer and its objective value.
+        ``(x_star, f_star)``: the minimizer and its objective value.
     """
     return _golden_bounded_minimize(
         f, a, b, dtype=dtype, xatol=tol, maxiter=max_iter
@@ -1890,12 +1912,12 @@ def multistart_argmin(
 ) -> MinimizeState:
     """Run ``minimizer`` from each row of ``starts`` and return the best result.
 
-    Replaces Python ``for model_type in ["STM", "OTM", ...]`` loops in
-    AutoTheta / AutoTBATS / AutoCES with a single ``vmap``'d minimization
-    followed by an ``argmin`` gather.
+    Used by the Auto* models (AutoTheta, AutoTBATS, AutoCES) to evaluate all
+    candidate starts as a single ``vmap``'d minimization followed by an
+    ``argmin`` gather.
 
     Args:
-        minimizer: Single-argument minimizer — typically
+        minimizer: Single-argument minimizer, typically
             ``lambda x0: minimize_armijo(fun, x0, ...)``.
         starts: Array of starting points, shape ``(K, n)``.
 
@@ -1914,11 +1936,11 @@ def multistart_argmin(
 
 
 # ============================================================
-# SECTION 12 — Nelder-Mead Simplex (derivative-free)
+# SECTION 12: Nelder-Mead Simplex (derivative-free)
 # ============================================================
 #
 # Pure-JAX, vmap-safe, JIT-compatible Nelder-Mead simplex minimizer.
-# Complements ``minimize_armijo`` — the latter is faster on smooth convex
+# Complements ``minimize_armijo``, which is faster on smooth convex
 # problems but gets trapped in local minima on non-smooth objectives
 # (e.g. TBATS's log-likelihood with Box-Cox clips and admissibility
 # penalties). Nelder-Mead has no gradient; it navigates by reflecting /
@@ -1965,7 +1987,7 @@ def nelder_mead(
 
     Args:
         fun: Scalar objective ``fun(x) -> float``. Does NOT need to be
-            differentiable — Nelder-Mead is gradient-free.
+            differentiable; Nelder-Mead is gradient-free.
         x0: Starting point, 1-D array of shape ``(n,)``.
         max_iter: Upper bound on outer iterations.
         x_tol: Converged when simplex diameter (max ‖vertex - best‖)
@@ -2029,15 +2051,13 @@ def nelder_mead(
         centroid = (jnp.sum(simplex, axis=0) - worst_vertex) / n
 
         # Every candidate point this iteration can need is simplex-determined
-        # BEFORE any objective evaluation:
-        # reflection, expansion, BOTH contraction candidates (the outside/inside
-        # base pick needs f_r, so evaluate both and select the VALUE — per-branch
-        # arithmetic unchanged), and the n+1 shrink candidates. One vmapped eval
-        # replaces 3 sequential evals plus a lax.cond'd shrink vmap — measured
-        # 2.4–2.6× per-iteration amortization on the CES objective — and deletes
-        # the shrink cond (whose select-executes-both-branches hazard under an
-        # outer CV vmap goes with it). The shrink row at best_idx re-evaluates
-        # the best vertex, exactly as the old _do_shrink did.
+        # before any objective evaluation: reflection, expansion, both
+        # contraction candidates (the outside/inside pick needs f_r, so both
+        # are evaluated and the value is selected), and the n+1 shrink
+        # candidates. One vmapped eval covers them all. A lax.cond on the
+        # shrink path would save nothing: under an outer vmap it lowers to a
+        # select that executes both branches. The shrink row at best_idx
+        # re-evaluates the best vertex.
         x_r = centroid + alpha * (centroid - worst_vertex)
         x_e = centroid + gamma * (x_r - centroid)
         x_c_out = centroid + rho * (x_r - centroid)
@@ -2074,8 +2094,8 @@ def nelder_mead(
         simplex_noshrink = simplex.at[worst_idx].set(x_new)
         f_noshrink = fvals.at[worst_idx].set(f_new)
 
-        # Shrink values came from the same batched eval above; a scalar-predicate
-        # where replaces the old lax.cond.
+        # Shrink values come from the same batched eval above; a scalar-predicate
+        # where selects them.
         shrink_f = f_cand[4:]
         simplex_next = jnp.where(case_shrink, shrink_pts, simplex_noshrink)
         f_next = jnp.where(case_shrink, shrink_f, f_noshrink)
@@ -2098,40 +2118,37 @@ def nelder_mead(
 
 
 # ============================================================
-# SECTION 13 — Seasonal Period Detection
+# SECTION 13: Seasonal Period Detection
 # ============================================================
-# Pure-JAX, vmap-safe seasonal period detection (moved here from the
-# former chronax/utils/period_detection.py so all automatic period
-# detection lives in one utilities module). Three helpers callable
+# Pure-JAX, vmap-safe seasonal period detection. Three helpers callable
 # directly by users (``from chronax.utils import detect_period``) and
 # consumable inside any model's ``fit`` path:
-#   - detect_period      – single dominant period
-#   - detect_periods     – top-n distinct periods (for MSTL etc.)
-#   - seasonal_strength  – Wang-Smith-Hyndman strength at a given period
+#   - detect_period: single dominant period
+#   - detect_periods: top-n distinct periods (for MSTL etc.)
+#   - seasonal_strength: Wang-Smith-Hyndman strength at a given period
 # Every public function is pure JAX (jnp.fft, lax.fori_loop, masked
-# arithmetic — no np.*, no Python control flow on traced values, no
+# arithmetic; no np.*, no Python control flow on traced values, no
 # data-dependent shapes), so jax.vmap / jax.jit match eager output.
 # Caveat: a model that uses the returned period as a *static-shape*
 # parameter cannot vary it across a vmap batch without padded state;
 # the detection itself is vmap-safe, padding is the model's job.
 
 def adaptive_iterate(step, init, params_of, *, max_steps, rtol=1e-6, patience=2):
-    """Run an optimizer ``step`` to convergence-or-cap, returning the best iterate.
+    """Run an optimizer ``step`` to convergence or to a cap, returning the best iterate.
 
     A ``lax.while_loop`` driver that stops when the relative loss improvement
     stays ``< rtol`` for ``patience`` consecutive iterations, or when ``max_steps``
-    is reached — auto-adapting the step count to the data instead of running a
-    fixed budget. It tracks the *best-loss* iterate seen (not the last), so a step
-    that overshoots never degrades the result.
+    is reached, so the step count adapts to the data instead of a fixed budget.
+    It tracks the *best-loss* iterate seen (not the last), so a step that
+    overshoots never degrades the result.
 
-    Intended to replace a fixed ``lax.scan(step, length=N)`` in an optimizer's
-    refinement phase. **vmap semantics:** the loop is a ``lax.while_loop`` with all
-    control flow on traced scalars via ``jnp`` — so it composes with ``jax.vmap``.
-    Called *eagerly* (e.g. one model candidate at a time), it stops at that call's
-    own convergence — the real speedup. Called *under vmap* (a batched CV/conformal
-    refit), ``lax.while_loop`` runs until the slowest lane's condition is false, i.e.
-    to the slowest lane's convergence capped at ``max_steps`` — correct, and never
-    more work than the fixed-``max_steps`` scan it replaces.
+    A drop-in alternative to a fixed ``lax.scan(step, length=N)`` in an
+    optimizer's refinement phase. All control flow is on traced scalars via
+    ``jnp``, so the loop composes with ``jax.vmap``. Called eagerly (one model
+    candidate at a time) it stops at that call's own convergence. Called under
+    vmap (a batched cross-validation (CV) or conformal refit) the
+    ``lax.while_loop`` runs until the slowest lane converges, capped at
+    ``max_steps``.
 
     Args:
         step: ``carry -> (carry', loss)``. ``loss`` is the objective at the *input*
@@ -2139,21 +2156,21 @@ def adaptive_iterate(step, init, params_of, *, max_steps, rtol=1e-6, patience=2)
             "best evaluated point" convention); ``carry'`` is the advanced state.
             ``carry`` is any pytree (params + optimizer state).
         init: initial carry.
-        params_of: ``carry -> params`` — extracts the point that ``step`` evaluates,
+        params_of: ``carry -> params``; extracts the point that ``step`` evaluates,
             so the tracked best pairs each loss with the point it was measured at
             (never a post-update point whose loss is unknown).
         max_steps: hard iteration cap (static int).
-        rtol: relative-improvement plateau threshold (static float). Larger ⇒ stops
-            sooner; must be small enough that hard problems run to ``max_steps``.
+        rtol: relative-improvement plateau threshold (static float). Larger means
+            it stops sooner; must be small enough that hard problems run to ``max_steps``.
         patience: consecutive plateau iterations required before stopping (static int).
 
     Returns:
-        ``(best_params, best_loss, n_used)`` — ``n_used`` is a traced int32 count of
+        ``(best_params, best_loss, n_used)``; ``n_used`` is a traced int32 count of
         steps actually taken (including the initial one).
     """
     max_steps = int(max_steps)
     patience = int(patience)
-    # One step up front seeds best/prev at the loss's own dtype — seeding with a
+    # One step up front seeds best/prev at the loss's own dtype; seeding with a
     # python inf would make the while_loop carry f64 and mismatch an f32 loss
     # ("carry input/output types differ"). The
     # first step evaluates `init`, so `init`'s params seed the best iterate.
@@ -2181,7 +2198,7 @@ def adaptive_iterate(step, init, params_of, *, max_steps, rtol=1e-6, patience=2)
     return best_p, best_l, n_used
 
 
-ArrayLike = Union[jnp.ndarray, "np.ndarray"]  # noqa: F821 — np as string
+ArrayLike = Union[jnp.ndarray, "np.ndarray"]  # noqa: F821 (np as string)
 
 
 def _acf_and_score(
@@ -2196,7 +2213,7 @@ def _acf_and_score(
           maxima above the noise threshold.
         - score: shape (max_period - 1,) float, ACF at lag plus harmonic
           contribution; -inf at masked-out positions.
-        - threshold: float scalar — the noise floor used.
+        - threshold: float scalar, the noise floor used.
 
     Static shapes: max_period is a Python int → all output shapes are static.
     """
@@ -2204,7 +2221,7 @@ def _acf_and_score(
     n = y.shape[0]
     M = int(max_period)
     if M < 2:
-        # Degenerate — caller treats this as no detection.
+        # Degenerate; caller treats this as no detection.
         empty = jnp.zeros(0, dtype=jnp.float64)
         return (
             jnp.zeros(0, dtype=jnp.int32),
@@ -2218,7 +2235,7 @@ def _acf_and_score(
     nd = dy.shape[0]  # static = n - 1
     dy_centered = dy - jnp.mean(dy)
 
-    # Static FFT length: next power of two ≥ 2*nd.
+    # Static fast Fourier transform (FFT) length: next power of two >= 2*nd.
     fft_len = 1
     while fft_len < 2 * max(nd, 1):
         fft_len *= 2
@@ -2243,15 +2260,15 @@ def _acf_and_score(
     acf_left = acf[1 : M]
     acf_right = acf[3 : M + 2]
 
-    # Noise-floor threshold (same as original numpy version).
+    # Noise-floor threshold.
     n_f = jnp.asarray(n, dtype=jnp.float64)
     threshold = jnp.maximum(0.1, 3.0 / jnp.sqrt(n_f))
 
     # Local-maximum + above-threshold mask.
     is_peak = (acf_at > threshold) & (acf_at >= acf_left) & (acf_at >= acf_right)
 
-    # Lag must have its right-neighbour inside the original (non-padded) ACF —
-    # i.e., k + 1 ≤ nd - 1, which is k ≤ nd - 2.
+    # Lag must have its right-neighbour inside the original (non-padded) ACF,
+    # i.e. k + 1 <= nd - 1, which is k <= nd - 2.
     lag_arr = jnp.arange(2, M + 1, dtype=jnp.int32)
     valid_lag = lag_arr <= (nd - 2)
     candidate_mask = is_peak & valid_lag
@@ -2279,7 +2296,7 @@ def _seasonal_strength_grid(y: jnp.ndarray, max_period: int) -> jnp.ndarray:
     static shapes (Python loop over the *static* period grid; each P is a
     Python int so ``jnp.arange(P)`` is static) → vmap/jit-safe. Lets strict
     mode read strength at a *traced* candidate period via ``jnp.take``
-    (``seasonal_strength`` itself can't — it does ``int(period)``).
+    (``seasonal_strength`` itself cannot, since it does ``int(period)``).
     """
     y = jnp.asarray(y, dtype=jnp.float64)
     n = y.shape[0]
@@ -2314,17 +2331,17 @@ def detect_period(
 ) -> jnp.ndarray:
     """Detect the dominant seasonal period of a time series.
 
-    Detailed Description:
+    Details:
         Detrends the series via first differencing, computes the ACF via
-        FFT (Wiener-Khinchin), and selects the lag k ∈ [2, max_period] whose
+        the FFT (Wiener-Khinchin), and selects the lag k ∈ [2, max_period] whose
         ACF is a local maximum above a noise-floor threshold and which has
         consistent harmonic support (elevated ACF at 2k, 3k). Returns
         ``fallback`` when no candidate clears the threshold or the series
         is too short.
 
-        The implementation is pure JAX — every comparison is a masked
-        ``jnp.where`` and every loop is unrolled or expressed via ``lax``
-        — so the function is ``jax.vmap`` and ``jax.jit`` safe. Use it
+        The implementation is pure JAX: every comparison is a masked
+        ``jnp.where`` and every loop is unrolled or expressed via ``lax``,
+        so the function is ``jax.vmap`` and ``jax.jit`` safe. Use it
         inside conformal-inference vmap'd fits or batched-forecast pipelines.
 
     Args:
@@ -2334,14 +2351,14 @@ def detect_period(
             SARIMA state-space explosions at very large periods. Must be ≥ 2.
         fallback: Returned when no significant period is detected. Default 1
             (no seasonality).
-        strict: Opt-in (default ``False`` → behaviour byte-identical to
-            before; AutoARIMA and existing tests unaffected). When ``True``,
-            confirm the ACF-selected lag with a period-folded
-            Wang-Smith-Hyndman seasonal-strength gate (≥0.15), a
-            ≥3-full-cycle requirement, and a fundamental-over-harmonic
-            correction (prefer the smallest sub-harmonic ``k//{2,3,4}`` whose
-            strength is ≥0.9× the candidate's, which corrects ~2× aliasing).
-            This is the canonical mode for ``season_length="auto"``.
+        strict: When ``False`` (default), return the ACF-selected lag as is.
+            When ``True``, select the period from the periodogram peak among
+            candidates that pass a period-folded Wang-Smith-Hyndman
+            seasonal-strength gate (>=0.15) and a >=5-full-cycle requirement,
+            then apply a fundamental-over-harmonic correction (prefer the
+            smallest sub-harmonic ``k//{2,3,4,5}`` whose strength is >=0.9x
+            the candidate's, which corrects harmonic aliasing). This is the
+            canonical mode for ``season_length="auto"``.
 
     Returns:
         jnp.ndarray: int32 scalar period in [2, max_period] when a strong
@@ -2351,7 +2368,7 @@ def detect_period(
     Raises:
         None.
 
-    Side Effects:
+    Side effects:
         None. Pure function.
 
     Example:
@@ -2385,12 +2402,12 @@ def detect_period(
         )
         return chosen.astype(jnp.int32)
 
-    # ---- strict: periodogram + folded-strength (validated algorithm) ----
-    # ACF-first-difference aliases on near-integer cycles (lynx 19≈2×9.5).
-    # The validated detector uses the periodogram peak + period-folded
-    # Wang-Hyndman strength, picking the *smallest* strongly-seasonal
-    # significant period (= the fundamental). Pure-jnp / static-shape →
-    # vmap & jit safe.
+    # ---- strict: periodogram + folded-strength ----
+    # The ACF of first differences can alias onto a harmonic of a near-integer
+    # cycle. The strict path uses the periodogram peak plus period-folded
+    # Wang-Hyndman strength and picks the *smallest* strongly-seasonal
+    # significant period (the fundamental). Pure-jnp / static-shape, so
+    # vmap and jit safe.
     y_arr = jnp.asarray(y, dtype=jnp.float64)
     n = int(y_arr.shape[0])
     periods = jnp.arange(2, M + 1, dtype=jnp.int32)            # (M-1,) static
@@ -2407,16 +2424,14 @@ def detect_period(
     bins = jnp.clip(jnp.round(n / periods.astype(jnp.float64)).astype(jnp.int32),
                     1, nbins - 1)
     cand_pw = jnp.take(pw, bins, mode="clip")                  # (M-1,)
-    # Noise floor = median spectral power (static shape; robust to the few
-    # ~0 bins — no boolean indexing, vmap/jit-safe).
+    # Noise floor = median spectral power (static shape; unaffected by the few
+    # near-zero bins; no boolean indexing, so vmap/jit-safe).
     noise = jnp.median(pw[1:])
 
     strength = _seasonal_strength_grid(y_arr, M)               # (M-1,)
     n_i = jnp.asarray(n, jnp.int32)
-    # ≥5 full cycles (validated recipe: pmax≈n//5) — folding with <5
-    # blocks lets noise spuriously "explain" variance at long periods
-    # (sunspots→55, lynx→19). us-deaths n≈48 then yields fallback → the
-    # documented DOMAIN_M override at the benchmark layer.
+    # Require >=5 full cycles: folding with fewer blocks lets noise spuriously
+    # "explain" variance at long periods.
     enough = (n_i // jnp.maximum(periods, 1)) >= 5
     significant = cand_pw > (6.0 * jnp.maximum(noise, 1e-30))
     qualify = significant & enough & (strength >= 0.15)
@@ -2456,11 +2471,11 @@ def detect_periods(
 ) -> jnp.ndarray:
     """Detect the top ``n_periods`` distinct seasonal periods.
 
-    Detailed Description:
+    Details:
         Computes the same FFT-ACF + harmonic score as :func:`detect_period`,
         then iteratively picks the top peak, records it, and zeros out a
         window of ±max(2, lag/5) around it before the next pick. Static
-        shapes throughout — ``n_periods`` is a Python int that fixes the
+        shapes throughout: ``n_periods`` is a Python int that fixes the
         output length so vmap is safe. Pads with ``fallback`` when fewer
         than ``n_periods`` distinct strong seasonalities exist.
 
@@ -2481,7 +2496,7 @@ def detect_periods(
     Raises:
         None.
 
-    Side Effects:
+    Side effects:
         None. Pure function.
 
     Example:
@@ -2531,7 +2546,7 @@ def detect_periods(
 def seasonal_strength(y: ArrayLike, period: int) -> jnp.ndarray:
     """Wang-Smith-Hyndman strength of seasonality at a given period.
 
-    Detailed Description:
+    Details:
         Linearly detrends the series, computes a per-phase mean (the
         seasonal pattern), and reports ``1 - var(remainder) / var(detrended)``
         clipped to ``[0, 1]``. A value near 1 means the series is dominated
@@ -2550,7 +2565,7 @@ def seasonal_strength(y: ArrayLike, period: int) -> jnp.ndarray:
     Raises:
         None.
 
-    Side Effects:
+    Side effects:
         None. Pure function.
 
     Example:

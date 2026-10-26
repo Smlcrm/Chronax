@@ -2,17 +2,19 @@
 
 Three concerns are separated:
 
-1. ``RobustScaler``          — per-window median/MAD normalisation (pure JAX).
-2. Window building           — ``build_windows`` / ``split_train_val_windows``
-                               extract sliding windows from a 1-D series.
-3. Batch construction        — ``create_batch`` assembles JAX batches for the
-                               masked-loss training path (mirrors RNN data.py).
+1. ``RobustScaler``: per-window median / median absolute deviation (MAD)
+   normalisation (pure JAX).
+2. Window building: ``build_windows`` / ``split_train_val_windows``
+   extract sliding windows from a 1-D series.
+3. Batch construction: ``create_batch`` assembles JAX batches for the
+   masked-loss training path (same format as the recurrent neural network
+   (RNN) data module).
 
 The window-based path (``build_windows`` + ``RobustScaler``) is the primary
 path used by ``NBEATSForecaster``; it applies per-window scaling inside the
 ``train_step`` JIT kernel, so no global statistics need to be tracked.
 
-No NumPy — every array is a ``jnp.ndarray``, including the sliding-window
+No NumPy: every array is a ``jnp.ndarray``, including the sliding-window
 extraction (done via a single vectorised gather).
 """
 
@@ -25,7 +27,7 @@ from jax import random
 
 
 # ---------------------------------------------------------------------------
-# Robust per-window scaler (pure JAX — operates on device arrays)
+# Robust per-window scaler (pure JAX, operates on device arrays)
 # ---------------------------------------------------------------------------
 
 _MAD_TO_STD = 0.6744897501960817  # scipy.stats.norm.ppf(0.75), pre-computed

@@ -2,11 +2,11 @@
 
 Two families are provided:
 
-* **Window losses** — ``mae``, ``mse``, ``huber``: reduce over all elements,
+* **Window losses**: ``mae``, ``mse``, ``huber`` reduce over all elements,
   signature ``(pred, target) -> scalar``. Used by the window-based training
-  loop (``AutoformerForecaster``) where batches are already per-window scaled.
+  loop (:class:`Autoformer`) where batches are already per-window scaled.
 
-* **Masked losses** — ``masked_mae``, ``masked_mse``: reduce with a
+* **Masked losses**: ``masked_mae``, ``masked_mse`` reduce with a
   multiplicative mask and optional per-horizon weighting, signature
   ``(y, y_hat, mask, horizon_weight) -> scalar``. Used with the
   ``create_batch``-style training loop (explicit ``sample_mask``).
@@ -29,7 +29,7 @@ LossFn = Callable[..., jnp.ndarray]
 
 
 # ---------------------------------------------------------------------------
-# Window losses (element-wise; optional outsample mask for NF-style padding)
+# Window losses (element-wise; optional outsample mask for neuralforecast-style padding)
 # ---------------------------------------------------------------------------
 
 
@@ -44,7 +44,7 @@ def mae(
     target: jnp.ndarray,
     mask: Optional[jnp.ndarray] = None,
 ) -> jnp.ndarray:
-    """Mean absolute error; masked mean when ``mask`` is given (NF padder)."""
+    """Mean absolute error; masked mean when ``mask`` is given (neuralforecast padder)."""
     return _reduce(jnp.abs(pred - target), mask)
 
 

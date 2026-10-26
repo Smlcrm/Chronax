@@ -1,4 +1,5 @@
-"""Window construction and JIT/scan training for TCN.
+"""Window construction and JIT/scan training for the temporal convolutional
+network (TCN) forecaster.
 
 Windows are scaled per-window (scaler stats on the insample target; per-channel
 scaling on historical and future-known exog), the loss is computed in scaled space, and the
@@ -76,7 +77,7 @@ def _scale_exog(windows: jnp.ndarray, scaler, stats_len: int | None = None) -> j
     # SPREAD-based floor bounds |scaled| <= range/(frac*range) = 1/frac by
     # construction (the shift lies inside [min, max]). frac sits ~15x below the
     # Gaussian scale/range ratio (~0.15 at these window lengths), so ordinary
-    # covariates — including level-offset ones like temperature in Kelvin —
+    # covariates, including level-offset ones like temperature in Kelvin,
     # never trip it, while degenerate spans (scale/range ~ 1e-9) always do.
     # Covariate values are known inputs, so the bound may read the full window;
     # the CENTERING stays insample-span.
@@ -210,7 +211,7 @@ def train(net, y, *, h, input_size, max_steps, windows_batch_size, lr, seed, los
 
 @nnx.jit
 def _forward_det(net, insample_z, hist_z, futr_z):
-    """Inference forward. The TCN forward is deterministic — jit for dispatch speed."""
+    """Inference forward. The TCN forward is deterministic, jit for dispatch speed."""
     return net(insample_z, hist_exog=hist_z, futr_exog=futr_z)
 
 

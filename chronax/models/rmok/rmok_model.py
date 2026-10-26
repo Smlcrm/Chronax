@@ -16,42 +16,70 @@ from chronax.models.rmok.rmok_training import predict_step, train
 class RMoK(BaseForecaster):
     """Univariate RMoK forecaster (JAX/Flax-NNX port of neuralforecast.RMoK).
 
-    Reversible Mixture of KAN experts (Han et al., 2024). Reversible instance
-    normalization wraps a softmax-gated mixture of four experts that each map the
-    input window to the horizon: a Taylor-KAN (polynomial expansion), a Jacobi-KAN
-    (Jacobi-polynomial recurrence on ``tanh``-squashed input), a Wave-KAN (a
-    wavelet transform followed by BatchNorm), and a plain linear layer. Defaults
-    match neuralforecast 3.1.7 (``taylor_order=3, jacobi_degree=6,
-    wavelet_function="mexican_hat", dropout=0.1, revin_affine=True,
-    max_steps=1000, learning_rate=1e-3, windows_batch_size=32``, identity scaler,
-    MAE loss) so the benchmark harness compares both libraries at native settings.
+    Reversible Mixture of KAN (Kolmogorov-Arnold Network) experts (Han et al.,
+    2024). Reversible instance normalization (RevIN) wraps a softmax-gated
+    mixture of four experts that each map the input window to the horizon: a
+    Taylor-KAN (polynomial expansion), a Jacobi-KAN (Jacobi-polynomial
+    recurrence on ``tanh``-squashed input), a Wave-KAN (a wavelet transform
+    followed by BatchNorm), and a plain linear layer. Defaults match
+    neuralforecast 3.1.7. ``float32`` throughout, matching torch and
+    neuralforecast defaults.
 
-    This is a UNIVARIATE adaptation of a model neuralforecast marks multivariate:
-    ``n_series`` is fixed to 1 internally (the benchmark auto-injects ``n_series=1``
-    on the neuralforecast side). RevIN normalizes each window over time (per
-    channel); the WaveKAN expert's BatchNorm running statistics are trained through the fit and
-    used at prediction (a ``deterministic`` flag drives both BatchNorm and dropout,
-    like DeepNPTS).
+    This is a univariate adaptation of a model neuralforecast marks
+    multivariate: ``n_series`` is fixed to 1 internally. RevIN normalizes each
+    window over time; the WaveKAN expert's BatchNorm running statistics are
+    trained through the fit and used at prediction (a ``deterministic`` flag
+    drives both BatchNorm and dropout, like DeepNPTS). Only
+    ``wavelet_function="mexican_hat"`` (the default) has a neuralforecast parity
+    test; the other four wavelets run but are not parity-checked.
 
-    Maintenance Status:
+    Maintenance status:
         Active univariate forecaster. Integrates with the ``BaseForecaster``
         interface, including conformal prediction intervals via
-        ``predict(level=...)``, pickle round-trip (BatchNorm running stats and all
-        params are preserved), and ``forecast(fitted=True)``.
+        ``predict(level=...)``, pickle round-trip (BatchNorm running stats and
+        all params are preserved), and ``forecast(fitted=True)``.
 
-    ``input_size=-1`` (default) expands to ``3*h`` — a Chronax convenience;
-    neuralforecast requires ``input_size`` explicitly.
+    Args:
+        h (int): Forecast horizon.
+        input_size (int): Input window length. Any value ``< 1`` (default
+            ``-1``) resolves to ``3 * h``; neuralforecast requires an explicit
+            value.
+        taylor_order (int): Number of polynomial terms in the Taylor-KAN
+            expert; must be ``>= 0``. Default ``3``.
+        jacobi_degree (int): Degree of the Jacobi-KAN recurrence; must be
+            ``>= 0``. Default ``6``.
+        wavelet_function (str): One of ``"mexican_hat"``, ``"morlet"``,
+            ``"dog"``, ``"meyer"``, ``"shannon"``. Default ``"mexican_hat"``.
+        dropout (float): Dropout rate on the normalized input, in
+            ``[0.0, 1.0)``. Default ``0.1``.
+        revin_affine (bool): Learn an affine weight and bias inside RevIN.
+            Default ``True``.
+        max_steps (int): Number of Adam steps. Default ``1000``.
+        learning_rate (float | Callable[[int], float]): Adam learning rate, a
+            scalar or an ``optax`` schedule. Default ``1e-3``.
+        windows_batch_size (int): Rolling windows sampled per step. Default
+            ``32``.
+        loss (str | LossFn): Registry name (``"mae"``, ``"mse"``, ``"huber"``)
+            or a callable ``(pred, target, mask=None) -> scalar``. Default
+            ``"mae"``.
+        scaler (str | Scaler): Per-window scaler: ``"identity"`` (default,
+            matches neuralforecast), ``"robust"`` (median and median absolute
+            deviation, MAD), or a ``Scaler`` instance.
+        random_seed (int): Seed for parameter init and window sampling.
+            Default ``1``.
+        alias (str): Display name. Default ``"RMoK"``.
 
-    ``scaler``: ``"identity"`` (default, matches neuralforecast — RevIN does the
-    normalization) or ``"robust"``. Constructor guards (``taylor_order >= 0``,
-    ``jacobi_degree >= 0``, ``wavelet_function`` in the five KAN4TSF wavelets,
-    ``0 <= dropout < 1``) are mostly NF-faithful; ``dropout < 1`` is deliberately
-    stricter than neuralforecast: ``dropout=1`` would zero the entire normalized
-    input, feeding the experts all-zeros — a degenerate config we reject rather
-    than silently train. Only
-    ``wavelet_function="mexican_hat"`` (the default) is verified at parity with
-    neuralforecast; the other four run but are not parity-checked. ``float32``
-    throughout, matching torch/neuralforecast defaults.
+    Raises:
+        ValueError: If ``taylor_order < 0``, ``jacobi_degree < 0``,
+            ``wavelet_function`` is not one of the five names above, or
+            ``dropout`` is outside ``[0.0, 1.0)``. The ``dropout < 1`` bound
+            is stricter than neuralforecast: ``dropout=1`` would zero the whole
+            normalized input and feed the experts all-zeros.
+
+    Note:
+        A callable ``loss`` or ``learning_rate`` must itself be picklable for
+        the fitted estimator to pickle. Unknown ``loss`` or ``scaler`` names
+        raise ``ValueError`` at ``fit`` time.
     """
 
     uses_exog = False
@@ -107,8 +135,29 @@ class RMoK(BaseForecaster):
                        revin_affine=self.revin_affine, rngs=nnx.Rngs(self.random_seed))
 
     def fit(self, y: jnp.ndarray, X: jnp.ndarray | None = None) -> "RMoK":
-        """Fit on a 1-D series. Raises NotImplementedError on exog; ValueError if
-        y is not 1-D or shorter than input_size+h; RuntimeError on divergence."""
+        """Fit the network on a 1-D series.
+
+        Builds the network and runs ``max_steps`` Adam steps over rolling
+        windows of length ``input_size + h``, sampled per step the way
+        neuralforecast does.
+
+        Args:
+            y (jnp.ndarray): Univariate series, shape ``(T,)`` with
+                ``T >= input_size + h``.
+            X (jnp.ndarray | None): Exogenous regressors. Not supported; must
+                be ``None``.
+
+        Returns:
+            RMoK: ``self`` with ``model_`` populated.
+
+        Raises:
+            NotImplementedError: If ``X`` is not ``None``.
+            ValueError: If ``y`` is not 1-D, if it is shorter than
+                ``input_size + h``, or if ``loss`` or ``scaler`` is an unknown
+                registry name.
+            RuntimeError: If a non-finite training loss is observed (the
+                training run diverged).
+        """
         if X is not None:
             raise NotImplementedError("Exogenous variables are not supported.")
         y = jnp.asarray(y, dtype=jnp.float32)
@@ -128,7 +177,30 @@ class RMoK(BaseForecaster):
 
     def predict(self, h: int, X: jnp.ndarray | None = None,
                 level: list[int | float] | None = None) -> dict:
-        """Forecast h steps (1 <= h <= self.h). ``level`` -> inherited conformal path."""
+        """Forecast ``h`` steps from the fitted context.
+
+        The network is direct-decoded for ``self.h`` steps and the first ``h``
+        are returned.
+
+        Args:
+            h (int): Forecast horizon, ``1 <= h <= self.h``.
+            X (jnp.ndarray | None): Exogenous regressors. Ignored.
+            level (list[int | float] | None): Confidence levels in (0, 100),
+                e.g. ``[80, 95]``. When given, conformal intervals come from
+                ``BaseForecaster.conformity_scores``, which re-fits the model on
+                every cross-validation (CV) window under ``vmap``; requires
+                ``self.conformal_params``.
+
+        Returns:
+            dict: ``"mean"`` (shape ``(h,)``) plus ``"lo-{lv}"`` and
+            ``"hi-{lv}"`` (shape ``(h,)``) for each level when ``level`` is
+            given.
+
+        Raises:
+            RuntimeError: If called before ``fit``.
+            ValueError: If ``h < 1``, if ``h > self.h``, or if ``level`` is
+                given while ``self.conformal_params`` is ``None``.
+        """
         if self.model_ is None or self._context is None:
             raise RuntimeError("Call fit(y) before predict(h).")
         if h < 1:
@@ -152,7 +224,33 @@ class RMoK(BaseForecaster):
     def forecast(self, y: jnp.ndarray, h: int, X: jnp.ndarray | None = None,
                  X_future: jnp.ndarray | None = None, level: list[int | float] | None = None,
                  fitted: bool = False) -> dict:
-        """Stateless fit-then-predict; ``fitted=True`` adds one-step-ahead fitted values."""
+        """Fit on ``y`` and forecast ``h`` steps in one call.
+
+        Equivalent to ``self.fit(y).predict(h=h, level=level)``; the fitted
+        state stays on the estimator.
+
+        Args:
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            h (int): Forecast horizon, ``1 <= h <= self.h``.
+            X (jnp.ndarray | None): Exogenous regressors. Not supported; must
+                be ``None``.
+            X_future (jnp.ndarray | None): Future exogenous regressors. Not
+                supported; must be ``None``.
+            level (list[int | float] | None): Confidence levels; see
+                ``predict``.
+            fitted (bool): If ``True``, add a ``"fitted"`` key with
+                one-step-ahead in-sample predictions, shape ``(T,)``; the first
+                ``input_size`` entries are NaN.
+
+        Returns:
+            dict: ``"mean"`` (shape ``(h,)``), the interval keys when ``level``
+            is given, and ``"fitted"`` when ``fitted=True``.
+
+        Raises:
+            NotImplementedError: If ``X`` or ``X_future`` is not ``None``.
+            ValueError: Forwarded from ``fit`` and ``predict``.
+            RuntimeError: Forwarded from ``fit`` and ``predict``.
+        """
         if X is not None or X_future is not None:
             raise NotImplementedError("Exogenous variables are not supported.")
         self.fit(y)
@@ -181,8 +279,8 @@ class RMoK(BaseForecaster):
 
     def __getstate__(self) -> dict:
         """Serialize NNX state (params + WaveKAN BatchNorm running stats) and
-        rebuild the GraphDef via _build_net() on load — smaller payload and robust
-        to flax-internal GraphDef changes across versions. A full ``nnx.split``
+        rebuild the GraphDef via ``_build_net()`` on load: a smaller payload that
+        does not depend on flax-internal GraphDef layout. A full ``nnx.split``
         captures both ``nnx.Param`` and the ``nnx.BatchStat`` running stats, so a
         reloaded model predicts identically (same convention as DeepNPTS, the
         sibling that also carries BatchNorm state)."""

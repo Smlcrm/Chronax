@@ -1,52 +1,20 @@
 """
-Holt-Winters' Exponential Smoothing — JAX-accelerated implementation.
+Holt-Winters' exponential smoothing in JAX.
 
-Implements triple exponential smoothing with additive/multiplicative error
-and seasonality variants, damped trend, and two-phase ADAM + L-BFGS optimization.
+Triple exponential smoothing with additive or multiplicative error and
+seasonality, an optional damped trend, and a two-phase Adam + L-BFGS fit.
 
-Features:
-- Additive and multiplicative error models
-- Additive and multiplicative seasonality
-- Damped and non-damped trend variants
-- Native prediction intervals (analytical formulas)
-- Conformal prediction intervals support
-- JAX JIT compilation for performance
-- Four prediction methods: fit/predict, predict_in_sample, forecast, forward
+Implementation notes:
 
-Instance Attributes:
-1. season_length: int - Number of observations per unit of time (e.g., 12 for monthly)
-2. error_type: str - Type of error: 'A' (additive) or 'M' (multiplicative)
-3. season_type: str - Type of seasonality: 'A' (additive) or 'M' (multiplicative)
-4. damped: bool - Whether to use damped trend
-5. phi: float | None - Damping parameter (0.8-0.98), used only if damped=True
-6. alias: str - Custom name for the model
-7. conformal_params: ConformalIntervals | None - Parameters for conformal prediction intervals
-8. model_: dict - Fitted model parameters (created after fit())
-   - fitted: In-sample fitted values
-   - level: Final level state
-   - trend: Final trend state
-   - seasonal: Final seasonal states (array of length season_length)
-   - alpha, beta, gamma: Estimated smoothing parameters
-   - sigma: Residual standard error
-   - residuals: Forecast residuals
-   - y_train: Original training data (for conformal prediction)
-
-Methods:
-1. __init__() - Initialize with error, season, and damping parameters
-2. fit(y, X=None) - Fit model to training data via ADAM + L-BFGS optimization
-3. predict(h, X=None, level=None) - Generate forecasts with fitted model
-4. predict_in_sample(level=None) - Return fitted values with optional intervals
-5. forecast(y, h, X=None, X_future=None, level=None, fitted=False) - Stateless prediction
-6. forward(y, h, X=None, X_future=None, level=None, fitted=False) - Apply fitted model to new data
-
-Implementation Notes:
 - Sigmoid reparameterization bounds each smoothing parameter to (0, 1)
-  INDEPENDENTLY (a per-parameter box, NOT a joint ETS admissibility/invertibility
-  constraint — the fit can reach the box corners, e.g. gamma->1)
-- States initialized via classical decomposition with trend estimation
-- Supports 8 model variants: AAA, AAM, MAA, MAM (+ damped versions)
-- Analytical interval formulas from Hyndman et al. (2008) and Taylor (2003)
-- Seasonal constraint: additive sums to 0, multiplicative averages to 1
+  independently (a per-parameter box, not a joint exponential smoothing (ETS)
+  admissibility constraint; the fit can reach the box corners, e.g. gamma
+  near 1).
+- States are initialized by classical decomposition with trend estimation.
+- Eight variants: AAA, AAM, MAA, MAM, each with or without damping.
+- Analytical interval formulas follow Hyndman et al. (2008) and Taylor (2003).
+- Seasonal constraint: additive factors sum to 0, multiplicative factors
+  average to 1.
 """
 import jax
 import jax.numpy as jnp
@@ -76,7 +44,7 @@ __all__ = ['HoltWinters']
 
 
 # =============================================================================
-# Core Math — Module-level JIT'd functions
+# Core math: module-level jitted functions
 # =============================================================================
 
 def _to_constrained(p_raw: jnp.ndarray, l0_decomp: float, b0_decomp: float,
@@ -173,7 +141,7 @@ def _hw_core(alpha: jnp.ndarray, beta: jnp.ndarray, gamma: jnp.ndarray,
 
 
 # =============================================================================
-# Optimizer — ADAM + L-BFGS
+# Optimizer: Adam + L-BFGS
 # =============================================================================
 
 def _optimize_hw(y: jnp.ndarray, l0_decomp: float, b0_decomp: float,
@@ -182,7 +150,7 @@ def _optimize_hw(y: jnp.ndarray, l0_decomp: float, b0_decomp: float,
                  ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray,
                             jnp.ndarray, jnp.ndarray,
                             jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Two-phase ADAM + L-BFGS optimization for Holt-Winters.
+    """Two-phase Adam + L-BFGS optimization for Holt-Winters.
 
     Parameters
     ----------
@@ -234,7 +202,7 @@ def _optimize_hw(y: jnp.ndarray, l0_decomp: float, b0_decomp: float,
 
     inf_val = jnp.asarray(float('inf'), dtype=dtype)
 
-    # Phase 1: ADAM warm-up
+    # Phase 1: Adam warm-up
     adam_opt = optax.adam(_ADAM_LR)
     adam_state = adam_opt.init(p0)
 
@@ -301,22 +269,43 @@ _optimize_hw = jax.jit(_optimize_hw, static_argnums=(4, 5, 6))
 class HoltWinters(BaseForecaster):
     r"""Holt-Winters' seasonal exponential smoothing.
 
+    Fits the smoothing parameters and initial states by Adam + L-BFGS on
+    ``n * log(SSE)`` (SSE: sum of squared errors). Native intervals use the
+    Hyndman et al. (2008) and Taylor (2003) formulas; conformal intervals
+    come from ``BaseForecaster`` when ``conformal_params`` is set.
+
     Parameters
     ----------
     season_length : int, default 12
-        Number of observations per unit of time. Must be >= 2.
+        Number of observations per seasonal cycle. Must be >= 2.
     error_type : str, default 'A'
         Error type: 'A' (additive) or 'M' (multiplicative).
     season_type : str, default 'A'
         Seasonality type: 'A' (additive) or 'M' (multiplicative).
-    damped : bool | None, default None
-        Whether to use damped trend. None treated as False.
-    phi : float | None, default None
-        Damping parameter in [0.8, 0.98]. Only used if damped=True.
+    damped : bool or None, default None
+        Whether to use a damped trend. ``None`` is treated as ``False``.
+    phi : float or None, default None
+        Damping parameter in [0.8, 0.98]. Used only when ``damped=True``;
+        ``None`` then means 0.9.
     alias : str, default 'HoltWinters'
         Custom name for the model.
-    conformal_params : ConformalIntervals | None, default None
-        Parameters for conformal prediction intervals.
+    conformal_params : ConformalIntervals or None, default None
+        Configuration for conformal prediction intervals.
+
+    Attributes
+    ----------
+    model_ : dict
+        Set by :meth:`fit`: ``fitted``, ``level``, ``trend``, ``seasonal``,
+        ``residuals``, ``alpha``, ``beta``, ``gamma``, ``sigma``,
+        ``sigma_rel``, ``y_train``.
+
+    Raises
+    ------
+    ValueError
+        If ``season_length`` is not an int >= 2; if ``error_type`` or
+        ``season_type`` is not 'A'/'M'; if ``phi`` is not a number in
+        [0.8, 0.98]; or if ``conformal_params`` is not a
+        ``ConformalIntervals``.
     """
 
     @staticmethod
@@ -336,8 +325,9 @@ class HoltWinters(BaseForecaster):
         """Initialize level, trend, and seasonal states via classical decomposition.
 
         When fewer than 2 full seasons are available, falls back to simple
-        averages.  Otherwise uses OLS on per-season averages to estimate a
-        per-step trend, then detrends to extract the seasonal pattern.
+        averages. Otherwise uses ordinary least squares (OLS) on per-season
+        averages to estimate a per-step trend, then detrends to extract the
+        seasonal pattern.
 
         Parameters
         ----------
@@ -347,15 +337,16 @@ class HoltWinters(BaseForecaster):
         Returns
         -------
         tuple[float, float, jnp.ndarray]
-            (l0, b0, s0) — initial level, per-step trend, and seasonal
-            factors of shape (season_length,).
+            ``(l0, b0, s0)``: initial level, per-step trend, and seasonal
+            factors of shape ``(season_length,)``.
         """
         m = self.season_length
         n = len(y)
         n_seasons = n // m
 
         # All branches below are static (shapes/config only); l0/b0 stay jnp
-        # scalars — float() on values derived from y breaks the vmapped CV path.
+        # scalars, since float() on y-derived values breaks the vmapped
+        # cross-validation (CV) path.
         if n_seasons < 2:
             l0 = jnp.mean(y[:m]) if n >= m else y[0]
             b0 = 0.0
@@ -436,10 +427,11 @@ class HoltWinters(BaseForecaster):
         return y
 
     def _fit_parameters(self, y: jnp.ndarray) -> dict:
-        """Fit smoothing parameters and initial states via ADAM + L-BFGS.
+        """Fit smoothing parameters and initial states via Adam + L-BFGS.
 
-        Returns a dict with keys: 'fitted', 'level', 'trend', 'seasonal',
-        'residuals', 'alpha', 'beta', 'gamma', 'sigma'.
+        Returns a dict with keys ``fitted``, ``level``, ``trend``,
+        ``seasonal``, ``residuals``, ``alpha``, ``beta``, ``gamma``,
+        ``sigma`` and ``sigma_rel``.
         """
         l0, b0, s0 = self._initialize_states(y)
         phi = self._get_phi()
@@ -605,19 +597,30 @@ class HoltWinters(BaseForecaster):
         self.conformal_params = conformal_params
 
     def conformity_scores(self, y: jnp.ndarray, X: jnp.ndarray | None = None):
-        """Walk-forward conformity scores, regime-routed by window length.
+        """Walk-forward CV conformity scores, routed by window length.
 
-        HW's fit is a fixed 150-step Adam+L-BFGS whose zoom linesearch makes the CV
-        vmap an anti-optimization on short windows (batched carries + both-branch
-        selects), so those run several times faster sequentially. On long/big-m
-        windows the vmap amortizes the optimizer scan and wins instead. The routing
-        bound of 512 is an EMPIRICAL crossover measured between the two regimes, not
-        a mechanism bound — re-probe before moving it.
+        The fit is a fixed 150-step Adam + L-BFGS whose zoom linesearch makes
+        the CV vmap an anti-optimization on short windows (batched carries and
+        both-branch selects), so windows of at most 512 points run
+        sequentially. Longer windows amortize the optimizer scan under the
+        vmap and use the base path. The 512 bound is an empirical crossover
+        between the two regimes, not a mechanism bound.
 
-        HW's optimizer is trajectory-sensitive: the two regimes reach equally valid
-        fit endpoints whose scores differ materially, so the equivalence that matters
-        here is interval CALIBRATION, not bits. Aggregate coverage and median
-        interval width are unchanged across regimes.
+        The optimizer is trajectory-sensitive: the two regimes reach equally
+        valid fit endpoints whose scores differ, so the two paths agree on
+        interval calibration rather than bit for bit.
+
+        Parameters
+        ----------
+        y : jnp.ndarray
+            Univariate series, shape ``(T,)``.
+        X : jnp.ndarray or None, default None
+            Exogenous regressors, shape ``(T, F)``. Ignored by the model.
+
+        Returns
+        -------
+        jnp.ndarray
+            Signed scores, shape ``(n_windows, h)``.
         """
         if self.conformal_params is not None:
             window_n = jnp.asarray(y).size - self.conformal_params.h
@@ -631,14 +634,22 @@ class HoltWinters(BaseForecaster):
         Parameters
         ----------
         y : jnp.ndarray
-            Clean time series of shape (n,).
+            Univariate series, shape ``(T,)``, at least ``season_length``
+            observations.
         X : jnp.ndarray or None, default None
-            Optional exogenous of shape (n, n_x).
+            Exogenous regressors, shape ``(T, F)``. Ignored.
 
         Returns
         -------
         HoltWinters
-            Fitted model instance.
+            ``self``.
+
+        Raises
+        ------
+        ValueError
+            If ``y`` has fewer than ``season_length`` observations, or if a
+            multiplicative error or seasonality is used with a non-positive
+            value in ``y``.
         """
         y = utils.ensure_float(y)
         if len(y) < self.season_length:
@@ -657,21 +668,32 @@ class HoltWinters(BaseForecaster):
 
     def predict(self, h: int, X: jnp.ndarray | None = None,
                 level: list[int] | None = None) -> dict:
-        r"""Predict with fitted Holt-Winters.
+        r"""Predict with the fitted Holt-Winters model.
 
         Parameters
         ----------
         h : int
-            Forecast horizon.
+            Forecast horizon (positive int).
         X : jnp.ndarray or None, default None
-            Optional exogenous of shape (h, n_x).
+            Future exogenous regressors, shape ``(h, F)``. Only forwarded to
+            :meth:`conformity_scores`; otherwise ignored.
         level : list of int or None, default None
-            Confidence levels (0-100) for prediction intervals.
+            Confidence levels in [0, 100], e.g. ``[80, 95]``.
 
         Returns
         -------
         dict
-            Keys: 'mean' and optionally 'lo-{lv}', 'hi-{lv}'.
+            ``"mean"`` (shape ``(h,)``) plus ``"lo-{lv}"``/``"hi-{lv}"`` per
+            level when ``level`` is given.
+
+        Raises
+        ------
+        ValueError
+            If the model is not fitted, if ``h`` is not a positive int, if
+            ``level`` is not a list of numbers in [0, 100], if native
+            intervals are requested with fewer than ``season_length + 7``
+            training observations, or if the conformal path finds the
+            training series too short for 2 CV windows.
         """
         if not hasattr(self, 'model_'):
             raise ValueError("Model must be fitted before calling predict(). Call fit() first.")
@@ -710,17 +732,25 @@ class HoltWinters(BaseForecaster):
         return res
 
     def predict_in_sample(self, level: list[int] | None = None) -> dict:
-        r"""Access fitted Holt-Winters in-sample predictions.
+        r"""Return the in-sample fitted values of the fitted model.
 
         Parameters
         ----------
         level : list of int or None, default None
-            Confidence levels (0-100) for prediction intervals.
+            Confidence levels in [0, 100].
 
         Returns
         -------
         dict
-            Keys: 'fitted' and optionally 'fitted-lo-{lv}', 'fitted-hi-{lv}'.
+            ``"fitted"`` (shape ``(T,)``) plus
+            ``"fitted-lo-{lv}"``/``"fitted-hi-{lv}"`` per level when ``level``
+            is given.
+
+        Raises
+        ------
+        ValueError
+            If the model is not fitted or if ``level`` is not a list of
+            numbers in [0, 100].
         """
         if not hasattr(self, 'model_'):
             raise ValueError("Model must be fitted before calling predict_in_sample(). Call fit() first.")
@@ -737,29 +767,41 @@ class HoltWinters(BaseForecaster):
     def forecast(self, y: jnp.ndarray, h: int, X: jnp.ndarray | None = None,
                  X_future: jnp.ndarray | None = None, level: list[int] | None = None,
                  fitted: bool = False) -> dict:
-        r"""Memory-efficient Holt-Winters predictions.
-
-        Fits and forecasts without storing model state.
+        r"""Stateless fit-and-predict in one call.
 
         Parameters
         ----------
         y : jnp.ndarray
-            Clean time series of shape (n,).
+            Univariate series, shape ``(T,)``, at least ``season_length``
+            observations.
         h : int
-            Forecast horizon.
+            Forecast horizon (positive int).
         X : jnp.ndarray or None, default None
-            Optional exogenous of shape (n, n_x).
+            In-sample exogenous regressors, shape ``(T, F)``. Only forwarded
+            to :meth:`conformity_scores`; otherwise ignored.
         X_future : jnp.ndarray or None, default None
-            Optional future exogenous of shape (h, n_x).
+            Future exogenous regressors, shape ``(h, F)``. Ignored.
         level : list of int or None, default None
-            Confidence levels (0-100) for prediction intervals.
+            Confidence levels in [0, 100].
         fitted : bool, default False
-            Whether to return in-sample predictions.
+            Whether to return in-sample fitted values under ``"fitted"``.
 
         Returns
         -------
         dict
-            Keys: 'mean', and optionally 'fitted', 'lo-{lv}', 'hi-{lv}'.
+            ``"mean"`` (shape ``(h,)``); ``"fitted"`` (shape ``(T,)``) when
+            ``fitted``; ``"lo-{lv}"``/``"hi-{lv}"`` per level when ``level``
+            is given, plus ``"fitted-lo-{lv}"``/``"fitted-hi-{lv}"`` when
+            both are set.
+
+        Raises
+        ------
+        ValueError
+            If ``y`` has fewer than ``season_length`` observations, if ``h``
+            is not a positive int, if ``level`` is not a list of numbers in
+            [0, 100], if native intervals are requested with fewer than
+            ``season_length + 7`` observations, or if the conformal path
+            finds the series too short for 2 CV windows.
         """
         y = self._validate_forecast_inputs(y, h, level)
         result = self._fit_parameters(y)
@@ -769,29 +811,38 @@ class HoltWinters(BaseForecaster):
     def forward(self, y: jnp.ndarray, h: int, X: jnp.ndarray | None = None,
                 X_future: jnp.ndarray | None = None, level: list[int] | None = None,
                 fitted: bool = False) -> dict:
-        r"""Apply fitted Holt-Winters model to a new time series.
+        r"""Apply the fitted model's structure to a new series.
 
-        Uses the model structure from the original fit but re-estimates parameters.
+        Re-estimates the parameters on ``y``; the stored ``model_`` is left
+        unchanged.
 
         Parameters
         ----------
         y : jnp.ndarray
-            Clean time series of shape (n,).
+            Univariate series, shape ``(T,)``, at least ``season_length``
+            observations.
         h : int
-            Forecast horizon.
+            Forecast horizon (positive int).
         X : jnp.ndarray or None, default None
-            Optional exogenous of shape (n, n_x).
+            In-sample exogenous regressors, shape ``(T, F)``. Only forwarded
+            to :meth:`conformity_scores`; otherwise ignored.
         X_future : jnp.ndarray or None, default None
-            Optional future exogenous of shape (h, n_x).
+            Future exogenous regressors, shape ``(h, F)``. Ignored.
         level : list of int or None, default None
-            Confidence levels (0-100) for prediction intervals.
+            Confidence levels in [0, 100].
         fitted : bool, default False
-            Whether to return in-sample predictions.
+            Whether to return in-sample fitted values under ``"fitted"``.
 
         Returns
         -------
         dict
-            Keys: 'mean', and optionally 'fitted', 'lo-{lv}', 'hi-{lv}'.
+            Same keys as :meth:`forecast`.
+
+        Raises
+        ------
+        ValueError
+            If the model is not fitted, plus every condition listed for
+            :meth:`forecast`.
         """
         if not hasattr(self, 'model_'):
             raise ValueError("Model must be fitted before calling forward(). Call fit() first.")

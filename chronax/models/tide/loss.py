@@ -1,6 +1,6 @@
 """Loss functions for Chronax TiDE.
 
-Mirrors the RNN / N-BEATS loss API::
+Mirrors the recurrent neural network (RNN) / N-BEATS loss interface::
 
     masked_mae(y, y_hat, mask=None) -> scalar
     masked_mse(y, y_hat, mask=None) -> scalar

@@ -1,22 +1,23 @@
 """Training utilities for Chronax TiDE.
 
-Pure JAX/Flax/Optax — no PyTorch, no numpy at training time.
+Pure JAX/Flax/Optax: no PyTorch, no numpy at training time.
 
 Two training paths are provided:
 
 1. **Window-based** (``train_step_windows`` / ``eval_step_windows``):
    Primary path. Accepts raw ``[B, input_size + h]`` windows, applies
-   per-window ``RobustScaler`` (median/MAD) internally, then optimises the
+   per-window ``RobustScaler`` (median / median absolute deviation, MAD)
+   internally, then optimises the
    supplied loss. Used by :class:`~chronax.models.tide.forecaster.TiDEForecaster`
    and mirrors the NBEATS training path exactly.
 
 2. **Batch-based** (``train_step`` / ``eval_step``):
    Compatibility path for pre-assembled ``{insample_y, outsample_y, ...}``
-   dicts — required when exogenous variables are present.
+   dicts; required when exogenous variables are present.
 
 LR schedule options:
     - ``cosine_decay_steps > 0``: warmup-cosine schedule.
-    - ``num_lr_decays > 0``:     NF-style StepLR (gamma=0.5).
+    - ``num_lr_decays > 0``:     neuralforecast-style StepLR (gamma=0.5).
     - otherwise: constant learning rate.
 
 Optimizer: ``chain(clip_by_global_norm, adam[w])``.
@@ -36,7 +37,7 @@ from chronax.models.tide.loss import masked_mae
 from chronax.models.tide.data import RobustScaler
 from chronax.models.tide.model import TiDE, TiDEConfig
 
-# Module-level scaler singleton — re-used across all JIT calls so JAX never
+# Module-level scaler singleton, re-used across all JIT calls so JAX never
 # sees it as a varying closure value that would trigger recompilation.
 _SCALER = RobustScaler()
 
@@ -139,7 +140,7 @@ def create_train_state(
         grad_clip: Global gradient-norm clip (0 = disabled).
         cosine_decay_steps: Warmup-cosine schedule length (0 = disabled).
         warmup_steps: Linear warmup steps for the cosine schedule.
-        num_lr_decays: NF-style StepLR decays (-1 = constant LR).
+        num_lr_decays: neuralforecast-style StepLR decays (-1 = constant learning rate).
         max_steps: Total training steps (used for StepLR spacing).
         weight_decay: Use AdamW when > 0; plain Adam otherwise.
         optimizer: Pre-built transform that overrides all defaults.
@@ -311,11 +312,12 @@ def train_loop(
 
 
 # ---------------------------------------------------------------------------
-# Window-based training steps (primary path — mirrors NBEATS train.py)
+# Window-based training steps (primary path; same scheme as the NBEATS train module)
 # ---------------------------------------------------------------------------
 # These accept raw [B, input_size + h] windows, apply per-window RobustScaler
 # inside the JIT, and call model.apply with [B, L, 1] shaped inputs.
-# ``input_size`` is a static arg so XLA re-traces only when the horizon changes.
+# ``input_size`` is a static arg so XLA (accelerated linear algebra) re-traces
+# only when the horizon changes.
 
 
 def _window_forward_loss(
@@ -390,10 +392,9 @@ def eval_step_windows(
 # ---------------------------------------------------------------------------
 # Standard (mean/std) per-window training steps
 # ---------------------------------------------------------------------------
-# Alternative to the RobustScaler path above.  Uses per-window mean/std
-# (instance normalisation) rather than median/MAD.  Better for small,
-# smooth datasets (e.g. < 1000 training points) where the median estimator
-# can be noisy on short windows.
+# Alternative to the RobustScaler path above: per-window mean/std (instance
+# normalisation) rather than median/MAD. The median estimator is noisy on
+# short windows, so this path suits small, smooth datasets.
 
 
 _STD_EPS: float = 1e-6

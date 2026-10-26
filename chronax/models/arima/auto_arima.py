@@ -2,7 +2,8 @@
 File: auto_arima.py
 
 High-level Purpose:
-    Implements ARIMA and AutoARIMA model estimation, model-order search,
+    Implements autoregressive integrated moving average (ARIMA) and AutoARIMA
+    model estimation, model-order search,
     state-space construction, Kalman likelihood evaluation, and forecasting
     kernels optimized for JAX execution.
 
@@ -37,7 +38,7 @@ Expected Inputs and Outputs:
 
 Example:
     >>> import jax.numpy as jnp
-    >>> from auto_arima import AutoARIMA
+    >>> from chronax.models.arima import AutoARIMA
     >>> model = AutoARIMA(seasonal=False, stepwise=True)
     >>> model.fit(jnp.array([10.0, 12.0, 11.0, 13.0, 14.0]))
     >>> model.predict(h=2)["mean"].shape
@@ -66,7 +67,6 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 import optax
-# import jaxopt
 import jax.scipy.optimize
 from ..stl import stl_decompose
 Array = jnp.ndarray
@@ -83,11 +83,12 @@ from chronax.utils.conformal_intervals import ConformalIntervals
 
 def detect_period(y: np.ndarray, max_period: Optional[int] = None) -> int:
     """
-    Detect the dominant seasonal period from a time series using ACF peaks.
+    Detect the dominant seasonal period from a time series using
+    autocorrelation function (ACF) peaks.
 
     Detailed Description:
-        Detrends the series via first differencing, computes the
-        autocorrelation function (ACF) using FFT, and identifies lag peaks
+        Detrends the series via first differencing, computes the ACF with a
+        fast Fourier transform (FFT), and identifies lag peaks
         above a noise-floor threshold. Candidates are scored by requiring
         elevated ACF at harmonics (2*period, 3*period) to reduce spurious
         picks. Returns 1 if no significant seasonality is found or if
@@ -383,7 +384,8 @@ def diff(x: Array, lag: int, differences: int) -> Array:
         >>> dx = diff(y, 1, 1); d12y = diff(y, 12, 1)
 
     Notes:
-        Role: Shared differencing primitive for CSS, seasonal detection, and
+        Role: Shared differencing primitive for conditional sum of squares
+        (CSS) estimation, seasonal detection, and
         model fitting; static args keep JIT efficient.
     """
     x = jnp.asarray(x, dtype=jnp.float64)
@@ -403,7 +405,7 @@ def diff(x: Array, lag: int, differences: int) -> Array:
     return x
 
 # =============================================================================
-# 3. GETQ0_WEB (Doubling Algorithm)
+# GETQ0 (Doubling Algorithm)
 # =============================================================================
 
 @partial(jax.jit, static_argnames=['arma'])
@@ -449,7 +451,7 @@ def getQ0(phi: Array, theta: Array, arma: Tuple[int, ...]) -> Array:
     phi = jnp.asarray(phi, dtype=jnp.float64)
     theta = jnp.asarray(theta, dtype=jnp.float64)
 
-    # 2. State Transition Matrix F — must match make_arima's T on the
+    # 2. State transition matrix F: must match make_arima's T on the
     # stationary block (phi in COLUMN 0, ones on the SUPERdiagonal) so the
     # solved P is the stationary covariance of the SAME representation the
     # Kalman filter runs: P = T P T' + R R'.
@@ -518,7 +520,8 @@ def arima_css(y: Array, arma: Tuple[int, ...], phi: Array, theta: Array) -> Tupl
         are treated as conditioning; sigma2 is the sum of squared residuals
         over the valid range divided by (n - ncond). Used by _objective_css
         for fast CSS objective evaluation and by arima_fit when method is CSS
-        or the first phase of CSS-ML. Returns inf variance when residuals are
+        or the first phase of CSS followed by maximum likelihood (CSS-ML).
+        Returns inf variance when residuals are
         non-finite or unstable.
 
     Args:
@@ -565,13 +568,11 @@ def arima_css(y: Array, arma: Tuple[int, ...], phi: Array, theta: Array) -> Tupl
     # to match the user's specific logic (w[1:] - w[:-1]).
     w = y
     
-    # Ordinary Differencing: w[t] = w[t] - w[t-1]; first element invalid (0).
+    # Ordinary differencing: w[t] = w[t] - w[t-1]; first element invalid (0).
     # Functional concatenate form, NOT `w.at[1:].add(-w[:-1])`: that scatter
-    # reads the same buffer it writes, and XLA (jax 0.6.2 CPU) miscompiles
-    # the scatter chain when it fuses into the AR convolution below — the
-    # jitted kernel returned different residuals than eager/vmap execution
-    # (observed max Δ 0.25 on a 72-pt seasonal series), silently corrupting
-    # CSS objectives, fitted params, and ICs for every d>0, p>0 model.
+    # reads the same buffer it writes, and XLA (Accelerated Linear Algebra)
+    # can miscompile the scatter chain when it fuses into the AR convolution
+    # below, making the jitted kernel disagree with eager and vmap execution.
     for _ in range(d):
         w = jnp.concatenate([jnp.zeros(1, dtype=w.dtype), w[1:] - w[:-1]])
 
@@ -813,7 +814,7 @@ def make_arima(phi: Array, theta: Array, delta: Array, arma: Tuple[int, ...], ka
     return StateSpaceModel(T, Z, V, a0, P0)
 
 # -----------------------------------------------------------------------------
-# 3. OPTIMIZED PYTREE (arima_like_3) - PREFERRED
+# KALMAN LIKELIHOOD
 # -----------------------------------------------------------------------------
 @partial(jax.jit, static_argnames=['arma'])
 def arima_like(y: Array, mod: StateSpaceModel, arma: Tuple[int, ...]) -> Tuple[float, float, int, Array]:
@@ -826,8 +827,10 @@ def arima_like(y: Array, mod: StateSpaceModel, arma: Tuple[int, ...]) -> Tuple[f
         returns the sum of squared prediction errors (ssq), the sum of log
         innovation variances (sumlog), the number of valid observations (nu),
         and the standardized residuals. These quantities are used to compute
-        the exact Gaussian log-likelihood and information criteria (AIC, BIC,
-        AICc) in arima_fit and _objective_ml. JIT-compiled with static arma.
+        the exact Gaussian log-likelihood and the information criteria (the
+        Akaike information criterion (AIC), the Bayesian information criterion
+        (BIC), and the corrected AIC (AICc)) in arima_fit and _objective_ml.
+        JIT-compiled with static arma.
 
     Args:
         y (Array): Observed univariate series (possibly after differencing and
@@ -873,9 +876,9 @@ def _kalman_filter_core(
         prediction error (innovation), its variance (F), the Kalman gain (K),
         and the posterior state and covariance. Accumulates sum of squared
         standardized errors and sum of log(F) for likelihood computation.
-        Returns the final (a, P, ssq, sumlog, nu) carry — where (a, P) is
-        the one-step-ahead prior state after the last observation, the state
-        forecasts start from — plus the array of standardized residuals and
+        Returns the final (a, P, ssq, sumlog, nu) carry, where (a, P) is
+        the one-step-ahead prior state after the last observation (the state
+        forecasts start from), plus the array of standardized residuals and
         the array of raw innovations. arima_like uses only the sufficient
         statistics.
 
@@ -956,16 +959,16 @@ def _kalman_filter_core(
     return final_carry, std_resids, innovations
 
 
-# Steady-state Kalman likelihood (large-n eager ML path). The prior covariance P_t — and
-# hence the Kalman gain K_t and innovation variance F_t — are data-independent (functions of
+# Steady-state Kalman likelihood (large-n eager ML path). The prior covariance P_t, and
+# hence the Kalman gain K_t and innovation variance F_t, are data-independent (functions of
 # T, Z, V, P0 only). Convergence speed is set by the MA (invertibility) root. Routed fits
-# converge fast (measured: within ~40 steps), so _STEADYSTATE_BURNIN = 512 is a >10x margin;
-# the _use_steadystate d+D<=1 gate keeps out the over-differenced region where the MA root
-# reaches the unit circle and the gain never converges, and the exact full filter is always
-# used for the forecast and reported likelihood, so the residual boundary case forecasts
-# exactly regardless. The burn-in runs the full covariance filter on every optimizer
-# evaluation, so k0 is a per-eval cost, not a one-time one. _STEADYSTATE_MIN_N gates the
-# switch and is >= the burn-in so k0 < n on the routed path.
+# converge well within _STEADYSTATE_BURNIN steps; the _use_steadystate d+D<=1 gate keeps
+# out the over-differenced region where the MA root reaches the unit circle and the gain
+# never converges, and the exact full filter is always used for the forecast and reported
+# likelihood, so the residual boundary case forecasts exactly regardless. The burn-in runs
+# the full covariance filter on every optimizer evaluation, so k0 is a per-eval cost, not a
+# one-time one. _STEADYSTATE_MIN_N gates the switch and is >= the burn-in so k0 < n on the
+# routed path.
 _STEADYSTATE_BURNIN = 512
 _STEADYSTATE_MIN_N = 2048
 
@@ -999,7 +1002,7 @@ def _kalman_filter_steadystate(
     the MA (invertibility) root and slows as it nears the unit circle
     (theta -> +/-1, the over-differencing signature); past the k0 margin the
     frozen tail carries a small per-step bias, so its error GROWS with the tail
-    length n - k0 — long series are the risk, not the safe case. Callers that
+    length n - k0, so long series are the risk, not the safe case. Callers that
     need an exact result near that boundary (the forecast, the reported
     likelihood) use _kalman_filter_core directly.
 
@@ -1010,13 +1013,13 @@ def _kalman_filter_steadystate(
 
     Returns:
         Tuple[Array, Array, Array, Array, Array]: (a_final, P_frozen, ssq,
-            sumlog, nu) — the same likelihood carry _kalman_filter_core's final
+            sumlog, nu), the same likelihood carry _kalman_filter_core's final
             carry holds (P_frozen is the converged prior covariance).
     """
     T, Z, V = mod.T, mod.Z, mod.V
     n = y.shape[0]
 
-    # Phase 1 — burn-in: the exact filter over the first k0 steps.
+    # Phase 1, burn-in: the exact filter over the first k0 steps.
     (a_k0, P_k0, ssq_b, sumlog_b, nu_b), _, _ = _kalman_filter_core(y[:k0], mod)
 
     # Freeze the converged gain / innovation variance from the prior covariance at k0.
@@ -1028,7 +1031,7 @@ def _kalman_filter_steadystate(
     A_froz = T - jnp.outer(T @ K_inf, Z)
     TK = T @ K_inf
 
-    # Phase 2 — frozen-gain tail; no covariance update.
+    # Phase 2, frozen-gain tail; no covariance update.
     def tail_step(carry: Tuple[Array, Array], y_t: Array) -> Tuple[Tuple[Array, Array], None]:
         a, ssq = carry
         v = y_t - jnp.dot(Z, a)
@@ -1054,9 +1057,9 @@ def _kalman_forecast_from_state(
     Multi-step-ahead point forecasts and variances from a filtered state.
 
     Detailed Description:
-        Starting from a ONE-STEP-AHEAD PRIOR state (a, P) — exactly what
+        Starting from a ONE-STEP-AHEAD PRIOR state (a, P), exactly what
         _kalman_filter_core's final carry holds after filtering the training
-        series — iterates n_ahead steps: reads forecast = Z @ a and
+        series, iterates n_ahead steps: reads forecast = Z @ a and
         variance = Z P Z', then advances (a, P) to (T @ a, T P T' + V).
         Read-then-advance from the prior is algebraically identical to
         R/statsforecast's advance-then-read from the last posterior state.
@@ -1164,9 +1167,9 @@ def _compute_metrics(loglik: Array, sigma2: Array, n_obs: Array, n_params: int) 
     }
 
 
-# Generosity factors for the intercept/drift box constraint. Wide
-# enough to never bind on a legitimate fit, narrow relative to the runaway
-# magnitudes the unconstrained LBFGS produces (drift ~ -3e5 on scale-100 data).
+# Generosity factors for the intercept/drift box constraint: wide enough
+# never to bind on a legitimate fit, narrow relative to the runaway
+# magnitudes an unconstrained optimizer step can produce.
 _DRIFT_BOUND_FACTOR = 25.0
 _MEAN_BOUND_FACTOR = 3.0
 
@@ -1178,9 +1181,8 @@ def _intercept_bounds(
 
     The mean/drift is an unconstrained parameter jointly optimized with the
     ARMA coefficients; a poorly-conditioned LBFGS step can drive it to a
-    non-physical value (observed: drift = -2.96e5 on a scale-~100 d=1 series),
-    which the drift ramp then compounds over the horizon into a ~1e8
-    forecast. This returns a generous but finite ``(lo, hi)``
+    non-physical value, which the drift ramp then compounds over the
+    horizon. This returns a generous but finite ``(lo, hi)``
     the coefficient is clipped to, both inside the objective (via
     :func:`_unpack_and_adjust`, so the optimizer converges to the true small
     value rather than wandering off) and post-fit on the raw parameter vector
@@ -1296,7 +1298,7 @@ def _unpack_and_adjust(
             is used.
 
         Args:
-            args (Tuple[Array, Array, Array]): (y_in, xr, cf) — response,
+            args (Tuple[Array, Array, Array]): (y_in, xr, cf): response,
                 exogenous matrix, and padded coefficient vector.
 
         Returns:
@@ -1323,10 +1325,10 @@ def _unpack_and_adjust(
     # If n_exog=0 and include_mean=False, it picks the dummy 0.0 we added.
     intercept_val = jax.lax.dynamic_index_in_dim(safe_coefs, n_exog, keepdims=False)
 
-    # Box-constrain the mean/drift inside the objective so the
-    # optimizer converges to the true (small) value instead of a runaway (which
-    # the d>0 forecast integrator amplifies to ~1e8). No-op for well-behaved
-    # fits — the true optimum sits well inside the bound.
+    # Box-constrain the mean/drift inside the objective so the optimizer
+    # converges to the true (small) value instead of a runaway that the d>0
+    # forecast integrator would amplify. No-op for well-behaved fits; the
+    # true optimum sits well inside the bound.
     _lo, _hi = _intercept_bounds(y, d, D, ns)
     intercept_val = jnp.clip(intercept_val, _lo, _hi)
 
@@ -1334,12 +1336,12 @@ def _unpack_and_adjust(
     # `arma` tuple so the branch is trace-safe; `include_mean` can be a traced
     # value on the objective path, so it gates through jnp.where (when it is
     # False, ncxreg == 0 and intercept_val is the padded dummy 0.0 anyway):
-    #   d+D == 0 — constant mean, subtracted as a constant;
-    #   d+D == 1 — drift, subtracted as the linear ramp c*t so differencing
+    #   d+D == 0: constant mean, subtracted as a constant;
+    #   d+D == 1: drift, subtracted as the linear ramp c*t so differencing
     #              leaves a DEMEANED series for the ARMA part to fit (a
     #              constant would be annihilated by the differencing and leave
     #              the drift contaminating the differenced series' mean);
-    #   d+D >= 2 — no deterministic term (as in R's arima).
+    #   d+D >= 2: no deterministic term (as in R's arima).
     gated_intercept = jnp.where(include_mean, intercept_val, 0.0)
     if d + D == 0:
         y_adj = y_adj - gated_intercept
@@ -1481,10 +1483,11 @@ def _objective_ml_ss(
     _kalman_filter_steadystate (frozen-gain tail) instead of the full filter,
     which is what makes each optimizer evaluation cheap. Matches _objective_ml
     (value and gradient) to machine precision when the MA roots sit inside the
-    invertibility boundary by margin — the common case — and stays close enough
+    invertibility boundary by margin (the common case) and stays close enough
     to place the optimizer at the same optimum otherwise; near the boundary
     (theta -> +/-1) the frozen tail is approximate. Only the fitted parameters
-    flow out of here: the forecast and the reported likelihood/IC are always
+    flow out of here: the forecast and the reported likelihood/information
+    criterion (IC) are always
     recomputed with the exact full filter, so a fit near the boundary still
     forecasts and scores exactly. Same signature as _objective_ml so the fit
     kernels accept it as a drop-in loss_fn.
@@ -1582,7 +1585,7 @@ def _fit_model_bfgs(
         return loss_fn(p, y, xreg, delta, arma, ncxreg, n_exog, include_mean)
 
     # 2. Run Optimization
-    # method='BFGS' is robust for unconstrained optimization like ARIMA
+    # method='BFGS' suits unconstrained optimization like ARIMA
     results = jax.scipy.optimize.minimize(
         fun=objective,
         x0=init_params,
@@ -1594,13 +1597,13 @@ def _fit_model_bfgs(
     return results.x
 
 
-# Fast-path (forecast) optimizer budget — config-static scan lengths.
+# Fast-path (forecast) optimizer budget: config-static scan lengths.
 _FAST_LBFGS_MEMORY = 10
 _FAST_LBFGS_LS_STEPS = 20
 # Early-exit rule for the fast-path while_loop: stop after _FAST_LBFGS_PATIENCE
 # consecutive iterations whose EVALUATED loss fails to improve the running best
-# by a relative _FAST_LBFGS_FTOL (scipy L-BFGS-B factr=1e7 equivalent). maxiter
-# stays the hard cap, so no run does more work than the old fixed budget.
+# by a relative _FAST_LBFGS_FTOL (the scipy L-BFGS-B factr=1e7 equivalent).
+# maxiter stays the hard cap.
 _FAST_LBFGS_FTOL = 2.22e-9
 _FAST_LBFGS_PATIENCE = 2
 
@@ -1619,41 +1622,33 @@ def _fit_model_scan(
     maxiter: int,
 ) -> Array:
     """
-    Batch-stable fixed-budget L-BFGS for the one-shot forecast fast path.
+    Convergence-gated L-BFGS for the one-shot forecast fast path.
 
-    Detailed Description:
-        Drop-in replacement for _fit_model_bfgs on the forecast fast path.
-        jax.scipy's BFGS returns an inconsistent (fun, x) pair when its zoom
-        line search fails (nit=1/status=3 on seasonal-MA specs like
-        (1,1,1)(0,1,1)[12]), so the fast path — the code conformity_scores
-        vmaps — uses this pure-lax optimizer instead (optax.lbfgs + zoom
-        linesearch with best-iterate tracking): a failed search can never
-        return a worse-than-init point. Same pattern as the GARCH optax
-        fallback.
+    Pure-``lax`` optimizer (optax.lbfgs with a zoom line search and
+    best-iterate tracking) used by ``ARIMA.forecast`` and
+    ``AutoARIMA.forecast``, the code ``conformity_scores`` vmaps. It is used
+    there instead of ``jax.scipy``'s BFGS because that solver can return an
+    inconsistent (fun, x) pair when its zoom line search fails, whereas a
+    failed search here can never return a point worse than the start.
 
-        The loop is a convergence-gated lax.while_loop rather than a fixed-length
-        lax.scan, which would pay every one of `maxiter` O(n) CSS steps even when the
-        fit converges in a fraction of them — costly on long series. Exit fires after
-        _FAST_LBFGS_PATIENCE consecutive evaluated losses that fail to
-        improve the best by a relative _FAST_LBFGS_FTOL; `maxiter` remains
-        the hard cap, so cost is never above the old fixed budget. Per-lane
-        SEMANTICS are identical between eager and vmapped runs: `done`
-        latches on the PREVIOUS trip (the latching trip's own update still
-        lands) and converged lanes ride along frozen while other vmap lanes
-        finish; numerics agree to vmap-lowering noise (measured 4.5e-11 —
-        batched reductions associate differently, the pre-existing class).
-        ⚠ Because the exit test thresholds a lowering-sensitive loss, a ~ULP
-        eager-vs-vmap loss difference near ftol can in principle flip one exit and
-        bifurcate a trajectory — accepted repo-wide for convergence-gated
-        optimizers, so endpoints are compared on accuracy, not bits.
-        Non-finite losses count as
-        non-improving, so a diverging run exits after PATIENCE trips and
-        returns the tracked best (or init) exactly as before.
+    The loop is a convergence-gated ``lax.while_loop`` rather than a
+    fixed-length ``lax.scan``, which would pay every one of ``maxiter`` O(n)
+    objective evaluations even when the fit converges in a fraction of them.
+    The exit fires after ``_FAST_LBFGS_PATIENCE`` consecutive evaluated losses
+    that fail to improve the best by a relative ``_FAST_LBFGS_FTOL``;
+    ``maxiter`` stays the hard cap. Per-lane semantics are identical between
+    eager and vmapped runs: ``done`` latches on the previous trip (the
+    latching trip's own update still lands) and converged lanes ride along
+    frozen while other vmap lanes finish. Because the exit test thresholds a
+    lowering-sensitive loss, an eager-vs-vmap loss difference near ``ftol``
+    can flip one exit and bifurcate a trajectory, so endpoints are compared
+    on accuracy, not bits. Non-finite losses count as non-improving, so a
+    diverging run exits after ``_FAST_LBFGS_PATIENCE`` trips and returns the
+    tracked best (or the start).
 
-        Best-iterate tracking stores the point the loss was EVALUATED at
-        (not the post-update point), and the final iterate is evaluated once
-        after the scan so it also competes; a diverging run therefore never
-        returns anything worse than init_params.
+    Best-iterate tracking stores the point the loss was evaluated at (not
+    the post-update point), and the final iterate is evaluated once after
+    the loop so it also competes.
 
     Args:
         init_params (Array): Initial parameter vector (ARMA + regression).
@@ -1671,16 +1666,9 @@ def _fit_model_scan(
     Returns:
         Array: Best parameter vector found, same shape as init_params.
 
-    Raises:
-        None.
-
-    Side Effects:
-        None. Pure optimization.
-
-    Notes:
-        Role: Optimizer for ARIMA.forecast / AutoARIMA.forecast fast paths —
-        the code conformity_scores vmaps. arima_fit (fit/predict path) keeps
-        jax.scipy BFGS; it never runs under vmap.
+    Note:
+        ``arima_fit`` (the fit/predict path) keeps ``jax.scipy`` BFGS; it
+        never runs under vmap.
     """
     def objective(p: Array) -> Array:
         return loss_fn(p, y, xreg, delta, arma, ncxreg, n_exog, include_mean)
@@ -1696,8 +1684,8 @@ def _fit_model_scan(
     )
 
     # ftol floored at 8*eps(dtype): a relative tolerance below the dtype's
-    # resolution is unreachable and would disable the exit (the AutoCES f32
-    # tolerance lesson). init_params.dtype is concrete at trace time.
+    # resolution is unreachable and would disable the exit.
+    # init_params.dtype is concrete at trace time.
     ftol = max(_FAST_LBFGS_FTOL, 8.0 * float(jnp.finfo(init_params.dtype).eps))
 
     def _lbfgs_cond(carry):
@@ -1727,7 +1715,7 @@ def _fit_model_scan(
         # converged lane rides along as a no-op. For a lane that instead runs out
         # of `maxiter` without latching, per-lane parity is carried by JAX's
         # batched-while lowering itself (the entire carry is re-selected on the
-        # entry predicate per lane) — the freeze alone does not cover that case.
+        # entry predicate per lane); the freeze alone does not cover that case.
         frz = done
         return (jnp.where(frz, params, new_params),
                 jax.tree_util.tree_map(
@@ -1753,16 +1741,15 @@ def _fit_model_scan(
 
 # Jitted aliases for the EAGER post-processing call sites only.
 # Both raw functions build their `lax.cond` / `lax.scan` bodies as fresh closures,
-# so an eager call recompiles an identical jaxpr every time — 16 of the 17 compiles
-# a fresh-instance `AutoARIMA.forecast` pays (one cond + one scan per candidate of
-# the stepwise search), plus two per eager `ARIMA.fit()`.
+# so an eager call recompiles an identical jaxpr every time (one cond + one scan
+# per candidate of the stepwise search, plus two per eager `ARIMA.fit()`).
 #
 # The RAW functions must stay in place: `_unpack_and_adjust` is also called from
 # inside `_objective_css`/`_objective_ml`, which pass `ncxreg`/`n_exog`/`include_mean`
-# as *traced* ints — `static_argnames` on the shared symbol raises "Non-hashable
+# as *traced* ints; `static_argnames` on the shared symbol raises "Non-hashable
 # static arguments ... DynamicJaxprTracer". Jitting only the eager sites also leaves
-# every existing compiled kernel's jaxpr byte-identical — no nested pjit inside the
-# programs that contain `arima_css`, which must keep its current fusion.
+# every compiled kernel's jaxpr unchanged: no nested pjit inside the programs that
+# contain `arima_css`, which must keep its fusion.
 _unpack_and_adjust_jit = partial(
     jax.jit, static_argnames=['arma', 'ncxreg', 'n_exog', 'include_mean']
 )(_unpack_and_adjust)
@@ -1892,8 +1879,8 @@ def arima_fit(
         )
 
     if "CSS" in method:
-        # Each phase gets the FULL budget (R gives its CSS and ML optim
-        # phases independent default budgets; splitting starved both).
+        # Each phase gets the FULL budget, as R gives its CSS and ML optim
+        # phases independent default budgets.
         current_params = run_bfgs(current_params, _objective_css, maxiter)
 
     if "ML" in method:
@@ -1907,7 +1894,7 @@ def arima_fit(
         ml_obj = _objective_ml_ss if use_ss else _objective_ml
         current_params = run_bfgs(current_params, ml_obj, maxiter)
 
-    # The mean/drift coefficient is estimated unreliably by the ARMA optimizer — a
+    # The mean/drift coefficient is estimated unreliably by the ARMA optimizer; a
     # poorly-conditioned BFGS step can drive it to a wrong-sign runaway that the d>0
     # forecast ramp then amplifies over the horizon. Replace it with its
     # closed form, which is well-conditioned and what R's joint estimate converges
@@ -1930,11 +1917,11 @@ def arima_fit(
             current_params = current_params.at[_mi].set(
                 jnp.clip(current_params[_mi], _ilo, _ihi))
         else:
-            # d+D >= 2: no deterministic term (R semantics) — pin the inert
+            # d+D >= 2: no deterministic term (R semantics): pin the inert
             # slot to zero so reports cannot suggest otherwise.
             current_params = current_params.at[_mi].set(0.0)
 
-    # 4. POST-PROCESSING (eager: use the jitted aliases — see their definition)
+    # 4. POST-PROCESSING (eager: use the jitted aliases; see their definition)
     y_adj, phi, theta, _ = _unpack_and_adjust_jit(current_params, x, xreg, arma, ncxreg, n_exog, include_mean)
     mod = make_arima(phi, theta, delta, arma)
     (a_final, P_final, ssq, sumlog, nu), resid, innovations = _kalman_filter_core_jit(y_adj, mod)
@@ -1949,8 +1936,8 @@ def arima_fit(
     success = jnp.isfinite(loglik) & (sigma2 > 0)
     
     # Extract the optimized drift from fitted params (not the initial guess).
-    # Kept as a jnp scalar: float() here forced a device sync on every fit and
-    # concretized under tracing; downstream use is arithmetic-only.
+    # Kept as a jnp scalar: a float() cast would force a device sync on every
+    # fit and concretize under tracing; downstream use is arithmetic-only.
     if use_drift:
         drift_coef = current_params[narma + n_exog]
     
@@ -1958,7 +1945,7 @@ def arima_fit(
         "coef": current_params,
         **metrics,
         "model": mod,
-        # One-step-ahead prior state after the last observation — the state
+        # One-step-ahead prior state after the last observation, the state
         # predict_arima forecasts from.
         "a_final": a_final,
         "P_final": P_final,
@@ -1999,7 +1986,7 @@ def _forecast_from_params(
     back at the end. Output is on the same scale as `y`.
 
     Returns:
-        Tuple[Array, Array]: (forecasts, se) — the point forecasts and their
+        Tuple[Array, Array]: (forecasts, se): the point forecasts and their
         standard errors (scaled by the filter's own sigma2 = ssq/nu).
     """
     _, _, _, _, _ns, d, D = arma
@@ -2076,7 +2063,8 @@ def predict_arima(
         >>> pred, se = predict_arima(fit, 12, newxreg=None, se_fit=True)
 
     Notes:
-        Role: Public prediction API for fixed-order and AutoARIMA fitted
+        Role: Public prediction application programming interface (API) for
+        fixed-order and AutoARIMA fitted
         models.
     """
     params = model["coef"]
@@ -2173,11 +2161,13 @@ def is_constant(x: Array, tol: float = 1e-10) -> Array:
 @jax.jit
 def kpss_test(x: jax.Array) -> float:
     """
-    KPSS stationarity test: null is stationarity; returns approximate p-value.
+    Kwiatkowski-Phillips-Schmidt-Shin (KPSS) stationarity test: null is
+    stationarity; returns approximate p-value.
 
     Detailed Description:
         Demeans the series, computes the KPSS statistic using cumulative
-        sums and a HAC variance estimator (Bartlett weights, lag length
+        sums and a heteroskedasticity and autocorrelation consistent (HAC)
+        variance estimator (Bartlett weights, lag length
         floor(3*sqrt(n)/13)), then maps the statistic to an approximate
         p-value via interpolation in a small critical-value table. Logic
         matches statsmodels. Used by ndiffs to decide whether additional
@@ -2325,7 +2315,8 @@ def nsdiffs(x: Array, period: int, max_D: int = 1, alpha: float = 0.64) -> int:
     Determine number of seasonal differences (Optimized).
     
     This implementation matches statsforecast's approach:
-    1. Use STL decomposition to extract seasonal component (preferred)
+    1. Use seasonal-trend decomposition using LOESS (STL) to extract the
+       seasonal component (preferred)
     2. Fall back to classical decomposition if STL fails
     3. Compute seasonal strength: 1 - Var(remainder) / Var(remainder + seasonal)
     4. If strength > alpha (default 0.64), seasonal differencing is needed
@@ -2371,7 +2362,7 @@ def nsdiffs(x: Array, period: int, max_D: int = 1, alpha: float = 0.64) -> int:
 
         Notes:
             Role: Primary seasonal-strength metric in nsdiffs; STL is more
-            robust than classical decomposition when applicable.
+            reliable than classical decomposition when applicable.
         """
         try:
             # Import STL decomposition
@@ -2492,7 +2483,7 @@ def _min_arma_root(coef_narma: np.ndarray, arma: Tuple[int, ...]) -> float:
     Expands the (unconstrained-space) ARMA coefficients to their effective
     values, trims trailing near-zero terms, and returns the smallest root
     modulus across the AR polynomial 1 - phi(z) and the MA polynomial
-    1 + theta(z) (2.0 when neither has active terms). Host-side numpy — used
+    1 + theta(z) (2.0 when neither has active terms). Host-side numpy, used
     only by the eager order search and final-refit admissibility check.
     """
     phi_eff, theta_eff = arima_transpar(jnp.asarray(coef_narma), arma, trans=True)
@@ -2657,7 +2648,7 @@ def myarima(
     )
 
     # 4. Near-unit-root veto (Hyndman-Khandakar): reject candidates whose
-    # fitted AR or MA polynomial has a root with modulus below 1.01 — such
+    # fitted AR or MA polynomial has a root with modulus below 1.01; such
     # fits sit on the (non-)stationarity/invertibility boundary and forecast
     # erratically even when their in-sample IC looks good. Host-side numpy is
     # fine: myarima only runs inside the eager order search.
@@ -3034,7 +3025,7 @@ def auto_arima_f(
             allow_drift=allowdrift, allow_mean=allowmean
         )
     # Stepwise Search (Hyndman-Khandakar: 5 starting models, 17 moves per
-    # round — single steps, diagonal steps, and the constant toggle — with a
+    # round (single steps, diagonal steps, and the constant toggle) with a
     # visited-set so no candidate is ever fitted twice; the scan restarts
     # from the first move after every improvement. max_order restricts the
     # grid search only, not the stepwise walk.)
@@ -3129,7 +3120,7 @@ def auto_arima_f(
     # on the near-unit-root veto band even when the search endpoint did not,
     # so walk the tried candidates in search-IC order and accept the first
     # whose exact refit is admissible (finite likelihood + roots outside the
-    # veto band) — the same fallback statsforecast runs after an
+    # veto band), the same fallback statsforecast runs after an
     # approximation-mode search.
     default_constant = (allowdrift and d_val + D_val == 1) or (allowmean and d_val + D_val == 0)
     ranked = sorted(
@@ -3160,7 +3151,7 @@ def auto_arima_f(
         final_model = fit_try
         break
     if final_model is None:
-        # Every ranked candidate failed the exact-method admissibility check —
+        # Every ranked candidate failed the exact-method admissibility check;
         # fall back to the search winner's spec unvetoed rather than raising.
         c_p, c_q, c_P, c_Q, _, _, _ = bestfit["arma"]
         final_model = arima_fit(
@@ -3181,64 +3172,76 @@ def auto_arima_f(
 
 class AutoARIMA(BaseForecaster):
     """
-    AutoARIMA
+    Automatic ARIMA forecaster.
 
-    Description:
-        Performs automatic ARIMA model selection and fitting over configured
-        search spaces, then exposes forecasting and interval prediction APIs.
-
-    Attributes:
-        uses_exog (bool): Whether exogenous features are supported.
-        ``model_`` (dict[str, Any] | None): Fitted model payload after ``fit``.
-        standardize (bool): Whether to normalize series before optimization.
-        _cached_order (tuple[int, int, int] | None): Cached best non-seasonal order.
-        _cached_seasonal_order (tuple[int, int, int] | None): Cached best seasonal order.
-        _cached_delta (Array | None): Cached differencing polynomial.
+    Selects the ARIMA order with the Hyndman-Khandakar stepwise search (or a
+    full grid search), fits the winner on a standardized copy of the series
+    and returns forecasts on the original scale. Differencing orders are
+    inferred with KPSS and seasonal-strength tests unless fixed; the seasonal
+    period is detected from the data when ``period`` is ``None``. Intervals
+    are analytic (Gaussian, from the forecast standard errors) unless
+    ``conformal_params`` is set, in which case they are conformal. Exogenous
+    regressors are not supported: ``fit``, ``forecast`` and ``predict`` raise
+    ``ValueError`` when ``X`` (or ``X_future``) is given.
 
     Args:
-        d (int | None): Optional non-seasonal differencing override.
-        D (int | None): Optional seasonal differencing override.
-        max_p (int): Maximum non-seasonal AR order.
-        max_q (int): Maximum non-seasonal MA order.
-        max_P (int): Maximum seasonal AR order.
-        max_Q (int): Maximum seasonal MA order.
-        max_order (int): Maximum total ARMA order budget.
-        max_d (int): Upper bound for inferred non-seasonal differencing.
-        max_D (int): Upper bound for inferred seasonal differencing.
-        start_p (int): Initial stepwise AR order.
-        start_q (int): Initial stepwise MA order.
-        start_P (int): Initial stepwise seasonal AR order.
-        start_Q (int): Initial stepwise seasonal MA order.
-        stationary (bool): Force stationary differencing (`d=D=0`) when true.
-        seasonal (bool): Enable seasonal search behavior.
-        ic (str): Information criterion for model selection.
-        stepwise (bool): Enable stepwise search over full grid search.
-        nmodels (int): Max number of candidate fits during stepwise search.
-        method (str): Fitting objective path (`CSS`, `ML`, or hybrid).
-        allowdrift (bool): Allow drift models when integration order is one.
-        allowmean (bool): Allow mean term for stationary candidates.
-        period (int | None): Seasonal period, or auto-detect when `None`.
+        d (int | None): Non-seasonal differencing order; ``None`` infers it.
+            Default ``None``.
+        D (int | None): Seasonal differencing order; ``None`` infers it.
+            Default ``None``.
+        max_p (int): Maximum non-seasonal AR order. Default ``5``.
+        max_q (int): Maximum non-seasonal MA order. Default ``5``.
+        max_P (int): Maximum seasonal AR order. Default ``2``.
+        max_Q (int): Maximum seasonal MA order. Default ``2``.
+        max_order (int): Maximum ``p + q + P + Q`` for the grid search
+            (ignored by the stepwise search). Default ``5``.
+        max_d (int): Upper bound for the inferred ``d``. Default ``2``.
+        max_D (int): Upper bound for the inferred ``D``. Default ``1``.
+        start_p (int): Stepwise starting AR order. Default ``2``.
+        start_q (int): Stepwise starting MA order. Default ``2``.
+        start_P (int): Stepwise starting seasonal AR order. Default ``1``.
+        start_Q (int): Stepwise starting seasonal MA order. Default ``1``.
+        stationary (bool): Force ``d = D = 0``. Default ``False``.
+        seasonal (bool): Allow seasonal terms and infer ``D``. Default
+            ``True``.
+        ic (str): Selection criterion: ``"aic"``, ``"bic"`` or ``"aicc"``.
+            Default ``"aicc"``.
+        stepwise (bool): Stepwise search when ``True``, full grid search when
+            ``False``. Default ``True``.
+        nmodels (int): Maximum number of candidate fits in the stepwise
+            search. Default ``94``.
+        method (str): Estimation method for the final fit: ``"CSS"``,
+            ``"ML"`` or ``"CSS-ML"``. Default ``"CSS-ML"``.
+        allowdrift (bool): Allow a drift term when ``d + D == 1``. Default
+            ``True``.
+        allowmean (bool): Allow a constant mean when ``d + D == 0``. Default
+            ``True``.
+        period (int | None): Seasonal period; ``None`` detects it from the
+            series at fit time. Default ``None``.
+        conformal_params (ConformalIntervals | None): Conformal interval
+            configuration. When set, ``fit`` caches conformity scores and
+            ``predict``/``forecast`` return conformal instead of analytic
+            intervals. Default ``None``.
 
-    Methods:
-        fit(): Search and fit the best ARIMA candidate.
-        forecast(): Fast fit-and-forecast path with order caching.
-        predict(): Forecast from a previously fitted model.
-        summary(): Return compact model summary text.
-
-    Returns:
-        Controls automatic model selection and forecast generation.
+    Attributes:
+        model_ (dict[str, Any] | None): Fitted model payload after ``fit``.
+        standardize (bool): Always ``True``; the series is standardized
+            before the search.
+        period (int): Seasonal period used by the last ``fit`` (user-given or
+            detected). Set by ``fit``.
+        y_train_ (jnp.ndarray): Standardized training series after ``fit``.
 
     Example:
         >>> model = AutoARIMA(seasonal=False)
         >>> model.fit(jnp.array([1.0, 1.2, 1.5, 1.7]))
         >>> model.predict(h=2)["mean"]
 
-    Notes:
-        Stateful estimator; avoid concurrent mutation from multiple threads.
+    Note:
+        The instance is stateful and not thread-safe for concurrent mutation.
     """
     # Exogenous support is not wired end-to-end (the cached-order fast path
-    # and the CV path ignore X), so it is not advertised; passing X raises
-    # instead of silently dropping it.
+    # and the cross-validation (CV) path ignore X), so it is not advertised;
+    # passing X raises instead of silently dropping it.
     uses_exog: bool = False
     
     def __init__(
@@ -3268,37 +3271,11 @@ class AutoARIMA(BaseForecaster):
         conformal_params: Optional[ConformalIntervals] = None,
     ) -> None:
         """
-        Set up AutoARIMA search bounds, options, and internal caches.
+        Store the search bounds and options and reset the fitted-state caches.
 
-        Detailed Description:
-            Stores all order bounds (max_p, max_q, max_P, max_Q, max_order,
-            max_d, max_D), stepwise settings (start_*, stepwise, nmodels),
-            fitting options (method, ic), and flags (stationary, seasonal,
-            allowdrift, allowmean). Initializes model_ to None and caches
-            (_cached_order, _cached_seasonal_order, _cached_delta, etc.) for
-            the fast forecast() path after the first fit. Period can be None
-            for auto-detection on first fit.
-
-        Args:
-            d, D (Optional[int]): Override differencing; None to infer.
-            max_p, max_q, max_P, max_Q, max_order, max_d, max_D (int): As in class docstring.
-            start_p, start_q, start_P, start_Q (int): Stepwise starting orders.
-            stationary, seasonal (bool): Differencing and seasonal search flags.
-            ic (str): Information criterion for selection.
-            stepwise (bool): Stepwise vs full grid search.
-            nmodels (int): Max stepwise iterations.
-            method (str): CSS, ML, or CSS-ML.
-            allowdrift, allowmean (bool): Drift and mean inclusion.
-            period (Optional[int]): Seasonal period or None for auto-detect.
-
-        Returns:
-            None.
-
-        Side Effects:
-            Sets instance attributes and caches; no I/O.
-
-        Notes:
-            Role: Constructor for AutoARIMA; must be called before fit or forecast.
+        Constructor arguments are documented in the class docstring. The
+        cached order, differencing polynomial and parameter counts that the
+        ``forecast`` fast path reuses are filled by the first ``fit``.
         """
         self.d = d
         self.D = D
@@ -3340,36 +3317,38 @@ class AutoARIMA(BaseForecaster):
     
     def fit(self, y: jnp.ndarray, X: Optional[jnp.ndarray] = None) -> "AutoARIMA":
         """
-        Fit automatic ARIMA model selection on a series.
+        Select the ARIMA order and fit it on a training series.
 
-        Detailed Description:
-            Optionally standardizes the series, infers/uses seasonal period,
-            executes automatic order search, and caches the winning order for
-            subsequent fast forecast calls.
+        Standardizes ``y``, detects the seasonal period when ``period`` is
+        ``None`` (``detect_period`` with ``max_period = min(T // 4, 24)``),
+        runs the order search in ``auto_arima_f`` and stores the fitted model
+        in ``model_``. The selected order is cached so later ``forecast``
+        calls re-fit only the parameters. When ``conformal_params`` is set,
+        conformity scores are computed on ``y`` and cached for ``predict``.
+
+        The order search is host-side Python and does not trace; this method
+        is eager by design and is never called inside the cross-validation
+        ``vmap``.
 
         Args:
-            y (jnp.ndarray): Training target series.
-            X (jnp.ndarray | None, optional): Optional exogenous regressors.
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            X (jnp.ndarray | None): Not supported; must be ``None``.
 
         Returns:
-            AutoARIMA: The fitted estimator instance.
+            AutoARIMA: The fitted estimator (``self``).
 
         Raises:
-            RuntimeError: Propagated when no valid model can be estimated.
-
-        Side Effects:
-            Mutates fitted model state, normalization stats, and cached order
-            metadata.
+            ValueError: If ``X`` is not ``None``, or if ``conformal_params`` is
+                set and ``y`` is too short for two cross-validation windows.
+            RuntimeError: If the grid search (``stepwise=False``) cannot
+                estimate any candidate.
 
         Example:
             >>> model = AutoARIMA(seasonal=False)
             >>> _ = model.fit(jnp.array([10.0, 11.0, 12.0, 12.5]))
-
-        Notes:
-            The first fit may trigger JAX compilation overhead.
         """
         # fit() hosts the order search (numpy/scipy stepwise) and is eager by
-        # design; the vmapped CV path never calls it directly — see
+        # design; the vmapped CV path never calls it directly. See
         # conformity_scores() below for how conformal CV reaches forecast().
         y_jax = jnp.asarray(y, dtype=jnp.float64)
 
@@ -3425,7 +3404,7 @@ class AutoARIMA(BaseForecaster):
             period=period,
         )
 
-        # Search succeeded — commit state to self.
+        # Search succeeded; commit state to self.
         self._y_mean = y_mean
         self._y_std = y_std
         self.y_train_ = y_fit
@@ -3467,36 +3446,38 @@ class AutoARIMA(BaseForecaster):
         self, y: jnp.ndarray, X: Optional[jnp.ndarray] = None
     ) -> jnp.ndarray:
         """
-        Conformity scores with eager order selection, vmapped per-window refit.
+        Conformity scores with eager order selection and vmapped per-window refit.
 
-        Detailed Description:
-            The base-class implementation vmaps ``self.forecast`` over CV
-            windows. AutoARIMA's order search (stepwise/grid over numpy and
-            Python control flow) cannot trace, so it runs ONCE, eagerly, on
-            the full series here; the vmapped ``forecast`` then re-fits the
-            *parameters* of that fixed order independently per window via the
-            traceable CSS fast path.
+        The base-class implementation vmaps ``self.forecast`` over
+        cross-validation windows. The order search cannot trace, so it runs
+        once, eagerly, on the full series (via ``fit`` when the instance has
+        no cached order yet); the vmapped ``forecast`` then re-fits the
+        parameters of that fixed order independently per window on the
+        traceable CSS fast path. When ``fit`` runs here and caches scores on
+        this ``y``, those scores are returned directly.
 
-            Calibration caveat (shared with the other Auto models): the ORDER is
-            selected with sight of the full series,
-            including CV test windows — mildly optimistic. Parameters are
-            still honestly re-fit per window, so scores vary across windows.
+        Calibration caveat, shared with the other Auto models: the order is
+        selected with sight of the full series, including the test windows,
+        which is mildly optimistic. Parameters are re-fit per window, so the
+        scores still vary across windows.
 
         Args:
-            y (jnp.ndarray): Series to score on (concrete; order selection is
-                a host-side search).
-            X (jnp.ndarray | None, optional): Optional exogenous regressors.
+            y (jnp.ndarray): Univariate series, shape ``(T,)``. Must be
+                concrete when the order has not been selected yet.
+            X (jnp.ndarray | None): Not supported; must be ``None``.
 
         Returns:
-            jnp.ndarray: ``(n_windows, h)`` conformity scores.
+            jnp.ndarray: Signed residuals, shape ``(n_windows, h)``.
 
-        Side Effects:
-            First call on an unfitted estimator runs ``fit`` (caches the
-            selected order) — mirroring ``forecast``'s first-call behaviour.
+        Raises:
+            ValueError: If ``conformal_params`` is ``None``, if ``y`` is too
+                short for two windows, or if ``X`` is not ``None``.
+            RuntimeError: Propagated from ``fit`` on a first call when the
+                grid search cannot estimate any candidate.
         """
         if self._cached_order is None:
             self.fit(y, X)
-            # fit() just cached scores on exactly this y — reuse them rather
+            # fit() just cached scores on exactly this y; reuse them rather
             # than paying the n_windows CV re-fits a second time.
             if self._cs is not None:
                 return self._cs
@@ -3504,40 +3485,45 @@ class AutoARIMA(BaseForecaster):
     
     def forecast(self, h: int, y: jnp.ndarray, X: Optional[jnp.ndarray] = None, X_future: Optional[jnp.ndarray] = None, level: Optional[list] = None, fitted: bool = False) -> Dict[str, jnp.ndarray]:
         """
-        Produce fast forecasts from history with cached-order optimization.
+        Forecast from history, selecting the order on the first call only.
 
-        Detailed Description:
-            On first invocation, this method runs full automatic selection via
-            `fit`. On later calls, it reuses cached orders and only runs the
-            optimization/forecast kernels needed for fresh predictions.
+        On an instance with no cached order this runs ``fit`` (full order
+        search) and returns ``predict``. On later calls it re-fits only the
+        parameters of the cached order with the CSS objective and the
+        pure-``lax`` L-BFGS optimizer, then forecasts from the filtered
+        state. That cached-order branch writes nothing to the instance and is
+        the path ``conformity_scores`` vmaps, so every operation in it traces
+        under ``jax.vmap``.
 
         Args:
             h (int): Forecast horizon.
-            y (jnp.ndarray): Input history series.
-            X (jnp.ndarray | None, optional): Optional exogenous matrix.
-            X_future (jnp.ndarray | None, optional): Future exogenous regressors (unused; included for BaseForecaster compliance). Default is None.
-            level (list | None, optional): Confidence levels (0-100) for conformal
-                prediction intervals. Requires ``conformal_params``. Default is None.
-            fitted (bool, optional): Whether to return fitted values (unused; the
-                fast path computes forecasts only). Default is False.
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            X (jnp.ndarray | None): Not supported; must be ``None``.
+            X_future (jnp.ndarray | None): Not supported; must be ``None``.
+            level (list[int] | None): Confidence levels in (0, 100), e.g.
+                ``[80, 95]``. Analytic Gaussian intervals unless
+                ``conformal_params`` is set, then conformal intervals.
+                Default ``None``.
+            fitted (bool): Accepted for ``BaseForecaster`` API parity; unused.
+                Default ``False``.
 
         Returns:
-            dict[str, jnp.ndarray]: Forecast dictionary containing `mean`, plus
-            `lo-{l}`/`hi-{l}` conformal bounds when `level` is given.
+            dict[str, jnp.ndarray]: ``"mean"`` (shape ``(h,)``), plus
+            ``"lo-{lv}"`` and ``"hi-{lv}"`` (shape ``(h,)``) for each level
+            when ``level`` is given.
 
         Raises:
-            RuntimeError: Propagated from optimizer if fitting fails.
-
-        Side Effects:
-            May update cache/state when invoked before initial `fit`.
+            ValueError: If ``X`` or ``X_future`` is not ``None``; if ``level``
+                is given with ``conformal_params`` set and ``h`` differs from
+                ``conformal_params.h``; or if ``y`` is too short for two
+                cross-validation windows in that case.
+            RuntimeError: On the first call, if the grid search
+                (``stepwise=False``) cannot estimate any candidate.
 
         Example:
             >>> model = AutoARIMA(seasonal=False)
             >>> model.forecast(h=2, y=jnp.array([1.0, 2.0, 3.0]))["mean"].shape
             (2,)
-
-        Notes:
-            Fast path intentionally uses CSS objective for low latency.
         """
         if X is not None or X_future is not None:
             raise ValueError(
@@ -3629,7 +3615,7 @@ class AutoARIMA(BaseForecaster):
                 "conformity scores cover exactly conformal_params.h steps."
             )
         if fitted_this_call and self._cs is not None:
-            # fit() above just cached scores on exactly this y — don't pay
+            # fit() above just cached scores on exactly this y; don't pay
             # the n_windows CV re-fits a second time.
             cs = self._cs
         else:
@@ -3643,33 +3629,35 @@ class AutoARIMA(BaseForecaster):
         level: Optional[Union[int, Tuple[int, ...]]] = None,
     ) -> Dict[str, jnp.ndarray]:
         """
-        Forecast from the fitted automatic ARIMA model.
+        Forecast from the fitted model.
 
-        Detailed Description:
-            Uses stored fitted model state to generate mean forecasts and, when
-            confidence levels are provided, symmetric interval bounds.
+        Forecasts from the end-of-sample filtered state stored by ``fit`` and
+        maps the result back to the original scale. Intervals are analytic
+        (Gaussian, from the forecast standard errors) unless
+        ``conformal_params`` is set, in which case the conformity scores
+        cached by ``fit`` are used.
 
         Args:
             h (int): Forecast horizon.
-            X (jnp.ndarray | None, optional): Optional future exogenous matrix.
-            level (int | tuple[int, ...] | None, optional): Confidence levels.
+            X (jnp.ndarray | None): Not supported; must be ``None``.
+            level (int | tuple[int, ...] | None): Confidence level(s) in
+                (0, 100), e.g. ``95`` or ``(80, 95)``. Default ``None``.
 
         Returns:
-            dict[str, jnp.ndarray]: Mean forecast and optional interval bounds.
+            dict[str, jnp.ndarray]: ``"mean"`` (shape ``(h,)``), plus
+            ``"lo-{lv}"`` and ``"hi-{lv}"`` (shape ``(h,)``) for each level
+            when ``level`` is given.
 
         Raises:
-            RuntimeError: If estimator was not fitted.
-
-        Side Effects:
-            None; consumes existing model state.
+            RuntimeError: If called before ``fit``.
+            ValueError: If ``X`` is not ``None``; or, with ``level`` given and
+                ``conformal_params`` set, if no conformity scores are cached
+                or ``h`` differs from ``conformal_params.h``.
 
         Example:
             >>> model = AutoARIMA(seasonal=False).fit(jnp.array([1.0, 2.0, 3.0, 4.0]))
             >>> model.predict(h=2, level=95)["mean"].shape
             (2,)
-
-        Notes:
-            Integrated models accumulate uncertainty across horizons.
         """
         if self.model_ is None:
             raise RuntimeError("Model not fitted. Call fit() first.")
@@ -3698,11 +3686,9 @@ class AutoARIMA(BaseForecaster):
         # state space).
         mean_orig = _aa_denormalize(mean_pred, self._y_mean, self._y_std)
 
-        # Standard Errors. The state-space (make_arima) already bakes the
-        # differencing into T/Z, so kalman_forecast returns the integrated-series
-        # forecast SE directly; the old sqrt(cumsum(se^2)) here integrated a
-        # SECOND time (double count). se_pred is already the correct per-horizon
-        # SE — just rescale to the original units.
+        # se_pred is the integrated-series forecast SE (the state space bakes
+        # differencing into T/Z), so it is already per-horizon; only rescale
+        # to the original units.
         if se_pred is not None:
             se_orig = se_pred * self._y_std
         else:
@@ -3737,29 +3723,11 @@ class AutoARIMA(BaseForecaster):
 
     def summary(self) -> str:
         """
-        Return a compact textual summary of the fitted model.
-
-        Detailed Description:
-            Builds an ARIMA order summary string with AICc when fitted, or a
-            not-fitted status message otherwise.
-
-        Args:
-            None: This method takes no explicit parameters beyond `self`.
+        Return a one-line summary of the fitted model.
 
         Returns:
-            str: Human-readable model summary.
-
-        Raises:
-            None.
-
-        Side Effects:
-            None.
-
-        Example:
-            >>> AutoARIMA().summary()
-
-        Notes:
-            Intended for logging and diagnostics.
+            str: ``"ARIMA(p,d,q)(P,D,Q)[m] | AICc: <value>"`` when fitted,
+            otherwise ``"Model not fitted"``.
         """
         if self.model_ is None: return "Model not fitted"
         p, q, P, Q, m, d, D = self.model_["arma"]

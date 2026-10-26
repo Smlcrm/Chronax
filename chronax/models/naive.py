@@ -1,30 +1,11 @@
 """
-The naive class implements statsforecast's naive forecasting model, in which any forecast is equal to the previously observed value.
+Naive forecaster: every forecast equals the last observed value.
 
-This JAX implementation provides complete compatibility with statsforecast's Naive class, including:
-- fit(): Trains the model and stores parameters
-- predict(): Makes forecasts using fitted model (stateful) with confidence intervals
-- predict_in_sample(): Returns fitted values from training with confidence intervals
-- forecast(): Stateless prediction (fit + predict in one step) with confidence intervals
-- forward(): Applies fitted model to new/updated time series
-
-Core computation is handled by _naive_core() which computes forecasts, fitted values, and residual statistics.
-
-Confidence Intervals:
-- Native intervals: Uses residual standard error with normal distribution assumption
-- Conformal intervals: Uses base_forecaster's conformal prediction methods when conformal_params is provided
-
-Instance Attributes:
-1. All instance attributes in the parent class base_forecaster
-2. model_: Dict containing fitted parameters (last_y, sigma, fitted values)
-
-Class Attributes:
-- Inherits from base_forecaster
-
-Methods:
-- All statsforecast Naive methods implemented with JAX operations
-- Full confidence interval support (both native and conformal)
-- Proper integration with base_forecaster's conformal prediction framework
+Port of statsforecast's ``Naive``. ``_naive_core`` computes the forecasts, the
+one-step fitted values and the residual standard error. Native intervals use
+the residual standard error with a normal assumption and grow as ``sqrt(h)``;
+conformal intervals come from ``BaseForecaster`` when ``conformal_params`` is
+set.
 """
 
 import jax
@@ -34,6 +15,21 @@ from chronax.utils import ConformalIntervals
 from chronax import utils
 
 class Naive(BaseForecaster):
+    """Naive model: every forecast equals the last observed value.
+
+    Args:
+        alias (str): Custom name of the model. Defaults to ``"Naive"``.
+        conformal_params (ConformalIntervals | None): Configuration for
+            conformal prediction intervals. When ``None``, native intervals
+            (residual standard error, normal quantiles) are used. Defaults to
+            ``None``.
+
+    Note:
+        ``forecast`` and ``forward`` take ``(h, y, ...)`` in that order, the
+        reverse of the ``BaseForecaster`` signature. Call them with keyword
+        arguments.
+    """
+
     def __init__(
         self,
         alias: str = "Naive",
@@ -56,7 +52,6 @@ class Naive(BaseForecaster):
         dictionary = {'mean': forecasts, 'fitted': fitted_vals, 'sigma': sigma, 'last_y': y[-1]}
         return dictionary
 
-    # JIT-compiled version for performance
     _naive_core_jit = jax.jit(_naive_core.__func__, static_argnums=(1,))
 
     def fit(
@@ -64,6 +59,19 @@ class Naive(BaseForecaster):
         y: jnp.ndarray,
         X: jnp.ndarray | None = None,
     ):
+        """Fit the Naive model.
+
+        Stores the last value, the one-step fitted values, the residual
+        standard error and the training series in ``model_``.
+
+        Args:
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            X (jnp.ndarray | None): Exogenous regressors, shape ``(T, F)``.
+                Ignored. Defaults to ``None``.
+
+        Returns:
+            Naive: ``self``.
+        """
         y = utils.ensure_float(y)
         mod = Naive._naive_core_jit(y, h=1)
         mod['y_train'] = y  # Store for conformal prediction
@@ -76,18 +84,26 @@ class Naive(BaseForecaster):
         X: jnp.ndarray | None = None,
         level: list[int] | None = None,
     ):
-        """Predict with fitted Naive.
+        """Predict with the fitted Naive model.
 
         Args:
-            h: Forecast horizon.
-            X: Optional exogenous of shape (h, n_x).
-            level: Confidence levels (0-100) for prediction intervals.
+            h (int): Forecast horizon.
+            X (jnp.ndarray | None): Future exogenous regressors, shape
+                ``(h, F)``. Only forwarded to ``conformity_scores``; otherwise
+                ignored. Defaults to ``None``.
+            level (list[int] | None): Confidence levels in (0, 100), e.g.
+                ``[80, 95]``. Defaults to ``None``.
 
         Returns:
-            dict: Dictionary with entries `mean` for point predictions and `level_*` for probabilistic predictions.
+            dict: ``"mean"`` (shape ``(h,)``) plus ``"lo-{lv}"``/``"hi-{lv}"``
+            per level when ``level`` is given.
+
+        Raises:
+            ValueError: If called before ``fit``, or if the conformal path
+                finds the training series too short for 2 cross-validation
+                (CV) windows.
         """
         self._require_fitted()
-        # Use stored last_y to create forecasts
         mean = jnp.full(h, self.model_["last_y"], dtype=self.model_["last_y"].dtype)
         res = {"mean": mean}
 
@@ -109,13 +125,16 @@ class Naive(BaseForecaster):
         return res
 
     def predict_in_sample(self, level: list[int] | None = None):
-        """Access fitted Naive insample predictions.
+        """Return the in-sample fitted values of the fitted Naive model.
 
         Args:
-            level: Confidence levels (0-100) for prediction intervals.
+            level (list[int] | None): Confidence levels in (0, 100). Defaults
+                to ``None``.
 
         Returns:
-            dict: Dictionary with entries `fitted` for point predictions.
+            dict: ``"fitted"`` (shape ``(T,)``, first value NaN) plus
+            ``"fitted-lo-{lv}"``/``"fitted-hi-{lv}"`` per level when ``level``
+            is given.
         """
         res = {"fitted": self.model_["fitted"]}
         if level is not None:
@@ -131,22 +150,33 @@ class Naive(BaseForecaster):
         level: list[int] | None = None,
         fitted: bool = False,
     ):
-        """Memory Efficient Naive predictions.
+        """Stateless fit+predict in one call.
 
-        This method avoids memory burden due from object storage.
-        It is analogous to `fit_predict` without storing information.
-        It assumes you know the forecast horizon in advance.
+        Takes ``h`` before ``y``, the reverse of the ``BaseForecaster``
+        signature; call with keyword arguments.
 
         Args:
-            h: Forecast horizon.
-            y: Clean time series of shape (n,).
-            X: Optional insample exogenous of shape (t, n_x).
-            X_future: Optional exogenous of shape (h, n_x).
-            level: Confidence levels (0-100) for prediction intervals.
-            fitted: Whether or not to return insample predictions.
+            h (int): Forecast horizon.
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            X (jnp.ndarray | None): In-sample exogenous regressors, shape
+                ``(T, F)``. Only forwarded to ``conformity_scores``. Defaults
+                to ``None``.
+            X_future (jnp.ndarray | None): Future exogenous regressors, shape
+                ``(h, F)``. Ignored. Defaults to ``None``.
+            level (list[int] | None): Confidence levels in (0, 100). Defaults
+                to ``None``.
+            fitted (bool): Whether to return in-sample fitted values under
+                ``"fitted"``. Defaults to ``False``.
 
         Returns:
-            dict: Dictionary with entries `mean` for point predictions and `level_*` for probabilistic predictions.
+            dict: ``"mean"`` (shape ``(h,)``); ``"fitted"`` (shape ``(T,)``)
+            when ``fitted``; ``"lo-{lv}"``/``"hi-{lv}"`` per level when
+            ``level`` is given, plus ``"fitted-lo-{lv}"``/``"fitted-hi-{lv}"``
+            when both are set.
+
+        Raises:
+            ValueError: If the conformal path finds the series too short for
+                2 CV windows.
         """
         y = utils.ensure_float(y)
         out = Naive._naive_core_jit(y=y, h=h)
@@ -182,18 +212,24 @@ class Naive(BaseForecaster):
         level: list[int] | None = None,
         fitted: bool = False,
     ):
-        """Apply fitted model to an new/updated series.
+        """Apply the model to a new series; delegates to :meth:`forecast`.
+
+        Takes ``h`` before ``y``; call with keyword arguments.
 
         Args:
-            h: Forecast horizon.
-            y: Clean time series of shape (n,).
-            X: Optional insample exogenous of shape (t, n_x).
-            X_future: Optional exogenous of shape (h, n_x).
-            level: Confidence levels (0-100) for prediction intervals.
-            fitted: Whether or not to return insample predictions.
+            h (int): Forecast horizon.
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            X (jnp.ndarray | None): In-sample exogenous regressors, shape
+                ``(T, F)``. Defaults to ``None``.
+            X_future (jnp.ndarray | None): Future exogenous regressors, shape
+                ``(h, F)``. Ignored. Defaults to ``None``.
+            level (list[int] | None): Confidence levels in (0, 100). Defaults
+                to ``None``.
+            fitted (bool): Whether to return in-sample fitted values. Defaults
+                to ``False``.
 
         Returns:
-            dict: Dictionary with entries `mean` for point predictions and `level_*` for probabilistic predictions.
+            dict: Same keys as :meth:`forecast`.
         """
         y = utils.ensure_float(y)
         res = self.forecast(
@@ -209,7 +245,7 @@ class Naive(BaseForecaster):
         mean = res["mean"]
         intervals = {}
 
-        # Lower bounds (in reverse order to match statsforecast convention)
+        # Lower bounds in reverse level order (statsforecast key convention)
         for i, lv in enumerate(reversed(level)):
             z = z_scores[len(level) - 1 - i]
             intervals[f"lo-{lv}"] = mean - z * sigmah

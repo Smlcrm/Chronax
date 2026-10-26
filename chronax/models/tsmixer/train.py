@@ -8,12 +8,12 @@ TSMixer's forward pass returns a plain ``[B, h, N]`` tensor; the training step
 also updates ``batch_stats`` via the mutable collection returned by
 ``model.apply(..., mutable=['batch_stats'])``.
 
-Public API:
-    :func:`create_train_state` — initialise model parameters + optimiser.
-    :func:`train_step`          — JIT-compiled forward + backward + update.
-    :func:`eval_step`           — JIT-compiled deterministic evaluation.
-    :func:`scan_train_loop`     — all-steps-at-once XLA scan (no batch_stats).
-    :func:`train_loop`          — convenience epoch loop.
+Public interface:
+    :func:`create_train_state`: initialise model parameters and optimiser.
+    :func:`train_step`: JIT-compiled forward, backward and update.
+    :func:`eval_step`: JIT-compiled deterministic evaluation.
+    :func:`scan_train_loop`: whole-run XLA (accelerated linear algebra) scan, no batch_stats.
+    :func:`train_loop`: convenience epoch loop.
 """
 
 from __future__ import annotations
@@ -173,7 +173,7 @@ def eval_step(
 
 
 # ---------------------------------------------------------------------------
-# Scan loop (no batch_stats update — use train_step loop for BatchNorm)
+# Scan loop (no batch_stats update; use the train_step loop for BatchNorm)
 # ---------------------------------------------------------------------------
 
 

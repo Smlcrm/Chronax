@@ -1,33 +1,29 @@
 """
-LOESS/LOWESS (Locally Weighted Scatterplot Smoothing) in JAX
+LOESS/LOWESS (locally weighted scatterplot smoothing) in JAX.
 
-This module implements LOESS (Local Polynomial Regression) with tricube kernel weighting
-and optional robust reweighting for non-parametric smoothing of time series and scatter data.
+Local polynomial regression with tricube kernel weights and optional robust
+reweighting for non-parametric smoothing of time series and scatter data.
 
-**Methods:**
-- Fixed-window LOESS (`loess_window_jump`): Uses a fixed window size with optional jump anchors for speed
-- Fraction-based LOWESS (`lowess_frac`): Classic Cleveland LOWESS using neighborhood fraction
-- Convenience wrapper (`loess_smooth`): Automatically selects appropriate method
+Functions:
 
-**Kernel & Weighting:**
-- Tricube weights: w(u) = (1 - |u|³)³ for |u| < 1
-- Robust reweighting: Bisquare weights via MAD for outlier resistance
+- ``loess_window_jump(y, window, deg, robust_outer, jump)``: fixed-window
+  LOESS with optional jump anchors (STL-style: seasonal-trend decomposition
+  using LOESS)
+- ``lowess_frac(y, x, frac, it)``: classic Cleveland LOWESS with a
+  neighbourhood fraction
+- ``loess_smooth(y, ...)``: convenience wrapper that picks one of the two
 
-**Implementation:**
-- JIT-compiled for performance with static window/degree parameters
-- Supports local constant (deg=0) and local linear (deg=1) regression
-- Edge padding for boundary handling
-- Optional jump anchors (STL-style) for faster computation
+Kernel and weighting:
 
-**Attributes:**
-None (utility functions only)
+- Tricube weights: ``w(u) = (1 - |u|^3)^3`` for ``|u| < 1``
+- Robust reweighting: bisquare weights via the median absolute deviation (MAD)
 
-**Methods:**
-- `loess_window_jump(y, window, deg, robust_outer, jump)`: Fixed-window LOESS
-- `lowess_frac(y, x, frac, it)`: Fraction-based LOWESS
-- `loess_smooth(y, ...)`: Convenience wrapper
+Implementation:
+
+- JIT-compiled with static window and degree parameters
+- Local constant (deg=0) and local linear (deg=1) regression
+- Edge padding at the boundaries
 """
-# loess.py
 from __future__ import annotations
 from functools import partial as _partial
 import jax
@@ -85,7 +81,7 @@ def _tricube_weights(window: int) -> tuple[jnp.ndarray, jnp.ndarray]:
     Returns:
         tuple[jnp.ndarray, jnp.ndarray]: A tuple containing:
             - offsets of shape (window,): Integer offsets from center.
-            - weights of shape (window,): Tricube weights w(u) = (1 - |u|^3)^3.
+            - weights of shape (window,): Tricube weights ``w(u) = (1 - |u|^3)^3``.
     """
     half = window // 2
     offsets = jnp.arange(-half, half + 1)
@@ -106,10 +102,10 @@ def loess_window_jump(
     jump: int = 1,           # evaluate only on anchors (0, jump, 2*jump, ...)
 ) -> jnp.ndarray:
     """
-    LOESS with fixed odd window using tricube weights.
-    - deg ∈ {0,1}: local constant or local linear (value at center).
-    - robust_outer: bisquare outer reweighting count.
-    - jump: compute only at anchor points and linearly interpolate in-between (STL-like speedup).
+    LOESS with a fixed odd window and tricube weights.
+
+    Evaluates the local fit at anchor points ``0, jump, 2*jump, ...`` and
+    linearly interpolates in between (the STL speedup).
 
     Args:
         y (jnp.ndarray): Input 1D array to smooth.
@@ -201,11 +197,12 @@ def lowess_frac(
     it: int = 0,              # robust iterations
 ) -> jnp.ndarray:
     """
-    Statsmodels-style LOWESS (Cleveland):
-    - Neighborhood defined by frac*n nearest x.
-    - Tricube kernel; robust outer iterations via bisquare.
-    - Returns yhat aligned to x (input order).
-    Note: 'delta' skip optimization is omitted for JAX-purity.
+    Statsmodels-style LOWESS (Cleveland).
+
+    The neighbourhood of each point is its ``frac * n`` nearest ``x``
+    values; the kernel is tricube and robust outer iterations use bisquare
+    weights. The result is aligned to the input order of ``x``. The
+    statsmodels ``delta`` skip is omitted to keep the function JAX-pure.
 
     Args:
         y (jnp.ndarray): Input 1D array of values to smooth.
@@ -284,9 +281,12 @@ def loess_smooth(
     x: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
     """
-    Convenience wrapper. Choose one mode:
-      - Fixed-window: pass window (odd). Uses loess_window_jump (supports jump, deg, robust_outer).
-      - Frac-based: pass frac and x. Uses lowess_frac (supports robust iterations).
+    Convenience wrapper with two modes.
+
+    Pass ``window`` (odd) for fixed-window LOESS via ``loess_window_jump``
+    (``jump``, ``deg`` and ``robust_outer`` apply), or pass ``frac`` and
+    ``x`` for LOWESS via ``lowess_frac`` (``robust_outer`` is the number of
+    robust iterations).
 
     Args:
         y (jnp.ndarray): Input 1D array to smooth.

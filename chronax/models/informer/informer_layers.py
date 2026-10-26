@@ -23,7 +23,7 @@ class _TorchLinearInit:
     torch draws both weight and bias from ``U(-1/sqrt(fan_in), 1/sqrt(fan_in))``
     (Kaiming-uniform with ``a=sqrt(5)`` reduces to this bound). Flax's
     ``nnx.Linear`` defaults to ``lecun_normal`` instead, so matching torch here is
-    what makes training trajectories — and thus accuracy — comparable to
+    what makes training trajectories, and thus accuracy, comparable to
     neuralforecast. ``fan_in`` is the layer's ``in_features`` (the bias shares the
     weight's fan_in).
     """
@@ -41,7 +41,7 @@ class _TorchLinearInit:
         # Value equality. Initializer instances are static graphdef leaves, so an
         # identity-based __eq__ makes same-config graphdefs UNEQUAL and the
         # module-level @nnx.jit _forward_det cache can never hit across nets built by
-        # a later fit — costing a full recompile on every refit->predict.
+        # a later fit, costing a full recompile on every refit->predict.
         return type(other) is type(self) and other.fan_in == self.fan_in
 
     def __hash__(self):
@@ -75,7 +75,7 @@ class _KaimingNormalConvInit:
     def __call__(self, key, shape, dtype=jnp.float32):
         return jax.random.normal(key, shape, dtype) * math.sqrt(2.0 / self.fan_in)
 
-    def __eq__(self, other):  # I2 value equality — see _TorchLinearInit above
+    def __eq__(self, other):  # I2 value equality, see _TorchLinearInit above
         return type(other) is type(self) and other.fan_in == self.fan_in
 
     def __hash__(self):
@@ -120,13 +120,13 @@ def sinusoid_position_embedding(L: int, hidden_size: int) -> jnp.ndarray:
 
 
 class TokenEmbedding(nnx.Module):
-    """Circular 1-D conv token embedding (NF ``TokenEmbedding``).
+    """Circular 1-D conv token embedding (neuralforecast ``TokenEmbedding``).
 
     A kernel-3 conv with ``padding="CIRCULAR"`` is length-preserving and wraps
     values at the sequence boundary, matching torch's ``Conv1d(kernel_size=3,
     padding=1, padding_mode='circular')``. Flax is feature-last (``[B, L,
-    C]``), so — unlike a literal torch port — no axis permutes are needed. No
-    bias (NF default); Kaiming-normal init with ``fan_in = 3 * c_in``.
+    C]``), so, unlike a literal torch port, no axis permutes are needed. No
+    bias (neuralforecast default); Kaiming-normal init with ``fan_in = 3 * c_in``.
     """
 
     def __init__(self, c_in: int, hidden_size: int, *, rngs: nnx.Rngs) -> None:
@@ -141,7 +141,7 @@ class TokenEmbedding(nnx.Module):
 
 
 class TimeFeatureEmbedding(nnx.Module):
-    """Bias-free linear projection of time-feature marks (NF ``TimeFeatureEmbedding``)."""
+    """Bias-free linear projection of time-feature marks (neuralforecast ``TimeFeatureEmbedding``)."""
 
     def __init__(self, input_size: int, hidden_size: int, *, rngs: nnx.Rngs) -> None:
         self.lin = _torch_linear(input_size, hidden_size, use_bias=False, rngs=rngs)
@@ -152,10 +152,10 @@ class TimeFeatureEmbedding(nnx.Module):
 
 
 class DataEmbedding(nnx.Module):
-    """Token + sinusoidal-position (+ optional time-feature) embedding (NF ``DataEmbedding``).
+    """Token + sinusoidal-position (+ optional time-feature) embedding (neuralforecast ``DataEmbedding``).
 
     Sums the circular-conv token embedding, the fixed sinusoidal position code,
-    and — only when ``exog_input_size > 0`` — a bias-free linear embedding of
+    and, only when ``exog_input_size > 0``, a bias-free linear embedding of
     future-known time-feature marks, then applies dropout. ``temporal_embedding``
     is ``None`` (rather than a zero-input layer) when there are no exogenous
     marks, so ``x_mark`` may be passed as ``None`` in that case.
@@ -218,25 +218,24 @@ def _prob_attention(q, k, v, *, factor: int, mask_flag: bool, key) -> jnp.ndarra
 
 
 class AttentionLayer(nnx.Module):
-    """Multi-head ProbSparse attention (NF ``AttentionLayer`` + ``ProbAttention`` folded into one).
+    """Multi-head ProbSparse attention (neuralforecast ``AttentionLayer`` + ``ProbAttention`` folded into one).
 
-    q/k/v/out projections are ``hidden_size -> hidden_size`` (torch init, bias=True — NF
+    q/k/v/out projections are ``hidden_size -> hidden_size`` (torch init, bias=True, neuralforecast
     default), split into ``n_head`` heads of size ``hidden_size // n_head``. Unlike
     ``itransformer``'s ``AttentionLayer`` (self-attention only), queries and keys/values
-    here may have DIFFERENT lengths (``L_Q`` vs ``L_K``) — this is what lets the decoder's
+    here may have DIFFERENT lengths (``L_Q`` vs ``L_K``), this is what lets the decoder's
     cross-attention run queries from the decoder against keys/values from the encoder.
     The inner attention is :func:`_prob_attention` rather than dense softmax attention.
 
     **Head mixing (``mixing``):** two flatten conventions exist for the multi-head
     context at ``H > 1``. ``"official"`` transposes to ``[B, L, H, E]`` before
     flattening (the Informer2020-paper convention; keeps each head's features
-    aligned with its own time steps). ``"nf"`` — the default — flattens straight
+    aligned with its own time steps). ``"nf"``, the default, flattens straight
     from the ``[B, H, L, E]`` layout (``out.view(B, L, -1)`` in the
     neuralforecast reference), reinterpreting head-major memory as ``[B, L, H*E]``.
-    The nf form is the variant the benchmarked reference trains, and it
-    measurably trains better on period≈L data (paired A/B across the losing
-    cells), so it is the default; ``"official"`` preserves paper-exact per-head
-    alignment. The two are identical at ``n_head == 1``.
+    ``"nf"`` is the layout the neuralforecast reference trains with, so it
+    is the default; ``"official"`` preserves paper-exact per-head alignment.
+    The two are identical at ``n_head == 1``.
 
     No dropout (``_prob_attention`` never applies its own), no ``deterministic`` arg.
     """
@@ -281,21 +280,21 @@ class AttentionLayer(nnx.Module):
 
 
 class ConvLayer(nnx.Module):
-    """Self-attention distilling layer (NF ``ConvLayer``).
+    """Self-attention distilling layer (neuralforecast ``ConvLayer``).
 
-    Roughly halves the sequence length between encoder stacks. NF pins torch
-    ``Conv1d(kernel_size=3, padding=2, padding_mode='circular')`` — the paper
-    repo's padding is torch-version-conditional and the NF benchmark twin uses
+    Roughly halves the sequence length between encoder stacks. neuralforecast pins torch
+    ``Conv1d(kernel_size=3, padding=2, padding_mode='circular')``, the paper
+    repo's padding is torch-version-conditional and the neuralforecast benchmark twin uses
     padding=2, which EXPANDS the sequence to ``L + 2`` before the pool (the
     length-preserving padding=1 variant is NOT equivalent). Torch circular padding
     draws the left pad from the
     sequence tail and the right pad from its head, so we pre-pad explicitly and
-    run a VALID conv. Init matches torch ``Conv1d`` default — same
+    run a VALID conv. Init matches torch ``Conv1d`` default, same
     ``U(-1/sqrt(fan_in), 1/sqrt(fan_in))`` bound as ``_torch_linear``, with
     ``fan_in = 3 * c_in`` for both kernel and bias. The conv feeds a
     ``BatchNorm`` + ELU, then a stride-2 max-pool. ``BatchNorm`` (rather than
-    dropout/LayerNorm) is what the reference actually uses here, so — like
-    ``patchtst_module.py``'s ``TSTEncoderLayer`` — the running-stat toggle is
+    dropout/LayerNorm) is what the reference actually uses here, so, like
+    ``patchtst_module.py``'s ``TSTEncoderLayer``, the running-stat toggle is
     threaded as its own ``use_running_average`` flag; there is no dropout in
     this layer, so there is no ``deterministic`` argument.
 
@@ -314,7 +313,9 @@ class ConvLayer(nnx.Module):
     def __call__(self, x: jnp.ndarray, *, use_running_average: bool) -> jnp.ndarray:
         """x: ``[B, L, C]`` -> ``[B, (L+1)//2 + 1, C]``."""
         x = jnp.concatenate([x[:, -2:], x, x[:, :2]], axis=1)  # torch circular padding=2
-        # k=3 VALID conv on L+4 -> L+2, expressed as 3 shifted GEMMs: XLA-CPU lowers
+        # k=3 VALID conv on L+4 -> L+2, expressed as 3 shifted general matrix
+        # multiplies (GEMMs): the XLA (Accelerated Linear Algebra) CPU (central
+        # processing unit) backend lowers
         # `convolution` at these shapes to its naive elemental emitter inside the
         # training scan (no Eigen custom-call), which dominates the fit wall, while
         # the GEMM form keeps the fast dot path. `self.conv` stays the parameter
@@ -331,16 +332,17 @@ class ConvLayer(nnx.Module):
 
 
 class TransEncoderLayer(nnx.Module):
-    """One Informer encoder layer (post-norm; NF ``EncoderLayer``).
+    """One Informer encoder layer (post-norm; neuralforecast ``EncoderLayer``).
 
     Adapted from ``itransformer_module.py``'s ``TransEncoderLayer`` (same
-    post-norm skeleton: residual attention -> norm1 -> pointwise FFN ->
+    post-norm skeleton: residual attention -> norm1 -> pointwise feed-forward
+    network (FFN) ->
     residual -> norm2), swapping in the ProbSparse ``AttentionLayer``
     (``mask_flag=False``, unmasked self-attention) and threading a
     ``sample_key`` for its data-independent key subsample. The two
-    ``Conv1d(kernel_size=1)`` layers in NF are pointwise linear maps over the
-    channel axis, so — as in ``itransformer``'s port — they are plain
-    ``nnx.Linear`` (named ``conv1``/``conv2`` to keep the NF correspondence
+    ``Conv1d(kernel_size=1)`` layers in neuralforecast are pointwise linear maps over the
+    channel axis, so, as in ``itransformer``'s port, they are plain
+    ``nnx.Linear`` (named ``conv1``/``conv2`` to keep the neuralforecast correspondence
     visible), with FFN width ``conv_hidden_size``.
     """
 
@@ -371,7 +373,7 @@ class TransEncoderLayer(nnx.Module):
 
 
 class TransDecoderLayer(nnx.Module):
-    """One Informer decoder layer (post-norm; NF ``DecoderLayer``).
+    """One Informer decoder layer (post-norm; neuralforecast ``DecoderLayer``).
 
     Same FFN/config shape as :class:`TransEncoderLayer` but with two attention
     sub-layers and three norms: masked ProbSparse self-attention
@@ -379,7 +381,7 @@ class TransDecoderLayer(nnx.Module):
     ProbSparse cross-attention (``mask_flag=False``) with queries from the
     decoder against keys/values from the encoder output (``cross``). Each
     attention call gets its own independent sampling key (``self_key`` /
-    ``cross_key``) since the two ``AttentionLayer``s draw unrelated key
+    ``cross_key``) since the two ``AttentionLayer`` instances draw unrelated key
     subsamples.
     """
 

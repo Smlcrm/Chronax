@@ -3,7 +3,7 @@
 WHAT: The objective functions optimised during training and used for validation.
 WHY:  Forecasting models are trained by minimising a discrepancy between the
       predicted horizon and the observed horizon. Different losses encode
-      different notions of "error" (absolute vs squared vs robust).
+      different notions of "error" (absolute, squared, or Huber).
 HOW:  Two families are provided:
 
   * **Window losses** -- ``mae``, ``mse``, ``huber``: signature
@@ -25,12 +25,12 @@ from typing import Callable, Mapping, Optional
 import jax.numpy as jnp
 
 
-# Type alias for window-loss callables (optional mask for NF-style padding).
+# Type alias for window-loss callables (optional mask for neuralforecast-style padding).
 LossFn = Callable[..., jnp.ndarray]
 
 
 # ---------------------------------------------------------------------------
-# Window losses (element-wise; optional outsample mask for NF-style padding)
+# Window losses (element-wise; optional outsample mask for neuralforecast-style padding)
 # ---------------------------------------------------------------------------
 
 
@@ -45,7 +45,7 @@ def mae(
     target: jnp.ndarray,
     mask: Optional[jnp.ndarray] = None,
 ) -> jnp.ndarray:
-    """Mean Absolute Error; masked mean when ``mask`` is given (NF padder)."""
+    """Mean absolute error; masked mean when ``mask`` is given (neuralforecast padder)."""
     return _reduce(jnp.abs(pred - target), mask)
 
 

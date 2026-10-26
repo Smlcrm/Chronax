@@ -1,8 +1,8 @@
-"""Training utilities for the Chronax RNN model.
+"""Training utilities for the Chronax recurrent neural network (RNN) model.
 
 Pure JAX/Flax/Optax. All long-lived state is held in
 ``flax.training.train_state.TrainState`` and all randomness is threaded
-explicitly through ``jax.random.PRNGKey`` — there is no hidden global state.
+explicitly through ``jax.random.PRNGKey``; there is no hidden global state.
 
 * :func:`create_train_state`  - build a JIT-friendly train state from a config.
 * :func:`train_step`           - JIT'd forward + backward + optax update.

@@ -1,12 +1,14 @@
 """
-Theta Model — JAX-accelerated implementation.
+Theta model: JAX-accelerated implementation.
 
 Implements the Standard Theta Method (STM), Optimized Theta Method (OTM),
 Dynamic Standard Theta Method (DSTM), and Dynamic Optimized Theta Method (DOTM)
-with full JAX JIT compilation and two-phase ADAM + L-BFGS optimization.
+with full JAX just-in-time (JIT) compilation and two-phase ADAM + L-BFGS
+optimization.
 
 This module contains the core computational engine (state initialization,
-step functions, optimization, forecasting, Monte Carlo PI sampling).
+step functions, optimization, forecasting, Monte Carlo prediction interval
+sampling).
 The ``AutoTheta`` and ``Theta`` classes live in ``auto_theta.py`` and are
 re-exported here for backward compatibility.
 
@@ -17,7 +19,7 @@ Features:
 - JAX JIT compilation for performance
 - Two-phase ADAM + L-BFGS optimization
 
-Implementation Notes:
+Implementation notes:
 - State vector: [level, mean_y, An, Bn, mu] (5 elements)
 - forecast[i] = SES_level[i-1] + (1 - 1/theta) * trend_correction(i)
 - trend_correction(i) = An*(1-alpha)^i + Bn*(1-(1-alpha)^(i+1))/alpha
@@ -83,14 +85,15 @@ __all__ = ['Theta', 'AutoTheta', 'ModelType']
 
 
 # =============================================================================
-# Core Math — Module-level JIT'd functions
+# Core math: module-level JIT-compiled functions
 # =============================================================================
 
 def _init_state(y: jnp.ndarray, model_type: int, initial_smoothed: float,
                 alpha: float, theta: float) -> jnp.ndarray:
     """Initialize the 5-element state vector [level, mean_y, An, Bn, mu].
 
-    For STM/OTM: An, Bn come from OLS linear regression on full series.
+    For STM/OTM: An, Bn come from ordinary least squares (OLS) linear
+    regression on the full series.
     For DSTM/DOTM: An = y[0], Bn = 0.
 
     Parameters
@@ -197,7 +200,8 @@ def _make_step_fn(model_type_val: int) -> tuple[callable, callable]:
     def forecast_step_fn(carry: tuple, _unused: jnp.ndarray) -> tuple[tuple, jnp.ndarray]:
         """Single forecast step for lax.scan.
 
-        Uses mu (the forecast) as the pseudo-observation for SES level updates.
+        Uses mu (the forecast) as the pseudo-observation for the simple
+        exponential smoothing (SES) level update.
 
         Parameters
         ----------
@@ -246,7 +250,7 @@ for _mt in ModelType._all:
 
 def _pegels_resid(y: jnp.ndarray, model_type: int, initial_smoothed: jnp.ndarray,
                   alpha: jnp.ndarray, theta: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Compute Theta model residuals and MSE using ``lax.scan``.
+    """Compute Theta model residuals and mean squared error (MSE) using ``lax.scan``.
 
     Parameters
     ----------
@@ -304,7 +308,7 @@ _pegels_resid = jax.jit(_pegels_resid, static_argnums=(1,))
 
 
 # =============================================================================
-# Optimizer — ADAM + L-BFGS (following Holt-Winters pattern)
+# Optimizer: ADAM + L-BFGS (same pattern as Holt-Winters)
 # =============================================================================
 
 def _jit_optimize_theta(y: jnp.ndarray, model_type: int, x0: jnp.ndarray,
@@ -408,7 +412,7 @@ def _jit_optimize_theta(y: jnp.ndarray, model_type: int, x0: jnp.ndarray,
         _, _, mse = _pegels_resid(y, model_type, level, alpha, theta)
         return mse
 
-    # Phase 1: ADAM warm-up — essential for navigating the flat, ridged
+    # Phase 1: ADAM warm-up: essential for navigating the flat, ridged
     # MSE landscape where level/alpha/theta trade off.  L-BFGS alone
     # (including jaxopt.LBFGSB) gets trapped in local minima; Adam's
     # momentum-based exploration finds the basin, then L-BFGS refines.
@@ -438,9 +442,10 @@ def _jit_optimize_theta(y: jnp.ndarray, model_type: int, x0: jnp.ndarray,
         new_p = optax.apply_updates(p, updates)
         improved = jnp.isfinite(loss) & (loss < best_loss)
         # Track the EVALUATED point p (where `loss` was measured), not the
-        # post-update new_p — best_loss corresponds to p, so storing new_p
+        # post-update new_p: best_loss corresponds to p, so storing new_p
         # mismatches the pair and seeds L-BFGS from the wrong iterate. Matches
-        # the L-BFGS phase below and the ETS backend's convention.
+        # the L-BFGS phase below and the exponential smoothing (ETS) backend's
+        # convention.
         best_p = jnp.where(improved, p, best_p)
         best_loss = jnp.where(improved, loss, best_loss)
         return (new_p, new_state, best_p, best_loss), None
@@ -723,7 +728,7 @@ def _compute_pi_samples(last_state: jnp.ndarray, model_type: int, alpha: jnp.nda
     Each path adds N(0, sigma) noise to the deterministic forecast
     and evolves its own independent level/trend state.
 
-    For static models (STM, OTM), An and Bn remain constant — they are
+    For static models (STM, OTM), An and Bn remain constant: they are
     derived from OLS on the full training series. Only dynamic models
     (DSTM, DOTM) update these coefficients during simulation.
 
@@ -748,7 +753,7 @@ def _compute_pi_samples(last_state: jnp.ndarray, model_type: int, alpha: jnp.nda
     n_samples : int
         Number of Monte Carlo paths (static arg).
     seed : int, default 0
-        PRNG seed.
+        Pseudo-random number generator (PRNG) seed.
 
     Returns
     -------
@@ -770,7 +775,7 @@ def _compute_pi_samples(last_state: jnp.ndarray, model_type: int, alpha: jnp.nda
     eps_c = jnp.asarray(_EPSILON, dtype=dtype)
 
     def body_fn(j: int, val: tuple) -> tuple:
-        """Single MC simulation step for lax.fori_loop.
+        """Single Monte Carlo simulation step for lax.fori_loop.
 
         Parameters
         ----------
@@ -799,7 +804,7 @@ def _compute_pi_samples(last_state: jnp.ndarray, model_type: int, alpha: jnp.nda
         eps = jrandom.normal(subkey, shape=(n_samples,), dtype=dtype) * sigma
         s = mu + eps  # (n_samples,)
 
-        # Per-path state updates — each sample path evolves independently
+        # Per-path state updates: each sample path evolves independently
         new_smoothed = alpha * s + (one - alpha) * smoothed  # (n_samples,)
         new_mean_y = (i_f * mean_y_acc + s) / (i_f + one)   # (n_samples,)
 
@@ -895,7 +900,7 @@ def _forecast_from_model(obj: dict, h: int, level: list | None = None, n_samples
     else:
         model_type_int = ModelType._from_name[obj["modeltype"]]
 
-    # Generate forecasts — handle traced model_type_int under vmap
+    # Generate forecasts: handle traced model_type_int under vmap
     alpha_f32 = jnp.asarray(alpha, dtype=jnp.float32)
     theta_f32 = jnp.asarray(theta, dtype=jnp.float32)
     if isinstance(model_type_int, (jnp.ndarray, jax.Array)):
@@ -913,10 +918,11 @@ def _forecast_from_model(obj: dict, h: int, level: list | None = None, n_samples
 
     res = {"mean": forecasts}
 
-    # Prediction intervals via Monte Carlo (not called under vmap — level is None)
+    # Prediction intervals via Monte Carlo (not called under vmap, level is None)
     if level is not None:
         sigma = jnp.std(obj["residuals"][3:], ddof=1)
-        # Eager path (level is not None ⇒ not under the CV vmap): read the
+        # Eager path (level is not None, so not under the cross-validation
+        # vmap): read the
         # winning variant's int so DSTM/DOTM sample their own dynamics.
         mt_int = int(model_type_int)
         samples = _compute_pi_samples(
@@ -989,7 +995,7 @@ def _auto_theta(y: jnp.ndarray, m: int, model: str | None = None,
     NotImplementedError
         If the series has 3 or fewer observations.
     """
-    # Validate model type (static check — OK under vmap)
+    # Validate model type (static check, OK under vmap)
     if model is not None and model not in ("STM", "OTM", "DSTM", "DOTM"):
         raise ValueError(f"Invalid model type: {model}.")
 
@@ -1046,7 +1052,7 @@ def _auto_theta(y: jnp.ndarray, m: int, model: str | None = None,
     mses_safe = jnp.where(jnp.isnan(mses), jnp.inf, mses)
     best_idx = jnp.argmin(mses_safe)
 
-    # Select best model dict — stack numeric/array values, index by best_idx
+    # Select best model dict: stack numeric/array values, index by best_idx
     ref = fits[0]
     if len(fits) > 1:
         best_model = {}
@@ -1061,7 +1067,7 @@ def _auto_theta(y: jnp.ndarray, m: int, model: str | None = None,
             elif isinstance(v, (jnp.ndarray, jax.Array)):
                 best_model[k] = jnp.stack([f[k] for f in fits])[best_idx]
             else:
-                # Static values (ints, strings) — same across fits
+                # Static values (ints, strings): same across fits
                 best_model[k] = v
         # Store all model type ints for downstream forecast dispatch
         model_type_ints = jnp.array([ModelType._from_name[mt] for mt in model_types])

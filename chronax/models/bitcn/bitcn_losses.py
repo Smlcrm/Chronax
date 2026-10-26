@@ -3,7 +3,7 @@
 Self-contained (no dependency on other models' loss modules). Each loss has
 signature ``(pred, target) -> scalar`` and reduces by mean over all elements.
 Functions are module-level so they pickle cleanly when stored as the ``loss``
-attribute of a fitted ``BiTCN``. NF ``BiTCN`` defaults to ``MAE()``.
+attribute of a fitted ``BiTCN``. neuralforecast ``BiTCN`` defaults to ``MAE()``.
 """
 from __future__ import annotations
 

@@ -1,13 +1,13 @@
 """Distilling encoder, generative decoder, and the top-level network (flax.nnx).
 
 Assembles the encoder/decoder layers from ``informer_layers.py`` into the full
-Informer backbone (NF ``Encoder`` + ``Decoder`` + top-level ``Informer.forward``).
+Informer backbone (neuralforecast ``Encoder`` + ``Decoder`` + top-level ``Informer.forward``).
 The encoder interleaves ``encoder_layers`` ProbSparse attention layers with
-``encoder_layers - 1`` distilling ``ConvLayer``s (the last attention layer has no
+``encoder_layers - 1`` distilling ``ConvLayer`` instances (the last attention layer has no
 conv after it, so the sequence is halved ``encoder_layers - 1`` times, not
 ``encoder_layers`` times); the decoder runs masked self-attention then
 cross-attention against the encoder output through ``decoder_layers`` layers and
-carries its own output projection (NF convention: the head lives inside the
+carries its own output projection (neuralforecast convention: the head lives inside the
 decoder, not the top-level net, unlike ``TFTNet``/``ITransformerNet``). The
 public wrapper is registered as ``chronax.models.Informer``, matching the
 style of ``chronax/models/tft/tft_module.py``. ``float32`` throughout; every path
@@ -29,9 +29,9 @@ from chronax.models.informer.informer_layers import (
 
 
 def distilled_length(input_size: int, n_conv: int) -> int:
-    """Sequence length remaining after ``n_conv`` distilling ``ConvLayer``s.
+    """Sequence length remaining after ``n_conv`` distilling ``ConvLayer`` instances.
 
-    Each conv applies ``L -> (L+1)//2 + 1`` (NF-parity circular padding=2 conv
+    Each conv applies ``L -> (L+1)//2 + 1`` (neuralforecast-parity circular padding=2 conv
     expands to L+2, then the stride-2 maxpool arithmetic from ``ConvLayer``).
     Pure Python int arithmetic on static shapes, so callers (e.g. the
     training/model wrappers) can size buffers without invoking the net.
@@ -45,13 +45,13 @@ def distilled_length(input_size: int, n_conv: int) -> int:
 class TransEncoder(nnx.Module):
     """Stack of ``encoder_layers`` ProbSparse attention layers, optionally distilled.
 
-    NF interleave (``distil=True``): ``attn -> conv -> attn -> conv -> ... -> attn``
+    neuralforecast interleave (``distil=True``): ``attn -> conv -> attn -> conv -> ... -> attn``
     -- ``encoder_layers`` attention layers alternating with ``encoder_layers - 1``
-    ``ConvLayer``s, where the LAST attention layer has no conv after it. Without
+    ``ConvLayer`` instances, where the LAST attention layer has no conv after it. Without
     distilling, it is a plain attention stack (no length reduction). Either way a
-    final ``LayerNorm`` closes the encoder (NF ``norm_layer``). Each attention
+    final ``LayerNorm`` closes the encoder (neuralforecast ``norm_layer``). Each attention
     layer consumes its own entry of ``sample_keys`` (ProbSparse's data-independent
-    key subsample, one per attention site); the ``ConvLayer``s consume the shared
+    key subsample, one per attention site); the ``ConvLayer`` instances consume the shared
     ``use_running_average`` flag (BatchNorm running-stat toggle).
     """
 
@@ -99,8 +99,8 @@ class TransDecoder(nnx.Module):
 
     Each layer consumes a ``(self_key, cross_key)`` pair taken as consecutive
     entries of ``sample_keys``, in order. After the stack, a final ``LayerNorm``
-    (NF ``norm_layer``) precedes the output ``projection`` -- unlike
-    ``TFTNet``/``ITransformerNet``, the output head lives INSIDE the decoder (NF
+    (neuralforecast ``norm_layer``) precedes the output ``projection`` -- unlike
+    ``TFTNet``/``ITransformerNet``, the output head lives INSIDE the decoder (neuralforecast
     ``Decoder.projection`` convention), not as a separate top-level adapter.
     """
 
@@ -140,9 +140,9 @@ class InformerNet(nnx.Module):
 
     I/O mirrors the other Chronax neural nets: ``__call__(insample_y: [B, L, 1],
     futr_exog: [B, L+h, F] | None) -> [B, h, outputsize_multiplier]``. Encoder and
-    decoder get SEPARATE ``DataEmbedding``s (NF does not share embedding weights
+    decoder get SEPARATE ``DataEmbedding`` instances (neuralforecast does not share embedding weights
     between them), both fed the same future-known time-feature marks sliced to
-    their own window. The decoder input is NF's generative "start token" trick:
+    their own window. The decoder input is neuralforecast's generative "start token" trick:
     the last ``label_len`` steps of the raw history concatenated with ``h`` zero
     placeholders, so a single forward pass produces all ``h`` horizon steps (no
     autoregressive loop). One ``sample_key`` is split into ``n_attn_sites =

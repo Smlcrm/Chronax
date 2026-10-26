@@ -11,7 +11,7 @@ non-stationary normalization (per-window mean/std, statistics carry no
 parameter dependence so no stop-gradient is needed for gradient equivalence
 with the reference's detach).
 
-The reference's position-wise FFN uses kernel-size-1 convolutions — pointwise
+The reference's position-wise feed-forward network (FFN) uses kernel-size-1 convolutions, pointwise
 Linears here, mathematically identical. ``float32`` throughout.
 """
 from __future__ import annotations
@@ -101,7 +101,7 @@ class DataEmbeddingInverted(nnx.Module):
     projected time -> hidden. ``x [B, L, N] -> [B, N, d_model]``.
 
     Optional exogenous covariates ``x_mark [B, L, X]`` concatenate along the
-    variate axis (endogenous variates first, then covariates — matching the
+    variate axis (endogenous variates first, then covariates, matching the
     reference), producing ``[B, N + X, d_model]`` extra cross-attention tokens.
     Covariates enter unnormalized (the reference feeds them raw while only the
     target is non-stationary-normalized); the value-embedding Linear is shared
@@ -165,7 +165,7 @@ class TimeXerEncoderLayer(nnx.Module):
 
     ``x [B * n_vars, pn + 1, d]`` with the global token LAST; ``cross`` is
     ``[B, n_cross_tokens, d]``. Only the global token row reads the cross
-    context inside a layer — patch tokens see it through later layers.
+    context inside a layer, patch tokens see it through later layers.
     """
 
     def __init__(self, *, hidden_size: int, n_heads: int, d_ff: int, dropout: float,
@@ -209,7 +209,7 @@ class TimeXerNet(nnx.Module):
 
     ``__call__(insample_y [B, L, N], deterministic) -> [B, h, N * mult]``
     (the reference reshapes its ``[B, h * mult, N]`` head output with
-    ``reshape(B, h, -1)`` — kept verbatim).
+    ``reshape(B, h, -1)``, kept verbatim).
     """
 
     def __init__(self, *, h: int, input_size: int, n_series: int, patch_len: int = 16,
@@ -246,7 +246,7 @@ class TimeXerNet(nnx.Module):
     def __call__(self, insample_y: jnp.ndarray, hist_exog: jnp.ndarray | None = None,
                  *, deterministic: bool = True) -> jnp.ndarray:
         """insample_y: [B, L, N] target; hist_exog: [B, L, X] historical covariates
-        (raw — only the target is non-stationary-normalized)."""
+        (raw, only the target is non-stationary-normalized)."""
         x = insample_y.astype(jnp.float32)                    # [B, L, N]
         B, _, N = x.shape
         if self.use_norm:

@@ -2,7 +2,7 @@
 
 Training runs in SCALED space: each rolling window's insample slice sets the
 robust (median/MAD) statistics, the target is scaled with those same statistics,
-and the loss is taken there — which is what neuralforecast does via ``TemporalNorm``
+and the loss is taken there, which is what neuralforecast does via ``TemporalNorm``
 (``scaler_type="robust"``) before ``DilatedRNN.forward``. Predictions are inverted
 with the statistics of the prediction context.
 """
@@ -32,15 +32,15 @@ def build_windows(y: jnp.ndarray, input_size: int, h: int) -> jnp.ndarray:
 
 
 def make_lr_schedule(learning_rate, max_steps: int, num_lr_decays: int):
-    """Reproduce NF's ``StepLR(step_size=max_steps // num_lr_decays, gamma=0.5)``.
+    """Reproduce neuralforecast's ``StepLR(step_size=max_steps // num_lr_decays, gamma=0.5)``.
 
     neuralforecast's ``DilatedRNN`` defaults to ``num_lr_decays=3``, i.e. the learning
-    rate halves three times over training — a real part of the recipe, not a detail:
+    rate halves three times over training, a real part of the recipe, not a detail:
     without it the model keeps taking full-size steps at the end of the run. Torch's
     StepLR is a staircase, ``lr * gamma^floor(step / step_size)``, which is exactly
     ``optax.exponential_decay(..., staircase=True)``.
 
-    ``num_lr_decays <= 0`` disables decay (NF's convention). A callable
+    ``num_lr_decays <= 0`` disables decay (neuralforecast's convention). A callable
     ``learning_rate`` is assumed to be a user-supplied ``optax`` schedule and is
     passed through untouched.
     """
@@ -59,7 +59,7 @@ def scaled_forward_loss(model: DilatedRNNNet, windows: jnp.ndarray, *, h: int,
     """Forward + point loss in SCALED space. windows: [B, input_size+h] -> scalar.
 
     The insample slice sets (shift, scale); the target is scaled with the SAME
-    statistics, so the loss is computed exactly where NF computes it.
+    statistics, so the loss is computed exactly where neuralforecast computes it.
     """
     insample = windows[:, :input_size]
     target = windows[:, input_size:]
@@ -85,19 +85,18 @@ def train(model: DilatedRNNNet, y: jnp.ndarray, *, h: int, input_size: int,
     The whole loop is one ``nnx.scan`` (carry = (model, optimizer)), which keeps the
     function ``jax.vmap``-traceable for ``BaseForecaster.conformity_scores``. Window
     sampling replicates neuralforecast's REGIME-DEPENDENT scheme (``_base_model.py``
-    training_step): when ``n_windows < windows_batch_size`` NF draws
-    ``windows_batch_size`` indices WITH replacement (oversampling with duplicates —
-    the regime the small benchmark series hit, e.g. ~25 windows for AirlinePassengers
-    at input_size=72, h=24, far below the default batch of 128); otherwise it takes a
-    without-replacement permutation of ``windows_batch_size`` windows. Getting this
-    branch right is load-bearing for accuracy parity, so we do NOT collapse it to a
+    training_step): when ``n_windows < windows_batch_size`` neuralforecast draws
+    ``windows_batch_size`` indices WITH replacement (oversampling with duplicates,
+    which is the regime short series fall into at the default batch of 128);
+    otherwise it takes a without-replacement permutation of ``windows_batch_size``
+    windows. The branch matters for accuracy parity, so it is not collapsed to a
     full batch.
 
-    ``lr`` may be a scalar or an ``optax`` schedule — pass the output of
-    :func:`make_lr_schedule` to get NF's StepLR behaviour.
+    ``lr`` may be a scalar or an ``optax`` schedule, pass the output of
+    :func:`make_lr_schedule` to get neuralforecast's StepLR behaviour.
 
     Note: ``batches`` materializes a ``[max_steps, windows_batch_size, input_size+h]``
-    tensor up front. At NF's DilatedRNN defaults (windows_batch_size=128,
+    tensor up front. At neuralforecast's DilatedRNN defaults (windows_batch_size=128,
     max_steps=1000, input_size=72, h=24) that is ~49 MB of float32; raising
     ``windows_batch_size`` much further wants a per-step sampler instead.
     """
@@ -110,11 +109,11 @@ def train(model: DilatedRNNNet, y: jnp.ndarray, *, h: int, input_size: int,
     step_keys = jax.random.split(key, max_steps)
 
     if n_windows < windows_batch_size:
-        # NF: torch.randint(0, n_windows, size=(windows_batch_size,)) — WITH replacement.
+        # neuralforecast: torch.randint(0, n_windows, size=(windows_batch_size,)), WITH replacement.
         def sample_one(k):
             return jax.random.choice(k, n_windows, shape=(windows_batch_size,), replace=True)
     else:
-        # NF: torch.randperm(n_windows)[:windows_batch_size] — WITHOUT replacement.
+        # neuralforecast: torch.randperm(n_windows)[:windows_batch_size], WITHOUT replacement.
         def sample_one(k):
             return jax.random.permutation(k, n_windows)[:windows_batch_size]
 
