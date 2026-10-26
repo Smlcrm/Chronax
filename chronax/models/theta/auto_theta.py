@@ -130,6 +130,7 @@ class AutoTheta(BaseForecaster):
         dict
             Keys: 'mean' and optionally 'lo-{lv}', 'hi-{lv}'.
         """
+        self._require_fitted()
         fcst = _forecast_from_model(self.model_, h=h, level=level, n_samples=self.n_samples)
         if self.prediction_intervals is not None and level is not None:
             fcst = _add_predict_conformal_intervals(self, fcst, level)

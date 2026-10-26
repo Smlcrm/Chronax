@@ -45,6 +45,12 @@ class IdentityScaler:
     def inverse(self, z: jnp.ndarray, shift: jnp.ndarray, scale: jnp.ndarray) -> jnp.ndarray:
         return z
 
+    def __eq__(self, other):  # stateless: any two instances are interchangeable, which
+        return type(other) is type(self)  # keeps them usable as jit static args
+
+    def __hash__(self):
+        return hash(type(self))
+
 
 class RobustScaler:
     """Median + median-absolute-deviation (MAD) scaler, mirroring
@@ -72,13 +78,26 @@ class RobustScaler:
     def inverse(self, z: jnp.ndarray, shift: jnp.ndarray, scale: jnp.ndarray) -> jnp.ndarray:
         return z * scale + shift
 
+    def __eq__(self, other):  # stateless: any two instances are interchangeable, which
+        return type(other) is type(self)  # keeps them usable as jit static args
+
+    def __hash__(self):
+        return hash(type(self))
+
+
+_IDENTITY = IdentityScaler()
+_ROBUST = RobustScaler()
+
 
 def resolve_scaler(scaler: "str | Scaler") -> Scaler:
-    """Resolve a scaler from a name (``'identity'``/``'robust'``) or a Scaler instance."""
+    """Resolve a scaler from a name (``'identity'``/``'robust'``) or a Scaler instance.
+
+    Registry names return module singletons so repeated resolution yields the
+    same object (jit static-arg cache hits across fits)."""
     if isinstance(scaler, str):
         if scaler == "identity":
-            return IdentityScaler()
+            return _IDENTITY
         if scaler == "robust":
-            return RobustScaler()
+            return _ROBUST
         raise ValueError(f"Unknown scaler {scaler!r}. Available: 'identity', 'robust'.")
     return scaler

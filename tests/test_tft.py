@@ -4,8 +4,11 @@ Covers the TFT subpackage (losses, scaler, layers, module, training, model) in
 one flat file, matching the ``test_<model>.py`` convention used elsewhere in
 ``tests/``.
 """
+import io
+import logging
 import math
 import pickle
+import re
 
 import jax
 import jax.numpy as jnp
@@ -61,11 +64,13 @@ def test_mqloss_multiplier_and_requires_median():
 
 def test_mqloss_pinball_value():
     # err = y - yhat. For q and a single (h=1) point with pred all zeros, target=2:
-    # QL = mean_q max(q*2, (q-1)*2) = mean_q q*2  -> mean of {0.2,1.0,1.8} = 1.0
+    # QL = sum_q max(q*2, (q-1)*2) = sum of {0.2,1.0,1.8} = 3.0 — NF's effective
+    # reduction (its 1/len(quantiles) factor is dead), matching the trainer's
+    # masked inline branch.
     loss = MultiQuantileLoss((0.1, 0.5, 0.9))
     pred = jnp.zeros((1, 1, 3))
     target = jnp.array([[2.0]])
-    assert float(loss(pred, target)) == pytest.approx(1.0)
+    assert float(loss(pred, target)) == pytest.approx(3.0)
 
 
 def test_mqloss_pickles():
@@ -90,6 +95,16 @@ def test_robust_scaler_uses_median():
     x = jnp.asarray([[1.0, 2.0, 3.0, 4.0, 100.0]], dtype=jnp.float32)
     shift, _ = RobustScaler().stats(x, axis=1)
     assert float(shift[0, 0]) == pytest.approx(3.0)  # median, robust to the 100 outlier
+
+
+def test_robust_scaler_torch_median_convention():
+    # torch median/nanmedian returns the LOWER of the two middle order stats on
+    # even lengths (jnp.median would average to 2.5 here). MAD inherits it.
+    x = jnp.asarray([[4.0, 1.0, 3.0, 2.0]], dtype=jnp.float32)
+    shift, scale = RobustScaler().stats(x, axis=1)
+    assert float(shift[0, 0]) == pytest.approx(2.0)
+    # |x - 2| = [2, 1, 1, 0] -> sorted [0, 1, 1, 2] -> lower middle = 1
+    assert float(scale[0, 0]) == pytest.approx(1.0 + 1e-6)
 
 
 def test_identity_scaler_is_noop():
@@ -209,6 +224,30 @@ def test_continuous_embedding_zero_features():
     assert out.shape == (2, 5, 0, 8)
 
 
+def test_continuous_embedding_xavier_init_nf_parity():
+    # NF initializes embedding vectors with torch.nn.init.xavier_normal_ —
+    # std = sqrt(2/(num_features+hidden)). A fixed small std starts the input
+    # coupling far weaker. Guard the distribution, not exact values.
+    emb = ContinuousEmbedding(num_features=1, hidden_size=512, rngs=nnx.Rngs(0))
+    std = float(np.asarray(emb.vectors.value).std())
+    expected = (2.0 / (1 + 512)) ** 0.5
+    assert abs(std - expected) / expected < 0.15
+    np.testing.assert_array_equal(np.asarray(emb.bias.value), 0.0)
+
+
+def test_vsn_selection_weights_ignore_dropout_nf_parity():
+    # NF builds the VSN joint/selection GRN WITHOUT dropout — only the
+    # per-variable GRNs take it. Selection weights must
+    # be deterministic across training-mode calls while the variable transforms
+    # stay stochastic.
+    vsn = VariableSelectionNetwork(hidden_size=8, num_inputs=2, dropout=0.5, rngs=nnx.Rngs(0))
+    x = jnp.asarray(np.random.RandomState(0).randn(4, 2, 8), jnp.float32)
+    out_a, w_a = vsn(x, deterministic=False)
+    out_b, w_b = vsn(x, deterministic=False)
+    np.testing.assert_array_equal(np.asarray(w_a), np.asarray(w_b))
+    assert not bool(jnp.allclose(out_a, out_b)), "var_grns dropout inactive in training mode"
+
+
 def test_imha_shapes_and_divisibility():
     attn = InterpretableMultiHeadAttention(n_head=4, hidden_size=16, rngs=nnx.Rngs(0))
     out, w = attn(jnp.ones((2, 7, 16)), deterministic=True)
@@ -232,6 +271,22 @@ def test_imha_rows_sum_to_one():
     attn = InterpretableMultiHeadAttention(n_head=2, hidden_size=8, rngs=nnx.Rngs(0))
     _, w = attn(jnp.ones((1, 4, 8)), deterministic=True)
     np.testing.assert_allclose(np.asarray(w).sum(-1), np.ones((1, 2, 4)), rtol=1e-5)
+
+
+def test_imha_out_dropout_applied_in_training_mode():
+    """NF parity: InterpretableMultiHeadAttention applies out_dropout (rate =
+    `dropout`, NOT attn_dropout) after the output projection.
+    Training-mode forwards must be stochastic when dropout > 0; deterministic
+    forwards must be reproducible and match the eval path."""
+    attn = InterpretableMultiHeadAttention(
+        n_head=2, hidden_size=16, attn_dropout=0.0, dropout=0.5, rngs=nnx.Rngs(0))
+    x = jnp.asarray(np.random.RandomState(0).randn(2, 6, 16), jnp.float32)
+    out_a, _ = attn(x, deterministic=False)
+    out_b, _ = attn(x, deterministic=False)
+    assert not bool(jnp.allclose(out_a, out_b)), "out_dropout inactive in training mode"
+    det_a, _ = attn(x, deterministic=True)
+    det_b, _ = attn(x, deterministic=True)
+    np.testing.assert_allclose(np.asarray(det_a), np.asarray(det_b), rtol=1e-6)
 
 
 # =============================================================================
@@ -308,7 +363,65 @@ def test_fusion_decoder_slices_to_horizon():
     ce = jnp.zeros((B, hidden))
     out, attn = dec(temporal, ce, input_size=L, deterministic=True)
     assert out.shape == (B, h, hidden)
-    assert attn.shape == (B, 2, L + h, L + h)
+    # TFT-S1: only the surviving h query rows are computed (query_start=L).
+    assert attn.shape == (B, 2, h, L + h)
+
+
+def test_imha_query_slice_matches_compute_then_slice():
+    # TFT-S1 deviation guard: NF computes all T query rows and discards all but
+    # the last h; chronax computes only the last h. Per-row math is identical;
+    # outputs match compute-then-slice to floating-point reassociation (~1 ULP
+    # — the sliced einsum tiles differently; measured 1.6e-8 at these dims).
+    imha = InterpretableMultiHeadAttention(n_head=2, hidden_size=16, attn_dropout=0.0,
+                                           dropout=0.5, rngs=nnx.Rngs(0))
+    x = jnp.asarray(np.random.RandomState(0).randn(3, 10, 16), jnp.float32)
+    full, attn_full = imha(x, deterministic=True)
+    sliced, attn_sliced = imha(x, deterministic=True, query_start=6)
+    np.testing.assert_allclose(np.asarray(full[:, 6:]), np.asarray(sliced), rtol=0, atol=1e-6)
+    np.testing.assert_allclose(np.asarray(attn_full[:, :, 6:]), np.asarray(attn_sliced), rtol=0, atol=1e-6)
+
+
+def test_imha_matches_numpy_reference():
+    # Implementation-independent oracle for the interpretable attention (paper
+    # Eq 13-16 / NF lineage): multi-head Q/K, SHARED single-head V, causal mask
+    # including the diagonal, softmax, per-head context, mean over heads, out
+    # projection. Guards the q-slice einsum path against silent math drift.
+    H, d, T, B = 2, 8, 5, 3
+    hidden = H * d
+    imha = InterpretableMultiHeadAttention(n_head=H, hidden_size=hidden,
+                                           attn_dropout=0.0, dropout=0.0, rngs=nnx.Rngs(3))
+    x = np.random.RandomState(7).randn(B, T, hidden).astype(np.float32)
+    w_qkv = np.asarray(imha.qkv.kernel.value)          # [hidden, (2H+1)*d]
+    w_out = np.asarray(imha.out_proj.kernel.value)     # [d, hidden]
+
+    qkv = x @ w_qkv
+    nh = H * d
+    q, k, v = qkv[..., :nh], qkv[..., nh:2 * nh], qkv[..., 2 * nh:]   # v: [B,T,d] shared
+    causal = np.tril(np.ones((T, T), dtype=bool))
+    ctx_heads = []
+    for hh in range(H):
+        qh = q[..., hh * d:(hh + 1) * d]
+        kh = k[..., hh * d:(hh + 1) * d]
+        scores = (qh @ kh.transpose(0, 2, 1)) * (d ** -0.5)           # [B,T,T]
+        scores = np.where(causal[None], scores, -1e9)
+        e = np.exp(scores - scores.max(axis=-1, keepdims=True))
+        attn = e / e.sum(axis=-1, keepdims=True)
+        ctx_heads.append(attn @ v)                                    # [B,T,d]
+    ref = (np.mean(ctx_heads, axis=0)) @ w_out                        # [B,T,hidden]
+
+    out_full, _ = imha(jnp.asarray(x), deterministic=True)
+    np.testing.assert_allclose(np.asarray(out_full), ref, rtol=0, atol=1e-5)
+    out_sliced, _ = imha(jnp.asarray(x), deterministic=True, query_start=2)
+    np.testing.assert_allclose(np.asarray(out_sliced), ref[:, 2:], rtol=0, atol=1e-5)
+
+
+def test_same_config_nets_share_graphdef():
+    # Value-__eq__ on the picklable initializers makes same-config graphdefs
+    # EQUAL, so the module-level @nnx.jit _forward_det cache hits across nets
+    # built by a later fit instead of recompiling per instance.
+    gd_a, _ = nnx.split(_tnet())
+    gd_b, _ = nnx.split(_tnet())
+    assert gd_a == gd_b
 
 
 def _net(**kw):
@@ -352,6 +465,34 @@ def test_net_quantile_multiplier_widens_output():
     assert out.shape == (2, 4, 3)
 
 
+def test_param_count_pins_nf_structure():
+    # Structure pin at the audit config (hidden=128, n_head=4, lstm, no exog).
+    # NF 3.1.7 counts 870,158 at the same config; the +1,024 delta is exactly
+    # torch nn.LSTM's redundant double bias (2 cells x 4 gates x 128: b_ih+b_hh
+    # vs flax's single fused bias) — expressivity-equal. Any other drift in
+    # either direction is a structural regression.
+    net = TFTNet(h=24, input_size=72, hidden_size=128, rngs=nnx.Rngs(1))
+    params = nnx.state(net, nnx.Param)
+    total = sum(int(np.prod(x.shape)) for x in jax.tree.leaves(params))
+    assert total == 869_134
+
+
+def test_dropout_masks_fresh_per_scan_step():
+    # Dropout RNG must advance per nnx.scan step (NF semantics: fresh
+    # per-element masks every training step). A frozen mask would be silent —
+    # the loss still decreases — so pin the mechanism directly.
+    net = _net(dropout=0.5)
+    x = jnp.ones((2, 6, 1))
+
+    @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
+    def step(carry, _):
+        return carry, carry(x, deterministic=False)
+
+    _, outs = step(net, jnp.arange(3))
+    assert not np.allclose(np.asarray(outs[0]), np.asarray(outs[1]))
+    assert not np.allclose(np.asarray(outs[1]), np.asarray(outs[2]))
+
+
 # =============================================================================
 # Training
 # =============================================================================
@@ -376,7 +517,22 @@ def _tnet(mult=1, **kw):
 
 
 def test_build_windows_shape():
-    assert build_windows(_make_y(60), 36, 12).shape == (60 - 48 + 1, 48)
+    w, m = build_windows(_make_y(60), 36, 12)
+    assert w.shape == (60 - 36, 48) and m.shape == (60 - 36, 12)
+
+
+def test_build_windows_nf_padding_semantics():
+    # NF parity (NEU-A1): series right-padded with h zeros; n = T - input_size
+    # windows; every window with >=1 real target point is kept, padded tail
+    # masked out of the loss.
+    y = jnp.arange(1.0, 11.0)                # T=10, values 1..10 (no zeros)
+    w, m = build_windows(y, input_size=3, h=2)
+    assert w.shape == (7, 5) and m.shape == (7, 2)
+    np.testing.assert_array_equal(np.asarray(w[0]), [1, 2, 3, 4, 5])
+    np.testing.assert_array_equal(np.asarray(m[0]), [1, 1])
+    np.testing.assert_array_equal(np.asarray(w[6]), [7, 8, 9, 10, 0])   # padded tail
+    np.testing.assert_array_equal(np.asarray(m[6]), [1, 0])             # masked out
+    assert float(m.sum()) == 13.0
 
 
 def test_build_windows_too_short_raises():
@@ -386,14 +542,48 @@ def test_build_windows_too_short_raises():
 
 def test_build_exog_windows_spans():
     arr = jnp.asarray(np.random.RandomState(0).randn(60, 2), jnp.float32)
-    n = 60 - 48 + 1
+    n = 60 - 36
     assert build_exog_windows(arr, 36, 12, n, "input").shape == (n, 36, 2)
     assert build_exog_windows(arr, 36, 12, n, "full").shape == (n, 48, 2)
 
 
+def test_exog_scaling_stats_use_insample_span_only():
+    # Exog CENTERING comes from the insample span only; the scale is the
+    # insample robust scale unless the degeneracy floor binds — the floor
+    # deliberately reads the FULL window's spread (a regime-shifted horizon
+    # after a near-constant insample span is exactly the case it exists for).
+    # Pin the whole contract in closed form, bitwise.
+    from chronax.models.tft.tft_training import (
+        _EXOG_SCALE_FLOOR_FRAC, _scale_exog,
+    )
+    rng = np.random.RandomState(0)
+    L, h, F = 8, 4, 2
+    w = jnp.asarray(rng.randn(3, L + h, F), jnp.float32)
+    w = w.at[:, L:, :].add(1e4)          # massive horizon regime shift
+    sc = RobustScaler()
+    shift, scale = sc.stats(w[:, :L], axis=1)            # insample-span stats
+    rng_full = jnp.max(w, axis=1, keepdims=True) - jnp.min(w, axis=1, keepdims=True)
+    expected = (w - shift) / jnp.maximum(scale, _EXOG_SCALE_FLOOR_FRAC * rng_full)
+    np.testing.assert_array_equal(np.asarray(_scale_exog(w, sc, stats_len=L)),
+                                  np.asarray(expected))
+
+
+def test_masked_loss_ignores_padded_tail():
+    # A window whose padded target cell is masked must contribute only its
+    # real points to the loss (NF `_weighted_mean` semantics).
+    net = _tnet()
+    y = jnp.asarray(np.arange(1.0, 61.0), jnp.float32)   # T=60
+    w, m = build_windows(y, 36, 12)
+    kw = dict(h=12, input_size=36, scaler=RobustScaler(), loss_fn=mae, deterministic=True)
+    full = forward_loss(net, w, m, **kw)
+    w_poison = w.at[-1, -1].set(1e6)     # last target cell of the last window is padded
+    poisoned = forward_loss(net, w_poison, m, **kw)
+    np.testing.assert_allclose(float(full), float(poisoned), rtol=0, atol=1e-6)
+
+
 def test_forward_loss_scalar_finite():
     net = _tnet()
-    w = build_windows(_make_y(), 36, 12)
+    w, _ = build_windows(_make_y(), 36, 12)
     loss = forward_loss(net, w[:8], h=12, input_size=36, scaler=RobustScaler(),
                         loss_fn=mae, deterministic=True)
     assert loss.shape == () and bool(jnp.isfinite(loss))
@@ -503,9 +693,18 @@ def test_predict_smaller_h_slices_and_larger_raises():
 
 def test_fit_short_series_and_2d_raise():
     with pytest.raises(ValueError, match="too short|short"):
-        _tiny().fit(_make_y(40))
+        _tiny().fit(_make_y(36))  # T == input_size: zero windows
     with pytest.raises(ValueError, match="1-D"):
         _tiny().fit(jnp.ones((200, 2), jnp.float32))
+
+
+def test_fit_at_minimum_length_nf_parity():
+    # NF trains on h-padded partial windows: one window (T = input_size+1) is
+    # enough to fit. The old gate demanded T >= input_size+h.
+    m = _tiny().fit(_make_y(37))
+    pred = m.predict(h=12)["mean"]
+    assert pred.shape == (12,)
+    assert bool(jnp.all(jnp.isfinite(pred)))
 
 
 def test_predict_before_fit_raises():
@@ -551,11 +750,18 @@ def test_futr_exog_required_at_predict_when_fit_with_it():
 
 
 def test_exog_improves_accuracy_on_covariate_driven_signal():
-    # Target is a noisy copy of a known future covariate -> exog must help vs univariate.
+    # Target is a noisy copy of a known future covariate that is UNPREDICTABLE
+    # from its own history (smoothed random walk): the univariate model cannot
+    # anticipate the horizon while the exog model reads it off the covariate,
+    # so the margin is decisive. (A periodic covariate makes this a knife-edge
+    # single-seed race between two good fits, re-rolled by any ULP-class
+    # program change.)
     rng = np.random.RandomState(0)
     T = 360
-    futr = np.sin(np.arange(T + 12) / 6.0).astype(np.float32)
-    y = (futr[:T] + 0.05 * rng.randn(T)).astype(np.float32)
+    walk = np.cumsum(rng.randn(T + 12)).astype(np.float32)
+    futr = np.convolve(walk, np.ones(5, np.float32) / 5.0, mode="same")
+    futr = (futr / (np.abs(futr).max() + 1e-6)).astype(np.float32)
+    y = (futr[:T] + 0.02 * rng.randn(T)).astype(np.float32)
     fk = dict(h=12, input_size=48, hidden_size=32, n_head=4, max_steps=250,
               windows_batch_size=64, random_seed=0)
     m_ex = TFT(**fk).fit(jnp.asarray(y), futr_exog=jnp.asarray(futr[:T, None]))
@@ -614,6 +820,61 @@ def test_constant_series_and_h1_finite():
     assert m.predict(h=1)["mean"].shape == (1,)
 
 
+_COMPILE_LOG_RE = re.compile(r"Compiling ")
+
+
+def _count_compiles(fn):
+    """Run fn under jax.log_compiles and return (result, n_xla_compilations)."""
+    buf = io.StringIO()
+    handler = logging.StreamHandler(buf)
+    loggers = [
+        logging.getLogger("jax._src.dispatch"),
+        logging.getLogger("jax._src.interpreters.pxla"),
+    ]
+    with jax.log_compiles(True):
+        for lg in loggers:
+            lg.addHandler(handler)
+        try:
+            out = fn()
+            jax.block_until_ready(out)
+        finally:
+            for lg in loggers:
+                lg.removeHandler(handler)
+    return out, len(_COMPILE_LOG_RE.findall(buf.getvalue()))
+
+
+def test_count_compiles_canary():
+    # Live-fire proof _count_compiles can still see a compile: a fresh jit'd
+    # closure always compiles (pjit keys on callable identity), so the counter
+    # must report >=1. If a jax bump renames the "Compiling " message or the
+    # logger paths, this fails instead of letting test_refit_does_not_recompile
+    # go vacuously green on a counter that matches nothing.
+    def fresh():
+        @jax.jit
+        def f(x):
+            return x * 2.0 + 1.0
+        return f(jnp.ones((3, 7)))
+
+    _, n = _count_compiles(fresh)
+    assert n >= 1
+
+
+def test_refit_does_not_recompile():
+    # The training program is a module-level nnx.jit whose cache keys on config
+    # graphdefs (value-__eq__ initializers, _adam/scaler singletons) and operand
+    # shapes — never on data or call-site closures. A refit AND a fresh
+    # same-config instance must both hit the cache with zero XLA compiles;
+    # fit #2 is counted directly (no uncounted settle call).
+    y = _make_y(60)
+    m = _tiny(max_steps=3, windows_batch_size=4)
+    m.fit(y)                                     # first fit pays the one compile
+    _, n_refit = _count_compiles(lambda: m.fit(y)._train_y)
+    assert n_refit == 0
+    m2 = _tiny(max_steps=3, windows_batch_size=4)
+    _, n_fresh = _count_compiles(lambda: m2.fit(y)._train_y)
+    assert n_fresh == 0
+
+
 def test_pickle_round_trip_point():
     m = _tiny().fit(_make_y())
     before = np.asarray(m.predict(h=12)["mean"])
@@ -637,3 +898,38 @@ def test_pickle_round_trip_quantile_and_exog():
 def test_importable_from_models_namespace():
     from chronax.models import TFT as T
     assert T is TFT
+
+
+def test_exog_scale_floor_bounds_degenerate_windows():
+    # A near-constant stats span (all-night zero runs; jitter-constant channel)
+    # collapses the robust scale toward its epsilon; without the floor,
+    # regime-shifted horizon values scale to 1e4-class inputs (the diurnal-
+    # covariate divergence class). The floor bounds |scaled| by construction.
+    from chronax.models.tft.tft_training import build_exog_windows, _scale_exog
+    from chronax.models.tft.tft_scaler import resolve_scaler
+
+    t = np.arange(240)
+    day = (np.sin(t / 12.0) > 0.6).astype(np.float32) * 7000.0     # zero runs > L
+    const = np.full(240, 1.0, np.float32)
+    const[::37] = 0.997                                             # f32-jitter constant
+    Xp = np.stack([day, const], axis=1)
+    w = build_exog_windows(jnp.asarray(Xp), 24, 12, 240 - 24, "full")
+    z = _scale_exog(w, resolve_scaler("robust"), stats_len=24)
+    assert bool(jnp.all(jnp.isfinite(z)))
+    assert float(jnp.max(jnp.abs(z))) <= 105.0   # bound = 1/frac (+slack)
+
+
+def test_exog_scale_floor_inert_on_offset_covariate():
+    # Level-offset covariates (temperature-in-Kelvin class: mean >> spread) must
+    # NOT trip the floor: the spread-based form compares like with like, so the
+    # transform is bit-identical to the unfloored insample-robust scaling. A
+    # magnitude-based floor would fire on every window here and compress the
+    # channel ~10x.
+    from chronax.models.tft.tft_training import _scale_exog
+    rng = np.random.RandomState(3)
+    w = jnp.asarray(100.0 + 2.0 * rng.randn(4, 12, 2), jnp.float32)   # 100 +- 2
+    sc = RobustScaler()
+    shift, scale = sc.stats(w[:, :8], axis=1)
+    unfloored = (w - shift) / scale
+    np.testing.assert_array_equal(np.asarray(_scale_exog(w, sc, stats_len=8)),
+                                  np.asarray(unfloored))

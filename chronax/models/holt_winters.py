@@ -40,7 +40,9 @@ Methods:
 6. forward(y, h, X=None, X_future=None, level=None, fitted=False) - Apply fitted model to new data
 
 Implementation Notes:
-- Sigmoid reparameterization for admissibility-constrained smoothing parameters
+- Sigmoid reparameterization bounds each smoothing parameter to (0, 1)
+  INDEPENDENTLY (a per-parameter box, NOT a joint ETS admissibility/invertibility
+  constraint — the fit can reach the box corners, e.g. gamma->1)
 - States initialized via classical decomposition with trend estimation
 - Supports 8 model variants: AAA, AAM, MAA, MAM (+ damped versions)
 - Analytical interval formulas from Hyndman et al. (2008) and Taylor (2003)
@@ -243,7 +245,8 @@ def _optimize_hw(y: jnp.ndarray, l0_decomp: float, b0_decomp: float,
         updates, new_state = adam_opt.update(grads, state, p)
         new_p = optax.apply_updates(p, updates)
         improved = jnp.isfinite(loss) & (loss < best_loss)
-        best_p = jnp.where(improved, new_p, best_p)
+        # loss was evaluated at p, so p (not new_p) is what best_loss labels
+        best_p = jnp.where(improved, p, best_p)
         best_loss = jnp.where(improved, loss, best_loss)
         return (new_p, new_state, best_p, best_loss), None
 
@@ -351,32 +354,34 @@ class HoltWinters(BaseForecaster):
         n = len(y)
         n_seasons = n // m
 
+        # All branches below are static (shapes/config only); l0/b0 stay jnp
+        # scalars — float() on values derived from y breaks the vmapped CV path.
         if n_seasons < 2:
-            l0 = float(jnp.mean(y[:m])) if n >= m else float(y[0])
+            l0 = jnp.mean(y[:m]) if n >= m else y[0]
             b0 = 0.0
             if n >= m:
                 s0 = y[:m] - l0 if self.season_type == 'A' else y[:m] / jnp.maximum(l0, _EPSILON)
             else:
-                s0 = jnp.zeros(m, dtype=jnp.float32) if self.season_type == 'A' else jnp.ones(m, dtype=jnp.float32)
-            return l0, b0, s0.astype(jnp.float32)
+                s0 = jnp.zeros(m, dtype=y.dtype) if self.season_type == 'A' else jnp.ones(m, dtype=y.dtype)
+            return l0, b0, s0.astype(y.dtype)
 
         n_complete = n_seasons * m
         y_reshaped = y[:n_complete].reshape(n_seasons, m)
         seasonal_avgs = jnp.mean(y_reshaped, axis=1)
 
         # OLS on seasonal averages for trend
-        t = jnp.arange(n_seasons, dtype=jnp.float32)
+        t = jnp.arange(n_seasons, dtype=y.dtype)
         t_mean = jnp.mean(t)
         avg_mean = jnp.mean(seasonal_avgs)
         cov_ta = jnp.sum((t - t_mean) * (seasonal_avgs - avg_mean))
         var_t = jnp.sum((t - t_mean) ** 2)
-        b0_per_season = float(cov_ta / jnp.maximum(var_t, _EPSILON))
-        l0 = float(avg_mean - b0_per_season * t_mean)
+        b0_per_season = cov_ta / jnp.maximum(var_t, _EPSILON)
+        l0 = avg_mean - b0_per_season * t_mean
         b0 = b0_per_season / m
         l0 = l0 - b0 * (m - 1) / 2.0
 
         # Detrend and compute seasonal pattern
-        trend_vals = l0 + b0 * jnp.arange(n_complete, dtype=jnp.float32)
+        trend_vals = l0 + b0 * jnp.arange(n_complete, dtype=y.dtype)
         y_complete = y[:n_complete]
         if self.season_type == 'A':
             detrended = y_complete - trend_vals
@@ -391,7 +396,7 @@ class HoltWinters(BaseForecaster):
         else:
             s0 = s0 / jnp.maximum(jnp.mean(s0), _EPSILON)
 
-        return l0, b0, s0.astype(jnp.float32)
+        return l0, b0, s0.astype(y.dtype)
 
     def _get_phi(self) -> float:
         """Return the damping factor: self.phi (or 0.9) if damped, else 1.0."""
@@ -443,19 +448,27 @@ class HoltWinters(BaseForecaster):
         fitted, level, trend, seasonal, residuals, alpha, beta, gamma = _optimize_hw(
             y, l0, b0, s0, phi, is_additive_season, self.season_length)
 
-        n_params = 3 + 2 + (self.season_length - 1)
+        # dof follows the reference AAA convention: (m+5) free parameters
+        # plus one for sigma^2 -> n - (m+6). Multiplicative-error/-season
+        # interval formulas need the RELATIVE-residual sigma (dimensionless;
+        # the width formula multiplies by |mean| exactly once).
+        dof = len(y) - (self.season_length + 6)
+        denom_f = jnp.where(jnp.abs(fitted) > 1e-10, fitted,
+                            jnp.asarray(1.0, y.dtype))
         return {
             'fitted': fitted, 'level': level, 'trend': trend,
             'seasonal': seasonal, 'residuals': residuals,
-            'alpha': float(alpha), 'beta': float(beta), 'gamma': float(gamma),
-            'sigma': utils.calculate_sigma(residuals, len(y) - n_params),
+            'alpha': alpha, 'beta': beta, 'gamma': gamma,
+            'sigma': utils.calculate_sigma(residuals, dof),
+            'sigma_rel': utils.calculate_sigma(residuals / denom_f, dof),
         }
 
     def _generate_forecasts(self, level: jnp.ndarray, trend: jnp.ndarray,
                             seasonal: jnp.ndarray, phi: float, h: int) -> jnp.ndarray:
         """Generate h-step ahead point forecasts (vectorized)."""
         m = self.season_length
-        t_vals = jnp.arange(1, h + 1, dtype=jnp.float32)
+        dt = level.dtype if hasattr(level, 'dtype') else jnp.float64
+        t_vals = jnp.arange(1, h + 1, dtype=dt)
 
         if phi == 1.0:
             trend_components = t_vals * trend
@@ -476,9 +489,18 @@ class HoltWinters(BaseForecaster):
 
         Based on Hyndman et al. (2008) and Taylor (2003).
         """
-        t = jnp.arange(1, h + 1, dtype=jnp.float32)
-        base_var = self._compute_base_variance(t, alpha, beta, phi)
-        seasonal_var = gamma**2 * ((t - 1) // self.season_length + 1)
+        dt = mean.dtype if hasattr(mean, 'dtype') else jnp.float64
+        t = jnp.arange(1, h + 1, dtype=dt)
+        # The recursion stores the CLASSICAL smoothing weights; the variance
+        # formulas (Hyndman et al. 2008, class 1) are stated in the
+        # innovations parametrization: beta_i = alpha*beta, gamma_i =
+        # gamma*(1-alpha).
+        beta_i = alpha * beta
+        gamma_i = gamma * (1.0 - alpha)
+        base_var = self._compute_base_variance(t, alpha, beta_i, phi)
+        m = self.season_length
+        hm = (t - 1) // m
+        seasonal_var = gamma_i * hm * (2.0 * alpha + gamma_i + beta_i * m * (hm + 1.0))
 
         if self.error_type == 'A':
             if self.season_type == 'A':
@@ -520,19 +542,24 @@ class HoltWinters(BaseForecaster):
         if level is not None:
             level = sorted(level)
             if self.conformal_params is not None:
-                temp_model = getattr(self, 'model_', None)
-                self.model_ = result
+                # conformity_scores only calls self.forecast (never reads
+                # model_), so no state needs to be swapped in or restored.
                 cs = self.conformity_scores(y=y, X=X)
                 res = self.add_confidence_intervals(
                     fcst=res, cs=cs, level=level,
                     method=self.conformal_params.method)
-                if temp_model is not None:
-                    self.model_ = temp_model
-                else:
-                    delattr(self, 'model_')
             else:
+                if len(y) - (self.season_length + 6) < 1:
+                    raise ValueError(
+                        "Native prediction intervals need at least "
+                        f"season_length + 7 = {self.season_length + 7} "
+                        "observations; pass conformal_params for shorter series."
+                    )
+                sig = (result['sigma']
+                       if (self.error_type == 'A' and self.season_type == 'A')
+                       else result['sigma_rel'])
                 sigmah = self._calculate_native_intervals(
-                    mean, result['sigma'], result['alpha'],
+                    mean, sig, result['alpha'],
                     result['beta'], result['gamma'], phi, h)
                 res = self._add_interval_bounds(res, mean, sigmah, level)
 
@@ -577,6 +604,27 @@ class HoltWinters(BaseForecaster):
         self.alias = alias
         self.conformal_params = conformal_params
 
+    def conformity_scores(self, y: jnp.ndarray, X: jnp.ndarray | None = None):
+        """Walk-forward conformity scores, regime-routed by window length.
+
+        HW's fit is a fixed 150-step Adam+L-BFGS whose zoom linesearch makes the CV
+        vmap an anti-optimization on short windows (batched carries + both-branch
+        selects), so those run several times faster sequentially. On long/big-m
+        windows the vmap amortizes the optimizer scan and wins instead. The routing
+        bound of 512 is an EMPIRICAL crossover measured between the two regimes, not
+        a mechanism bound — re-probe before moving it.
+
+        HW's optimizer is trajectory-sensitive: the two regimes reach equally valid
+        fit endpoints whose scores differ materially, so the equivalence that matters
+        here is interval CALIBRATION, not bits. Aggregate coverage and median
+        interval width are unchanged across regimes.
+        """
+        if self.conformal_params is not None:
+            window_n = jnp.asarray(y).size - self.conformal_params.h
+            if window_n <= 512:
+                return self._conformity_scores_sequential(y=y, X=X)
+        return super().conformity_scores(y=y, X=X)
+
     def fit(self, y: jnp.ndarray, X: jnp.ndarray | None = None) -> 'HoltWinters':
         r"""Fit the Holt-Winters model.
 
@@ -597,6 +645,10 @@ class HoltWinters(BaseForecaster):
             raise ValueError(
                 f"Time series must have at least {self.season_length} observations "
                 f"(season_length), got {len(y)}"
+            )
+        if (self.error_type == 'M' or self.season_type == 'M') and bool(jnp.any(y <= 0)):
+            raise ValueError(
+                "Multiplicative error/seasonality requires strictly positive data."
             )
         result = self._fit_parameters(y)
         result['y_train'] = y
@@ -640,8 +692,18 @@ class HoltWinters(BaseForecaster):
                     fcst=res, cs=cs, level=level,
                     method=self.conformal_params.method)
             else:
+                n_train = self.model_['residuals'].shape[0]
+                if n_train - (self.season_length + 6) < 1:
+                    raise ValueError(
+                        "Native prediction intervals need at least "
+                        f"season_length + 7 = {self.season_length + 7} "
+                        "observations; pass conformal_params for shorter series."
+                    )
+                sig = (self.model_['sigma']
+                       if (self.error_type == 'A' and self.season_type == 'A')
+                       else self.model_.get('sigma_rel', self.model_['sigma']))
                 sigmah = self._calculate_native_intervals(
-                    mean, self.model_['sigma'], self.model_['alpha'],
+                    mean, sig, self.model_['alpha'],
                     self.model_['beta'], self.model_['gamma'], phi, h)
                 res = self._add_interval_bounds(res, mean, sigmah, level)
 

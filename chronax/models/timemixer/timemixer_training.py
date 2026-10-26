@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import functools
+
 import optax
 from flax import nnx
 
@@ -101,7 +103,32 @@ def train(model: TimeMixerNet, y: jnp.ndarray, *, h: int, input_size: int,
     else:
         sample = lambda k: jax.random.permutation(k, n)[:windows_batch_size]
     batch_idx = jax.vmap(sample)(step_keys)             # [max_steps, B]
-    optimizer = nnx.Optimizer(model, optax.adam(lr), wrt=nnx.Param)
+    optimizer = nnx.Optimizer(model, _adam(lr), wrt=nnx.Param)
+    losses = _train_scan(model, optimizer, y_windows, target_mask, batch_idx,
+                         h=h, input_size=input_size, loss_fn=loss_fn)
+    return _finite_or_raise(losses)
+
+
+@functools.lru_cache(maxsize=None)
+def _adam(lr: float):
+    """One optax transform per learning rate. The optimizer's graphdef embeds the
+    transform object, so a fresh ``optax.adam`` per fit would make same-config
+    optimizers unequal and defeat the cross-fit ``_train_scan`` cache."""
+    return optax.adam(lr)
+
+
+@functools.partial(nnx.jit, static_argnames=("h", "input_size", "loss_fn"))
+def _train_scan(model, optimizer, y_windows, target_mask, batch_idx,
+                *, h, input_size, loss_fn):
+    """The whole training loop as one cached program.
+
+    Module-level so the traced/compiled program is reused across ``fit()`` calls:
+    the jit cache keys on the model/optimizer graphdefs (value-``__eq__``
+    initializers and the ``_adam`` memo make same-config instances equal), the
+    static config args, and operand shapes -- never on data. A per-call scan
+    closure would retrace and recompile every fit, because pjit caches on the
+    callable's identity.
+    """
 
     @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
     def step(carry, idx):
@@ -113,7 +140,7 @@ def train(model: TimeMixerNet, y: jnp.ndarray, *, h: int, input_size: int,
         return (model, opt), loss
 
     _, losses = step((model, optimizer), batch_idx)
-    return _finite_or_raise(losses)
+    return losses
 
 
 @nnx.jit

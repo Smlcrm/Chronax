@@ -106,8 +106,9 @@ def test_2_synthetic_sine_wave():
     
     print(f"Training on {T} points of noisy sine wave...")
     
-    # Train model
-    model, params, losses = train_model(
+    # Train model (returns (model, params, losses, scaler) since the
+    # accuracy fix that normalizes y internally)
+    model, params, losses, scaler = train_model(
         y_hist,
         x_f_all=None,
         x_static=None,
@@ -141,7 +142,8 @@ def test_2_synthetic_sine_wave():
         x_static=None,
         H=H,
         N=100,
-        seed=42
+        seed=42,
+        scaler=scaler,
     )
     
     assert paths.shape == (100, H), f"Expected paths shape (100, {H}), got {paths.shape}"
@@ -182,7 +184,7 @@ def test_3_with_covariates():
     
     print(f"Training with future covariates (d_f={d_f}) and static covariates (d_s={d_s})...")
     
-    model, params, losses = train_model(
+    model, params, losses, scaler = train_model(
         y_hist,
         x_f_all=x_f_all,
         x_static=x_static,
@@ -214,7 +216,8 @@ def test_3_with_covariates():
         x_static=x_static,
         H=H,
         N=50,
-        seed=123
+        seed=123,
+        scaler=scaler,
     )
     
     assert paths.shape == (50, H), f"Expected (50, {H}), got {paths.shape}"

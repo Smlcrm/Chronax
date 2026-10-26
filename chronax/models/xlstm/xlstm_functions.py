@@ -77,8 +77,11 @@ def _build_optimizer(total_steps: int, lr: float, weight_decay: float):
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
         peak_value=lr,
+        # optax requires decay_steps > warmup_steps (the cosine leg has length
+        # decay_steps - warmup_steps); total_steps == warmup happens at
+        # total_steps == 1 (tiny n_epochs x few windows).
         warmup_steps=warmup,
-        decay_steps=max(1, total_steps),
+        decay_steps=max(warmup + 1, total_steps),
         end_value=lr * 0.1,
     )
     return optax.chain(
@@ -161,7 +164,8 @@ def _get_decoder(cfg: XLSTMConfig, h: int):
 # =============================================================================
 
 def xlstm_f(z: jnp.ndarray, cfg: XLSTMConfig, key: jax.Array, *,
-            n_epochs: int, batch_size: int, lr: float, weight_decay: float):
+            n_epochs: int, batch_size: int, lr: float, weight_decay: float,
+            max_steps: int | None = None):
     """Train an xLSTM / xLSTMTime model on series ``z``.
 
     Series-level normalization (z-score) is the caller's responsibility when
@@ -189,7 +193,12 @@ def xlstm_f(z: jnp.ndarray, cfg: XLSTMConfig, key: jax.Array, *,
 
     n_win = int(X.shape[0])
     bs = int(min(batch_size, n_win))
-    total_steps = int(n_epochs * max(1, n_win // bs))
+    if max_steps is not None:
+        if max_steps < 1:
+            raise ValueError(f"max_steps must be >= 1, got {max_steps}")
+        total_steps = int(max_steps)
+    else:
+        total_steps = int(n_epochs * max(1, n_win // bs))
 
     k_init, k_train = random.split(key)
     params = init_params(k_init, cfg)

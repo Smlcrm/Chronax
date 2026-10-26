@@ -92,6 +92,7 @@ class WindowAverage(BaseForecaster):
         Returns:
             dict: Dictionary with entries `mean` for point predictions and `level_*` for probabilistic predictions.
         """
+        self._require_fitted()
         mean = _repeat_val(self.model_["mean"][0], h=h) 
         res = {"mean": mean}
         if level is None:

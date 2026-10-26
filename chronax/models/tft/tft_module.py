@@ -65,8 +65,10 @@ class StaticCovariateEncoder(nnx.Module):
         )
         n_states = 2 if rnn_type == "lstm" else 1
         self.n_context = 2 + n_states * n_rnn_layers
+        # NF hardcodes ELU for the 2+2L context GRNs regardless of grn_activation
+        # (only the VSN GRNs follow the configured activation).
         self.context_grns = [
-            GRN(hidden_size, hidden_size, dropout=dropout, activation=activation, rngs=rngs)
+            GRN(hidden_size, hidden_size, dropout=dropout, activation="ELU", rngs=rngs)
             for _ in range(self.n_context)
         ]
 
@@ -152,7 +154,7 @@ class TemporalFusionDecoder(nnx.Module):
             activation=activation, rngs=rngs,
         )
         self.attention = InterpretableMultiHeadAttention(
-            n_head, hidden_size, attn_dropout=attn_dropout, rngs=rngs,
+            n_head, hidden_size, attn_dropout=attn_dropout, dropout=dropout, rngs=rngs,
         )
         self.attention_gate = GLU(hidden_size, hidden_size, rngs=rngs)
         self.attention_ln = nnx.LayerNorm(hidden_size, epsilon=1e-3, rngs=rngs)
@@ -164,8 +166,12 @@ class TemporalFusionDecoder(nnx.Module):
 
     def __call__(self, temporal, ce, input_size, deterministic=True):
         enriched = self.enrichment_grn(temporal, ce, deterministic=deterministic)
-        attn_out, attn_w = self.attention(enriched, deterministic=deterministic)
-        x = attn_out[:, input_size:, :]
+        # TFT-S1: only the last h query rows survive the slice below, so only
+        # they are computed (query_start; see the IMHA docstring for the
+        # deviation record). attn_w is [B, n_head, h, T].
+        attn_out, attn_w = self.attention(enriched, deterministic=deterministic,
+                                          query_start=input_size)
+        x = attn_out
         enriched = enriched[:, input_size:, :]
         temporal = temporal[:, input_size:, :]
         x = self.attention_ln(self.attention_gate(x) + enriched)

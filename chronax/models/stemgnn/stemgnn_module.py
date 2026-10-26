@@ -110,6 +110,12 @@ class _TorchLinearInit:
         bound = 1.0 / math.sqrt(self.fan_in)
         return jax.random.uniform(key, shape, dtype, minval=-bound, maxval=bound)
 
+    def __eq__(self, other):  # value equality: same-config initializers make
+        return type(other) is type(self) and other.fan_in == self.fan_in
+
+    def __hash__(self):  # same-config graphdefs EQUAL, so nnx.jit caches hit
+        return hash((type(self), self.fan_in))  # across net instances
+
 
 class _XavierUniformInit:
     """torch ``nn.init.xavier_uniform_`` with explicit fans (our stored shapes
@@ -127,6 +133,13 @@ class _XavierUniformInit:
         bound = self.gain * math.sqrt(6.0 / (self.fan_in + self.fan_out))
         return jax.random.uniform(key, shape, dtype, minval=-bound, maxval=bound)
 
+    def __eq__(self, other):  # value equality — see _TorchLinearInit
+        return (type(other) is type(self) and other.fan_in == self.fan_in
+                and other.fan_out == self.fan_out and other.gain == self.gain)
+
+    def __hash__(self):
+        return hash((type(self), self.fan_in, self.fan_out, self.gain))
+
 
 class _XavierNormalInit:
     """torch ``nn.init.xavier_normal_`` with explicit fans:
@@ -142,6 +155,13 @@ class _XavierNormalInit:
     def __call__(self, key, shape, dtype=jnp.float32):
         std = self.gain * math.sqrt(2.0 / (self.fan_in + self.fan_out))
         return std * jax.random.normal(key, shape, dtype)
+
+    def __eq__(self, other):  # value equality — see _TorchLinearInit
+        return (type(other) is type(self) and other.fan_in == self.fan_in
+                and other.fan_out == self.fan_out and other.gain == self.gain)
+
+    def __hash__(self):
+        return hash((type(self), self.fan_in, self.fan_out, self.gain))
 
 
 def _dropout(x: jnp.ndarray, rate: float, key, deterministic: bool) -> jnp.ndarray:

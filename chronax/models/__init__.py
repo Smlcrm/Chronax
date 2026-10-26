@@ -150,6 +150,20 @@ try:
 except ImportError:
     BiTCN = None
 
+# TCN is guarded like BiTCN so an off-pin flax degrades to None instead of
+# breaking the namespace.
+try:
+    from .tcn import TCN
+except ImportError:
+    TCN = None
+
+# StemGNN is guarded like TCN so an off-pin flax degrades to None instead of
+# breaking the namespace.
+try:
+    from .stemgnn import StemGNN
+except ImportError:
+    StemGNN = None
+
 # DeepNPTS hard-pins flax 0.10.x (raises ImportError otherwise); guard like BiTCN so a
 # version/availability mismatch degrades to DeepNPTS=None instead of breaking the namespace.
 try:
@@ -275,6 +289,8 @@ __all__ = [
     "RMoK",
     "PatchTST",
     "BiTCN",
+    "TCN",
+    "StemGNN",
     "DeepNPTS",
     "SOFTS",
     "DilatedRNN",

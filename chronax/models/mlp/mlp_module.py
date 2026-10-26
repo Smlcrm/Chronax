@@ -1,12 +1,15 @@
 """Flax NNX module for the MLP forecaster (port of neuralforecast.MLP).
 
-The network flattens its inputs — the scaled insample target and, when
-present, the future-known exogenous window spanning input and horizon — into
-one vector, passes it through ``num_layers`` fully connected layers with a
-ReLU after every one, and projects with a separate raw output head whose
-width is ``h * outputsize_multiplier`` (the multiplier is loss-driven: 1 for
-point losses, Q for multi-quantile heads, ``(2+weighted)*K`` for the GMM
-distribution head). ``float32`` throughout.
+The network flattens its inputs — the scaled insample target, the
+historical exogenous window over the input span, and the future-known
+exogenous window spanning input and horizon (each present only when its
+feature count is nonzero) — into one vector, passes it through ``num_layers``
+fully connected layers with a ReLU after every one, and projects with a
+separate raw output head whose width is ``h * outputsize_multiplier`` (the
+multiplier is loss-driven: 1 for point losses, Q for multi-quantile heads,
+``(2+weighted)*K`` for the GMM distribution head). The flatten order is
+``[insample | hist | futr]``, matching the reference so a weight transplant
+lines up column-for-column. ``float32`` throughout.
 """
 from __future__ import annotations
 
@@ -51,14 +54,16 @@ def _torch_linear(n_in: int, n_out: int, *, rngs: nnx.Rngs) -> nnx.Linear:
 
 
 class MLPNet(nnx.Module):
-    """Full MLP: flatten ``[insample_y | futr_exog]`` -> ReLU'd Linear stack -> raw head.
+    """Full MLP: flatten ``[insample_y | hist_exog | futr_exog]`` -> ReLU'd Linear stack -> raw head.
 
     Mirrors the reference layer structure exactly: ``num_layers`` Linears (the
     first maps the flattened input to ``hidden_size``, the rest are
     hidden-to-hidden), each followed by ReLU, then a separate un-activated
     ``out`` head. The flattened input is the scaled insample target of length
-    ``input_size`` concatenated with the row-major flattened future-known exog
-    window of shape ``[input_size + h, F]`` when ``futr_exog_size > 0``.
+    ``input_size``, concatenated (when the corresponding feature count is
+    nonzero) with the row-major flattened historical exog window of shape
+    ``[input_size, F_hist]`` and then the future-known exog window of shape
+    ``[input_size + h, F_futr]`` — hist before futr, matching the reference.
     """
 
     def __init__(
@@ -66,6 +71,7 @@ class MLPNet(nnx.Module):
         *,
         h: int,
         input_size: int,
+        hist_exog_size: int = 0,
         futr_exog_size: int = 0,
         num_layers: int = 2,
         hidden_size: int = 1024,
@@ -76,9 +82,11 @@ class MLPNet(nnx.Module):
             raise ValueError(f"num_layers must be >= 1; got {num_layers}.")
         self.h = h
         self.input_size = input_size
+        self.hist_exog_size = hist_exog_size
         self.futr_exog_size = futr_exog_size
         self.outputsize_multiplier = outputsize_multiplier
-        first_in = input_size + futr_exog_size * (input_size + h)
+        first_in = (input_size + hist_exog_size * input_size
+                    + futr_exog_size * (input_size + h))
         layers = [_torch_linear(first_in, hidden_size, rngs=rngs)]
         layers += [
             _torch_linear(hidden_size, hidden_size, rngs=rngs)
@@ -87,13 +95,17 @@ class MLPNet(nnx.Module):
         self.mlp = layers
         self.out = _torch_linear(hidden_size, h * outputsize_multiplier, rngs=rngs)
 
-    def __call__(self, insample_z: jnp.ndarray, futr_exog: jnp.ndarray | None = None) -> jnp.ndarray:
-        """insample_z: [B, L, 1] scaled target; futr_exog: [B, L+h, F] or None.
+    def __call__(self, insample_z: jnp.ndarray, hist_exog: jnp.ndarray | None = None,
+                 futr_exog: jnp.ndarray | None = None) -> jnp.ndarray:
+        """insample_z: [B, L, 1] scaled target; hist_exog: [B, L, F] or None;
+        futr_exog: [B, L+h, F] or None.
 
         Returns [B, h, outputsize_multiplier] (scaled space for point/quantile
         heads; raw pre-``domain_map`` parameters for distribution heads).
         """
         x = insample_z.astype(jnp.float32)[..., 0]                 # [B, L]
+        if self.hist_exog_size > 0:
+            x = jnp.concatenate([x, hist_exog.reshape(x.shape[0], -1)], axis=1)
         if self.futr_exog_size > 0:
             x = jnp.concatenate([x, futr_exog.reshape(x.shape[0], -1)], axis=1)
         for layer in self.mlp:

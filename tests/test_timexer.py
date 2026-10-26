@@ -91,6 +91,18 @@ class TestDataEmbeddingInverted:
         ref = np.asarray(x)[0].T @ W + b
         np.testing.assert_allclose(np.asarray(out[0]), ref, rtol=1e-5)
 
+    def test_x_mark_appends_covariate_tokens(self):
+        # Covariates concat AFTER the endogenous variates (reference order):
+        # N variate tokens then X covariate tokens, all through the shared Linear.
+        emb = DataEmbeddingInverted(c_in=12, d_model=8, dropout=0.0, rngs=nnx.Rngs(0))
+        x = _rand(2, 12, 1)                                  # [B, L, N=1]
+        xm = _rand(2, 12, 2)                                 # [B, L, X=2]
+        out = emb(x, x_mark=xm, deterministic=True)
+        assert out.shape == (2, 3, 8)                        # 1 + 2 tokens
+        # First token == endogenous-only; the two after == covariate tokens.
+        endo = emb(x, deterministic=True)
+        np.testing.assert_allclose(np.asarray(out[:, :1]), np.asarray(endo), rtol=1e-5)
+
 
 class TestAttention:
     def test_self_attention_matches_manual(self):
@@ -238,6 +250,16 @@ class TestTraining:
         out = jax.vmap(run)(jnp.arange(2))
         assert out.shape == (2, 3) and bool(jnp.all(jnp.isfinite(out)))
 
+    def test_train_with_hist_exog_is_vmap_traceable(self):
+        hist = jnp.asarray(np.random.RandomState(0).randn(60, 2), jnp.float32)
+        def run(seed):
+            net = _tiny_net(hist_exog_size=2)
+            return train(net, _make_y(), h=4, input_size=12, max_steps=3,
+                         windows_batch_size=8, lr=1e-3, seed=seed, loss_fn=mae,
+                         hist_exog=hist)
+        out = jax.vmap(run)(jnp.arange(2))
+        assert out.shape == (2, 3) and bool(jnp.all(jnp.isfinite(out)))
+
     def test_train_updates_params(self):
         net = _tiny_net()
         before = np.asarray(net.head.kernel.value).copy()
@@ -332,15 +354,52 @@ class TestModel:
         assert o1["fitted"].shape == y.shape
         assert bool(jnp.all(jnp.isnan(o1["fitted"][:12])))
 
-    def test_rejects_2d_exog_short_and_patch_guard(self):
+    def test_rejects_2d_y_short_and_patch_guard(self):
         with pytest.raises(ValueError, match="1-D"):
             _tiny().fit(jnp.ones((30, 2)))
-        with pytest.raises(NotImplementedError, match="exog"):
-            _tiny().fit(_make_y(), X=jnp.ones((60, 2)))
         with pytest.raises(ValueError, match="too short"):
             _tiny().fit(jnp.ones((12,)))
         with pytest.raises(ValueError, match="patch_len"):
             TimeXer(h=4, input_size=3, patch_len=4)
+
+    def test_hist_exog_fit_predict(self):
+        # Historical exog (X): raw covariate variate tokens in the cross context;
+        # predict needs no future X (historical-only). Same net params (the
+        # ex_embedding Linear is shared), so hist widens tokens, not weights.
+        X = jnp.asarray(np.random.RandomState(1).randn(60, 2), jnp.float32)
+        m = _tiny().fit(_make_y(60), X=X)
+        assert m._hist_size == 2
+        out = m.predict(h=4)
+        assert out["mean"].shape == (4,) and bool(jnp.all(jnp.isfinite(out["mean"])))
+
+    def test_hist_exog_misaligned_raises(self):
+        X = jnp.asarray(np.random.RandomState(1).randn(50, 2), jnp.float32)
+        with pytest.raises(ValueError, match="historical exog.*align"):
+            _tiny().fit(_make_y(60), X=X)
+
+    def test_hist_exog_forecast_threads_X_and_rejects_futr(self):
+        X = jnp.asarray(np.random.RandomState(1).randn(60, 2), jnp.float32)
+        assert _tiny().forecast(_make_y(60), 4, X=X)["mean"].shape == (4,)
+        with pytest.raises(NotImplementedError, match="future-known"):
+            _tiny().forecast(_make_y(60), 4, X_future=X[:4])
+
+    def test_hist_exog_conformal_refused(self):
+        # TimeXer has no native interval head, so historical exog leaves no
+        # interval path — conformal is refused at predict and conformity_scores.
+        X = jnp.asarray(np.random.RandomState(1).randn(60, 2), jnp.float32)
+        m = _tiny().fit(_make_y(60), X=X)
+        m.conformal_params = ConformalIntervals(h=4, n_windows=2)
+        with pytest.raises(ValueError, match="historical exog"):
+            m.predict(h=4, level=[80])
+        with pytest.raises(ValueError, match="historical exog"):
+            _tiny().conformity_scores(_make_y(60), X=X)
+
+    def test_hist_exog_pickle_roundtrip(self):
+        X = jnp.asarray(np.random.RandomState(1).randn(60, 2), jnp.float32)
+        m = _tiny().fit(_make_y(60), X=X)
+        o1 = m.predict(h=4)["mean"]
+        o2 = pickle.loads(pickle.dumps(m)).predict(h=4)["mean"]
+        np.testing.assert_array_equal(np.asarray(o1), np.asarray(o2))
 
     def test_default_ctor_matches_nf_defaults(self):
         m = TimeXer(h=4, input_size=16)
@@ -435,3 +494,63 @@ class TestBoxCoxConformal:
         lam_exp = m.fit(y_exp)._bc_lambda
         lam_lin = m.fit(y_lin)._bc_lambda
         assert lam_exp != lam_lin
+
+
+# === Refit compile-cache gates (module-level nnx.jit _train_scan) ===
+import io as _io
+import logging as _logging
+import re as _re
+
+_COMPILE_LOG_RE = _re.compile(r"Compiling ")
+
+
+def _count_compiles(fn):
+    """Run fn under jax.log_compiles and return (result, n_xla_compilations)."""
+    buf = _io.StringIO()
+    handler = _logging.StreamHandler(buf)
+    loggers = [
+        _logging.getLogger("jax._src.dispatch"),
+        _logging.getLogger("jax._src.interpreters.pxla"),
+    ]
+    with jax.log_compiles(True):
+        for lg in loggers:
+            lg.addHandler(handler)
+        try:
+            out = fn()
+            jax.block_until_ready(out)
+        finally:
+            for lg in loggers:
+                lg.removeHandler(handler)
+    return out, len(_COMPILE_LOG_RE.findall(buf.getvalue()))
+
+
+def test_count_compiles_canary():
+    # Live-fire proof _count_compiles can still see a compile: a fresh jit'd
+    # closure always compiles (pjit keys on callable identity), so the counter
+    # must report >=1. Guards test_refit_does_not_recompile against going
+    # vacuously green if a jax bump renames the log message or logger paths.
+    def fresh():
+        @jax.jit
+        def f(x):
+            return x * 9.0 - 3.0
+        return f(jnp.ones((2, 3)))
+
+    _, n = _count_compiles(fresh)
+    assert n >= 1
+
+
+def test_refit_does_not_recompile():
+    # The training program is a module-level nnx.jit keyed on config graphdefs
+    # (value-__eq__ initializers and the memoized optax transform) and operand
+    # shapes — a refit AND a fresh same-config instance must hit the cache with
+    # zero XLA compiles; fit #2 is counted directly (no uncounted settle call).
+    y = jnp.asarray(np.sin(np.arange(40) / 5.0), jnp.float32)
+    kw = dict(h=4, input_size=16, patch_len=8, max_steps=3,
+              windows_batch_size=4, random_seed=0)
+    m = TimeXer(**kw)
+    m.fit(y)                                     # first fit pays the one compile
+    _, n_refit = _count_compiles(lambda: (m.fit(y), None)[1])
+    assert n_refit == 0
+    m2 = TimeXer(**kw)
+    _, n_fresh = _count_compiles(lambda: (m2.fit(y), None)[1])
+    assert n_fresh == 0

@@ -78,7 +78,7 @@ hi-95: [170.3, 182.6, 192.2, 200.2, 207.3, 213.7]
 ## Features
 
 - ⚡ **JAX-accelerated** — JIT-compiled model fitting and forecasting on CPU, GPU, or TPU
-- 📈 **20+ forecasting models** including AutoARIMA, AutoETS, AutoTheta, TBATS, MFLES, GARCH, STL, and more
+- 📈 **35+ forecasting models** — classical (AutoARIMA, AutoETS, AutoTheta, TBATS, MFLES, GARCH, STL, and more) and neural (TFT, Informer, PatchTST, TCN, XLSTM, and more)
 - 🔁 **Unified API** — every model follows the same `fit()` → `predict()` pattern
 - 📊 **Prediction intervals** — built-in conformal and native interval support
 - ✅ **NumPy compatible** — accepts and returns standard array types
@@ -280,6 +280,26 @@ Forecasters tailored to sparse series with many zeros or irregular demand arriva
 | `IMAPA` | ✓ | ✓ | — | Conformal |
 | `TSB` | ✓ | ✓ | — | Native + conformal |
 
+### Deep Learning
+
+Neural forecasters implemented in JAX/Flax, ported from the Nixtla `neuralforecast` family.
+
+| Model | Point Forecast | Probabilistic Forecast | Exogenous Regressors | Interval Type |
+|-------|----------------|------------------------|----------------------|---------------|
+| `TFT` | ✓ | ✓ | ✓ | Conformal |
+| `Informer` | ✓ | ✓ | ✓ | Conformal |
+| `iTransformer` | ✓ | ✓ | — | Conformal |
+| `VanillaTransformer` | ✓ | ✓ | — | Conformal |
+| `PatchTST` | ✓ | ✓ | — | Conformal |
+| `KAN` | ✓ | ✓ | — | Conformal |
+| `BiTCN` | ✓ | ✓ | — | Conformal |
+| `TCN` | ✓ | ✓ | ✓ | Conformal |
+| `StemGNN` | ✓ | ✓ | — | Conformal |
+| `GRU` | ✓ | ✓ | — | Conformal |
+| `XLSTM` | ✓ | ✓ | — | Conformal |
+| `Autoformer` | ✓ | — | — | — |
+| `FEDformer` | ✓ | — | — | — |
+
 All models are importable from `chronax.models`.
 
 ---
@@ -349,6 +369,8 @@ pip install statsforecast pandas matplotlib
 # Run the benchmark suite
 python benchmarks/benchmark_suite.py
 ```
+
+A separate neural benchmark harness lives under `benchmarks/neural/` and compares Chronax neural forecasters against their Nixtla `neuralforecast` counterparts under a symmetric training budget. Set up the reference environment with `bash benchmarks/setup_nf_venv.sh`, then run it via `python benchmarks/neural/run.py` (models and settings are configured in `benchmarks/neural/config.yaml`).
 
 ---
 
