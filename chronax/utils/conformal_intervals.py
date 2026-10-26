@@ -1,17 +1,34 @@
-"""
-Parameters for conformal prediction interval construction.
-
-Instance Attributes
-1. n_windows -- number of walk-forward cross-validation windows (>= 2)
-2. h -- forecast horizon
-3. method -- interval construction method:
-   'conformal_distribution' (default, symmetric) or 'conformal_signed' (asymmetric)
-"""
+"""Parameters for conformal prediction interval construction."""
 
 _VALID_METHODS = {"conformal_distribution", "conformal_signed"}
 
 class ConformalIntervals:
-    # __slots__ = ('n_windows, 'h', 'method')
+    """Configuration for conformal prediction intervals.
+
+    Passed to a forecaster's ``conformal_params`` (or its
+    ``prediction_intervals`` alias). ``BaseForecaster.conformity_scores``
+    reads it to build ``n_windows`` walk-forward cross-validation windows of
+    horizon ``h`` and to pick the interval construction method.
+
+    Args:
+        n_windows (int): Number of walk-forward cross-validation windows.
+            Must be at least 2. Defaults to 2.
+        h (int): Forecast horizon of each window. Defaults to 1.
+        method (str): Interval construction method,
+            ``"conformal_distribution"`` (symmetric, uses absolute residuals)
+            or ``"conformal_signed"`` (asymmetric, uses signed residuals).
+            Defaults to ``"conformal_distribution"``.
+
+    Attributes:
+        n_windows (int): As passed.
+        h (int): As passed.
+        method (str): As passed.
+
+    Raises:
+        ValueError: If ``n_windows < 2``.
+        ValueError: If ``method`` is not one of the two supported names.
+    """
+
     def __init__(
         self,
         n_windows: int = 2,

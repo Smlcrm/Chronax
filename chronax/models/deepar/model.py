@@ -19,7 +19,7 @@ _BUF_SIZE   = 8          # need 8 history values to serve lag-1 and lag-7 during
 
 
 def _build_lag_features(y: jnp.ndarray, h: int) -> jnp.ndarray:
-    """[L, 4]: lag-1, lag-7, lag-h, lag-2h — zero-padded at start."""
+    """[L, 4]: lag-1, lag-7, lag-h, lag-2h, zero-padded at the start."""
     def lag(k):
         return jnp.concatenate([jnp.zeros(k, dtype=y.dtype), y])[:-k]
     return jnp.stack([lag(1), lag(7), lag(h), lag(2 * h)], axis=-1)
@@ -28,9 +28,9 @@ def _build_lag_features(y: jnp.ndarray, h: int) -> jnp.ndarray:
 def _forecast_lags(y_hist: jnp.ndarray, enc_len: int, H: int):
     """
     Returns:
-        xf_enc      [enc_len, 4]  — lag-1/7/H/2H features for the encoder
-        xf_dec_safe [H, 2]        — lag-H/2H for the decoder (always from history)
-        buf_init    [_BUF_SIZE]   — last _BUF_SIZE history values for decoder lag-1/7
+        xf_enc      [enc_len, 4]: lag-1/7/H/2H features for the encoder
+        xf_dec_safe [H, 2]: lag-H/2H for the decoder (always from history)
+        buf_init    [_BUF_SIZE]: last _BUF_SIZE history values for decoder lag-1/7
     """
     max_k = max(2 * H, max(_SHORT_LAGS))
     T = y_hist.shape[0]
@@ -122,7 +122,7 @@ class DeepAR_EncDec(nn.Module):
         return mu, sigma
 
 
-# ── Legacy trainer ────────────────────────────────────────────────────────────
+# ── Single-series teacher-forced trainer (AdamW) ──────────────────────────────
 
 def make_trainer(model, lr=1e-3, weight_decay=1e-5):
     tx = optax.adamw(learning_rate=lr, weight_decay=weight_decay)
@@ -153,8 +153,8 @@ def _get_forecast_fn(model: DeepAR_EncDec, H: int, use_lags: bool = True):
         mc = type(model)
 
         def _run(params, path_keys, y_last, h0, c0, buf_init, xf_dec_safe, x_static):
-            # buf_init:    [_BUF_SIZE]  — last _BUF_SIZE history values
-            # xf_dec_safe: [H, 2]       — precomputed lag-H and lag-2H
+            # buf_init:    [_BUF_SIZE]: last _BUF_SIZE history values
+            # xf_dec_safe: [H, 2]: precomputed lag-H and lag-2H
             #              (use_lags=False: [H, F] user futr_exog, possibly F=0)
             # Decoder xf_step = [lag1, lag7, lagH, lag2H] ← dim 4 (matches training)
             def step_fn(carry, inp):
@@ -300,7 +300,7 @@ def forecast_mc(
     values are correctly used as lags in later decode steps.
 
     Set ``use_lags=False`` for models trained WITHOUT the lag-feature
-    augmentation (e.g. via the DeepARForecaster/train.py pipeline) — the
+    augmentation (e.g. via the DeepARForecaster/train.py pipeline); the
     encoder/decoder then see only the user-provided exogenous features,
     matching the feature width the params were trained with.
     """

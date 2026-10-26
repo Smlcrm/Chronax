@@ -39,9 +39,9 @@ docs = [
 
 
 [project.urls]
-Homepage = "https://github.com/Smlcrm/ml-library-chronax"
-Repository = "https://github.com/Smlcrm/ml-library-chronax"
-Issues = "https://github.com/Smlcrm/ml-library-chronax/issues"
+Homepage = "https://github.com/Smlcrm/Chronax"
+Repository = "https://github.com/Smlcrm/Chronax"
+Issues = "https://github.com/Smlcrm/Chronax/issues"
 
 [tool.setuptools.packages.find]
 include = ["chronax", "chronax.*"]

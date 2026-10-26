@@ -21,31 +21,78 @@ _DEFAULT_DILATIONS = ((1, 2), (4, 8))
 class DilatedRNN(BaseForecaster):
     """Univariate DilatedRNN forecaster (JAX/Flax-NNX port of neuralforecast.DilatedRNN).
 
-    Maintenance Status:
-        Active univariate forecaster. Integrates with the ``BaseForecaster``
-        interface, including conformal prediction intervals via ``predict(level=...)``,
-        pickle round-trip, and ``forecast(fitted=True)``.
-
     DilatedRNN (Chang et al. 2017, "Dilated Recurrent Neural Networks") stacks
-    recurrent layers that each read the sequence subsampled at their own DILATION
-    rate. A layer at rate ``r`` splits the window into ``r`` interleaved subsequences
-    and runs them as extra batch rows, so its receptive field spans ``r`` timesteps
-    per recurrent step at unchanged cost; stacking rates ``1, 2, 4, 8`` gives an
-    exponentially growing receptive field with a linear number of steps, which is
-    the point of the architecture (and its answer to vanishing gradients over long
+    recurrent neural network (RNN) layers that each read the sequence
+    subsampled at their own dilation rate. A layer at rate ``r`` splits the
+    window into ``r`` interleaved subsequences and runs them as extra batch
+    rows, so its receptive field spans ``r`` timesteps per recurrent step at
+    unchanged cost; stacking rates ``1, 2, 4, 8`` gives an exponentially
+    growing receptive field with a linear number of steps, which is the point
+    of the architecture (and its answer to vanishing gradients over long
     windows).
 
-    Layers are organised into GROUPS (``dilations``, default ``[[1, 2], [4, 8]]``),
-    with a residual connection added between groups. The final hidden sequence is
-    mapped from the lookback length to the horizon by a single linear "context
-    adapter" (``Linear(input_size -> h)``), then decoded pointwise by an MLP —
-    i.e. the model is direct multi-step, not recursive.
+    Layers are organised into groups (``dilations``), with a residual
+    connection added between groups. The final hidden sequence is mapped from
+    the lookback length to the horizon by a single linear "context adapter"
+    (``Linear(input_size -> h)``), then decoded pointwise by a multilayer
+    perceptron (MLP): the model is direct multi-step, not recursive.
 
-    Each rolling window is scaled by a robust median/MAD scaler (NF's
-    ``scaler_type="robust"`` default), the model trains in that scaled space with
-    Optax ``adam`` under NF's halving learning-rate staircase (``num_lr_decays``),
-    and predictions are inverted with the prediction context's statistics.
-    ``float32`` throughout.
+    Each rolling window is scaled by a robust median/MAD (median absolute
+    deviation) scaler (neuralforecast's ``scaler_type="robust"`` default), the
+    model trains in that scaled space with Optax ``adam`` under
+    neuralforecast's halving learning-rate staircase (``num_lr_decays``), and
+    predictions are inverted with the prediction context's statistics.
+    ``float32`` throughout. Defaults match neuralforecast.DilatedRNN.
+
+    Maintenance status:
+        Active univariate forecaster. Integrates with the ``BaseForecaster``
+        interface, including conformal prediction intervals via
+        ``predict(level=...)``, pickle round-trip, and ``forecast(fitted=True)``.
+
+    Args:
+        h (int): Forecast horizon.
+        input_size (int): Input window length. Any value ``< 1`` (default
+            ``-1``) resolves to ``3 * h``.
+        cell_type (str): One of ``"LSTM"`` (long short-term memory),
+            ``"GRU"`` (gated recurrent unit), ``"RNN"``, ``"ResLSTM"``,
+            ``"AttentiveLSTM"``. Default ``"LSTM"``.
+        dilations (Sequence[Sequence[int]]): Groups of dilation rates. Each
+            inner sequence is one group of stacked layers; a residual
+            connection is added between groups. Default ``((1, 2), (4, 8))``.
+        encoder_hidden_size (int): Recurrent hidden width (all layers).
+            Default ``128``.
+        context_size (int): Accepted for signature parity with neuralforecast,
+            which stores it but never reads it in ``DilatedRNN.forward``. No
+            effect here either. Default ``10``.
+        decoder_hidden_size (int): Hidden width of the MLP decoder. Default
+            ``128``.
+        decoder_layers (int): Total layers in the MLP decoder (``1`` = bare
+            linear). Default ``2``.
+        max_steps (int): Number of Adam steps. Default ``1000``.
+        learning_rate (float | Callable[[int], float]): Scalar, or an
+            ``optax`` schedule callable. A callable is used as-is and
+            ``num_lr_decays`` is ignored. Default ``1e-3``.
+        num_lr_decays (int): Number of times the learning rate halves, evenly
+            spread over ``max_steps`` (neuralforecast's ``StepLR``). ``<= 0``
+            disables decay. Default ``3``.
+        windows_batch_size (int): Rolling windows sampled per step. Default
+            ``128``.
+        scaler_type (str): Per-window scaler: ``"robust"`` (default),
+            ``"standard"`` or ``"identity"``.
+        random_seed (int): Seed for parameter init and window sampling.
+            Default ``1``.
+        alias (str): Display name. Default ``"DilatedRNN"``.
+        loss (str | LossFn): Registry name (``"mae"``, ``"mse"``, ``"huber"``)
+            or a callable. Default ``"mae"``.
+
+    Raises:
+        ValueError: On an unknown ``cell_type`` or ``scaler_type``, an empty
+            or non-positive ``dilations`` spec, or ``decoder_layers < 1``.
+
+    Note:
+        A callable ``loss`` or ``learning_rate`` must itself be picklable for
+        the fitted estimator to pickle. An unknown ``loss`` name raises
+        ``ValueError`` at ``fit`` time.
     """
 
     uses_exog = False
@@ -71,46 +118,9 @@ class DilatedRNN(BaseForecaster):
     ):
         """Initialize a DilatedRNN forecaster.
 
-        Stores hyperparameters; the network is built lazily at ``fit`` time so
-        construction is cheap and side-effect free. Defaults match
-        neuralforecast.DilatedRNN (``cell_type="LSTM"``, ``dilations=[[1,2],[4,8]]``,
-        ``encoder_hidden_size=128``, ``decoder_hidden_size=128``, ``decoder_layers=2``,
-        ``max_steps=1000``, ``learning_rate=1e-3``, ``num_lr_decays=3``,
-        ``windows_batch_size=128``, ``scaler_type="robust"``). ``input_size=-1``
-        resolves to ``3 * h``.
-
-        Args:
-            h: Forecast horizon.
-            input_size: Lookback length; ``-1`` (default) uses ``3 * h``.
-            cell_type: One of ``"GRU"``, ``"RNN"``, ``"LSTM"``, ``"ResLSTM"``,
-                ``"AttentiveLSTM"``.
-            dilations: Groups of dilation rates. Each inner sequence is one group of
-                stacked layers; a residual connection is added between groups.
-            encoder_hidden_size: Recurrent hidden width (all layers).
-            context_size: Accepted for signature parity with neuralforecast, which
-                stores it on the model but never reads it in ``DilatedRNN.forward``.
-                It has no effect here either; kept so configs transfer unchanged.
-            decoder_hidden_size: Hidden width of the MLP decoder.
-            decoder_layers: Total layers in the MLP decoder (``1`` = bare linear).
-            max_steps: Number of Adam steps.
-            learning_rate: Scalar, or an ``optax.ScalarOrSchedule`` callable. A
-                callable is used as-is and ``num_lr_decays`` is ignored.
-            num_lr_decays: Number of times the learning rate halves, evenly spread
-                over ``max_steps`` (NF's ``StepLR``). ``<= 0`` disables decay.
-            windows_batch_size: Rolling windows sampled per step.
-            scaler_type: Per-window scaler — ``"robust"`` (default), ``"standard"``
-                or ``"identity"``.
-            random_seed: Seed for parameter init and window sampling.
-            alias: Display name for external reporting.
-            loss: Registry name (``"mae"``/``"mse"``/``"huber"``) or a callable.
-
-        If the fitted estimator will be pickled, any callable passed for
-        ``loss``/``learning_rate`` must itself be picklable (a class-based callable or
-        module-level function).
-
-        Raises:
-            ValueError: On an unknown ``cell_type``/``scaler_type``, an empty or
-                non-positive ``dilations`` spec, or ``decoder_layers < 1``.
+        Stores hyperparameters; the network is built at ``fit`` time, so
+        construction is cheap and side-effect free. Constructor arguments are
+        documented on the class.
         """
         if input_size < 1:
             input_size = 3 * h
@@ -172,21 +182,26 @@ class DilatedRNN(BaseForecaster):
     def fit(self, y: jnp.ndarray, X: jnp.ndarray | None = None) -> "DilatedRNN":
         """Fit the network on a 1-D series.
 
-        Builds the network and runs ``max_steps`` Adam steps over rolling windows of
-        length ``input_size + h``, sampled per step the way neuralforecast does, under
-        the halving learning-rate staircase.
+        Builds the network and runs ``max_steps`` Adam steps over rolling
+        windows of length ``input_size + h``, sampled per step the way
+        neuralforecast does, under the halving learning-rate staircase.
 
         Args:
-            y: 1-D series of length ``>= input_size + h``.
-            X: Reserved for exogenous regressors; must be None.
+            y (jnp.ndarray): Univariate series, shape ``(T,)`` with
+                ``T >= input_size + h``.
+            X (jnp.ndarray | None): Exogenous regressors. Not supported; must
+                be ``None``.
 
         Returns:
-            DilatedRNN: ``self``, with ``model_`` populated.
+            DilatedRNN: ``self`` with ``model_`` populated.
 
         Raises:
-            NotImplementedError: If ``X`` is provided.
-            ValueError: If ``y`` is not 1-D or is shorter than ``input_size + h``.
-            RuntimeError: If a non-finite training loss is observed (divergence).
+            NotImplementedError: If ``X`` is not ``None``.
+            ValueError: If ``y`` is not 1-D, if it is shorter than
+                ``input_size + h``, or if ``loss`` is an unknown
+                registry name.
+            RuntimeError: If a non-finite training loss is observed (the
+                training run diverged).
         """
         if X is not None:
             raise NotImplementedError("Exogenous variables are not supported.")
@@ -218,23 +233,28 @@ class DilatedRNN(BaseForecaster):
     ) -> dict:
         """Forecast ``h`` steps from the fitted context.
 
+        The network is direct-decoded for ``self.h`` steps and the first ``h``
+        are returned.
+
         Args:
-            h: Forecast horizon; must satisfy ``1 <= h <= self.h`` (the model is
-                direct-decoded for ``self.h`` steps and sliced).
-            X: Reserved for exogenous regressors; ignored.
-            level: Optional confidence levels (e.g. ``[80, 95]``). When set, returns
-                conformal ``lo-XX``/``hi-XX`` keys via the inherited ``BaseForecaster``
-                path and requires ``self.conformal_params``. Each call re-fits the model
-                per CV window under ``vmap`` — expect minutes.
+            h (int): Forecast horizon, ``1 <= h <= self.h``.
+            X (jnp.ndarray | None): Exogenous regressors. Ignored.
+            level (list[int | float] | None): Confidence levels in (0, 100),
+                e.g. ``[80, 95]``. When given, conformal intervals come from
+                ``BaseForecaster.conformity_scores``, which re-fits the model on
+                every cross-validation (CV) window under ``vmap``; requires
+                ``self.conformal_params``. Expect minutes per call on this
+                model, scaling with ``n_windows`` and ``max_steps``.
 
         Returns:
-            dict: ``{"mean": jnp.ndarray of shape (h,)}`` plus interval keys when
-            ``level`` is provided.
+            dict: ``"mean"`` (shape ``(h,)``) plus ``"lo-{lv}"`` and
+            ``"hi-{lv}"`` (shape ``(h,)``) for each level when ``level`` is
+            given.
 
         Raises:
             RuntimeError: If called before ``fit``.
-            ValueError: If ``h < 1`` or ``h > self.h``, or if ``level`` is given without
-                ``self.conformal_params`` set.
+            ValueError: If ``h < 1``, if ``h > self.h``, or if ``level`` is
+                given while ``self.conformal_params`` is ``None``.
         """
         if self.model_ is None or self._context is None:
             raise RuntimeError("Call fit(y) before predict(h).")
@@ -275,25 +295,32 @@ class DilatedRNN(BaseForecaster):
         level: list[int | float] | None = None,
         fitted: bool = False,
     ) -> dict:
-        """Stateless fit-then-predict on ``y``.
+        """Fit on ``y`` and forecast ``h`` steps in one call.
 
-        Equivalent to ``self.fit(y).predict(h=h, level=level)``, optionally adding a
-        ``"fitted"`` key with one-step-ahead in-sample predictions.
+        Equivalent to ``self.fit(y).predict(h=h, level=level)``; the fitted
+        state stays on the estimator.
 
         Args:
-            y: 1-D training series.
-            h: Forecast horizon (``<= self.h``).
-            X / X_future: Reserved for exogenous regressors; must be None.
-            level: Optional confidence levels; see ``predict``.
-            fitted: If True, include ``"fitted"`` — one-step-ahead values over the
-                training series, NaN for the first ``input_size`` entries.
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            h (int): Forecast horizon, ``1 <= h <= self.h``.
+            X (jnp.ndarray | None): Exogenous regressors. Not supported; must
+                be ``None``.
+            X_future (jnp.ndarray | None): Future exogenous regressors. Not
+                supported; must be ``None``.
+            level (list[int | float] | None): Confidence levels; see
+                ``predict``.
+            fitted (bool): If ``True``, add a ``"fitted"`` key with
+                one-step-ahead in-sample predictions, shape ``(T,)``; the first
+                ``input_size`` entries are NaN.
 
         Returns:
-            dict: ``{"mean": ..., optional "fitted": ...}``.
+            dict: ``"mean"`` (shape ``(h,)``), the interval keys when ``level``
+            is given, and ``"fitted"`` when ``fitted=True``.
 
         Raises:
-            NotImplementedError: If ``X`` or ``X_future`` is provided.
-            ValueError / RuntimeError: Forwarded from ``fit`` / ``predict``.
+            NotImplementedError: If ``X`` or ``X_future`` is not ``None``.
+            ValueError: Forwarded from ``fit`` and ``predict``.
+            RuntimeError: Forwarded from ``fit`` and ``predict``.
         """
         if X is not None or X_future is not None:
             raise NotImplementedError("Exogenous variables are not supported.")
@@ -330,7 +357,7 @@ class DilatedRNN(BaseForecaster):
         """Serialize only NNX state (params). The GraphDef holds references to JAX
         ufuncs that are not pickle-stable, so we drop it and rebuild via
         ``_build_net()`` on unpickle, then reload the saved state with ``nnx.update``.
-        (DilatedRNN has no normalization layers with running stats — only
+        (DilatedRNN has no normalization layers with running stats, only
         ``nnx.Param`` variables are captured.)
         """
         state = self.__dict__.copy()

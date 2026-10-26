@@ -30,17 +30,17 @@
 <!-- smlcrm:begin overview -->
 ## Overview
 
-Chronax implements classical forecasting models in JAX: ARIMA, ETS, Theta, TBATS, MFLES, MSTL and STL, GARCH, exponential smoothing, intermittent-demand methods (Croston, ADIDA, IMAPA, TSB) and simple baselines, with automatic model selection for ARIMA, ETS, Theta, TBATS, MFLES and CES. Every model is fitted with `fit(y)` and forecasts with `predict(h)`, which returns a dictionary of JAX arrays, and adds native or conformal prediction intervals when you pass `level`. Fitting and forecasting run under JAX, so the same code runs on CPU, GPU or TPU. The package also contains early neural forecasters (Autoformer, iTransformer, KAN) that the model tables below do not cover yet.
+Chronax implements 59 time-series forecasting models in JAX behind one `fit(y)` / `predict(h)` interface. The 28 classical models are JAX ports of the statsforecast family: ARIMA, ETS, Theta, TBATS, MFLES, MSTL and STL, CES, GARCH, Holt and Holt-Winters exponential smoothing, intermittent-demand methods (Croston, ADIDA, IMAPA, TSB) and simple baselines, with automatic model selection for ARIMA, ETS, Theta, TBATS, MFLES and CES. The 31 neural models are Flax NNX ports of the neuralforecast family: MLP, NHITS, NBEATS, DLinear, NLinear, TiDE, TSMixer, TimeMixer, TimeXer, TFT, Informer, PatchTST, iTransformer, TCN, BiTCN, GRU, RNN, DeepAR, xLSTM and others, plus HINT for hierarchical reconciliation. `predict(h)` returns a dictionary of JAX arrays and adds native or conformal prediction intervals when you pass `level`. Fitting and forecasting run under JAX, so the same code runs on CPU, GPU or TPU.
 
-**Who it is for.** Python developers and researchers who forecast univariate time series and want statistical models that run inside a JAX workflow.
+**Who it is for.** Python developers and researchers who forecast univariate time series and want classical and neural models that run inside a JAX workflow.
 
-**What it does not do.** It forecasts one univariate series per model; it does not load data frames or manage panels of series for you. It ships no pretrained foundation models and is not a hosted forecasting service. The benchmark suite's comparison libraries (statsforecast, pandas) are not installed with the package.
+**What it does not do.** It forecasts one univariate series per model (HINT reconciles a hierarchy, and MLP accepts a panel); it does not load data frames or manage panels of series for you. It ships no pretrained foundation models and is not a hosted forecasting service. The benchmark suite's comparison libraries (statsforecast, neuralforecast, pandas) are not installed with the package. Five neural wrappers (DeepAR, NBEATS, RNN, TiDE, TSMixer) keep their own fit and forecast signatures and return no prediction intervals; Autoformer and FEDformer forecast points only.
 <!-- smlcrm:end overview -->
 
 <!-- smlcrm:begin quickstart -->
 ## Quickstart
 
-<!-- smlcrm:tested 2026-10-05 macOS 26.6 (arm64), Python 3.11.14, fresh venvs, chronax 0.1.0 (cited) and 0.1.1 with jax 0.10.2 from PyPI, same output -->
+<!-- smlcrm:tested 2026-10-26 macOS 26.3.1 (arm64), Python 3.13.14, fresh venv, chronax 0.1.0 installed from the repository source with jax 0.7.2 and flax 0.10.7 from PyPI; the same output on two runs -->
 Requires Python 3.11 or later.
 
 ```bash
@@ -69,20 +69,20 @@ print("hi-95:", [round(v, 1) for v in forecast["hi-95"].tolist()])
 Expected output:
 
 ```text
-mean:  [139.5, 139.5, 139.5, 139.5, 139.5, 139.5]
-lo-95: [108.7, 96.3, 86.8, 78.8, 71.7, 65.2]
-hi-95: [170.3, 182.6, 192.2, 200.2, 207.3, 213.7]
+mean:  [128.9, 135.0, 145.2, 141.8, 135.5, 149.1]
+lo-95: [116.9, 118.2, 124.7, 118.2, 109.1, 120.2]
+hi-95: [140.9, 151.7, 165.7, 165.4, 161.8, 178.0]
 ```
 <!-- smlcrm:end quickstart -->
 
 ## Features
 
-- ⚡ **JAX-accelerated** — JIT-compiled model fitting and forecasting on CPU, GPU, or TPU
-- 📈 **35+ forecasting models** — classical (AutoARIMA, AutoETS, AutoTheta, TBATS, MFLES, GARCH, STL, and more) and neural (TFT, Informer, PatchTST, TCN, XLSTM, and more)
-- 🔁 **Unified API** — every model follows the same `fit()` → `predict()` pattern
-- 📊 **Prediction intervals** — built-in conformal and native interval support
-- ✅ **NumPy compatible** — accepts and returns standard array types
-- 🧪 **Benchmarked** against established libraries for correctness and speed
+- **JAX-accelerated**: just-in-time (JIT) compiled model fitting and forecasting on CPU, GPU or TPU
+- **59 forecasting models**: 28 classical (AutoARIMA, AutoETS, AutoTheta, TBATS, MFLES, GARCH, STL and more) and 31 neural (TFT, Informer, PatchTST, NHITS, TiDE, TCN, XLSTM and more)
+- **Unified API**: every model follows the same `fit()` then `predict()` pattern
+- **Prediction intervals**: conformal and native interval support
+- **NumPy compatible**: accepts and returns standard array types
+- **Benchmarked** against statsforecast and neuralforecast for accuracy and speed
 
 ---
 
@@ -116,7 +116,7 @@ pip install -e .
 
 ---
 
-## Usage Overview
+## Usage overview
 
 ### Fitting a model and forecasting
 
@@ -194,117 +194,137 @@ for name, m in models.items():
 
 ---
 
-## Available Models
+## Available models
 
-### Automatic Forecasting
+### Automatic forecasting
 
 Automatic model-selection wrappers that search over candidate configurations.
 
-| Model | Point Forecast | Probabilistic Forecast | Exogenous Regressors | Interval Type |
+| Model | Point forecast | Probabilistic forecast | Exogenous regressors | Interval type |
 |-------|----------------|------------------------|----------------------|---------------|
-| `AutoARIMA` | ✓ | ✓ | ✓ | Native |
-| `AutoETS` | ✓ | ✓ | — | Native + conformal |
-| `AutoTheta` | ✓ | ✓ | — | Monte Carlo + conformal |
-| `AutoMFLES` | ✓ | ✓ | ✓ | Gaussian approx. + conformal |
-| `AutoTBATS` | ✓ | ✓ | — | Conformal |
-| `AutoCES` | ✓ | ✓ | — | Conformal |
+| `AutoARIMA` | yes | yes | yes | Native |
+| `AutoETS` | yes | yes | no | Native + conformal |
+| `AutoTheta` | yes | yes | no | Monte Carlo + conformal |
+| `AutoMFLES` | yes | yes | yes | Gaussian approx. + conformal |
+| `AutoTBATS` | yes | yes | no | Conformal |
+| `AutoCES` | yes | yes | no | Conformal |
 
-### ARIMA Family
+### ARIMA family
 
 Autoregressive integrated moving-average models for autocorrelated series.
 
-| Model | Point Forecast | Probabilistic Forecast | Exogenous Regressors | Interval Type |
+| Model | Point forecast | Probabilistic forecast | Exogenous regressors | Interval type |
 |-------|----------------|------------------------|----------------------|---------------|
-| `ARIMA` | ✓ | ✓ | ✓ | Native |
+| `ARIMA` | yes | yes | yes | Native |
 
-### Theta Family
+### Theta family
 
 Theta-method forecasters for trend and seasonality decomposition.
 
-| Model | Point Forecast | Probabilistic Forecast | Exogenous Regressors | Interval Type |
+| Model | Point forecast | Probabilistic forecast | Exogenous regressors | Interval type |
 |-------|----------------|------------------------|----------------------|---------------|
-| `Theta` | ✓ | ✓ | — | Monte Carlo + conformal |
+| `Theta` | yes | yes | no | Monte Carlo + conformal |
 
-### Multiple Seasonalities & Decomposition
+### Multiple seasonalities and decomposition
 
 Models designed for multiple seasonal patterns or explicit trend-seasonal decomposition.
 
-| Model | Point Forecast | Probabilistic Forecast | Exogenous Regressors | Interval Type |
+| Model | Point forecast | Probabilistic forecast | Exogenous regressors | Interval type |
 |-------|----------------|------------------------|----------------------|---------------|
-| `MFLES` | ✓ | ✓ | ✓ | Conformal |
-| `TBATS` | ✓ | ✓ | — | Conformal |
-| `MSTL` | ✓ | ✓ | — | Conformal |
-| `STL` | ✓ | ✓ | — | Conformal |
+| `MFLES` | yes | yes | yes | Conformal |
+| `TBATS` | yes | yes | no | Conformal |
+| `MSTL` | yes | yes | no | Conformal |
+| `STL` | yes | yes | no | Conformal |
 
-### Volatility Models
+### Volatility models
 
 Models specialized for time-varying variance and heteroskedastic dynamics.
 
-| Model | Point Forecast | Probabilistic Forecast | Exogenous Regressors | Interval Type |
+| Model | Point forecast | Probabilistic forecast | Exogenous regressors | Interval type |
 |-------|----------------|------------------------|----------------------|---------------|
-| `GARCH` | ✓ | ✓ | — | Native + conformal |
+| `GARCH` | yes | yes | no | Native + conformal |
 
-### Baseline Models
+### Baseline models
 
 Simple reference forecasters used as strong, interpretable baselines.
 
-| Model | Point Forecast | Probabilistic Forecast | Exogenous Regressors | Interval Type |
+| Model | Point forecast | Probabilistic forecast | Exogenous regressors | Interval type |
 |-------|----------------|------------------------|----------------------|---------------|
-| `HistoricAverage` | ✓ | ✓ | — | Native + conformal |
-| `Naive` | ✓ | ✓ | — | Native + conformal |
-| `SeasonalNaive` | ✓ | ✓ | — | Native + conformal |
-| `WindowAverage` | ✓ | ✓ | — | Conformal |
-| `SeasonalWindowAverage` | ✓ | ✓ | — | Conformal |
-| `RandomWalkWithDrift` | ✓ | ✓ | — | Native + conformal |
+| `HistoricAverage` | yes | yes | no | Native + conformal |
+| `Naive` | yes | yes | no | Native + conformal |
+| `SeasonalNaive` | yes | yes | no | Native + conformal |
+| `WindowAverage` | yes | yes | no | Conformal |
+| `SeasonalWindowAverage` | yes | yes | no | Conformal |
+| `RandomWalkWithDrift` | yes | yes | no | Native + conformal |
 
-### Exponential Smoothing
+### Exponential smoothing
 
 Level, trend, and seasonal smoothing models with recursive state updates.
 
-| Model | Point Forecast | Probabilistic Forecast | Exogenous Regressors | Interval Type |
+| Model | Point forecast | Probabilistic forecast | Exogenous regressors | Interval type |
 |-------|----------------|------------------------|----------------------|---------------|
-| `ETS` | ✓ | ✓ | — | Native + conformal |
-| `Holt` | ✓ | ✓ | — | Native + conformal |
-| `HoltWinters` | ✓ | ✓ | — | Native + conformal |
-| `SimpleExponentialSmoothing` | ✓ | ✓ | — | Conformal |
-| `SeasonalExponentialSmoothing` | ✓ | ✓ | — | Conformal |
+| `ETS` | yes | yes | no | Native + conformal |
+| `Holt` | yes | yes | no | Native + conformal |
+| `HoltWinters` | yes | yes | no | Native + conformal |
+| `SimpleExponentialSmoothing` | yes | yes | no | Conformal |
+| `SeasonalExponentialSmoothing` | yes | yes | no | Conformal |
 
-### Sparse / Intermittent Demand
+### Sparse and intermittent demand
 
 Forecasters tailored to sparse series with many zeros or irregular demand arrivals.
 
-| Model | Point Forecast | Probabilistic Forecast | Exogenous Regressors | Interval Type |
+| Model | Point forecast | Probabilistic forecast | Exogenous regressors | Interval type |
 |-------|----------------|------------------------|----------------------|---------------|
-| `ADIDA` | ✓ | ✓ | — | Conformal |
-| `CrostonClassic` | ✓ | ✓ | — | Conformal |
-| `IMAPA` | ✓ | ✓ | — | Conformal |
-| `TSB` | ✓ | ✓ | — | Native + conformal |
+| `ADIDA` | yes | yes | no | Conformal |
+| `CrostonClassic` | yes | yes | no | Conformal |
+| `IMAPA` | yes | yes | no | Conformal |
+| `TSB` | yes | yes | no | Native + conformal |
 
-### Deep Learning
+### Deep learning
 
-Neural forecasters implemented in JAX/Flax, ported from the Nixtla `neuralforecast` family.
+Neural forecasters implemented in JAX/Flax, ported from the Nixtla `neuralforecast` family. "Conformal" means `predict(h, level=...)` uses the base-class conformal machinery once `conformal_params` is set; "native" means the model's own interval head is used when it is configured.
 
-| Model | Point Forecast | Probabilistic Forecast | Exogenous Regressors | Interval Type |
+| Model | Point forecast | Probabilistic forecast | Exogenous regressors | Interval type |
 |-------|----------------|------------------------|----------------------|---------------|
-| `TFT` | ✓ | ✓ | ✓ | Conformal |
-| `Informer` | ✓ | ✓ | ✓ | Conformal |
-| `iTransformer` | ✓ | ✓ | — | Conformal |
-| `VanillaTransformer` | ✓ | ✓ | — | Conformal |
-| `PatchTST` | ✓ | ✓ | — | Conformal |
-| `KAN` | ✓ | ✓ | — | Conformal |
-| `BiTCN` | ✓ | ✓ | — | Conformal |
-| `TCN` | ✓ | ✓ | ✓ | Conformal |
-| `StemGNN` | ✓ | ✓ | — | Conformal |
-| `GRU` | ✓ | ✓ | — | Conformal |
-| `XLSTM` | ✓ | ✓ | — | Conformal |
-| `Autoformer` | ✓ | — | — | — |
-| `FEDformer` | ✓ | — | — | — |
+| `MLP` | yes | yes | yes | Conformal; native with a quantile or GMM loss |
+| `NHITS` | yes | yes | yes | Conformal; native with a quantile or GMM loss |
+| `HINT` | yes | yes | yes | Native coherent samples + conformal |
+| `NBEATS` | yes | no | no | none |
+| `DLinear` | yes | yes | no | Conformal |
+| `NLinear` | yes | yes | no | Conformal |
+| `XLinear` | yes | yes | no | Conformal |
+| `RMoK` | yes | yes | no | Conformal |
+| `KAN` | yes | yes | no | Conformal |
+| `TiDE` | yes | no | no | none |
+| `TSMixer` | yes | no | no | none |
+| `TimeMixer` | yes | yes | no | Conformal |
+| `TimeXer` | yes | yes | yes | Conformal |
+| `SOFTS` | yes | yes | no | Conformal |
+| `SOFTSSharp` | yes | yes | no | Conformal |
+| `TFT` | yes | yes | yes | Conformal; native with a quantile loss |
+| `Informer` | yes | yes | yes | Conformal; native with a quantile loss |
+| `iTransformer` | yes | yes | no | Conformal |
+| `VanillaTransformer` | yes | yes | no | Conformal |
+| `PatchTST` | yes | yes | no | Conformal |
+| `Autoformer` | yes | no | no | none |
+| `FEDformer` | yes | no | no | none |
+| `TCN` | yes | yes | yes | Conformal; native with a quantile loss |
+| `BiTCN` | yes | yes | no | Conformal |
+| `StemGNN` | yes | yes | no | Conformal; native with a quantile loss |
+| `DeepNPTS` | yes | yes | no | Conformal |
+| `RNN` | yes | no | yes | none |
+| `GRU` | yes | yes | no | Conformal |
+| `DilatedRNN` | yes | yes | no | Conformal |
+| `XLSTM` | yes | yes | no | Conformal |
+| `DeepAR` | yes | yes | yes | Monte Carlo sample paths |
+
+Exogenous regressors enter through `fit(y, X=...)` for MLP, NHITS, TCN, TimeXer and HINT (historical covariates), through `futr_exog=` for Informer, and through either for TFT; RNN takes `hist_exog`, `futr_exog` and `stat_exog` sequences; DeepAR takes `x_futr_list` and `x_stat_list`. NBEATS, TiDE, TSMixer and RNN subclass `BaseForecaster` but their `forecast(y, h)` returns an array, and `predict(h, level=...)` raises `NotImplementedError`. DeepAR has its own `fit(y_series, ...)` / `predict(y_series, ..., num_samples)` API and does not subclass `BaseForecaster`. Autoformer and FEDformer are point forecasters: `predict(h, level=...)` is not supported.
 
 All models are importable from `chronax.models`.
 
 ---
 
-## Tutorial: Forecast a Time Series in Five Steps
+## Tutorial: forecast a time series in five steps
 
 ### 1. Install the package
 
@@ -352,15 +372,15 @@ python forecast.py
 
 ### 5. Explore further
 
-Try swapping `AutoETS` for `AutoARIMA` or `AutoTheta` and compare results — the API is identical across all models.
+Swap `AutoETS` for `AutoARIMA` or `AutoTheta` and compare the results. The API is identical across all models.
 
 ---
 
-## Evaluation Benchmarks
+## Evaluation benchmarks
 
 We provide a benchmarking suite to evaluate `chronax` against other time-series libraries.
 
-> **Note:** Benchmark dependencies (such as `statsforecast`, `pandas`, etc.) are **not** included in the core package to keep the installation lightweight.
+> **Note:** Benchmark dependencies such as `statsforecast` and `pandas` are not included in the core package.
 
 ```bash
 # Install benchmark dependencies
@@ -379,7 +399,7 @@ A separate neural benchmark harness lives under `benchmarks/neural/` and compare
 | Component | Description |
 |-----------|-------------|
 | `chronax.models.*` | All forecasting model classes (see table above) |
-| `chronax.utils.*` | Utilities — loss functions, plotting, conformal intervals |
+| `chronax.utils.*` | Utilities: loss functions, plotting, conformal intervals |
 
 Explore inline docstrings for detailed parameter and return-type information.
 

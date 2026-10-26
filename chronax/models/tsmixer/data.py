@@ -1,14 +1,15 @@
 """Functional data pipeline for the Chronax TSMixer model.
 
-TSMixer is a multivariate model — all N series are processed jointly in a
+TSMixer is a multivariate model: all N series are processed jointly in a
 single [B, L, N] window. The pipeline is therefore organised around a single
-2D array [T, N] rather than a list of univariate series as in the RNN module.
+2D array [T, N] rather than a list of univariate series as in the recurrent
+neural network (RNN) module.
 
 Main entry points:
     :func:`create_windows`   Extract all valid sliding windows from [T, N].
     :func:`make_batch`       Build a JAX batch from pre-extracted windows.
 
-No NumPy — every array is a ``jnp.ndarray``. The sliding-window extraction
+No NumPy: every array is a ``jnp.ndarray``. The sliding-window extraction
 uses a single vectorised gather rather than NumPy's stride-trick view, since
 JAX arrays don't support raw strided views.
 """
@@ -36,8 +37,8 @@ def create_windows(
         h:          forecast horizon.
 
     Returns:
-        insample  ``[W, L, N]`` float32 — history windows.
-        outsample ``[W, h, N]`` float32 — corresponding horizon targets.
+        insample  ``[W, L, N]`` float32, history windows.
+        outsample ``[W, h, N]`` float32, corresponding horizon targets.
     """
     if y.ndim == 1:
         y = y[:, None]
@@ -80,8 +81,8 @@ def make_batch(
         indices:   ``[B]`` integer indices selecting windows for this batch.
 
     Returns:
-        ``{"insample_y": [B, L, N], "outsample_y": [B, h, N],
-           "sample_mask": [B, h, N]}`` with all-ones mask.
+        Dict with ``"insample_y"`` ``[B, L, N]``, ``"outsample_y"`` ``[B, h, N]``
+        and an all-ones ``"sample_mask"`` ``[B, h, N]``.
     """
     ins = insample[indices]
     out = outsample[indices]

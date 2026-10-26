@@ -22,11 +22,62 @@ from chronax.utils import ConformalIntervals
 class FEDformer(BaseForecaster):
     """Univariate FEDformer forecaster (JAX/Flax Linen port of neuralforecast.FEDformer).
 
-    Maintenance Status:
-        Active univariate forecaster. Integrates with the ``BaseForecaster``
-        interface, including conformal prediction intervals via
-        ``predict(level=...)``. Defaults match neuralforecast.FEDformer architecture
-        (``n_heads`` must be 8); ``input_size=-1`` resolves to ``3 * h``.
+    Trains on rolling windows of length ``input_size + h`` with a per-window
+    ``RobustScaler`` and decodes all ``h`` steps in one pass. Exogenous
+    regressors are not supported (``uses_exog = False``); passing ``X`` raises.
+    Prediction intervals are conformal: set ``conformal_params`` to a
+    :class:`~chronax.utils.ConformalIntervals` before calling
+    ``predict(level=...)``. Defaults match neuralforecast.FEDformer.
+
+    Args:
+        h (int): Forecast horizon the model is trained for. ``predict`` accepts
+            any ``1 <= h <= self.h``.
+        input_size (int): Context window length. Default ``-1`` resolves to
+            ``3 * h``.
+        hidden_size (int): Model (embedding) dimension. Default ``128``.
+        n_heads (int): Attention heads. The spectral weights hard-code 8 heads,
+            so any other value raises ``ValueError`` at ``fit``. Default ``8``.
+        modes (int): Number of Fourier modes kept per spectral block.
+            Default ``64``.
+        mode_select (str): ``"random"`` samples ``modes`` frequencies with a
+            seeded random number generator; any other value keeps the lowest ``modes``.
+            Default ``"random"``.
+        moving_avg_window (int): Kernel of the moving-average series
+            decomposition. Default ``25``.
+        encoder_layers (int): Number of encoder layers. Default ``2``.
+        decoder_layers (int): Number of decoder layers. Default ``1``.
+        conv_hidden_size (int): Hidden width of the feed-forward convolutions.
+            Default ``32``.
+        decoder_input_size_multiplier (float): Fraction of ``input_size`` fed to
+            the decoder as label length. Default ``0.5``.
+        dropout (float): Dropout rate. Default ``0.05``.
+        activation (str): ``"gelu"`` or ``"relu"``. Default ``"gelu"``.
+        fea_activation (str): Activation applied inside the frequency-enhanced
+            cross-attention. Default ``"tanh"``.
+        max_steps (int): Total optimizer steps. Default ``1000``.
+        learning_rate (float): Adam learning rate. Default ``1e-4``.
+        batch_size (int): Windows per step. Default ``32``.
+        num_lr_decays (int): Number of StepLR halvings over ``max_steps``.
+            Default ``3``.
+        val_fraction (float): Fraction of windows held out for validation.
+            Default ``0.1``.
+        val_check_steps (int): Steps between validation checks. Default ``100``.
+        early_stop_patience_steps (int): Validation checks without improvement
+            before stopping; ``-1`` disables. Default ``-1``.
+        grad_clip (float): Global gradient-norm clip; ``0`` disables.
+            Default ``1.0``.
+        weight_decay (float): Adam weight decay. Default ``0.0``.
+        random_seed (int): Pseudo-random number generator (PRNG) seed for init
+            and batch sampling. Default ``1``.
+        alias (str): Display name. Default ``"FEDformer"``.
+        loss (str | LossFn): A key of ``LOSSES`` (``"mae"``, ``"mse"``,
+            ``"huber"``, ...) or a callable ``loss(pred, target)``.
+            Default ``"mae"``.
+
+    Attributes:
+        conformal_params (ConformalIntervals | None): Conformal configuration;
+            ``None`` until set by the user.
+        model_ (TrainState | None): Trained Flax state; ``None`` before ``fit``.
     """
 
     uses_exog = False
@@ -118,7 +169,23 @@ class FEDformer(BaseForecaster):
         )
 
     def fit(self, y: jnp.ndarray, X: jnp.ndarray | None = None) -> "FEDformer":
-        """Fit on a univariate 1-D series."""
+        """Fit on a univariate series.
+
+        Args:
+            y (jnp.ndarray): Univariate series, shape ``(T,)``; cast to float32.
+            X (jnp.ndarray | None): Not supported; must be ``None``.
+
+        Returns:
+            Self, with ``model_`` set.
+
+        Raises:
+            NotImplementedError: If ``X`` is not ``None``.
+            ValueError: If ``y`` is not 1-D, if ``T < input_size + h``, or if
+                a constructor value is invalid for the backbone config
+                (``activation`` not in ``{"relu", "gelu"}``, non-positive
+                sizes, ``hidden_size`` not divisible by ``n_heads``, an
+                unknown ``loss`` name).
+        """
         if X is not None:
             raise NotImplementedError("Exogenous variables are not supported.")
         y = jnp.asarray(y, dtype=jnp.float32)
@@ -154,7 +221,28 @@ class FEDformer(BaseForecaster):
         X: jnp.ndarray | None = None,
         level: list[int | float] | None = None,
     ) -> dict:
-        """Forecast ``h`` steps from the fitted context."""
+        """Forecast ``h`` steps from the last ``input_size`` training values.
+
+        The backbone always decodes ``self.h`` steps; the first ``h`` are
+        returned. Intervals are conformal: a clone of this estimator runs
+        ``conformity_scores`` on the training series (re-fitting once per cross-validation (CV)
+        window) and the residual quantiles are added around ``"mean"``.
+
+        Args:
+            h (int): Forecast horizon, ``1 <= h <= self.h``.
+            X (jnp.ndarray | None): Ignored.
+            level (list[int | float] | None): Confidence levels in (0, 100),
+                e.g. ``[80, 95]``. Requires ``conformal_params``.
+
+        Returns:
+            dict: ``"mean"`` of shape ``(h,)``, plus ``"lo-{lv}"`` and
+            ``"hi-{lv}"`` of shape ``(h,)`` per level when ``level`` is given.
+
+        Raises:
+            RuntimeError: If called before ``fit``.
+            ValueError: If ``h < 1``, if ``h > self.h``, or if ``level`` is
+                given while ``conformal_params`` is ``None``.
+        """
         if self.model_ is None or self._context is None:
             raise RuntimeError("Call fit(y) before predict(h).")
         if h < 1:
@@ -195,7 +283,27 @@ class FEDformer(BaseForecaster):
         level: list[int | float] | None = None,
         fitted: bool = False,
     ) -> dict:
-        """Stateless fit-then-predict on ``y``."""
+        """Stateless fit-then-predict on ``y``.
+
+        Args:
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            h (int): Forecast horizon, ``1 <= h <= self.h``.
+            X (jnp.ndarray | None): Not supported; must be ``None``.
+            X_future (jnp.ndarray | None): Not supported; must be ``None``.
+            level (list[int | float] | None): Confidence levels in (0, 100).
+                Requires ``conformal_params``.
+            fitted (bool): If True, also return in-sample one-step-ahead
+                fitted values.
+
+        Returns:
+            dict: ``"mean"`` of shape ``(h,)``; ``"lo-{lv}"``/``"hi-{lv}"`` per
+            level when ``level`` is given; ``"fitted"`` of shape ``(T,)`` when
+            ``fitted=True`` (the first ``input_size`` entries are NaN).
+
+        Raises:
+            NotImplementedError: If ``X`` or ``X_future`` is not ``None``.
+            ValueError: As raised by ``fit`` and ``predict``.
+        """
         if X is not None or X_future is not None:
             raise NotImplementedError("Exogenous variables are not supported.")
         self.fit(y)

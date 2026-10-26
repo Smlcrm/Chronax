@@ -46,7 +46,7 @@ from .ces import AutoCES
 from .tsb import TSB
 from .randomWalkWithDrift import RandomWalkWithDrift
 
-# NOTE: GRU is imported lazily (see __getattr__ below) — it hard-pins flax 0.10.x,
+# NOTE: GRU is imported lazily (see __getattr__ below): it hard-pins flax 0.10.x,
 # so `import chronax.models` must not force a flax import on callers using other models.
 
 # The autoformer package exports the forecaster as ``AutoformerForecaster``; expose it
@@ -81,7 +81,7 @@ try:
     from .fedformer import FEDformer
 except ImportError:
     FEDformer = None
-# NLinear depends on flax NNX (pinned 0.10.x — see chronax/models/nlinear/__init__.py).
+# NLinear depends on flax NNX (pinned 0.10.x, see chronax/models/nlinear/__init__.py).
 # Guard like KAN/PatchTST so an incompatible flax degrades this model to None instead
 # of crashing the entire chronax.models namespace. Note the trade-off: the pin's
 # informative ImportError is swallowed here; importing chronax.models.nlinear
@@ -91,16 +91,16 @@ try:
 except ImportError:
     NLinear = None
 
-# XLinear depends on flax NNX (pinned 0.10.x — see chronax/models/xlinear/__init__.py).
+# XLinear depends on flax NNX (pinned 0.10.x, see chronax/models/xlinear/__init__.py).
 # Guard like NLinear so an incompatible flax degrades this model to None instead of
 # crashing the entire chronax.models namespace; the pin's informative ImportError is
 # swallowed here, but importing chronax.models.xlinear directly surfaces it.
-# (Distinct from XLSTM below — different model family.)
+# (Distinct from XLSTM below, a different model family.)
 try:
     from .xlinear import XLinear
 except ImportError:
     XLinear = None
-# DLinear depends on flax NNX (pinned 0.10.x — see chronax/models/dlinear/__init__.py).
+# DLinear depends on flax NNX (pinned 0.10.x, see chronax/models/dlinear/__init__.py).
 # Guard like NLinear so an incompatible flax degrades this model to None instead of
 # crashing the entire chronax.models namespace; the pin's informative ImportError is
 # swallowed here, but importing chronax.models.dlinear directly surfaces it.
@@ -109,7 +109,7 @@ try:
 except ImportError:
     DLinear = None
 
-# RMoK depends on flax NNX (pinned 0.10.x — see chronax/models/rmok/__init__.py).
+# RMoK depends on flax NNX (pinned 0.10.x, see chronax/models/rmok/__init__.py).
 # Guard like NLinear so an incompatible flax degrades this model to None instead of
 # crashing the entire chronax.models namespace; the pin's informative ImportError is
 # swallowed here, but importing chronax.models.rmok directly surfaces it.
@@ -258,7 +258,6 @@ __all__ = [
     "AutoMFLES",
     "SimpleExponentialSmoothing",
     "SeasonalExponentialSmoothing",
-    "_seasonal_exponential_smoothing",
     "Holt",
     "HoltWinters",
     "ADIDA",
@@ -295,8 +294,6 @@ __all__ = [
     "SOFTS",
     "DilatedRNN",
     "SOFTSSharp",
-    "TCN",
-    "StemGNN",
     "MLP",
     "HINT",
     "NHITS",
@@ -318,7 +315,7 @@ def __getattr__(name):
     GRU hard-pins flax 0.10.x (see ``chronax/models/gru/__init__.py``); importing it
     eagerly would make the whole ``chronax.models`` namespace fail to import wherever
     flax is unavailable or version-incompatible. Accessing ``chronax.models.GRU`` (or
-    ``from chronax.models import GRU``) triggers the import — and its flax check — only
+    ``from chronax.models import GRU``) triggers the import, and its flax check, only
     when GRU is actually used.
     """
     if name == "GRU":

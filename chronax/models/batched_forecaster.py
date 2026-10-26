@@ -1,36 +1,23 @@
 """
-BatchedForecaster — multi-series wrapper for Chronax models.
+BatchedForecaster: multi-series wrapper for Chronax models.
 
-Fits and forecasts multiple time series with one or more models by looping
-over series sequentially. Each model's internals are JIT-compiled, so the
-sequential loop still outperforms pure-Python frameworks like StatsForecast.
+Fits and forecasts several time series with one or more models by looping
+over the series sequentially; each model's internals are JIT-compiled.
 
 Supported input formats (no hard dependency on any DataFrame library):
-- dict[str, jnp.ndarray]: {series_id: array} — primary/internal format
-- 2D jnp.ndarray or np.ndarray: (n_series, n_timesteps), equal-length only
-- pandas DataFrame: grouped by id_col, sorted by time_col, target in target_col
+
+- ``dict[str, jnp.ndarray]``: ``{series_id: array}``, the internal format
+- 2-D ``jnp.ndarray`` or ``np.ndarray``: ``(n_series, n_timesteps)``,
+  equal-length series only
+- pandas DataFrame: grouped by ``id_col``, sorted by ``time_col``, target in
+  ``target_col``
 - polars DataFrame: same semantics as pandas
 
-All formats are converted internally to dict[str, jnp.ndarray].
+All formats are converted internally to ``dict[str, jnp.ndarray]``.
 
-Instance Attributes:
-1. models: list[BaseForecaster] - Model instances to fit/forecast with
-2. id_col: str - Column name for series identifier (DataFrame input)
-3. time_col: str - Column name for timestamp (DataFrame input)
-4. target_col: str - Column name for target values (DataFrame input)
-5. _aliases: list[str] - Resolved display names (disambiguated if duplicates exist)
-6. _fitted_models: dict[str, list[BaseForecaster]] | None - Per-series fitted
-   model copies, populated by fit(), keyed by series ID
-
-Methods:
-1. fit(data, X) - Fit each model to each series, storing independent state
-2. predict(h, X, level) - Generate h-step forecasts from fitted models
-3. forecast(data, h, X, X_future, level) - Stateless fit+predict (no stored state)
-
-Output Format:
-All prediction methods return dict[str, dict[str, dict]] structured as
-{series_id: {model_alias: prediction_dict}} where prediction_dict contains
-'mean' and optionally 'lo-{level}', 'hi-{level}' keys.
+Every prediction method returns ``{series_id: {model_alias: prediction_dict}}``
+where ``prediction_dict`` holds ``"mean"`` and optionally
+``"lo-{lv}"``/``"hi-{lv}"``.
 """
 
 from __future__ import annotations
@@ -72,13 +59,19 @@ def _coerce_to_dict(
 ) -> dict[str, jnp.ndarray]:
     """Convert supported input formats to dict[str, jnp.ndarray].
 
-    Tries each format in order: dict → 2D array → pandas → polars.
-    Raises TypeError if none match.
+    Tries each format in order: dict, 2-D array, pandas, polars.
+
+    Raises
+    ------
+    ValueError
+        If an array input is not 2-D.
+    TypeError
+        If no supported format matches.
     """
     if isinstance(data, dict):
         return data
 
-    # 2D array — rows are series, columns are timesteps
+    # 2-D array: rows are series, columns are timesteps
     if isinstance(data, (jnp.ndarray, np.ndarray)):
         if data.ndim != 2:
             raise ValueError(
@@ -86,7 +79,7 @@ def _coerce_to_dict(
             )
         return {str(i): jnp.asarray(data[i]) for i in range(data.shape[0])}
 
-    # Lazy pandas check — avoids hard dependency
+    # Lazy pandas import: no hard dependency
     try:
         import pandas as pd
 
@@ -100,7 +93,7 @@ def _coerce_to_dict(
     except ImportError:
         pass
 
-    # Lazy polars check — avoids hard dependency
+    # Lazy polars import: no hard dependency
     try:
         import polars as pl  # type: ignore[import-unresolved]
 
@@ -127,10 +120,27 @@ def _coerce_to_dict(
 # =============================================================================
 
 class BatchedForecaster:
-    """Multi-series wrapper that fits and forecasts with multiple models.
+    """Multi-series wrapper that fits and forecasts with several models.
 
-    Loops over series sequentially, leveraging JIT-compiled model internals
-    for speed. Accepts dict, 2D array, pandas, or polars DataFrame inputs.
+    Loops over the series sequentially; each model's internals are
+    JIT-compiled. Accepts dict, 2-D array, pandas or polars DataFrame input.
+
+    Parameters
+    ----------
+    models : list of BaseForecaster
+        Model instances to fit and forecast with. Duplicate aliases are
+        suffixed ``_1``, ``_2``, ... in the output.
+    id_col : str, default "unique_id"
+        Series identifier column (DataFrame input).
+    time_col : str, default "ds"
+        Timestamp column used for sorting (DataFrame input).
+    target_col : str, default "y"
+        Target column (DataFrame input).
+
+    Raises
+    ------
+    ValueError
+        If ``models`` is empty.
     """
 
     def __init__(
@@ -156,21 +166,29 @@ class BatchedForecaster:
     ) -> BatchedForecaster:
         """Fit each model to each series, storing independent fitted copies.
 
-        Creates a shallow copy (BaseForecaster.new()) of each model per series
-        so that fitted state is independent across series.
+        Creates a shallow copy (``BaseForecaster.new()``) of each model per
+        series so that fitted state is independent across series.
 
         Parameters
         ----------
-        data : dict, 2D array, pandas DataFrame, or polars DataFrame
-            Input time series data in any supported format.
+        data : dict, 2-D array, pandas DataFrame, or polars DataFrame
+            Input time series in any supported format.
         X : dict[str, jnp.ndarray] or None, default None
-            Per-series in-sample exogenous variables, keyed by series ID.
-            Each value should be shape (n_timesteps, n_features). Series
-            without exogenous data can be omitted from the dict.
+            Per-series in-sample exogenous regressors keyed by series ID,
+            each of shape ``(T, F)``. Series without exogenous data can be
+            omitted.
 
         Returns
         -------
-        self
+        BatchedForecaster
+            ``self``.
+
+        Raises
+        ------
+        ValueError
+            If an array input is not 2-D.
+        TypeError
+            If ``data`` is not a supported format.
         """
         series_dict = _coerce_to_dict(
             data, self.id_col, self.time_col, self.target_col
@@ -180,8 +198,8 @@ class BatchedForecaster:
             x_sid = X.get(sid) if X is not None else None
             fitted_for_series = []
             for model in self.models:
-                # shallow copy is safe here — all pre-fit attrs are immutable;
-                # fit() assigns a new model_ dict rather than mutating in place
+                # A shallow copy is safe: pre-fit attributes are immutable and
+                # fit() assigns a new model_ dict rather than mutating in place.
                 model_copy = model.new()
                 model_copy.fit(y, X=x_sid)
                 fitted_for_series.append(model_copy)
@@ -194,22 +212,27 @@ class BatchedForecaster:
         X: dict[str, jnp.ndarray] | None = None,
         level: list[int | float] | None = None,
     ) -> dict[str, dict[str, dict]]:
-        """Generate h-step forecasts from fitted models.
+        """Generate h-step forecasts from the fitted models.
 
         Parameters
         ----------
         h : int
             Forecast horizon.
         X : dict[str, jnp.ndarray] or None, default None
-            Per-series future exogenous variables, keyed by series ID.
-            Each value should be shape (h, n_features).
-        level : list[int | float] | None
-            Confidence levels for prediction intervals (e.g. [80, 95]).
+            Per-series future exogenous regressors keyed by series ID, each
+            of shape ``(h, F)``.
+        level : list of int or float, or None, default None
+            Confidence levels in (0, 100), e.g. ``[80, 95]``.
 
         Returns
         -------
         dict[str, dict[str, dict]]
-            {series_id: {model_alias: prediction_dict}}
+            ``{series_id: {model_alias: prediction_dict}}``.
+
+        Raises
+        ------
+        ValueError
+            If called before :meth:`fit`.
         """
         if self._fitted_models is None:
             raise ValueError("Must call fit() before predict().")
@@ -231,26 +254,35 @@ class BatchedForecaster:
     ) -> dict[str, dict[str, dict]]:
         """Stateless fit+predict for each model on each series.
 
-        Creates a fresh copy of each model per series via new() to prevent
-        cross-series state leakage. Does not store fitted state on self.
+        Creates a fresh copy of each model per series via ``new()`` so no
+        state leaks across series or onto ``self``.
 
         Parameters
         ----------
-        data : dict, 2D array, pandas DataFrame, or polars DataFrame
-            Input time series data in any supported format.
+        data : dict, 2-D array, pandas DataFrame, or polars DataFrame
+            Input time series in any supported format.
         h : int
             Forecast horizon.
         X : dict[str, jnp.ndarray] or None, default None
-            Per-series in-sample exogenous variables, keyed by series ID.
+            Per-series in-sample exogenous regressors keyed by series ID,
+            each of shape ``(T, F)``.
         X_future : dict[str, jnp.ndarray] or None, default None
-            Per-series future exogenous variables, keyed by series ID.
-        level : list[int | float] | None
-            Confidence levels for prediction intervals (e.g. [80, 95]).
+            Per-series future exogenous regressors keyed by series ID, each
+            of shape ``(h, F)``.
+        level : list of int or float, or None, default None
+            Confidence levels in (0, 100), e.g. ``[80, 95]``.
 
         Returns
         -------
         dict[str, dict[str, dict]]
-            {series_id: {model_alias: prediction_dict}}
+            ``{series_id: {model_alias: prediction_dict}}``.
+
+        Raises
+        ------
+        ValueError
+            If an array input is not 2-D.
+        TypeError
+            If ``data`` is not a supported format.
         """
         series_dict = _coerce_to_dict(
             data, self.id_col, self.time_col, self.target_col

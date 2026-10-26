@@ -1,9 +1,9 @@
-"""GRU forecasting model."""
+"""Gated recurrent unit (GRU) forecasting model."""
 import flax
 
 # Sanity check: this model is pinned to flax 0.10.x. NNX is pre-1.0 and the
 # scan / Optimizer / GRUCell APIs have churned across minor versions.
-# Per the Maintenance Status banner in the GRU class docstring, this model is
+# Per the maintenance status banner in the GRU class docstring, this model is
 # shipped as-is; loud failure here beats silent miscompilation on a newer flax.
 if not flax.__version__.startswith("0.10"):
     raise ImportError(

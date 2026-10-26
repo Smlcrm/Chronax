@@ -43,6 +43,62 @@ class Informer(BaseForecaster):
     loop). Future-known exogenous inputs are supported (``uses_exog = True``);
     historical and static exog are not modeled. Point or multi-quantile
     losses; conformal or native quantile intervals. ``float32`` throughout.
+
+    Args:
+        h (int): Forecast horizon the network is trained for.
+        input_size (int): Length ``L`` of the encoder input window. ``-1``
+            (default) resolves to ``3 * h``.
+        decoder_input_size_multiplier (float): Fraction of ``input_size``
+            that forms the decoder start token: ``label_len =
+            ceil(input_size * multiplier)``. Default ``0.5``.
+        hidden_size (int): Model (embedding) width. Default ``128``.
+        n_head (int): Attention heads; must divide ``hidden_size``.
+            Default ``4``.
+        factor (int): ProbSparse sampling factor ``c``: each attention site
+            scores ``c * ceil(ln L)`` queries against ``c * ceil(ln L)``
+            sampled keys. Default ``3``.
+        conv_hidden_size (int): Width of the position-wise feed-forward
+            layers in every encoder and decoder layer. Default ``32``.
+        encoder_layers (int): ProbSparse self-attention layers in the
+            encoder. Default ``2``.
+        decoder_layers (int): Masked self-attention + cross-attention layers
+            in the decoder. Default ``1``.
+        distil (bool): Insert a conv + max-pool distilling layer after each
+            encoder layer except the last, halving the sequence length each
+            time. Default ``True``.
+        dropout (float): Dropout rate on embeddings and layer outputs.
+            Default ``0.05``.
+        activation (str): Feed-forward activation, ``"relu"`` or ``"gelu"``.
+            Default ``"gelu"``.
+        attention_mixing (str): Multi-head flatten convention, ``"nf"``
+            (the neuralforecast layout, default) or ``"official"`` (the
+            paper's per-head alignment). Identical at ``n_head == 1``.
+        max_steps (int): Optimizer steps. Default ``5000``.
+        learning_rate (float): Adam learning rate (constant). Default ``1e-4``.
+        windows_batch_size (int): Training windows per step. Default ``1024``.
+        scaler_type (str | Scaler): Per-window scaler, ``"identity"`` or
+            ``"robust"`` (median / mean absolute deviation), or a ``Scaler``
+            instance. Default ``"identity"``. Resolved at ``fit``.
+        loss (str | callable | MultiQuantileLoss): ``"mae"``, ``"mse"``,
+            ``"huber"``, a callable ``(pred, target) -> scalar``, or a
+            :class:`~chronax.models.informer.informer_losses.MultiQuantileLoss`
+            for native quantile intervals. Default ``"mae"``. Unknown names
+            raise ``ValueError`` at ``fit``.
+        quantile_sort (bool): Sort quantile outputs so they do not cross.
+            Default ``True``.
+        random_seed (int): Seed for parameter init, batch sampling, dropout
+            and ProbSparse key sampling. Default ``1``.
+        alias (str): Display name. Default ``"Informer"``.
+
+    Note:
+        Set ``conformal_params`` to a :class:`~chronax.utils.ConformalIntervals`
+        to enable conformal intervals on a point-loss model. ``model_`` holds
+        the trained network after ``fit``.
+
+    Raises:
+        ValueError: ``attention_mixing`` not ``"nf"``/``"official"``,
+            ``activation`` not ``"relu"``/``"gelu"``, or the resolved
+            ``label_len`` outside ``0 < label_len < input_size``.
     """
 
     uses_exog = True
@@ -122,6 +178,25 @@ class Informer(BaseForecaster):
 
     # ---- fit -----------------------------------------------------------------
     def fit(self, y, X=None, *, futr_exog=None) -> "Informer":
+        """Train a fresh network on ``y`` and store the tail context.
+
+        Args:
+            y (jnp.ndarray): Univariate series, shape ``(T,)`` with
+                ``T >= input_size + 1``.
+            X (None): Historical exog is not modeled; any value raises.
+            futr_exog (jnp.ndarray | None): Future-known exog aligned with
+                ``y``, shape ``(T, F)``. Its horizon values must then be
+                passed to ``predict``.
+
+        Returns:
+            Informer: ``self``, with ``model_`` set.
+
+        Raises:
+            NotImplementedError: ``X`` is not ``None``.
+            ValueError: ``y`` is not 1-D, ``T < input_size + 1``,
+                ``futr_exog`` has a different length than ``y``, or ``loss`` /
+                ``scaler_type`` is an unknown name.
+        """
         if X is not None:
             raise NotImplementedError(
                 "Informer supports future-known exog only; pass futr_exog="
@@ -130,7 +205,7 @@ class Informer(BaseForecaster):
         if y.ndim != 1:
             raise ValueError(f"y must be 1-D; got shape {y.shape}.")
         if y.shape[0] < self.input_size + 1:
-            # NF trains on h-padded partial windows, so one window (T >= L+1) suffices.
+            # neuralforecast trains on h-padded partial windows, so one window (T >= L+1) suffices.
             raise ValueError(
                 f"Series length {y.shape[0]} too short for input_size={self.input_size} "
                 f"(need at least input_size+1)."
@@ -174,6 +249,36 @@ class Informer(BaseForecaster):
         )
 
     def predict(self, h, X=None, *, futr_exog=None, level=None) -> dict:
+        """Forecast the first ``h`` steps of the trained horizon.
+
+        Args:
+            h (int): Steps to return, ``1 <= h <= self.h``.
+            X (None): Ignored.
+            futr_exog (jnp.ndarray | None): Horizon values of the
+                future-known exog, shape ``(self.h, F)``. Required when
+                ``fit`` received ``futr_exog``; ignored otherwise.
+            level (list[int] | None): Confidence levels in (0, 100), e.g.
+                ``[80, 95]``. With a point loss the intervals are conformal
+                (``conformal_params`` required); with a
+                ``MultiQuantileLoss`` they are read from the trained
+                quantiles.
+
+        Returns:
+            dict: ``"mean"`` (shape ``(h,)``; the 0.5-quantile head for a
+            quantile loss) plus ``"lo-{lv}"`` / ``"hi-{lv}"`` (shape ``(h,)``)
+            per level when ``level`` is given.
+
+        Raises:
+            RuntimeError: Called before ``fit``.
+            ValueError: ``h < 1`` or ``h > self.h``; ``futr_exog`` missing
+                or not ``(self.h, F)`` on a model fit with future exog;
+                ``level`` with a point loss while the model was fit with
+                exog, or while ``conformal_params`` is ``None``; ``level``
+                with a quantile loss whose quantiles do not contain
+                ``(100 - lv) / 200`` and ``1 - (100 - lv) / 200``. The
+                conformal path also raises the base-class ``ValueError`` when
+                the series is too short for two cross-validation windows.
+        """
         if self.model_ is None or self._context is None:
             raise RuntimeError("Call fit(y) before predict(h).")
         if h < 1:
@@ -229,9 +334,28 @@ class Informer(BaseForecaster):
     # ---- forecast ------------------------------------------------------------
     def forecast(self, y, h, X=None, X_future=None, *, futr_exog=None,
                  level=None, fitted=False) -> dict:
-        """Stateless fit-then-predict. ``X`` is unsupported (Informer models
-        future-known exog only); ``X_future`` = future-known exog for the horizon
-        ``(h, F)``; ``futr_exog`` = its history ``(T, F)``."""
+        """Stateless fit-then-predict.
+
+        Args:
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            h (int): Steps to return, ``1 <= h <= self.h``.
+            X (None): Historical exog is not modeled; any value raises.
+            X_future (jnp.ndarray | None): Future-known exog for the horizon,
+                shape ``(self.h, F)``; required when ``futr_exog`` is given.
+            futr_exog (jnp.ndarray | None): Future-known exog history aligned
+                with ``y``, shape ``(T, F)``.
+            level (list[int] | None): Confidence levels in (0, 100).
+            fitted (bool): Also return one-step-ahead in-sample predictions.
+
+        Returns:
+            dict: As :meth:`predict`, plus ``"fitted"`` (shape ``(T,)``, the
+            first ``input_size`` entries ``NaN``) when ``fitted=True``.
+
+        Raises:
+            NotImplementedError: ``X`` is not ``None``, or ``fitted=True``
+                on a model fit with exog.
+            ValueError: Any ``fit`` or ``predict`` error.
+        """
         self.fit(y, X=X, futr_exog=futr_exog)
         result = self.predict(h=h, futr_exog=X_future, level=level)
         if fitted:

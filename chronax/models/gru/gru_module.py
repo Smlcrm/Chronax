@@ -1,4 +1,5 @@
-"""Flax NNX modules for the GRU forecaster: encoder, decoder, full network."""
+"""Flax NNX modules for the gated recurrent unit (GRU) forecaster: encoder, decoder,
+full network."""
 from __future__ import annotations
 
 import math
@@ -12,7 +13,7 @@ class _UniformInit:
     """Picklable callable that draws from Uniform(-bound, bound).
 
     Implemented as a class (rather than a closure) so module references to
-    this initializer survive pickle.dumps — NNX `GRUCell`/`Linear` retain
+    this initializer survive pickle.dumps, NNX `GRUCell`/`Linear` retain
     their `kernel_init` etc. as instance attributes, and a `<locals>.init`
     closure would otherwise raise `AttributeError` on serialization.
     """
@@ -31,8 +32,8 @@ class _UniformInit:
 class _OrthogonalInit:
     """Picklable orthogonal initializer (Saxe et al. 2014).
 
-    Returns a (semi-)orthogonal matrix scaled by ``scale``. For RNN/GRU
-    recurrent kernels this stabilises gradients through time relative to
+    Returns a (semi-)orthogonal matrix scaled by ``scale``. For recurrent
+    kernels this stabilises gradients through time relative to
     a uniform init, especially for long input windows.
     """
 
@@ -84,8 +85,8 @@ class GRUEncoder(nnx.Module):
     Input kernel and bias init from Uniform(-1/sqrt(H), 1/sqrt(H)). The
     recurrent kernel uses the initializer selected by ``recurrent_init``
     (``"uniform"`` or ``"orthogonal"``). Flax ``nnx.GRUCell`` fuses input
-    and hidden biases into a single parameter on the input projection —
-    pinned by ``test_gru_encoder_has_single_fused_bias_per_cell``.
+    and hidden biases into a single parameter on the input projection, so
+    each cell carries one bias vector.
     """
 
     def __init__(
@@ -137,7 +138,7 @@ class GRUEncoder(nnx.Module):
 
 
 class MLPDecoder(nnx.Module):
-    """Linear -> ReLU -> Linear. Standard 2-layer MLP head."""
+    """Linear -> ReLU -> Linear. Standard two-layer multilayer perceptron (MLP) head."""
 
     def __init__(
         self,

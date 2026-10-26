@@ -15,9 +15,9 @@ from chronax.models.kan.kan_scaler import Scaler
 def build_windows(y: jnp.ndarray, input_size: int, h: int) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Rolling training windows with neuralforecast-style right-padding.
 
-    Right-pads ``y`` with ``h`` zeros before unfolding (NF ``padder_train =
+    Right-pads ``y`` with ``h`` zeros before unfolding (neuralforecast ``padder_train =
     ConstantPad1d((0, h))``), yielding ``len(y) - input_size`` windows of length
-    ``input_size + h`` — including ~``h`` partial-horizon windows whose context
+    ``input_size + h``, including ~``h`` partial-horizon windows whose context
     reaches the end of the series. Returns ``(windows, mask)`` where ``mask`` is
     1 on real points and 0 on the padded tail, so the loss can drop padded
     horizon steps. The insample (first ``input_size``) of every window is fully
@@ -25,7 +25,7 @@ def build_windows(y: jnp.ndarray, input_size: int, h: int) -> tuple[jnp.ndarray,
     """
     window_size = input_size + h
     n_real = y.shape[0]
-    n = n_real - input_size                              # NF keeps windows with >=1 valid outsample
+    n = n_real - input_size                              # neuralforecast keeps windows with >=1 valid outsample
     if n < 1:
         raise ValueError(f"Series length {n_real} too short for input_size={input_size}, h={h}")
     y_pad = jnp.concatenate([y, jnp.zeros((h,), y.dtype)])

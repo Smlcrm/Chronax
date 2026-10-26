@@ -3,9 +3,13 @@
 Mirrors ``neuralforecast.NeuralForecast(models=[TiDE(...)]).fit(df).predict()``
 with a familiar ``fit(y) -> self`` / ``forecast(y) -> ndarray`` interface.
 
-Training strategy (identical to the NBEATS forecaster):
+Training strategy (the same scheme as the NBEATS forecaster):
+
   - Extract all rolling windows from the input series.
-  - Apply per-window ``RobustScaler`` (median/MAD) inside each JIT step.
+  - Normalise inside each JIT step: per-window mean/std by default,
+    per-window ``RobustScaler`` (median / median absolute deviation, MAD)
+    with ``use_std_scaler=False``, or per-series global mean/std with
+    ``global_scale=True``.
   - Optionally hold out the latest windows for validation + early stopping.
   - Restore the best-validation checkpoint before returning.
 
@@ -14,7 +18,7 @@ supported.  Panel mode trains a single shared model over the union of all
 series, exactly like the upstream NeuralForecast implementation.
 
 Exogenous variables (hist_exog, futr_exog, stat_exog) require the lower-level
-``train_step`` / ``eval_step`` / ``create_batch`` API from this package.
+``train_step`` / ``eval_step`` / ``create_batch`` functions from this package.
 """
 
 from __future__ import annotations
@@ -62,7 +66,8 @@ _STD_EPS: float = 1e-6
 def _make_jit_infer(model: TiDE, scale: bool, use_std_scaler: bool = False) -> Callable:
     """Return a JIT-compiled function ``(params, insample [1,L]) → [1,h]``.
 
-    Fuses scaler + forward pass + inverse-scaler into a single XLA kernel so
+    Fuses scaler + forward pass + inverse-scaler into a single XLA (accelerated
+    linear algebra) kernel so
     warm ``forecast()`` calls are as fast as a plain matrix-multiply chain.
     ``model`` is captured in the closure (Flax modules are frozen dataclasses,
     so JAX can hash them and cache the trace correctly).
@@ -98,7 +103,7 @@ def _as_series_list(y: SeriesLike) -> List[jnp.ndarray]:
     """Normalise ``y`` to a list of 1-D float32 series.
 
     Anything that isn't a ``list``/``tuple`` of series (e.g. a plain
-    ``jax.numpy`` array, as passed by the benchmark harness) is treated as a
+    ``jax.numpy`` array) is treated as a
     single univariate series.
     """
     if not isinstance(y, (list, tuple)):
@@ -136,31 +141,85 @@ def _restore(state: TrainState, saved_params: dict) -> TrainState:
 class TiDEForecaster(BaseForecaster):
     """High-level fit/forecast wrapper for :class:`~chronax.models.tide.model.TiDE`.
 
+    Port of neuralforecast's ``TiDE`` training and inference flow. Trains
+    one shared model over a single series or a panel of series. Point
+    forecasts only: :meth:`predict` refuses ``level`` and :meth:`forecast`
+    returns a bare array rather than the :class:`BaseForecaster` dict, so
+    the base conformal machinery is not available for this model.
+    Exogenous inputs are not accepted by this wrapper; use the lower-level
+    ``train_step`` / ``create_batch`` functions of the package for them.
+
     Args:
-        h: Forecast horizon.
-        input_size: History window length; -1 (default) uses ``3 * h``.
-        hidden_size, decoder_output_dim, temporal_decoder_dim, dropout,
-        layernorm, num_encoder_layers, num_decoder_layers, temporal_width,
-        futr_exog_size, hist_exog_size, stat_exog_size, output_size: forwarded
-        to :class:`TiDEConfig`.
-        max_steps: Total optimiser steps.
-        learning_rate: Adam(W) peak learning rate.
-        batch_size: Windows sampled per training step.
-        random_seed: PRNG seed for parameter init and window sampling.
-        alias: Display name for external reporting.
-        loss: Registered name (``"mae"``, ``"mse"``) from
-            :mod:`chronax.models.tide.loss` or a callable ``(y, y_hat) -> scalar``.
-        scale: Apply per-window ``RobustScaler`` during training and inference.
-            Strongly recommended; matches NeuralForecast's ``scaler_type``.
-        grad_clip: Global gradient-norm clip (0 = disabled).
-        weight_decay: AdamW weight decay (0 = plain Adam).
-        use_lr_schedule: Warmup-cosine LR schedule; False = constant LR.
-        window_sampling: Use all rolling windows (True, recommended) vs only
-            the last window per series (False).
-        val_fraction: Fraction of windows held out for validation (0 = none).
-        val_check_steps: Evaluate validation loss every this many steps.
-        early_stop_patience_steps: Stop when val loss does not improve for
-            this many consecutive checks; -1 = disabled.
+        h (int): Forecast horizon.
+        input_size (int): History window length; ``-1`` (default) uses
+            ``3 * h``.
+        hidden_size (int): Hidden width of the encoder and decoder residual
+            blocks. Default ``512``.
+        decoder_output_dim (int): Per-step output dimension of the dense
+            decoder. Default ``32``.
+        temporal_decoder_dim (int): Hidden size of the temporal decoder
+            block. Default ``128``.
+        dropout (float): Dropout rate (``0`` = disabled). Default ``0.3``.
+        layernorm (bool): Apply LayerNorm after each residual block.
+            Default ``True``.
+        num_encoder_layers (int): Stacked encoder residual blocks. Default
+            ``1``.
+        num_decoder_layers (int): Stacked decoder residual blocks. Default
+            ``1``.
+        temporal_width (int): Projected feature dimension of temporal
+            covariates. Default ``4``.
+        futr_exog_size (int): Number of future exogenous features ``F``.
+            Default ``0``.
+        hist_exog_size (int): Number of historic exogenous features ``X``.
+            Default ``0``.
+        stat_exog_size (int): Number of static exogenous features ``S``.
+            Default ``0``.
+        output_size (int): Outputs per step; ``1`` for point forecasts.
+            Default ``1``.
+        max_steps (int): Total optimiser steps. Default ``1000``.
+        learning_rate (float): Adam or AdamW peak learning rate. Default
+            ``1e-3``.
+        batch_size (int): Windows sampled per training step. Default
+            ``1024``.
+        random_seed (int): PRNG seed for parameter init and window sampling.
+            Default ``0``.
+        alias (str): Display name for external reporting. Default
+            ``"TiDE"``.
+        loss (str | LossFn): Registered name (``"mae"``, ``"mse"``) from
+            :mod:`chronax.models.tide.loss` or a callable
+            ``(y, y_hat) -> scalar``. Default ``"mae"``.
+        scale (bool): Apply the per-window scaler inside the fused inference
+            function. The training step normalises every window regardless
+            of this flag, so ``False`` leaves inference unnormalised while
+            training was normalised. Ignored when ``global_scale=True``.
+            Default ``True``.
+        global_scale (bool): Normalise each series with its own training
+            mean and std, shared by all windows of that series, and apply no
+            per-window scaler; the series statistics are stored and reused
+            by :meth:`forecast`. Default ``False``.
+        use_std_scaler (bool | None): Per-window scaler choice when
+            ``global_scale=False``: ``True`` (default) uses the window
+            mean and std, ``False`` uses the ``RobustScaler`` (median and
+            median absolute deviation, MAD), ``None`` picks mean/std when
+            the longest series has fewer than 1000 points and the
+            ``RobustScaler`` otherwise.
+        grad_clip (float): Global gradient-norm clip (``0`` = disabled).
+            Default ``0.0``.
+        weight_decay (float): AdamW weight decay (``0`` = plain Adam).
+            Default ``0.0``.
+        use_lr_schedule (bool): ``True`` uses a linear-warmup, cosine-decay
+            schedule over ``max_steps`` with warmup ``max_steps // 10``;
+            ``False`` (default) keeps the learning rate constant.
+        window_sampling (bool): Train on all rolling windows (``True``,
+            default) or only the last window of the panel (``False``).
+        val_fraction (float): Fraction of the latest windows held out for
+            validation (``0`` = none). The best validation checkpoint is
+            restored at the end of :meth:`fit`. Default ``0.1``.
+        val_check_steps (int): Evaluate the validation loss every this many
+            steps. Default ``100``.
+        early_stop_patience_steps (int): Stop when the validation loss has
+            not improved for this many consecutive checks; ``-1``
+            (default) disables early stopping.
     """
 
     def __init__(
@@ -268,21 +327,28 @@ class TiDEForecaster(BaseForecaster):
         """Train the model in-place on ``y``.
 
         All rolling windows are extracted from every series long enough to
-        yield at least one window. Per-window ``RobustScaler`` is applied
-        inside the JIT-compiled ``train_step_windows``.
+        yield at least one window. Normalisation runs inside the
+        JIT-compiled training step as selected by ``global_scale`` and
+        ``use_std_scaler``. The fused inference function is built and
+        warmed up at the end of the call.
 
         Args:
-            y: A single 1-D series or a list of 1-D series (panel mode).
-            verbose: Print loss every ``max(1, max_steps // 10)`` steps.
+            y (jnp.ndarray | Sequence[jnp.ndarray]): A single 1-D series of
+                shape ``(T,)`` or a list of 1-D series (panel mode).
+            verbose (bool): Print training and validation loss every
+                ``max(1, max_steps // 10)`` steps. Default ``False``.
 
         Returns:
-            ``self`` (for chaining).
+            TiDEForecaster: ``self``.
+
+        Raises:
+            ValueError: If no series is at least ``input_size + h`` long.
         """
         y_list = _as_series_list(y)
         self._fit_y = y
         cfg = self.config
 
-        # Auto-select scaler: mean/std for short series (<1000 pts), median/MAD otherwise.
+        # use_std_scaler=None: mean/std for series under 1000 points, median/MAD otherwise.
         if self.use_std_scaler is None:
             train_len = max((len(s) for s in y_list), default=0)
             _use_std_scaler = train_len < 1000
@@ -290,10 +356,10 @@ class TiDEForecaster(BaseForecaster):
             _use_std_scaler = self.use_std_scaler
 
         if self.global_scale:
-            # Global per-series StandardScaler — matches NF's scaler_type="standard".
+            # Global per-series StandardScaler (neuralforecast's scaler_type="standard").
             # Fit on the full training series; all windows from that series are
-            # normalised with the SAME statistics, preserving level/trend information
-            # across windows (which per-window centering would erase).
+            # normalised with the same statistics, so level and trend information
+            # survives across windows (per-window centring would erase it).
             self._global_scalers = []
             y_for_windows: List[jnp.ndarray] = []
             for s in y_list:
@@ -418,19 +484,30 @@ class TiDEForecaster(BaseForecaster):
         y: Optional[SeriesLike] = None,
         h: Optional[int] = None,
     ) -> jnp.ndarray:
-        """Produce point forecasts from the last ``input_size`` of each series.
+        """Produce point forecasts from the last ``input_size`` points of each series.
 
-        Per-window ``RobustScaler`` statistics are computed on the last
-        ``input_size`` observations of each series (matching the scaler applied
-        during training) and the forecast is inverse-transformed before return.
+        Uses the fitted parameters; does not re-fit. When ``scale=True`` the
+        context window is normalised with per-window statistics of the
+        context (or with the stored per-series statistics when
+        ``global_scale=True``) and the forecast is inverse-transformed before
+        return. Unlike the :class:`BaseForecaster` contract this returns a
+        bare array, not a dict.
 
         Args:
-            y: Series to forecast for (required).
-            h: Horizon override — must match ``config.h`` if provided.
+            y (jnp.ndarray | Sequence[jnp.ndarray] | None): Series to
+                forecast, shape ``(T,)`` or a list of 1-D series. Required;
+                ``None`` raises because training data is not retained here
+                (:meth:`predict` reuses the series passed to :meth:`fit`).
+            h (int | None): Horizon; must equal ``config.h`` when given.
 
         Returns:
-            ``jnp.ndarray`` of shape ``[h]`` for univariate input or
-            ``[n_series, h]`` for panel input.
+            jnp.ndarray: Shape ``(h,)`` for a single series or
+            ``(n_series, h)`` for panel input.
+
+        Raises:
+            RuntimeError: If called before :meth:`fit`.
+            ValueError: If ``y`` is ``None``, or ``h`` differs from
+                ``config.h``.
         """
         if not self.fitted:
             raise RuntimeError("Call .fit() before .forecast().")
@@ -484,17 +561,24 @@ class TiDEForecaster(BaseForecaster):
     ) -> dict:
         """Forecast from the series passed to :meth:`fit`.
 
-        Satisfies the ``BaseForecaster`` contract: unlike :meth:`forecast`,
-        this does not take ``y`` explicitly — it reuses the series cached at
-        fit time.
+        Unlike :meth:`forecast`, this does not take ``y``; it reuses the
+        series cached at fit time.
 
         Args:
-            h: Forecast horizon. Defaults to ``config.h`` when None.
-            X: Reserved for future exogenous regressors; unused.
-            level: Not yet supported for this model.
+            h (int | None): Forecast horizon; must equal ``config.h`` when
+                given. Defaults to ``config.h``.
+            X (jnp.ndarray | None): Accepted for interface parity; ignored.
+            level (list[int] | None): Not supported; any value raises.
 
         Returns:
-            dict: ``{"mean": jnp.ndarray}``.
+            dict: ``{"mean": jnp.ndarray}`` with ``"mean"`` of shape ``(h,)``
+            for a single series or ``(n_series, h)`` for panel input. No
+            interval keys are ever emitted.
+
+        Raises:
+            RuntimeError: If called before :meth:`fit`.
+            NotImplementedError: If ``level`` is not ``None``.
+            ValueError: If ``h`` differs from ``config.h``.
         """
         if not self.fitted:
             raise RuntimeError("Call .fit() before .predict().")

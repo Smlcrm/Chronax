@@ -39,6 +39,9 @@ def plot_forecast(y: jnp.ndarray, y_hat: jnp.ndarray, y_train: Optional[jnp.ndar
 
     Returns:
         Any: The matplotlib Axes object containing the generated plot.
+
+    Raises:
+        ImportError: If matplotlib or seaborn is not installed.
     """
     _require_plotting()
     if ax is None:
@@ -74,6 +77,9 @@ def plot_forecast_intervals(y: jnp.ndarray, y_hat: jnp.ndarray, lower: jnp.ndarr
 
     Returns:
         Any: The matplotlib Axes object containing the generated plot.
+
+    Raises:
+        ImportError: If matplotlib or seaborn is not installed.
     """
     _require_plotting()
     if ax is None:
@@ -104,6 +110,9 @@ def plot_forecast_distribution(y: jnp.ndarray, y_samples: jnp.ndarray, ax: Optio
 
     Returns:
         Any: The matplotlib Axes object containing the generated fan chart.
+
+    Raises:
+        ImportError: If matplotlib or seaborn is not installed.
     """
     _require_plotting()
     if ax is None:
@@ -130,7 +139,7 @@ def plot_forecast_distribution(y: jnp.ndarray, y_samples: jnp.ndarray, ax: Optio
 # Plot the forecast pdf
 def plot_forecast_pdf(y_samples: jnp.ndarray, horizon_idx: int = -1, bins: int = 30, ax: Optional[Any] = None) -> Any:
     """
-    Plots the Probability Density Function (PDF) of the forecast samples at a specific horizon step.
+    Plots the probability density function (PDF) of the forecast samples at a specific horizon step.
 
     Args:
         y_samples (jnp.ndarray): A 2D array of simulated forecast samples.
@@ -140,6 +149,9 @@ def plot_forecast_pdf(y_samples: jnp.ndarray, horizon_idx: int = -1, bins: int =
 
     Returns:
         Any: The matplotlib Axes object containing the plotted PDF.
+
+    Raises:
+        ImportError: If matplotlib or seaborn is not installed.
     """
     _require_plotting()
     if ax is None:
@@ -158,12 +170,15 @@ def plot_chained_window(y: jnp.ndarray, y_preds: List[jnp.ndarray], horizon: int
 
     Args:
         y (jnp.ndarray): The actual continuous time series values.
-        y_preds (List[jnp.ndarray]): A list of forecasted arrays, each representing a CV window.
-        horizon (int, optional): The forecast horizon length (currently unused in logic, reserved for future functionality). Defaults to 1.
+        y_preds (List[jnp.ndarray]): A list of forecasted arrays, each representing a cross-validation window.
+        horizon (int, optional): The forecast horizon length. Accepted for API compatibility; unused. Defaults to 1.
         ax (Optional[Any], optional): A matplotlib Axes object. Defaults to None.
 
     Returns:
         Any: The matplotlib Axes object containing the chained cross-validation plot.
+
+    Raises:
+        ImportError: If matplotlib or seaborn is not installed.
     """
     _require_plotting()
     if ax is None:
@@ -185,10 +200,10 @@ def plot_chained_window(y: jnp.ndarray, y_preds: List[jnp.ndarray], horizon: int
     ax.legend()
     return ax
 
-# Plot the Autocorrelation Function (ACF) Plot
+# Autocorrelation function (ACF) and its plot
 def acf(x: jnp.ndarray, nlags: int = 40) -> jnp.ndarray:
     """
-    Computes the Autocorrelation Function (ACF) array for a given time series.
+    Computes the autocorrelation function (ACF) array for a given time series.
 
     Args:
         x (jnp.ndarray): The input time series data.
@@ -205,7 +220,7 @@ def acf(x: jnp.ndarray, nlags: int = 40) -> jnp.ndarray:
 
 def plot_acf(x: jnp.ndarray, nlags: int = 40) -> None:
     """
-    Computes and plots the Autocorrelation Function (ACF) along with 95% statistical significance bounds.
+    Computes and plots the autocorrelation function (ACF) along with 95% statistical significance bounds.
 
     Args:
         x (jnp.ndarray): The input time series data.
@@ -213,6 +228,9 @@ def plot_acf(x: jnp.ndarray, nlags: int = 40) -> None:
 
     Returns:
         None: Displays the plot via plt.show().
+
+    Raises:
+        ImportError: If matplotlib or seaborn is not installed.
     """
     _require_plotting()
     acf_vals = acf(x, nlags)

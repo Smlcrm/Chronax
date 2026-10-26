@@ -6,16 +6,16 @@ bottom rows, which must form an identity block): ``y_total = S @ y_bottom``.
 HINT trains ONE probabilistic base network on the windows of every series in
 the hierarchy (cross-learning with per-window scale decoupling), draws
 Monte-Carlo sample paths from each series' predictive mixture, and restores the
-aggregation constraints by projecting the sample tensor with ``SP = S @ P`` —
+aggregation constraints by projecting the sample tensor with ``SP = S @ P``,
 bootstrap sample reconciliation. Coherence is a per-sample (joint) property:
 the reconciled mean is exactly coherent, while marginal quantiles of coherent
 samples do not sum across the hierarchy in general.
 
 References:
-    Olivares et al., "Hierarchically Coherent Multivariate Mixture Networks" —
+    Olivares et al., "Hierarchically Coherent Multivariate Mixture Networks",
     https://arxiv.org/abs/2305.07089
     Olivares et al., "Probabilistic Hierarchical Forecasting with Deep Poisson
-    Mixtures" — https://arxiv.org/abs/2110.13179
+    Mixtures": https://arxiv.org/abs/2110.13179
 """
 from __future__ import annotations
 
@@ -57,7 +57,8 @@ def _mintrace_P(S: np.ndarray, W: np.ndarray) -> np.ndarray:
 
 
 def get_mintrace_ols_P(S: np.ndarray) -> np.ndarray:
-    """MinTrace reconciliation matrix with identity error covariance (OLS).
+    """MinTrace reconciliation matrix with identity error covariance (ordinary
+    least squares, OLS).
 
     Reference: Wickramasuriya, Athanasopoulos & Hyndman (2019), "Optimal
     forecast reconciliation for hierarchical and grouped time series through
@@ -89,8 +90,9 @@ _RECONCILIATIONS = {
 class HINT(BaseForecaster):
     """HINT: Hierarchical Mixture Network (flax.nnx port of neuralforecast.HINT).
 
-    Wraps a probabilistic base forecaster (an :class:`~chronax.models.mlp.MLP`
-    with a distribution loss such as :class:`~chronax.models.mlp.GMM`) into a
+    Wraps a probabilistic base forecaster (a multilayer perceptron,
+    :class:`~chronax.models.mlp.MLP`, with a distribution loss such as the
+    Gaussian mixture model :class:`~chronax.models.mlp.GMM`) into a
     coherent hierarchical forecaster. ``fit`` expects ``y`` of shape
     ``(T, n_total)`` with columns ordered exactly as the rows of ``S``
     (aggregates first, bottom identity block last); a 1-D series is accepted
@@ -105,17 +107,17 @@ class HINT(BaseForecaster):
 
     Conformal intervals follow the base-class contract on 1-D fits only; a
     hierarchical fit's intervals are the native reconciled-sample quantiles.
-    ``predict(level=...)`` always emits those native quantiles — per-window
+    ``predict(level=...)`` always emits those native quantiles, per-window
     distributional uncertainty, which does not widen for out-of-sample
     distribution shift. HINT adds value only when ``S`` encodes real
     aggregation: for data with no hierarchy (a single series, or ``S = I``
-    with nothing to reconcile) prefer the base model directly —
+    with nothing to reconcile) prefer the base model directly,
     :class:`~chronax.models.mlp.MLP` with a point loss supports calibrated
     conformal intervals via ``conformal_params``. On a 1-D HINT fit,
     calibrated intervals can be layered manually::
 
         hint.conformal_params = ConformalIntervals(h=h, n_windows=4)
-        cs = hint.conformity_scores(y)          # CV residuals, (n_windows, h)
+        cs = hint.conformity_scores(y)          # walk-forward residuals, (n_windows, h)
         fcst = hint.fit(y).predict(h=h)
         fcst = BaseForecaster.add_confidence_intervals(
             fcst, cs, level=[80], method="conformal_distribution")
@@ -125,6 +127,31 @@ class HINT(BaseForecaster):
     hierarchy series through the base model's historical-exog path. The passed
     ``model`` is used purely as a configuration carrier and is never fitted or
     mutated.
+
+    Args:
+        h (int): Forecast horizon; must equal ``model.h``.
+        S (array-like): Summing matrix, shape ``(n_total, n_bottom)`` with
+            ``n_total >= n_bottom >= 1``; its last ``n_bottom`` rows must be
+            the identity.
+        model (MLP): Base forecaster, an :class:`~chronax.models.mlp.MLP`
+            whose ``loss`` is a distribution loss (``GMM``). Used as a
+            configuration carrier only.
+        reconciliation (str): ``"BottomUp"``, ``"MinTraceOLS"`` (ordinary
+            least squares weights), ``"MinTraceWLS"`` (structural weights)
+            or ``"Identity"`` (no reconciliation). Default ``"BottomUp"``.
+        alias (str): Display name. Default ``"HINT"``.
+
+    Note:
+        ``SP`` holds the reconciliation projection ``S @ P`` of shape
+        ``(n_total, n_total)``, or ``None`` for ``"Identity"``.
+        ``conformal_params`` is needed only by :meth:`conformity_scores` on a
+        1-D fit. ``model_`` holds the trained base network after ``fit``.
+
+    Raises:
+        ValueError: ``model.h != h``; ``model`` is not an ``MLP``;
+            ``model.loss`` is not a distribution loss; unknown
+            ``reconciliation``; ``S`` not 2-D with ``n_total >= n_bottom >= 1``;
+            or the last ``n_bottom`` rows of ``S`` are not the identity.
     """
 
     uses_exog = True
@@ -172,6 +199,25 @@ class HINT(BaseForecaster):
 
     # ---- fit -----------------------------------------------------------------
     def fit(self, y, X=None) -> "HINT":
+        """Train one base network on the pooled windows of every hierarchy node.
+
+        Args:
+            y (jnp.ndarray): Hierarchy matrix, shape ``(T, n_total)`` with
+                columns ordered as the rows of ``S``; shape ``(T,)`` is
+                accepted only when ``S`` is ``1 x 1``. Needs
+                ``T >= model.input_size + 1``.
+            X (jnp.ndarray | None): Historical exog shared by every node,
+                shape ``(T, F)``.
+
+        Returns:
+            HINT: ``self``, with ``model_`` set.
+
+        Raises:
+            ValueError: ``y`` is 1-D while ``S`` has more than one row; a 2-D
+                ``y`` whose column count differs from ``S``'s row count; ``y``
+                of rank 3 or more; or any ``MLP.fit`` error (series too
+                short, ``X`` length mismatch).
+        """
         # X = historical exog (T, F): a shared-calendar covariate broadcast to
         # every hierarchy series by the base model's 2-D hist path.
         y = jnp.asarray(y, dtype=jnp.float32)
@@ -214,6 +260,27 @@ class HINT(BaseForecaster):
         return arr[0] if self._train_rank == 1 else arr.T
 
     def predict(self, h, X=None, level=None) -> dict:
+        """Reconciled forecast of the first ``h`` steps of the trained horizon.
+
+        Args:
+            h (int): Steps to return, ``1 <= h <= self.h``.
+            X (None): Must be ``None``; historical exog is read from the
+                ``fit`` call.
+            level (list[int] | None): Confidence levels in (0, 100), e.g.
+                ``[80, 95]``. Intervals are quantiles of the reconciled
+                Monte Carlo sample paths (seeded with ``model.random_seed``);
+                ``conformal_params`` is not used here.
+
+        Returns:
+            dict: ``"mean"`` (the reconciled analytic mixture mean) plus
+            ``"lo-{lv}"`` / ``"hi-{lv}"`` per level when ``level`` is given.
+            Each array is ``(h,)`` after a 1-D fit and ``(h, n_total)``
+            after a 2-D fit.
+
+        Raises:
+            RuntimeError: Called before ``fit``.
+            ValueError: ``X`` is not ``None``; ``h < 1``; or ``h > self.h``.
+        """
         if self.model_ is None or self._contexts is None:
             raise RuntimeError("Call fit(y) before predict(h).")
         if X is not None:
@@ -251,9 +318,27 @@ class HINT(BaseForecaster):
 
     # ---- forecast ------------------------------------------------------------
     def forecast(self, y, h, X=None, X_future=None, level=None, fitted=False) -> dict:
-        """Stateless fit-then-predict on the hierarchy matrix ``y``. ``X`` =
-        historical exog ``(T, F)`` (shared calendar); HINT is historical-only, so
-        ``X_future`` is unsupported."""
+        """Stateless fit-then-predict on the hierarchy matrix ``y``.
+
+        Args:
+            y (jnp.ndarray): Hierarchy matrix, shape ``(T, n_total)`` (or
+                ``(T,)`` with a ``1 x 1`` ``S``).
+            h (int): Steps to return, ``1 <= h <= self.h``.
+            X (jnp.ndarray | None): Historical exog shared by every node,
+                shape ``(T, F)``.
+            X_future (None): Must be ``None``; HINT has no future-known
+                pathway.
+            level (list[int] | None): Confidence levels in (0, 100).
+            fitted (bool): Must be ``False``.
+
+        Returns:
+            dict: As :meth:`predict`.
+
+        Raises:
+            ValueError: ``X_future`` is not ``None``, or any ``fit`` /
+                ``predict`` error.
+            NotImplementedError: ``fitted=True``.
+        """
         if X_future is not None:
             raise ValueError("HINT models historical exog only (no future-known pathway); pass X=, not X_future=.")
         if fitted:
@@ -263,11 +348,31 @@ class HINT(BaseForecaster):
 
     # ---- conformal -----------------------------------------------------------
     def conformity_scores(self, y, X=None) -> jnp.ndarray:
+        """Walk-forward conformity scores on a 1-D fit (see the base class).
+
+        HINT's ``predict`` emits native intervals, so this is the only
+        conformal surface; combine the result with
+        ``BaseForecaster.add_confidence_intervals`` by hand.
+
+        Args:
+            y (jnp.ndarray): Univariate series, shape ``(T,)`` (``S`` must be
+                ``1 x 1``).
+            X (None): Historical exog is refused here.
+
+        Returns:
+            jnp.ndarray: Signed residuals, shape ``(n_windows, h)``.
+
+        Raises:
+            ValueError: ``X`` is not ``None``; ``y`` is not 1-D;
+                ``conformal_params`` is ``None``; or the series is too short
+                for two cross-validation windows.
+        """
         y = jnp.asarray(y)
         if X is not None:
             # Historical exog uses the native reconciled-sample intervals, not
-            # conformal; guarding here keeps a passed X out of the base CV vmap,
-            # where the refusal could not raise under trace.
+            # conformal; guarding here keeps a passed X out of the base
+            # cross-validation vmap, where the refusal could not raise under
+            # trace.
             raise ValueError(
                 "Conformal intervals are not supported with historical exog; use the native "
                 "reconciled-sample intervals (predict(level=...) without conformal_params), or omit X."
@@ -278,10 +383,11 @@ class HINT(BaseForecaster):
                 "fit's intervals are the native reconciled-sample quantiles "
                 "(predict(level=...) without conformal_params)."
             )
-        # Run the walk-forward on a discarded clone: the CV vmap re-fits per
-        # window, and those fit() writes would leave escaped tracers on this
-        # estimator. This method is HINT's direct conformal surface (predict
-        # emits native intervals), so the clone lives here, not in a caller.
+        # Run the walk-forward on a discarded clone: the cross-validation vmap
+        # re-fits per window, and those fit() writes would leave escaped
+        # tracers on this estimator. This method is HINT's direct conformal
+        # surface (predict emits native intervals), so the clone lives here,
+        # not in a caller.
         return BaseForecaster.conformity_scores(self.new(), y, X)
 
     # ---- pickle --------------------------------------------------------------

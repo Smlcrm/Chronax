@@ -1,4 +1,4 @@
-"""Chronax TSMixer — JAX/Flax port of Nixtla NeuralForecast's TSMixer model."""
+"""Chronax TSMixer: JAX/Flax port of Nixtla neuralforecast's TSMixer model."""
 
 from chronax.models.tsmixer.data import create_windows, make_batch
 from chronax.models.tsmixer.forecaster import TSMixerForecaster

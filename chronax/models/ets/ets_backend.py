@@ -1,22 +1,25 @@
-"""ETS core simulation and optax-based parameter optimization in JAX.
+"""Exponential smoothing (ETS) core simulation and optax-based parameter optimization in JAX.
 
-This module provides the low-level building blocks for Exponential Smoothing
-(ETS) models.  It is consumed by ``ets_functions.py`` (model selection) and
-``auto_ets.py`` (public API).
+This module provides the low-level building blocks for ETS models.  It is
+consumed by ``ets_functions.py`` (model selection) and ``auto_ets.py`` (the
+public application programming interface, API).
 
 Key components
 --------------
-* **State primitives** — :func:`update` (one-step ETS recursion) and
+* **State primitives**: :func:`update` (one-step ETS recursion) and
   :func:`forecast` (multi-step ahead prediction from a given state).
-* **Rollout helpers** — :func:`calc_full` and :func:`calc` iterate through
-  an entire series, producing residuals, AMSE, and a likelihood-style scalar.
-* **Optimizer** — :func:`optimize_bfgs_smoothing` runs a two-phase strategy:
+* **Rollout helpers**: :func:`calc_full`, :func:`calc`,
+  :func:`_calc_roll_nohist` and :func:`_calc_roll_lik` iterate through an
+  entire series, producing residuals, the average mean squared error (AMSE),
+  and a likelihood-style scalar.
+* **Optimizer**: :func:`optimize_bfgs_smoothing` runs a two-phase strategy:
 
-  - *Stage 1*: Adam warm-up (first-order, ~15–30 steps in a Python loop).
-  - *Stage 2*: L-BFGS refinement (second-order, 30 steps via ``lax.scan``
-    compiled into a single XLA kernel).
+  - *Stage 1*: Adam warm-up, a fixed-length ``lax.scan``.
+  - *Stage 2*: limited-memory Broyden-Fletcher-Goldfarb-Shanno (L-BFGS)
+    refinement driven by ``adaptive_iterate``, a ``lax.while_loop`` that
+    stops when the loss plateaus, capped at ``_LBFGS_STEPS``.
 
-Only ``optax`` is used for optimization — no ``jaxopt`` or ``scipy``
+Only ``optax`` is used for optimization; there is no ``jaxopt`` or ``scipy``
 dependency.
 """
 from __future__ import annotations
@@ -36,7 +39,7 @@ from chronax.utils import adaptive_iterate  # convergence-based step runner
 
 
 def _init_jax_compilation_cache() -> None:
-    """Set up a local on-disk XLA compilation cache to avoid redundant recompiles."""
+    """Set up a local on-disk accelerated linear algebra (XLA) compilation cache to avoid redundant recompiles."""
     cache_dir = os.environ.get("JAX_COMPILATION_CACHE_DIR")
     if not cache_dir:
         cache_dir = os.path.join(os.path.dirname(__file__), ".jax_cache")
@@ -111,7 +114,7 @@ class OptimResult(NamedTuple):
     Attributes
     ----------
     success : jnp.ndarray
-        Traced boolean scalar — whether the best parameters and loss are finite.
+        Traced boolean scalar: whether the best parameters and loss are finite.
         (A jnp value, not a Python bool: the optimizer must stay traceable
         under vmap, so no concretizing casts are allowed here.)
     status : int
@@ -158,7 +161,7 @@ def _get_objective_closure(
     JAX only traces / compiles the objective once per unique combination of
     structural flags (error, trend, season, which parameters are free, etc.).
     The returned callable accepts *data*-level arrays and produces a scalar
-    loss — ready for ``jax.value_and_grad``.
+    loss, ready for ``jax.value_and_grad``.
 
     Parameters
     ----------
@@ -185,7 +188,7 @@ def _get_objective_closure(
     -------
     Callable
         ``_obj(p, y, init_state, n_obs, alpha, beta, gamma, phi, lower,
-        upper) -> jnp.float64`` — the scalar objective.
+        upper) -> jnp.float64``, the scalar objective.
     """
     # Inner callable receives data-level arrays; all structure config is baked in.
     def _obj(
@@ -232,7 +235,7 @@ def _get_objective_closure(
 
 
 # ---------------------------------------------------------------------------
-# Integer aliases for Component values — used inside ``lax.select`` branches
+# Integer aliases for Component values, used inside ``lax.select`` branches
 # where Python-level enum comparison is not possible.
 # ---------------------------------------------------------------------------
 _COMP_NOTHING: int = int(Component.Nothing.value)
@@ -438,7 +441,7 @@ def update(
 
 
 # ---------------------------
-# h-step forecast (NumPy logic) — phistar fixed
+# h-step forecast (NumPy logic); phistar fixed
 # ---------------------------
 @partial(jax.jit, static_argnames=("trend", "season", "m"))
 def forecast(
@@ -512,7 +515,7 @@ def forecast(
 
 
 # ---------------------------
-# Likelihood + error rollout (NumPy logic) — scan/fori_loop, dynamic slices fixed
+# Likelihood + error rollout (NumPy logic); scan/fori_loop, dynamic slices fixed
 # ---------------------------
 @partial(jax.jit, static_argnames=("error", "trend", "season", "n_mse", "m"))
 def _calc_roll(
@@ -629,8 +632,8 @@ def _calc_roll(
             denom_slice = denom[:n_mse_eff]
             a_slice = a_local[:n_mse_eff]
             denom_new = denom_slice + cond.astype(jnp.float64)
-            # SF etscalc: increment the count, then a_mse = (a_mse*(new-1)
-            # + e^2)/new — weight the OLD mean by the OLD count and divide
+            # statsforecast etscalc: increment the count, then a_mse = (a_mse*(new-1)
+            # + e^2)/new: weight the OLD mean by the OLD count and divide
             # by the incremented count; inactive horizons stay untouched.
             a_num = a_slice * denom_slice + tmp * tmp
             a_new = jnp.where(cond, a_num / jnp.maximum(denom_new, 1.0), a_slice)
@@ -733,7 +736,7 @@ def _calc_roll_nohist(
     lik : jnp.float64
         Likelihood-style objective value.
     last_state : jnp.ndarray
-        Final packed state row (length ``n_states``) — the one row the
+        Final packed state row (length ``n_states``), the one row the
         post-fit consumers actually read.
     """
     n = y.shape[0]
@@ -807,8 +810,8 @@ def _calc_roll_nohist(
                 denom_slice = denom[:n_mse_eff]
                 a_slice = a_local[:n_mse_eff]
                 denom_new = denom_slice + cond.astype(jnp.float64)
-                # SF etscalc: increment the count, then a_mse = (a_mse*(new-1)
-                # + e^2)/new — weight the OLD mean by the OLD count and divide
+                # statsforecast etscalc: increment the count, then a_mse = (a_mse*(new-1)
+                # + e^2)/new: weight the OLD mean by the OLD count and divide
                 # by the incremented count; inactive horizons stay untouched.
                 a_num = a_slice * denom_slice + tmp * tmp
                 a_new = jnp.where(cond, a_num / jnp.maximum(denom_new, 1.0), a_slice)
@@ -857,7 +860,7 @@ def _calc_roll_nohist(
     lik = jnp.where(error == Component.Multiplicative, base + 2.0 * lik2, base)
 
     # Final state snapshot: the post-fit rollout consumers (pegelsresid_C ->
-    # forecast seeding / native intervals / the stacked CV refit) only ever read the
+    # forecast seeding / native intervals / the stacked cross-validation (CV) refit) only ever read the
     # LAST state row, so materializing an (n+1)-row history via a per-step scatter
     # would be dead weight. Packing the final carry here costs one row.
     last_state = _pack_state_row(
@@ -877,14 +880,14 @@ def _make_step_core(
     """Scalar per-observation core of the likelihood rollout.
 
     Returns ``core(L, B, Sm, y_i, alpha, beta, gamma, phi)`` computing one
-    observation's forecast/error terms plus the state update — the exact
+    observation's forecast/error terms plus the state update: the exact
     expressions of ``_calc_roll_lik``'s step, but taking the ONLY seasonal
     entry the math reads (``Sm = old_s[m-1]``) as a scalar. Valid because the
     ETS recurrence's nonlinear math never reads ``old_s[0:m-1]``: ``update()``
     consumes ``old_s[m-1]`` for ``p``/``s0'`` and entries ``0..m-2`` only via the
     pure shift copy; the one-step forecast reads ``s[m-1]``. The state update is
     delegated to the SHARED :func:`update` on a synthesized seasonal vector
-    ``zeros(m).at[m-1].set(Sm)`` — when season is active, ``update`` overwrites
+    ``zeros(m).at[m-1].set(Sm)``; when season is active, ``update`` overwrites
     all ``m`` output entries, so the dummy zeros cannot leak; ``l'``, ``b'``,
     ``s0'`` are bit-identical to the full-vector call.
 
@@ -909,7 +912,7 @@ def _make_step_core(
     ) -> tuple:
         one = jnp.asarray(1.0, jnp.float64)
         # forecast()'s lane 0 (k=1), expression-for-expression (see
-        # _calc_roll_lik._forecast1, kept verbatim for the unrouted branch).
+        # _calc_roll_lik._forecast1, which the unrouted branch uses).
         if trend == Component.Nothing:
             base = L
         else:
@@ -943,8 +946,8 @@ def _make_step_core(
             s_dummy = jnp.zeros((m_eff,), dtype=jnp.float64).at[m_eff - 1].set(Sm)
         else:
             # season-N: update() never reads old_s and applies no seasonal
-            # writes — skip the scatter (it was the only one in the m=1
-            # backward body and a fusion hazard there).
+            # writes, so no scatter is needed (a scatter here would be a
+            # fusion hazard in the backward body).
             s_dummy = jnp.zeros((m_eff,), dtype=jnp.float64)
         l_new, b_new, s_new = update(
             s_dummy, L, B, L, B, s_dummy, m_eff,
@@ -968,25 +971,24 @@ def _make_step_partials(
     season: Component,
     clip_multiplicative_errors: bool,
 ) -> Callable[..., tuple]:
-    """Analytic per-step VJP of :func:`_make_step_core`'s math (v2 adjoint).
+    """Analytic per-step vector-Jacobian product (VJP) of :func:`_make_step_core`'s math.
 
     Returns ``partials(L, B, Sm, y_i, alpha, beta, gamma, phi, ct_l, ct_b,
-    ct_s0, ct_e, ct_lg) -> (L̄, B̄, S̄m, ȳ, ᾱ, β̄, γ̄, φ̄)`` — the hand-written
+    ct_s0, ct_e, ct_lg) -> (L̄, B̄, S̄m, ȳ, ᾱ, β̄, γ̄, φ̄)``, the hand-written
     transpose of one observation's forecast/error/update chain, live path
-    only (the ``jax.vjp``-of-core v1 measured ~1.0x the checkpointed AD it
-    replaced on m=1 M-error cells: same recompute + dead error-path
-    transposes + select/scatter machinery; this straight-line form is what
-    fuses). For additive error ``ct_e`` is the CONSTANT lik-cotangent and the
-    ``2*ei`` factor is applied internally; for multiplicative error ``ct_e``
-    is the per-step ``eis`` cotangent and ``ct_lg`` the ``lgs`` one.
+    only. The straight-line form fuses well; a ``jax.vjp`` of the core would
+    recompute the primal and transpose the dead error-path branches and the
+    select/scatter machinery as well. For additive error ``ct_e`` is the
+    CONSTANT lik-cotangent and the ``2*ei`` factor is applied internally; for
+    multiplicative error ``ct_e`` is the per-step ``eis`` cotangent and
+    ``ct_lg`` the ``lgs`` one.
 
-    Derivative discipline (AD-parity, NaN semantics included): every forward
-    ``where(c, f, g)`` transposes as gate-the-cotangent (``where(c, ct, 0)``
-    into ``f``, ``where(c, 0, ct)`` into ``g``) times the RAW un-protected
-    partial expressions; ``maximum``/``clip`` boundaries use the 3-way
-    select with 0.5 at exact ties (JAX's convention). Verified against AD of
-    the identical forward by ``autoets_adjoint_oracle.py`` (all routed forms
-    x param points x padded windows, NaN-aware).
+    Derivative discipline (parity with automatic differentiation (AD), NaN
+    semantics included): every forward ``where(c, f, g)`` transposes as
+    gate-the-cotangent (``where(c, ct, 0)`` into ``f``, ``where(c, 0, ct)``
+    into ``g``) times the RAW un-protected partial expressions;
+    ``maximum``/``clip`` boundaries use the 3-way select with 0.5 at exact
+    ties (JAX's convention).
     """
     has_season = season != Component.Nothing
     is_mul_error = error == Component.Multiplicative
@@ -998,7 +1000,7 @@ def _make_step_partials(
         ct_L = zero; ct_B = zero; ct_Sm = zero; ct_y = zero
         ct_al = zero; ct_be = zero; ct_ga = zero; ct_ph = zero
 
-        # ---- forward intermediates (live path only, verbatim expressions) ----
+        # ---- forward intermediates (live path only, same expressions as the forward) ----
         if trend == Component.Nothing:
             base_t = L
         else:
@@ -1247,38 +1249,35 @@ def _get_roll_scan_custom(
 ) -> Callable[..., Any]:
     """Custom-adjoint likelihood-rollout scan for one static ETS config.
 
-    Returns ``roll(l0, b0, s0, y, n_eff_f, alpha, beta, gamma, phi)`` — the
+    Returns ``roll(l0, b0, s0, y, n_eff_f, alpha, beta, gamma, phi)``, the
     scan section of :func:`_calc_roll_lik` wrapped in ``jax.custom_vjp`` with a
     hand-written reverse-scan backward. Routed for
     multiplicative-error forms (all trend x season, output ``(eis, lgs)``
     per-step arrays) and additive-error SEASONAL forms (output the in-carry
-    ``lik`` scalar, preserving today's bit-exact summation order); the
+    ``lik`` scalar, preserving the forward's summation order); the
     additive non-seasonal branch stays on plain AD in the caller.
 
-    Forward: today's step math verbatim (via :func:`_make_step_core` + the
-    real seasonal shift + ``jnp.where`` masking), additionally emitting the
-    PRE-update states ``(old_l, old_b, old_s[m-1])`` per step — the 3-scalar
-    trajectory the backward reads (no ``(n, m)`` storage; the seasonal shift
-    is linear so its adjoint needs no values). ``jax.checkpoint`` is gone from
-    routed branches: nothing differentiates through this forward anymore.
+    Forward: the step math of :func:`_make_step_core` plus the real seasonal
+    shift and ``jnp.where`` masking, additionally emitting the PRE-update
+    states ``(old_l, old_b, old_s[m-1])`` per step, the 3-scalar trajectory
+    the backward reads (no ``(n, m)`` storage; the seasonal shift is linear so
+    its adjoint needs no values). No ``jax.checkpoint`` is applied: nothing
+    differentiates through this forward.
 
     Backward: ONE reverse ``lax.scan`` carrying ``(l̄, b̄, s̄, ᾱ, β̄, γ̄, φ̄)``;
     per step the local input cotangents come from ``jax.vjp`` of the shared
-    core at the saved states (traced once at scan-trace time — straight-line
+    core at the saved states (traced once at scan-trace time: straight-line
     primal-recompute + transpose ops in the body), and the structural adjoints
     are wired by hand: masking ``z̄_i = J^T(a-gated z̄_{i+1}) + where(a, 0,
     z̄_{i+1})`` (AD's exact select-transpose form), seasonal-shift cotangent
     left-shift with the core's Sm-cotangent entering slot ``m-1``, parameter
-    accumulation in-carry, ``ȳ`` emitted as ys. The masking and shift adjoints are
-    verified against AD to ~4e-15 relative on M-error forms and bitwise on A-error
-    forms, including padded windows and the
-    ``jit∘vmap∘while∘value_and_grad`` composition.
+    accumulation in-carry, ``ȳ`` emitted as ys.
 
     ``n_eff`` rides as an f64 scalar (comparisons ``arange(n) < n_eff_f``
     inside) so the backward returns an ordinary zero cotangent for it instead
-    of int/float0 plumbing. Note the production CV path feeds a STATIC n_obs
-    (edge-filled windows; shape-derived int in ets_functions.py:~1135) — the
-    runtime mask is kept because it is strictly more general and free.
+    of int/float0 plumbing. The production CV path feeds a STATIC n_obs
+    (edge-filled windows, a shape-derived int); the runtime mask is kept
+    because it is strictly more general and free.
 
     Cache key = config + shapes only (``n = y.shape[0]``), per the repo's
     static-args-from-config rule; the cached identity also keeps repeat traces
@@ -1418,10 +1417,9 @@ def _get_roll_scan_custom(
         )
 
     roll.defvjp(roll_fwd, roll_bwd)
-    # Test hooks: the same forward WITHOUT the custom vjp (adjoint oracle
-    # compares the hand backward against plain AD of the identical forward —
-    # benchmarks/scripts/speed_probes/autoets_adjoint_oracle.py) and the raw
-    # backward (standalone timing/decomposition probes).
+    # Exposed for tests: the same forward WITHOUT the custom vjp (so plain AD
+    # of the identical forward can be compared against the hand backward) and
+    # the raw backward.
     roll._fwd_impl = _fwd_impl
     roll._bwd = roll_bwd
     return roll
@@ -1444,24 +1442,20 @@ def _calc_roll_lik(
 ) -> jnp.float64:
     """Likelihood-only rollout: the optimizer-objective hot path.
 
-    The ``Criterion.Likelihood`` slice of :func:`_calc_roll_nohist`, rebuilt
+    The ``Criterion.Likelihood`` slice of :func:`_calc_roll_nohist`, built
     lean because this scan body is what ``jax.value_and_grad`` differentiates
-    ~40x per candidate per fit, making it the AutoETS warm bottleneck. Differences
-    are shape/structure
-    only, never math: a scalar one-step forecast replaces the (30,)-lane
-    masked ``forecast`` buffer (the likelihood consumes only ``f[0]``); the
-    AMSE machinery (``a_local``/``denom``/``f_buf`` carries and their per-step
-    ``y`` gathers) is dropped — it never feeds the likelihood; the seasonal
-    state rides at its true ``(m,)`` width instead of ``max(m, 24)``; and the
-    padded-window mask is a ``jnp.where`` on the carry instead of a
-    ``lax.cond`` whose both-branch residuals the VJP must store. Every
-    surviving expression replicates the general rollout verbatim (same guard
-    order); only the M-error accumulation ORDER differs (ys-emitted terms reduced by
-    ``jnp.sum`` — see the in-step comment). Against ``_calc_roll_nohist`` the A-error
-    objective is bit-exact bar occasional single-digit-ULP XLA fusion
-    re-association, M-error values agree to ~1e-14 relative (the summation
-    reassociation) and gradients to ~1e-13, so optimizer endpoints can drift at the
-    ~1e-10 level without changing selection.
+    on every optimizer step of every candidate. Differences are
+    shape/structure only, never math: a scalar one-step forecast replaces the
+    (30,)-lane masked ``forecast`` buffer (the likelihood consumes only
+    ``f[0]``); the AMSE machinery (``a_local``/``denom``/``f_buf`` carries and
+    their per-step ``y`` gathers) is dropped because it never feeds the
+    likelihood; the seasonal state rides at its true ``(m,)`` width instead
+    of ``max(m, 24)``; and the padded-window mask is a ``jnp.where`` on the
+    carry instead of a ``lax.cond`` whose both-branch residuals the VJP must
+    store. Every surviving expression replicates the general rollout (same
+    guard order); only the M-error accumulation ORDER differs (ys-emitted
+    terms reduced by ``jnp.sum``, see the in-step comment), so M-error values
+    differ from ``_calc_roll_nohist`` only by summation reassociation.
     """
     n = y.shape[0]
     n_eff = jnp.minimum(n_obs, n)
@@ -1539,12 +1533,11 @@ def _calc_roll_lik(
         if is_mul_error:
             # M-error accumulators leave the carry: chaining the div/clip/log-
             # derived running sums through the carry breaks backward-scan
-            # fusion (measured 4.4x on the vg for M-trend specs); the per-step
-            # terms are emitted as ys and reduced outside the loop instead.
-            # Cost: summation reassociation — the M-error likelihood drifts by a few
-            # ULP relative to the sequential order.
-            # The A-error branch below keeps the in-carry form and stays
-            # bit-exact vs the general rollout.
+            # fusion; the per-step terms are emitted as ys and reduced outside
+            # the loop instead. Cost: summation reassociation, so the M-error
+            # likelihood differs from the sequential order by a few units in
+            # the last place. The A-error branch below keeps the in-carry form
+            # and matches the general rollout exactly.
             val = jnp.abs(f0)
             log_arg = jnp.where(val > 0.0, val, val + 1e-8)
             ei_out = jnp.where(active, ei, 0.0)
@@ -1554,14 +1547,13 @@ def _calc_roll_lik(
         lik = jnp.where(active, lik_new, lik)
         return (i + 1, l, b, s_vec, lik, lik2), None
 
-    # Gradient routing (static branch): the expensive AD paths — M-error (all
-    # forms) and A-error SEASONAL — go through the hand-written custom-vjp
-    # adjoint (`_get_roll_scan_custom`, session-2 levers 1-2): forward math
-    # verbatim (values unchanged; the sums below keep today's order), backward
-    # = one lean reverse scan over the saved 3-scalar state trajectory instead
-    # of AD-through-scan (which cost 10-59x a forward even checkpointed). The
-    # A-error NON-seasonal step is ~linear with near-zero AD residuals and
-    # stays on plain AD — its objective values are the bit-exact-prized path.
+    # Gradient routing (static branch): the expensive AD paths, M-error (all
+    # forms) and A-error SEASONAL, go through the hand-written custom-vjp
+    # adjoint (`_get_roll_scan_custom`): forward math unchanged (the sums
+    # below keep the forward's order), backward = one lean reverse scan over
+    # the saved 3-scalar state trajectory instead of AD-through-scan. The
+    # A-error NON-seasonal step is close to linear with near-zero AD residuals
+    # and stays on plain AD, which keeps its objective values exact.
     n_eff_f = n_eff.astype(jnp.float64)
     if is_mul_error:
         roll = _get_roll_scan_custom(
@@ -1708,10 +1700,10 @@ def _transform_smoothing_params(
 ) -> Tuple[jnp.float64, jnp.float64, jnp.float64, jnp.float64]:
     """Map an unconstrained parameter vector to valid (α, β, γ, φ) via sigmoid.
 
-    Jitted with config-only statics (session-2 lever 3, S2 pattern): the
-    eager post-fit unpacking call dispatched ~40 tiny ops per candidate; the
-    in-trace optimizer call site (``_objective_smoothing_only``) passes the
-    same Python-bool statics and simply inlines.
+    Jitted with config-only statics, so the eager post-fit unpacking call is
+    a single dispatch; the in-trace optimizer call site
+    (``_objective_smoothing_only``) passes the same Python-bool statics and
+    simply inlines.
 
     Two modes are supported:
 
@@ -1853,7 +1845,7 @@ def _objective_smoothing_only(
     init_state : jnp.ndarray
         Initial ETS state (may be overridden when ``opt_init_state`` is True).
     error, trend, season : Component
-        Model structure flags (static for JIT).
+        Model structure flags (static for just-in-time (JIT) compilation).
     opt_crit : Criterion
         Which loss to return.
     n_mse, m, n_obs : int
@@ -1959,9 +1951,9 @@ def _objective_smoothing_only(
 
 
 _LBFGS_STEPS = 30
-"""L-BFGS refinement budget CAP (quasi-Newton steps after the Adam warm-up).
-`adaptive_iterate` stops earlier once the loss plateaus; hard problems (e.g. co2,
-trend-heavy long series) still run the full 30."""
+"""L-BFGS refinement budget cap (quasi-Newton steps after the Adam warm-up).
+``adaptive_iterate`` stops earlier once the loss plateaus; trend-heavy long
+series still run the full 30."""
 
 _LBFGS_RTOL = 1e-4
 """Relative-loss-improvement plateau threshold for the adaptive L-BFGS refinement
@@ -2004,7 +1996,7 @@ def _get_optimizer_runner(
 
     The returned callable takes only data-level arrays
     ``(x0, y, init_state, alpha, beta, gamma, phi, lower, upper)`` and returns
-    ``(best_params, best_loss)`` as traced values — the whole optimizer is a
+    ``(best_params, best_loss)`` as traced values; the whole optimizer is a
     pair of ``lax.scan`` loops (Adam warm-up, then L-BFGS refinement) with
     best-iterate tracking in the carry, so it is natively traceable under
     ``jax.vmap`` (no host loop, no ``device_get``, no try/except).
@@ -2033,7 +2025,7 @@ def _get_optimizer_runner(
 
         # Both phases share one step shape: evaluate at p, update, and track
         # the best *evaluated* point (never the post-update point, whose loss
-        # is unknown — storing new_p with p's loss mislabels the optimum).
+        # is unknown; storing new_p with p's loss mislabels the optimum).
         # A NaN/Inf loss can never become the best, so a diverging line
         # search or exploding rollout degrades gracefully to the best finite
         # iterate instead of needing a try/except escape hatch.
@@ -2054,7 +2046,7 @@ def _get_optimizer_runner(
             # `step(carry) -> (carry', loss)` for adaptive_iterate: evaluate the
             # loss at the current point, then advance. adaptive_iterate does the
             # best-evaluated-point tracking + plateau stop that _tracked_step does
-            # inline for the fixed Adam scan — same NaN-graceful semantics (a
+            # inline for the fixed Adam scan, with the same NaN-graceful semantics (a
             # non-finite loss never becomes the best).
             def step(carry):
                 p, opt_state = carry
@@ -2083,7 +2075,7 @@ def _get_optimizer_runner(
         else:
             adam_p = x0
         # adam's best loss is not threaded to L-BFGS: adaptive_iterate re-evaluates
-        # loss(adam_p) as its probe-step seed, which is the same value.
+        # loss(adam_p) on its first step, which recovers the same value.
 
         # ── Phase 2: L-BFGS refinement, seeded from Adam's best point ─
         lbfgs = optax.lbfgs(
@@ -2099,9 +2091,9 @@ def _get_optimizer_runner(
 
         # Adaptive L-BFGS: stop once the loss plateaus (rel improvement < rtol for
         # 2 steps), capped at _LBFGS_STEPS. Eager (one candidate at a time) this
-        # stops fast-converging candidates early — the P6 warm speedup; under the
-        # CV vmap it runs to the slowest lane's stop, capped — never more than the
-        # old fixed scan. best_p seeds from Adam's best (params_of(init)=adam_p).
+        # stops fast-converging candidates early; under the CV vmap it runs to
+        # the slowest lane's stop, never more than _LBFGS_STEPS. best_p seeds
+        # from Adam's best (params_of(init)=adam_p).
         best_p, best_loss, _ = adaptive_iterate(
             _plain_step(_lbfgs_update),
             (adam_p, lbfgs.init(adam_p)),
@@ -2153,13 +2145,14 @@ def optimize_bfgs_smoothing(
     Finds the unconstrained parameter vector that minimises the ETS objective
     selected by *opt_crit*.  The search proceeds in two stages:
 
-    1. **Adam warm-up** — a short burst of momentum-based first-order steps
-       (15–30 iterations depending on series length) that moves ``x0`` into
-       a reasonable basin.
-    2. **L-BFGS refinement** — 30 quasi-Newton steps.
+    1. **Adam warm-up**: a short burst of momentum-based first-order steps
+       (a fraction of *steps*) that moves ``x0`` into a reasonable basin.
+    2. **L-BFGS refinement**: quasi-Newton steps that stop when the loss
+       plateaus, capped at ``_LBFGS_STEPS``.
 
-    Both phases run as ``lax.scan`` loops with best-iterate tracking in the
-    carry, so the whole optimizer is natively traceable under ``jax.vmap``
+    Both phases run as JAX loops (``lax.scan`` and ``lax.while_loop``) with
+    best-iterate tracking in the carry, so the whole optimizer is natively
+    traceable under ``jax.vmap``
     (the conformity_scores CV path). The best parameter vector seen across
     *both* phases is returned.
 
@@ -2193,16 +2186,16 @@ def optimize_bfgs_smoothing(
     lr : float
         Base learning rate for the Adam warm-up phase.
     clip_norm : float
-        *(Unused — kept for caller API compatibility.)*
+        *(Unused; kept for caller API compatibility.)*
     early_stop_patience : int
-        *(Unused — ``lax.scan`` runs a fixed number of iterations; host-side
+        *(Unused; ``lax.scan`` runs a fixed number of iterations; host-side
         early stopping would require concretizing the traced loss.)*
     early_stop_min_delta : float
-        *(Unused — kept for API compatibility.)*
+        *(Unused; kept for API compatibility.)*
     adaptive_tol : bool
-        *(Unused — kept for API compatibility.)*
+        *(Unused; kept for API compatibility.)*
     is_final_model : bool
-        *(Unused — kept for API compatibility.)*
+        *(Unused; kept for API compatibility.)*
     clip_multiplicative_errors : bool
         Clamp multiplicative residuals to ``[-2, 2]``.
     pure_sigmoid : bool

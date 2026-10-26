@@ -2,17 +2,17 @@
 
 Univariate JAX/Flax-NNX port of ``neuralforecast.DeepNPTS`` (Deep Non-Parametric
 Time Series forecaster; Rangapuram et al., 2023, arXiv:2312.14657). DeepNPTS is a
-baseline deep model: a small MLP reads the lookback window and emits, for each
-horizon step, a softmax weight over every position of the window; the forecast is
+baseline deep model: a small multilayer perceptron (MLP) reads the lookback
+window and emits, for each horizon step, a softmax weight over every position of the window; the forecast is
 the weighted sum of the in-sample values. It is a *learned non-parametric
 resample* of the context, not a parametric-distribution head. Point forecaster,
 univariate.
 
 Chronax (like the iTransformer / BiTCN / VanillaTransformer ports) targets the
-**no-exogenous** case, so NF's general ``forward`` reduces to::
+**no-exogenous** case, so neuralforecast's general ``forward`` reduces to::
 
     z = insample_y.reshape(B, L)          # [B, L, 1] -> [B, L]  (== input_size)
-    z = MLP(z)                            # n_layers x (Linear -> ReLU -> [BN] -> [Drop])
+    z = MLP(z)                            # n_layers x (Linear -> ReLU -> [BatchNorm] -> [Drop])
     w = out_linear(z).reshape(B, L, h)    # -> [B, L, h]
     w = softmax(w, axis=L)                # weights over the window
     forecast = sum(w * insample_y, L)     # [B, L, h]*[B, L, 1] -> [B, h] -> [B, h, 1]
@@ -21,7 +21,7 @@ Parity with neuralforecast (PyTorch): torch ``nn.Linear`` default init
 (``_TorchLinearInit``: ``U(-1/sqrt(fan_in), 1/sqrt(fan_in))``), exact ReLU, and
 softmax taken over the window (``L``) axis. ``float32`` throughout.
 
-``batch_norm`` is off by default (NF defaults it True). When enabled it uses
+``batch_norm`` is off by default (neuralforecast defaults it True). When enabled it uses
 ``nnx.BatchNorm`` with ``momentum=0.9`` (flax decay convention, equivalent to
 torch ``BatchNorm1d``'s ``momentum=0.1``) and ``epsilon=1e-5`` (torch default).
 BatchNorm reads ``use_running_average=deterministic``: batch statistics during
@@ -60,7 +60,7 @@ class DeepNPTSNet(nnx.Module):
     blocks of ``Linear -> ReLU -> [BatchNorm] -> [Dropout]`` feed a final linear
     that produces ``input_size * h`` logits; these are reshaped to ``[B, L, h]``,
     softmaxed over ``L`` (the window axis), and used to weight-sum the raw
-    in-sample values into the horizon. Identity scaling (NF default): the network
+    in-sample values into the horizon. Identity scaling (neuralforecast default): the network
     operates in raw scale. During training pass ``deterministic=False``; the
     ``nnx.Rngs`` dropout stream supplies noise and BatchNorm updates running stats.
     """

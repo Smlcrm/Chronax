@@ -1,19 +1,20 @@
-"""RMoK network: RevIN + mixture of KAN experts (NF-faithful forward).
+"""RMoK network: reversible instance normalization (RevIN) + mixture of
+Kolmogorov-Arnold Network (KAN) experts, following neuralforecast's forward.
 
-Univariate port of neuralforecast.RMoK's forward. RevIN is inline and NF-exact
-(stop-grad mean AND std, std=sqrt(var+eps), forward-local stats). Four experts
-map the lookback L -> h: Taylor-KAN (poly expansion), Jacobi-KAN (Jacobi
-recurrence), Wave-KAN (mexican-hat wavelet + BatchNorm), and a plain Linear; a
-softmax gate mixes them. BatchNorm running stats + dropout are driven by a
-``deterministic`` flag (DeepNPTS pattern): False in training (batch stats,
-running-stat update, dropout on), True at inference. Expert/gate weights are raw
-torch-layout params ([out,in], forward x@w.T+b) so an NF state_dict copies over
-without transposing or reshaping any weight (the BatchNorm state still needs a
-torch->flax key mapping). The
-WaveKAN ``weight1`` param exists (faithful pytree) but is unused (frozen). Init
-distributions replicate torch (draws differ). Only ``mexican_hat`` is parity-
-checked; the other four wavelets run finite but have no NF-parity arbiter.
-float32 throughout.
+Univariate port of neuralforecast.RMoK's forward. RevIN is inline and matches
+neuralforecast exactly (stop-grad mean AND std, std=sqrt(var+eps),
+forward-local stats). Four experts map the lookback L -> h: Taylor-KAN (poly
+expansion), Jacobi-KAN (Jacobi recurrence), Wave-KAN (mexican-hat wavelet +
+BatchNorm), and a plain Linear; a softmax gate mixes them. BatchNorm running
+stats + dropout are driven by a ``deterministic`` flag (DeepNPTS pattern):
+False in training (batch stats, running-stat update, dropout on), True at
+inference. Expert/gate weights are raw torch-layout params ([out,in], forward
+x@w.T+b) so a neuralforecast state_dict copies over without transposing or
+reshaping any weight (the BatchNorm state still needs a torch->flax key
+mapping). The WaveKAN ``weight1`` param exists (faithful pytree) but is unused
+(frozen). Init distributions replicate torch (draws differ). Only
+``mexican_hat`` has a neuralforecast parity test; the other four wavelets run
+finite but are not parity-checked. float32 throughout.
 """
 from __future__ import annotations
 
@@ -29,7 +30,7 @@ _WAVELETS = ("mexican_hat", "morlet", "dog", "meyer", "shannon")
 def _revin_norm(x: jnp.ndarray, affine_weight: "jnp.ndarray | None",
                 affine_bias: "jnp.ndarray | None", *, affine: bool, eps: float = 1e-5
                 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """NF RevINMultivariate norm. x [B,L,N] -> (xn, mean, std); stats stop-grad."""
+    """neuralforecast RevINMultivariate norm. x [B,L,N] -> (xn, mean, std); stats stop-grad."""
     mean = jax.lax.stop_gradient(jnp.mean(x, axis=1, keepdims=True))
     std = jax.lax.stop_gradient(jnp.sqrt(jnp.var(x, axis=1, keepdims=True) + eps))
     xn = (x - mean) / std
@@ -47,7 +48,7 @@ def _revin_denorm(y: jnp.ndarray, affine_weight: "jnp.ndarray | None",
 
 
 def _taylor(x: jnp.ndarray, coeffs: jnp.ndarray, bias: jnp.ndarray, order: int) -> jnp.ndarray:
-    """coeffs [h,L,order], bias [1,h]; x [B,L] -> [B,h]. y = Σ_i (x^i · c[:,:,i]).sum_L + b."""
+    """coeffs [h,L,order], bias [1,h]; x [B,L] -> [B,h]. y = sum_i (x^i * c[:,:,i]).sum_L + b."""
     xe = x[:, None, :]                                   # [B,1,L]
     y = jnp.zeros((x.shape[0], coeffs.shape[0]), jnp.float32)
     for i in range(order):
@@ -72,7 +73,7 @@ def _jacobi(x: jnp.ndarray, coeffs: jnp.ndarray, degree: int, a: float = 1.0, b:
 
 def _wavelet(x: jnp.ndarray, scale: jnp.ndarray, translation: jnp.ndarray,
              weights: jnp.ndarray, kind: str) -> jnp.ndarray:
-    """Wavelet transform (pre-BN). x [B,L] -> [B,h]. Only mexican_hat is parity-checked."""
+    """Wavelet transform, before BatchNorm. x [B,L] -> [B,h]. Only mexican_hat is parity-checked."""
     xs = (x[:, None, :] - translation[None]) / scale[None]        # [B,h,L]
     if kind == "mexican_hat":
         psi = (2.0 / (math.sqrt(3) * math.pi ** 0.25)) * (xs ** 2 - 1.0) * jnp.exp(-0.5 * xs ** 2)
@@ -82,7 +83,7 @@ def _wavelet(x: jnp.ndarray, scale: jnp.ndarray, translation: jnp.ndarray,
         psi = -xs * jnp.exp(-0.5 * xs ** 2)
     elif kind == "meyer":
         v = jnp.abs(xs)
-        t = 2.0 * v - 1.0                                # NF evaluates nu at (2v-1)
+        t = 2.0 * v - 1.0                                # neuralforecast evaluates nu at (2v-1)
         nu = t ** 4 * (35 - 84 * t + 70 * t ** 2 - 20 * t ** 3)
         aux = jnp.where(v <= 0.5, 1.0, jnp.where(v >= 1.0, 0.0, jnp.cos(math.pi / 2 * nu)))
         psi = jnp.sin(math.pi * v) * aux
@@ -125,14 +126,14 @@ class RMoKNet(nnx.Module):
         # Jacobi: normal(0, std=1/(L*(degree+1)))
         jstd = 1.0 / (L * (jacobi_degree + 1))
         self.jacobi_coeffs = nnx.Param(jax.random.normal(k[1], (L, h, jacobi_degree + 1), jnp.float32) * jstd)
-        # Wave: torch kaiming_uniform(a=sqrt(5)) reduces to U(±1/sqrt(fan_in)); fan_in=L.
+        # Wave: torch kaiming_uniform(a=sqrt(5)) reduces to U(+-1/sqrt(fan_in)); fan_in=L.
         kb = 1.0 / math.sqrt(L)
         self.wave_scale = nnx.Param(jnp.ones((h, L), jnp.float32))
         self.wave_translation = nnx.Param(jnp.zeros((h, L), jnp.float32))
         self.wave_weights = nnx.Param(jax.random.uniform(k[2], (h, L), jnp.float32, -kb, kb))
         self.wave_weight1 = nnx.Param(jax.random.uniform(k[3], (h, L), jnp.float32, -kb, kb))  # UNUSED
         self.wave_bn = nnx.BatchNorm(h, momentum=0.9, epsilon=1e-5, rngs=rngs)
-        # Linear expert + gate: raw torch-layout params [out,in], U(±1/sqrt(L))
+        # Linear expert + gate: raw torch-layout params [out,in], U(+-1/sqrt(L))
         self.linear_weight = nnx.Param(_torch_uniform(k[4], (h, L), L))
         self.linear_bias = nnx.Param(_torch_uniform(k[5], (h,), L))
         self.gate_weight = nnx.Param(_torch_uniform(k[6], (4, L), L))

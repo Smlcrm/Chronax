@@ -1,53 +1,58 @@
 """
-MFLES (Multi-Feature Locally Exponential Smoothing) in JAX
+MFLES (Multi-Feature Locally Exponential Smoothing) in JAX.
 
-Implements a StatsForecast-compatible MFLES model that combines multiple
-additive components fitted iteratively to residuals, fully JIT-compiled
-via lax.while_loop for performance.
+Implements a statsforecast-compatible MFLES model that combines several
+additive components fitted iteratively to residuals. The whole fitting loop
+is just-in-time (JIT) compiled via ``lax.while_loop``.
 
 **Components:**
-- Piecewise linear trend with adaptive changepoints (LASSO, fraction-based knot selection)
-- Multiple seasonal patterns via Fourier series (OLS or weighted OLS)
-- Residual smoothing via SES ensemble ("lite" mode) or rolling means ("full" mode)
+
+- Piecewise linear trend with adaptive changepoints, fitted by the least
+  absolute shrinkage and selection operator (LASSO) with fraction-based knot
+  selection
+- Multiple seasonal patterns via Fourier series, fitted by ordinary least
+  squares (OLS) or weighted least squares (WLS)
+- Residual smoothing via a simple exponential smoothing (SES) ensemble or
+  rolling means
 - Optional exogenous variables via OLS
-- Robust estimation via Siegel repeated medians (auto-detected or user-specified)
+- Robust estimation via Siegel repeated medians (auto-detected or
+  user-specified)
 
 **Algorithm:**
-Each iteration fits components sequentially to the current residuals:
+
+Each iteration fits components in turn to the current residuals:
+
 1. Median-based initialization
 2. Seasonal update: Fourier OLS/WLS on residuals, cycling through periods each round
 3. Trend update: OLS, robust (Siegel), or piecewise LASSO with adaptive knots
 4. Residual smoothing: SES ensemble or rolling mean
 5. Exogenous update: OLS on remaining residuals
-6. Convergence check: stops after 6 consecutive non-improving rounds or max_rounds
+6. Convergence check: stops after 6 consecutive non-improving rounds or ``max_rounds``
 
 **Formulas:**
+
 - Seasonal: y_t = Σ [a_k cos(2πkt/T) + b_k sin(2πkt/T)] for k=1..K
 - Trend: y_t = β₀ + β₁t + Σ β_k max(0, t-τ_k) (piecewise linear, LASSO-regularized)
 - SES: ŷ_t = α·y_t + (1-α)·ŷ_{t-1}
 
 **Implementation:**
-- Entire fitting loop JIT-compiled via lax.while_loop with a _LoopState NamedTuple
-- Static boolean flags (has_seasonality, use_changepoints, etc.) baked into the loop
-  at compile time via _make_fit_loop, avoiding runtime branching overhead
-- Adaptive changepoint count: n_changepoints as a float (e.g. 0.25) sets knots
-  proportional to series length, capped at 50
-- Multiplicative mode: automatic when seasonal_period is provided and series is positive;
-  uses log-transform internally, inverted at predict time
-- Seasonal tail fix: last full period stored in _LoopState for correct multi-step forecasting
-- Conformal prediction intervals via BaseForecaster.conformity_scores
 
-**Attributes:**
-- `robust`: Siegel repeated medians (True), OLS (False), or auto-detect (None)
-- `multiplicative`: Log-space fitting for multiplicative seasonality (set during fit)
-- `penalty`: R²-based trend dampening scalar (set during fit, optional)
-- `verbose`: Verbosity level (currently unused, reserved for future logging)
+- Entire fitting loop JIT-compiled via ``lax.while_loop`` with a ``_LoopState`` NamedTuple
+- Static boolean flags (has_seasonality, use_changepoints, etc.) baked into the loop
+  at compile time via ``_make_fit_loop``, avoiding runtime branching overhead
+- Adaptive changepoint count: ``n_changepoints`` as a float (e.g. 0.25) sets knots
+  proportional to series length, capped at ``min(0.1 * n, 64)``
+- Multiplicative mode: automatic when ``seasonal_period`` is provided and the series is positive;
+  uses a log transform internally, inverted at predict time
+- Seasonal tail: the last full period is stored in ``_LoopState`` for multi-step forecasting
+- Conformal prediction intervals via ``BaseForecaster.conformity_scores``
 
 **Methods:**
-- `fit(y, seasonal_period, X, ...)`: Fit all components; extensive hyperparameter control
-- `predict(h, X, level)`: Forecast h steps from fitted state; optional conformal intervals
-- `forecast(y, h, ...)`: Stateless fit+predict (inherits base class default)
-- `optimize(y, ...)`: Auto-tune hyperparameters via rolling cross-validation
+
+- ``fit(y, seasonal_period, X, ...)``: fit all components; extensive hyperparameter control
+- ``predict(h, X, level)``: forecast h steps from the fitted state; optional conformal intervals
+- ``forecast(y, h, ...)``: stateless fit+predict that replays the fitted configuration
+- ``optimize(y, ...)``: tune hyperparameters via rolling cross-validation (CV)
 """
 # mfles.py
 from __future__ import annotations
@@ -65,10 +70,10 @@ from chronax.utils import ConformalIntervals
 # Above this length, fit() skips live robust auto-detection (Siegel is O(n^2))
 # and pins robust=False statically. AutoMFLES.conformity_scores keys its CV
 # execution regime off the same bound: window fits at or above it trace with
-# a static robust (the CV vmap amortizes fine), below it they auto-detect a
-# traced robust whose trend lax.cond lowers to select under the batched
-# predicate — executing Siegel every round of every window (33x measured on
-# co2) — so those cells run the windows sequentially instead.
+# a static robust flag and run under the CV vmap; below it they auto-detect a
+# traced robust flag whose trend lax.cond lowers to select under the batched
+# predicate (executing Siegel every round of every window), so those series
+# run the windows sequentially instead.
 _ROBUST_AUTODETECT_MAX_N = 5000
 
 
@@ -91,7 +96,7 @@ class _LoopState(NamedTuple):
     trend_tail: jnp.ndarray         # [prev_end, curr_end] for forecasting (2,)
     seas_tail: jnp.ndarray          # last period of seasonal, pre-allocated (max_period,)
     seas_tail_len: jnp.ndarray      # actual length of seas_tail to use (scalar int)
-    best: jnp.ndarray               # best MSE so far (scalar float)
+    best: jnp.ndarray               # best mean squared error (MSE) so far (scalar float)
     stalls: jnp.ndarray             # consecutive non-improving iterations (scalar int)
     robust: jnp.ndarray             # robust regression flag (scalar bool)
     penalty: jnp.ndarray            # R² penalty for trend dampening (scalar float)
@@ -100,7 +105,7 @@ class _LoopState(NamedTuple):
 
 @jax.jit
 def _mse(y: jnp.ndarray, yhat: jnp.ndarray) -> jnp.ndarray:
-    """Mean squared error metric.
+    """Mean squared error (MSE) metric.
 
     Args:
         y: Actual values
@@ -113,7 +118,7 @@ def _mse(y: jnp.ndarray, yhat: jnp.ndarray) -> jnp.ndarray:
 
 @jax.jit
 def _mae(y: jnp.ndarray, yhat: jnp.ndarray) -> jnp.ndarray:
-    """Mean absolute error metric.
+    """Mean absolute error (MAE) metric.
 
     Args:
         y: Actual values
@@ -126,7 +131,7 @@ def _mae(y: jnp.ndarray, yhat: jnp.ndarray) -> jnp.ndarray:
 
 @jax.jit
 def _mape(y: jnp.ndarray, yhat: jnp.ndarray) -> jnp.ndarray:
-    """Mean absolute percentage error metric.
+    """Mean absolute percentage error (MAPE) metric.
 
     Args:
         y: Actual values
@@ -139,7 +144,7 @@ def _mape(y: jnp.ndarray, yhat: jnp.ndarray) -> jnp.ndarray:
 
 @jax.jit
 def _smape(y: jnp.ndarray, yhat: jnp.ndarray) -> jnp.ndarray:
-    """Symmetric mean absolute percentage error metric.
+    """Symmetric mean absolute percentage error (SMAPE) metric.
 
     Args:
         y: Actual values
@@ -332,24 +337,27 @@ def _bisect_median_axis1(A: jnp.ndarray) -> jnp.ndarray:
     bitcast + count-based bisection, NO sort).
 
     Selection by rank avoids the full row sort ``jnp.median(A, axis=1)`` performs,
-    which dominates the (n, n) Siegel slope matrix on XLA-CPU. Dtype-adaptive:
+    which dominates the (n, n) Siegel slope matrix on the XLA (Accelerated Linear
+    Algebra) central processing unit (CPU) backend. Dtype-adaptive:
     f32<->uint32, f64<->uint64.
 
-    BIT-IDENTICAL to jitted ``jnp.median(A, axis=1)`` on every input the Siegel matrix can
-    produce -- validated across adversarial + real-Siegel banks AND the full
-    MFLES(robust=True) _cs/mean/lo/hi/forecast pipeline (f32+f64, odd+even n, all BITEQ).
-    It is NOT a general drop-in: three row-level divergences exist, ALL unreachable from
-    finite y at sane scale AND laundered before any model output --
+    Bit-identical to jitted ``jnp.median(A, axis=1)`` on every input the Siegel
+    matrix can produce. It is not a general drop-in: three row-level divergences
+    exist, all unreachable from finite y at sane scale and all laundered before
+    any model output:
+
       (1) any-NaN rows: jnp poisons the whole row to NaN (total-row-replace), this
           rank-picks in IEEE order. Needs NaN/inf in y or |y| > ~dtype_max/(2n); and the
           unchanged outer ``intercept = median(y - slope*x)`` re-poisons, so the fitted
           output is all-NaN either way.
       (2) odd-n rows whose median exceeds dtype_max/2 (jnp's midpoint ``(x+x)*0.5``
-          overflows to inf) or is subnormal under XLA FTZ (jnp flushes to +-0). Subnormal
-          slopes can't even enter the matrix (FTZ at construction); the outer
-          ``jnp.median(med_slopes_i)`` re-applies both quirks, so integrated output matches.
+          overflows to inf) or is subnormal under XLA flush-to-zero (FTZ; jnp flushes
+          to +-0). Subnormal slopes cannot enter the matrix (FTZ at construction); the
+          outer ``jnp.median(med_slopes_i)`` re-applies both quirks, so integrated
+          output matches.
       (3) sign-of-zero bits on mixed +-0 rows: jnp canonicalizes -0->+0 in sort keys, this
-          uses strict IEEE total order. VALUE-equal; washes out at ``slope*x + intercept``.
+          uses strict IEEE total order. Value-equal; washes out at ``slope*x + intercept``.
+
     Even-n is unconditionally bit-identical ((a+b)/2 == jnp's (a+b)*0.5 for all IEEE).
 
     Traces inline under the already-jitted caller; NO data-dependent control flow (the
@@ -397,7 +405,7 @@ def _bisect_median_axis1(A: jnp.ndarray) -> jnp.ndarray:
     if n % 2 == 1:
         return _decode(_kth_code(k))
     # even n: mean of the two central order stats, (a+b)/2 in native dtype (the lerp
-    # form is NOT bit-identical to jnp.median; (a+b)/2 IS -- validated). The second
+    # form is NOT bit-identical to jnp.median; (a+b)/2 is). The second
     # order stat is derived from the first in TWO passes by an exact rank identity,
     # avoiding a second full 32/64-pass bisection:
     # with c1 = code of the (k-1)-th order stat, the k-th equals c1 itself when
@@ -422,15 +430,15 @@ def _siegel_repeated_medians(x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
     Costs O(n^2) memory (the (n, n) slope matrix) and O(n^2 * bits) time via
     ``_bisect_median_axis1`` (bit-space rank selection, bit-exact vs ``jnp.median``),
     which avoids the row sort that would otherwise dominate the call. ``fit()``
-    disables robust AUTO-detection at n >= 5000 — a chronax-only deviation — but
-    explicit ``robust=True`` stays on the Siegel path.
+    disables robust auto-detection at n >= 5000 (statsforecast has no such
+    bound), but explicit ``robust=True`` stays on the Siegel path.
 
-    Two divergences from statsforecast, both accidental and retained only on
-    accuracy evidence:
-      * SF skips the ``j == i`` pair; the mask below leaves a 0.0 on the
-        diagonal, which enters each row's median and shrinks it toward zero.
-      * SF's intercept is ``median(y - per_point_slopes * x)``; this uses the
-        global slope, which is the textbook Siegel estimator.
+    Two deliberate divergences from statsforecast:
+
+      * statsforecast skips the ``j == i`` pair; the mask below leaves a 0.0 on
+        the diagonal, which enters each row's median and shrinks it toward zero.
+      * statsforecast's intercept is ``median(y - per_point_slopes * x)``; this
+        uses the global slope, which is the textbook Siegel estimator.
 
     Args:
         x: Predictor array of shape (n,).
@@ -445,12 +453,10 @@ def _siegel_repeated_medians(x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
     dx = X_j - X_i
     dy = Y_j - Y_i
     slopes = jnp.where(dx != 0, dy / (dx + 1e-12), 0.0)
-    # Rank-selection row-median (bit-space bisection, no sort): the ~99.8%-cost hot path,
-    # ~2-5x (f64) / 5-7x (f32) vs jnp.median. Bit-identical to jnp.median on every input the
-    # Siegel matrix produces (edge-case row divergences are unreachable/laundered -- see
-    # _bisect_median_axis1's docstring); the integrated _siegel output + the full
-    # MFLES(robust) _cs/mean/lo/hi/forecast pipeline are BITEQ end-to-end (5.86x measured
-    # on the n=1976 f32 robust conformity_scores), so ZERO accuracy change.
+    # Rank-selection row-median (bit-space bisection, no sort) is the hot path.
+    # Bit-identical to jnp.median on every input the Siegel matrix produces
+    # (edge-case row divergences are unreachable or laundered; see
+    # _bisect_median_axis1's docstring).
     med_slopes_i = _bisect_median_axis1(slopes)
     slope = jnp.median(med_slopes_i)  # 1D over n, cheap -- left as jnp.median
     intercept = jnp.median(y - slope * x)
@@ -503,10 +509,10 @@ def _cov_proxy(y: jnp.ndarray, mult: int = 1) -> jnp.ndarray:
         mult: Non-zero for multiplicative formula, zero for additive (std/mean).
 
     Returns:
-        Scalar CoV proxy value.
+        Scalar coefficient-of-variation proxy value.
     """
     def mult_path():
-        # Keep parity with StatsForecast's multiplicative CoV proxy formula.
+        # Keep parity with statsforecast's multiplicative coefficient-of-variation proxy formula.
         return jnp.sqrt(jnp.exp(jnp.log(10.0) * (jnp.std(y) ** 2) - 1.0))
     
     def additive_path():
@@ -575,15 +581,17 @@ def _soft(z: jnp.ndarray, lam: float) -> jnp.ndarray:
 
 @jax.jit
 def _lasso_ista_with_step(X: jnp.ndarray, y: jnp.ndarray, alpha: float, step: jnp.ndarray, maxiter: int = 200, G: jnp.ndarray | None = None) -> jnp.ndarray:
-    """LASSO via ISTA with pre-computed spectral step (avoids redundant SVD).
+    """LASSO via the iterative shrinkage-thresholding algorithm (ISTA) with a
+    pre-computed spectral step (avoids a repeated singular value decomposition).
 
     The gradient is computed in normal-equation form, ``G @ b - c`` with
-    ``G = X^T X`` (loop-invariant — pass it precomputed; the fit loop hoists it to
+    ``G = X^T X`` (loop-invariant; pass it precomputed, the fit loop hoists it to
     ``config.hinge_gram`` next to ``lasso_step``) and ``c = X^T y`` built once per
     call. Each ISTA iteration then costs one (k,k) matvec instead of two (n,k) ones,
-    which matters because the trip count is a fixed budget (48-200 iters; no bitwise
-    fixed point exists to exit on). Same fixed-point map in exact arithmetic and the
-    same trip count; f32 values drift only by reassociation of the two matmul orders.
+    which matters because the trip count is a fixed budget (48-200 iterations; no
+    bitwise fixed point exists to exit on). In exact arithmetic this is the same
+    fixed-point map as the (n,k) gradient form; in f32 the two differ only by
+    reassociation.
     """
     beta = jnp.zeros((X.shape[1],), dtype=y.dtype)
     if G is None:
@@ -610,7 +618,7 @@ class _FitConfig(NamedTuple):
     X_exo: jnp.ndarray             # exogenous variables (n, n_features) or empty
     ma_array: jnp.ndarray          # MA cycle values (ma_len,)
     ses_alphas: jnp.ndarray        # pre-computed alphas for SES ensemble (num_alphas,)
-    # Pre-computed changepoint basis (avoids redundant SVD inside loop)
+    # Pre-computed changepoint basis (avoids a repeated singular value decomposition inside the loop)
     hinge_basis: jnp.ndarray       # pre-computed hinge basis matrix (n, n_cols) or empty
     lasso_step: jnp.ndarray        # pre-computed spectral step for LASSO (scalar)
     hinge_gram: jnp.ndarray        # pre-computed X^T X for LASSO (n_cols, n_cols) or dummy
@@ -651,12 +659,11 @@ def _fit_body(
     from config (explicit ``robust=`` or an already-resolved fit). It must then
     select the trend branch with a Python ``if``, not ``lax.cond(state.robust,
     ...)``: under the conformal CV vmap the ``while_loop`` predicate depends on
-    the window's ``converged``, so JAX batches the whole carry — including
-    ``robust`` — and a batched-predicate ``cond`` lowers to ``select``, which
-    executes BOTH branches. That ran the O(n^2) Siegel regression on every
-    round of every window even for non-robust series (410x on the conformal
-    path). ``None`` means genuinely auto-detected in-loop, where the traced
-    ``cond`` is unavoidable.
+    the window's ``converged``, so JAX batches the whole carry, including
+    ``robust``, and a batched-predicate ``cond`` lowers to ``select``, which
+    executes BOTH branches, running the O(n^2) Siegel regression on every
+    round of every window even for non-robust series. ``None`` means
+    auto-detected in-loop, where the traced ``cond`` is unavoidable.
     """
     i = state.i
     n = config.y_tr.shape[0]
@@ -796,7 +803,7 @@ def _fit_body(
         return _fast_ols_fit_predict(config.x_idx, resids)
 
     def odd_round_candidate():
-        # SF behavior: first odd trend round uses OLS even when changepoints are enabled.
+        # statsforecast behavior: first odd trend round uses OLS even when changepoints are enabled.
         use_piecewise = use_changepoints & (config.n_cps > 0) & (i != jnp.int32(1))
         if static_robust is None:
             tren = lax.cond(
@@ -814,7 +821,7 @@ def _fit_body(
         return tren, improves, test, jnp.bool_(False)
 
     def even_round_candidate():
-        # Even rounds before i>4 do not update in SF MFLES.
+        # Even rounds before i>4 do not update in statsforecast MFLES.
         def no_even_update():
             zero = jnp.zeros_like(resids)
             return zero, jnp.bool_(False), new_best_after_exo, jnp.bool_(True)
@@ -858,7 +865,7 @@ def _fit_body(
         lambda: state.ses_component
     )
 
-    # Keep trend state aligned with SF logic:
+    # Keep trend state aligned with statsforecast logic:
     # - accepted trend update contributes tren[-2:] to trend tail
     # - accepted residual smoother contributes tren[-1] to both tail points
     def trend_from_linear():
@@ -958,7 +965,7 @@ def _make_fit_loop(
 
     Uses lru_cache to avoid recompilation for identical configurations. Every
     key is config-derived, never data-derived (``static_robust`` is either the
-    ctor value or a flag already resolved on the host).
+    constructor value or a flag already resolved on the host).
     """
 
     def body_fn(state_and_config):
@@ -990,29 +997,33 @@ def _make_fit_loop(
 
 
 class MFLES(BaseForecaster):
-    """
-    JAX MFLES implementation with StatsForecast-compatible default behavior.
+    """JAX MFLES forecaster with statsforecast-compatible default behavior.
 
-    MFLES (Multi-Feature Locally Exponential Smoothing) combines multiple additive
-    components — piecewise linear trend, Fourier seasonal patterns, and residual
-    smoothing — fitted iteratively to successive residuals in a JIT-compiled loop.
-
-    The goal is algorithmic parity with MFLES in StatsForecast while keeping
-    the implementation JAX-friendly for speed at larger scales.
+    MFLES (Multi-Feature Locally Exponential Smoothing) combines additive
+    components (piecewise linear trend, Fourier seasonal patterns, residual
+    smoothing and optional exogenous regressors), fitted iteratively to
+    successive residuals in a JIT-compiled loop. Hyperparameters are passed to
+    :meth:`fit`; the constructor holds only the configuration below.
 
     Parity-oriented defaults:
-    - robust=None  -> auto-detect robust mode from residual CoV proxy.
-    - changepoints=True  -> piecewise LASSO trend enabled by default.
-    - ses_mode="lite"  -> rolling residual smoother (matches StatsForecast default).
+
+    - ``robust=None``: auto-detect robust mode from a residual coefficient-of-variation proxy.
+    - ``changepoints=True``: piecewise LASSO trend enabled by default.
+    - ``ses_mode="lite"``: rolling residual smoother (matches the statsforecast default).
 
     Args:
-        verbose (int): Verbosity level (currently reserved, unused). Default is 1.
-        robust (bool | None): If True, uses Siegel repeated medians for trend fitting. If False, uses OLS. If None, auto-detects based on residual variability. Default is None.
+        verbose (int): Verbosity level (reserved, unused). Default is 1.
+        robust (bool | None): If True, uses Siegel repeated medians for trend
+            fitting. If False, uses OLS. If None, auto-detects from residual
+            variability at fit; series with 5000 or more observations skip
+            auto-detection and use OLS. Default is None.
         alias (str): Model name identifier. Default is "MFLES".
-        conformal_params (ConformalIntervals | None): Conformal prediction configuration for generating prediction intervals. Default is None.
+        conformal_params (ConformalIntervals | None): Conformal prediction
+            configuration. When set, ``fit`` caches conformity scores and
+            ``predict``/``forecast`` can return conformal intervals. Default is None.
 
     Attributes:
-        ``model_`` (dict): Populated after fit(); contains fitted values and all components.
+        model_ (dict): Populated after fit(); contains fitted values and all components.
         multiplicative (bool): Whether the last fit used multiplicative (log-space) mode.
         penalty (float | None): R²-based trend dampening scalar (set during fit).
         trend_penalty (bool): Whether trend damping is applied during predict().
@@ -1078,7 +1089,7 @@ class MFLES(BaseForecaster):
             fourier_order (int | None): Fixed Fourier order for all periods. None uses the auto-heuristic (5 / 10 / 15 based on period length). Default is None.
             ma (int | list[int] | None): Moving-average window(s) for residual smoothing cadence. None defaults to [1]. Default is None.
             alpha (float): LASSO regularization strength for changepoint trend. Default is 1.0.
-            decay (float): Unused legacy parameter (kept for API compatibility). Default is -1.
+            decay (float): Unused legacy parameter (kept for interface compatibility). Default is -1.
             n_changepoints (float | int): Number of changepoint knots. A float < 1 is treated as a fraction of series length (e.g. 0.25 = 25% of n). An int specifies knots directly. None or 0 disables changepoints. Default is 0.25.
             seasonal_lr (float): Learning rate multiplier applied to seasonal updates. Default is 0.9.
             rs_lr (float): Learning rate multiplier for residual-smoothing updates. Default is 1.0.
@@ -1086,7 +1097,7 @@ class MFLES(BaseForecaster):
             exogenous_estimator: Unused legacy parameter. Default is None.
             exogenous_params (dict): Unused legacy parameter. Default is {}.
             linear_lr (float): Learning rate multiplier for trend updates. Default is 0.9.
-            cov_threshold (float): CoV proxy threshold for auto robust-mode detection. Set to -1 to effectively disable. Default is 0.7.
+            cov_threshold (float): Coefficient-of-variation proxy threshold for auto robust-mode detection. Set to -1 to effectively disable. Default is 0.7.
             moving_medians (bool): If True, initialises fitted values with period-wise medians instead of zeros. Default is False.
             max_rounds (int): Maximum number of fitting iterations. Default is 50.
             min_alpha (float): Minimum SES alpha in the ensemble grid. Default is 0.05.
@@ -1098,24 +1109,25 @@ class MFLES(BaseForecaster):
             smoother (bool): Used only when ses_mode="adaptive": True selects SES ensemble, False selects rolling mean. Default is False.
             ses_mode (str): Residual smoothing strategy. One of ``"off"`` (no residual smoothing), ``"lite"`` (rolling mean, StatsForecast default), ``"full"`` (SES ensemble), or ``"adaptive"`` (controlled by the ``smoother`` flag). Default is "lite".
             seasonality_weights (bool): If True, applies recency-weighted OLS for Fourier seasonal fitting. Auto-enabled for multiplicative single-period series. Default is False.
-            gradient_strategy (bool): Inert legacy flag; retained for API
-                compatibility. Has no effect on the fit.
+            gradient_strategy (bool): Inert legacy flag kept for interface compatibility; has no effect on the fit. Default is False.
 
         Returns:
             MFLES: Self (fitted model instance) for method chaining.
+
+        Raises:
+            ValueError: If ``ses_mode`` is not one of "off", "lite", "full", "adaptive".
         """
         y = utils.ensure_float(jnp.asarray(y).reshape(-1))
         n = y.shape[0]
 
-        # StatsForecast-compatible multiplicative decision:
+        # statsforecast-compatible multiplicative decision:
         # - if seasonality is provided, prefer multiplicative mode
         # - disable multiplicative when the series contains non-positive values
         if multiplicative is None:
             # Auto decision needs concrete data (log-space validity). It is
             # resolved ONCE, eagerly, at fit time; the CV path replays the
             # resolved value via _fit_config (captured below) so per-window
-            # fits trace statically. Same selection-with-sight class as
-            # AutoARIMA's cached order.
+            # fits trace statically.
             multiplicative = seasonal_period is not None
             if multiplicative:
                 multiplicative = bool(jnp.min(y) > 0)
@@ -1123,7 +1135,7 @@ class MFLES(BaseForecaster):
 
         # Resolved fit configuration. forecast() replays this when called with
         # no explicit config (the base conformity_scores path), so CV windows
-        # re-fit the SAME model configuration — not the bare defaults — and
+        # re-fit the SAME model configuration, not the bare defaults, and
         # every auto decision above stays static under the vmap trace.
         self._fit_config = dict(
             seasonal_period=seasonal_period, fourier_order=fourier_order,
@@ -1152,9 +1164,8 @@ class MFLES(BaseForecaster):
         self.const, self.mean, self.std = const, mean, std
         self.trend_penalty = bool(trend_penalty)
 
-        # Static short-series guard only. (The old `jnp.all(y_tr == mean)`
-        # constant-series test is a traced bool under vmap; the main loop is
-        # flat on constants anyway — AutoCES precedent.)
+        # Static short-series guard only. A constant-series test would be a
+        # traced bool under vmap, and the main loop is flat on constants anyway.
         if n < 4:
             base = y_tr[-1]
             self.trend = jnp.array([base, base], dtype=y.dtype)
@@ -1208,7 +1219,7 @@ class MFLES(BaseForecaster):
         if not changepoints:
             n_cps = 0
 
-        # SF uses min(n_changepoints, 0.1 * n). We keep that behavior but
+        # statsforecast uses min(n_changepoints, 0.1 * n). We keep that behavior but
         # apply a fixed knot cap so complexity scales monotonically with n.
         cp_cap = 64
         n_cps = max(0, min(int(n_cps), int(0.1 * n), cp_cap))
@@ -1234,13 +1245,13 @@ class MFLES(BaseForecaster):
             init_robust = False
             robust_init_value = False
 
-        # A Python bool here is config (explicit ctor value, or a flag already
+        # A Python bool here is config (explicit constructor value, or a flag already
         # resolved on the host by conformity_scores) and can select the trend
-        # branch statically. Anything else — None, or a jnp scalar left by a
-        # previous auto-detect — stays traced. See _fit_body's docstring.
+        # branch statically. Anything else (None, or a jnp scalar left by a
+        # previous auto-detect) stays traced. See _fit_body's docstring.
         static_robust = robust_init_value if isinstance(robust_init_value, bool) else None
 
-        # SF behavior: cov_threshold=-1 disables safeguards by using a very large threshold.
+        # statsforecast behavior: cov_threshold=-1 disables safeguards by using a very large threshold.
         if cov_threshold == -1:
             cov_threshold = 10000
 
@@ -1313,8 +1324,8 @@ class MFLES(BaseForecaster):
             knots = _uniform_knots(n, n_cps, max_knots=n_cps)
             hinge_basis = _hinge_basis_from_knots(n, knots)
             lasso_step = jnp.array(_spectral_step(hinge_basis), dtype=y.dtype)
-            # M5: X^T X is loop-invariant — hoist it out of the fit loop so
-            # each ISTA iteration is a (k,k) matvec, not two (n,k) ones.
+            # X^T X is loop-invariant: hoist it out of the fit loop so each
+            # ISTA iteration is a (k,k) matvec, not two (n,k) ones.
             hinge_gram = hinge_basis.T @ hinge_basis
         else:
             # Dummy values (unused when changepoints are inactive).
@@ -1399,7 +1410,7 @@ class MFLES(BaseForecaster):
         self.median_component = median_component
         self.exogenous_component = final_state.exogenous_component
 
-        # Trend tail is tracked during fitting to mirror SF trend updates
+        # Trend tail is tracked during fitting to mirror statsforecast trend updates
         # (trend updates add tren[-2:], residual smoother adds tren[-1]).
         self.trend = final_state.trend_tail.astype(fitted.dtype)
         
@@ -1414,7 +1425,7 @@ class MFLES(BaseForecaster):
             self._seas_len = None
 
         # Auto-detected flags stay jnp scalars end-to-end so the CV vmap can trace
-        # them. The resolved robust is stored SEPARATELY from the user's ctor
+        # them. The resolved robust is stored SEPARATELY from the user's constructor
         # `robust`: writing it back would change `_make_fit_loop`'s static key
         # between two fits of the same instance and force a fit_loop recompile on
         # every re-fit. conformity_scores pins the demoted bool on a CLONE, so
@@ -1426,7 +1437,7 @@ class MFLES(BaseForecaster):
         self.penalty = final_state.penalty
 
         # exo_beta is all-zeros whenever exogenous never improved the fit, so
-        # the X @ beta contribution is exactly 0 — no traced any() guard.
+        # the X @ beta contribution is exactly 0; no traced any() guard.
         if has_exogenous:
             self._exo_beta = final_state.exo_beta
 
@@ -1437,37 +1448,28 @@ class MFLES(BaseForecaster):
     def conformity_scores(self, y: jnp.ndarray, X: jnp.ndarray | None = None):
         """Walk-forward conformity scores, with the robust flag resolved once.
 
-        Same eager-select-once shape as AutoARIMA's order and AutoMFLES's
-        config: an auto-detected ``robust`` left as a jnp scalar by ``fit()``
-        would be batched by the CV vmap, turning the trend ``lax.cond`` into a
-        ``select`` that runs Siegel on every round of every window. Demoting it
-        to a Python bool here — on the host, where it is already concrete —
-        keeps the branch static.
+        An auto-detected ``robust`` left as a jnp scalar by ``fit()`` would be
+        batched by the CV vmap, turning the trend ``lax.cond`` into a ``select``
+        that runs Siegel on every round of every window. This method demotes
+        the flag to a Python bool on the host (where it is already concrete),
+        pins it on a clone, and runs the windows on that clone. With
+        ``robust=True`` the Siegel-heavy window fits run sequentially; with
+        ``robust=False`` they run under the base-class vmap. An unfitted model
+        with ``robust=None`` falls through to the base path, where each window
+        auto-detects.
 
-        The flag's value is unchanged, so this selects the same branch: scores
-        are bit-identical at float64 (the library's native precision). At
-        float32 they can differ on a minority of coordinates (max rel ~5e-3),
-        because dropping the dead branch lets XLA re-fuse the surviving ops and
-        the loop's discrete ``improved = cur < best`` test amplifies a last-bit
-        change into a flipped accept. Neither side is systematically nearer the
-        f64 result.
+        Args:
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            X (jnp.ndarray | None): Exogenous regressors, shape ``(T, F)``. Default is None.
 
-        Execution regime: with robust pinned True the window fits are
-        Siegel-bisection heavy and the CV vmap batches every while-loop carry, so
-        the windows run faster sequentially. Pinned False stays on the vmapped
-        base, where the scan-dominated fit amortizes the batch and vmap wins.
-
-        Sequential windows compute exactly what an eager fit of that window
-        computes; the vmapped values differ by batched-kernel rounding, which the
-        loop's discrete accept test can amplify into a different — equally valid —
-        trajectory on a short window. The resulting offset drift is far inside the
-        sampling variance of an ``n_windows=3`` quantile estimator.
+        Returns:
+            jnp.ndarray: Conformity scores of shape ``(n_windows, h)``.
         """
         robust = self.robust
         if robust is None:
             robust = getattr(self, "_resolved_robust", None)
         if robust is None:
-            # never fit: the CV windows auto-detect (the pre-S3 general path)
+            # never fit: the CV windows auto-detect
             return super().conformity_scores(y=y, X=X)
         if not isinstance(robust, bool):
             robust = bool(robust)  # host-side demotion; value unchanged
@@ -1478,7 +1480,7 @@ class MFLES(BaseForecaster):
         return BaseForecaster.conformity_scores(clone, y=y, X=X)
 
     def _cache_cs(self, y: jnp.ndarray, X: jnp.ndarray | None) -> None:
-        """Cache conformity scores on the TRAINING series (sibling convention).
+        """Cache conformity scores on the training series.
 
         Runs the base-class walk-forward CV once, eagerly, at fit time so
         predict(level=...) is a cheap lookup. forecast() strips
@@ -1529,30 +1531,29 @@ class MFLES(BaseForecaster):
 
         Extrapolates the stored trend tail by the fitted slope (optionally damped
         by the R² penalty), tiles the seasonal tail, and adds any exogenous contribution.
-        Optionally computes conformal prediction intervals.
+        Optionally adds conformal prediction intervals from the scores cached at fit.
 
         Args:
             h (int): Forecast horizon (number of steps ahead).
-            X (jnp.ndarray | None): Future exogenous matrix of shape (h, p). Required only if the model was fitted with exogenous variables. Default is None.
-            level (list[int | float] | None): Confidence levels (0-100) for conformal prediction intervals, e.g. [80, 95]. Requires ``conformal_params`` to be set. Default is None.
+            X (jnp.ndarray | None): Future exogenous matrix of shape ``(h, F)``. Used only when the model was fitted with exogenous variables; ignored otherwise. Default is None.
+            level (list[int | float] | None): Confidence levels in (0, 100) for conformal intervals, e.g. ``[80, 95]``. Requires ``conformal_params``. An empty list means no intervals. Default is None.
 
         Returns:
-            dict: Dictionary containing:
+            dict: ``"mean"`` of shape ``(h,)``, plus ``"lo-{lv}"`` and ``"hi-{lv}"`` of shape ``(h,)`` per level when ``level`` is given.
 
-                - "mean": Point forecasts of shape (h,).
-                - "lo-{l}" / "hi-{l}": Conformal interval bounds for each level l
-                  (only present when level is not None).
+        Raises:
+            ValueError: If called before ``fit``; if ``level`` is given without ``conformal_params`` or without cached conformity scores; or if ``h`` differs from ``conformal_params.h``.
         """
         self._require_fitted()
         h = int(h)
         last, prev = self.trend[1], self.trend[0]
         slope = (last - prev)
         if self.trend_penalty and (self.penalty is not None):
-            # SF applies slope * max(0, R²): a round-1 trend with R² <= 0 is
+            # statsforecast applies slope * max(0, R²): a round-1 trend with R² <= 0 is
             # anti-predictive and forecasts flat. penalty > 1 is the "no round-1
             # trend accepted" sentinel (no damping); penalty == 0 also maps to no
             # damping (compatibility with fitted states that encode 0 as the
-            # no-trend sentinel — an unfitted trend has ~zero slope regardless).
+            # no-trend sentinel; an unfitted trend has ~zero slope regardless).
             # Only a genuine computed R² in (-inf, 1] damps, clipped at 0.
             pen = jnp.asarray(self.penalty)
             no_damp = (pen > 1.0) | (pen == 0.0)
@@ -1563,10 +1564,10 @@ class MFLES(BaseForecaster):
             seas = jnp.asarray(self.seasonality)
             seas_len = getattr(self, "_seas_len", None)
             if seas_len is None:
-                # Pre-refactor fit/pickle stored the exact-length tail.
+                # Fitted states without a stored length carry an exact-length tail.
                 seas_len = jnp.int32(seas.shape[0])
-            # Modular gather over the static buffer (traced-length-safe tiling;
-            # replaces _repeat_val_seas, which needs a static pattern length).
+            # Modular gather over the static buffer (tiling that is safe with a
+            # traced length).
             idx = jnp.arange(h) % jnp.maximum(seas_len, 1)
             seas_fcst = jnp.where(seas_len > 0, seas[idx],
                                   jnp.zeros((), dtype=seas.dtype))
@@ -1617,22 +1618,29 @@ class MFLES(BaseForecaster):
         seasonal_period: int | list[int] | None = None,
         **fit_kwargs,
     ) -> dict:
-        r"""Stateless fit+predict in one call (convenience wrapper).
+        r"""Stateless fit+predict in one call.
 
-        Creates a fresh model copy, fits it on `y`, and immediately generates
-        forecasts. Does not store any state on `self`.
+        Fits a fresh copy of the model on ``y`` and forecasts from it without
+        storing state on ``self``. When ``seasonal_period`` and ``fit_kwargs``
+        are both omitted, the configuration of the last :meth:`fit` on this
+        instance is replayed; this is how the base-class ``conformity_scores``
+        re-fits each CV window with the fitted configuration.
 
         Args:
-            y (jnp.ndarray): Input time series of shape (n,).
+            y (jnp.ndarray): Input time series of shape ``(T,)``.
             h (int): Forecast horizon.
-            X (jnp.ndarray | None): In-sample exogenous matrix of shape (n, p). Default is None.
-            X_future (jnp.ndarray | None): Future exogenous matrix of shape (h, p). Default is None.
-            level (list[int | float] | None): Confidence levels for conformal intervals. Default is None.
-            seasonal_period (int | list[int] | None): Seasonal period(s) passed to fit. Default is None.
-            \**fit_kwargs: Any additional keyword arguments forwarded to fit().
+            X (jnp.ndarray | None): In-sample exogenous matrix of shape ``(T, F)``. Default is None.
+            X_future (jnp.ndarray | None): Future exogenous matrix of shape ``(h, F)``; ignored when ``X`` is None. Default is None.
+            level (list[int | float] | None): Confidence levels in (0, 100) for conformal intervals, e.g. ``[80, 95]``. Requires ``conformal_params``. Default is None.
+            fitted (bool): If True, also return in-sample fitted values. Default is False.
+            seasonal_period (int | list[int] | None): Seasonal period(s) passed to ``fit``. Default is None.
+            **fit_kwargs: Any further keyword arguments of :meth:`fit`.
 
         Returns:
-            dict: Same output as predict() -- "mean" and optional interval keys.
+            dict: ``"mean"`` of shape ``(h,)``; ``"lo-{lv}"`` and ``"hi-{lv}"`` of shape ``(h,)`` per level when ``level`` is given; ``"fitted"`` of shape ``(T,)`` when ``fitted`` is True.
+
+        Raises:
+            ValueError: If ``level`` is given without ``conformal_params``; if ``h`` differs from ``conformal_params.h``; or if ``fit_kwargs`` carries an invalid ``ses_mode``.
         """
         # Replay the fitted configuration when the caller passed none: the base
         # conformity_scores path calls forecast(h=..., y=..., X=..., X_future=...)
@@ -1665,7 +1673,7 @@ class MFLES(BaseForecaster):
                 )
             # Score from the JUST-FITTED clone so the CV windows replay the
             # same config the point forecast used (self._fit_config may be
-            # stale or absent — e.g. stateless forecast on an unfitted model
+            # stale or absent, e.g. stateless forecast on an unfitted model
             # or explicit kwargs overriding the fitted config). The clone's
             # own window-fits still get conformal_params=None → no recursion.
             cs_model = m.new()

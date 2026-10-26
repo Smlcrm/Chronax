@@ -1,4 +1,4 @@
-"""Pluggable point-loss functions for the GRU forecaster.
+"""Pluggable point-loss functions for the gated recurrent unit (GRU) forecaster.
 
 Each loss has signature ``(pred, target) -> scalar`` and reduces by mean over
 all elements. Functions are module-level so they pickle cleanly when stored

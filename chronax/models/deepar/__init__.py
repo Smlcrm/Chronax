@@ -1,7 +1,7 @@
 """DeepAR probabilistic forecasting model (JAX/FLAX/OPTAX implementation).
 
 A complete, NumPy-free implementation of DeepAR with support for:
-- LSTM encoder-decoder architecture
+- Long short-term memory (LSTM) encoder-decoder architecture
 - Multiple exogenous variable types (future, static)
 - Probabilistic forecasting with Gaussian distribution
 - Monte Carlo sampling for uncertainty quantification
@@ -68,6 +68,6 @@ __all__ = [
     "quantiles",
     "train_model",
     
-    # High-level API
+    # High-level interface
     "DeepARForecaster",
 ]

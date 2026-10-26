@@ -53,19 +53,51 @@ def _select_boxcox_lambda(y: jnp.ndarray) -> float:
 class DeepNPTS(BaseForecaster):
     """Univariate DeepNPTS forecaster (JAX/Flax-NNX port of neuralforecast.DeepNPTS).
 
-    Maintenance Status:
-        Active univariate forecaster. Integrates with the ``BaseForecaster``
-        interface, including conformal prediction intervals via ``predict(level=...)``,
-        pickle round-trip, and ``forecast(fitted=True)``.
-
     Deep Non-Parametric Time Series forecaster (Rangapuram, Gasthaus, Stella,
-    Flunkert, Salinas, Wang & Januschowski, 2023). A small MLP reads the lookback
-    window and emits, per horizon step, a softmax weight over each window
-    position; the forecast is the weighted sum of the raw in-sample values, i.e.
-    a learned non-parametric resample of the context. For the univariate,
-    no-exogenous case the MLP input dimension is ``input_size``. NF default
-    ``scaler_type="identity"`` is mirrored (trained in raw scale) with Optax
-    ``adam`` and a pluggable point loss. ``float32`` throughout.
+    Flunkert, Salinas, Wang & Januschowski, 2023). A small multilayer
+    perceptron (MLP) reads the lookback window and emits, per horizon step, a
+    softmax weight over each window position; the forecast is the weighted sum
+    of the raw in-sample values, that is, a learned non-parametric resample of
+    the context. For the univariate, no-exogenous case the MLP input dimension
+    is ``input_size``. neuralforecast's default ``scaler_type="identity"`` is
+    mirrored (trained in raw scale) with Optax ``adam`` and a pluggable point
+    loss. ``float32`` throughout.
+
+    Maintenance status:
+        Active univariate forecaster. Integrates with the ``BaseForecaster``
+        interface, including conformal prediction intervals via
+        ``predict(level=...)``, pickle round-trip, and ``forecast(fitted=True)``.
+
+    Args:
+        h (int): Forecast horizon.
+        input_size (int): Input window length. Any value ``< 1`` (default
+            ``-1``) resolves to ``3 * h``.
+        hidden_size (int): Width of each hidden layer. Default ``32``.
+        n_layers (int): Number of hidden layers. Default ``2``.
+        dropout (float): Dropout rate after each hidden layer. Default ``0.1``.
+        batch_norm (bool): Apply BatchNorm after each dense layer
+            (``momentum=0.9``, ``eps=1e-5``). neuralforecast defaults to
+            ``True``; off here because BatchNorm adds running statistics to
+            training, inference and pickling. Default ``False``.
+        use_boxcox (bool): Box-Cox transform the series before modelling
+            (lambda chosen once at fit by profile likelihood) and invert the
+            forecast, as :class:`chronax.models.TBATS` does. Requires strictly
+            positive values. Default ``False``.
+        max_steps (int): Number of Adam steps. Default ``1000``.
+        learning_rate (float | Callable[[int], float]): Adam learning rate, a
+            scalar or an ``optax`` schedule. Default ``1e-3``.
+        windows_batch_size (int): Rolling windows sampled per step. Default
+            ``1024``.
+        random_seed (int): Seed for parameter init, dropout and window
+            sampling. Default ``1``.
+        alias (str): Display name. Default ``"DeepNPTS"``.
+        loss (str | LossFn): Registry name (``"mae"``, ``"mse"``, ``"huber"``)
+            or a callable. Default ``"mae"``.
+
+    Note:
+        A callable ``loss`` or ``learning_rate`` must itself be picklable for
+        the fitted estimator to pickle. An unknown ``loss`` name raises
+        ``ValueError`` at ``fit`` time.
     """
 
     uses_exog = False
@@ -93,14 +125,14 @@ class DeepNPTS(BaseForecaster):
         (``hidden_size=32``, ``n_layers=2``, ``dropout=0.1``, ``max_steps=1000``,
         ``learning_rate=1e-3``, ``windows_batch_size=1024``,
         ``scaler_type="identity"``), with one documented override: ``batch_norm``
-        defaults to ``False`` (NF defaults ``True``). ``input_size=-1`` resolves to
+        defaults to ``False`` (neuralforecast defaults ``True``). ``input_size=-1`` resolves to
         ``3 * h``. ``loss`` is a registry name (``"mae"``/``"mse"``/``"huber"``) or
         a callable; ``learning_rate`` is a scalar or an ``optax.ScalarOrSchedule``.
         If the fitted estimator will be pickled, any callable passed for
         ``loss``/``learning_rate`` must itself be picklable.
 
         ``batch_norm`` (default ``False``) applies Batch Normalization after each
-        dense layer, matching NF's default architecture when enabled. It is left
+        dense layer, matching neuralforecast's default architecture when enabled. It is left
         off by default because BatchNorm carries non-parameter running statistics
         that add state complexity to training, inference, and pickling; when
         enabled it uses ``momentum=0.9`` (equivalent to torch's ``0.1``) and
@@ -145,7 +177,33 @@ class DeepNPTS(BaseForecaster):
         )
 
     def fit(self, y: jnp.ndarray, X: jnp.ndarray | None = None) -> "DeepNPTS":
-        """Fit the network on a 1-D series of length ``>= input_size + h``."""
+        """Fit the network on a 1-D series.
+
+        Builds the network and runs ``max_steps`` Adam steps over rolling
+        windows of length ``input_size + h``, sampled per step the way
+        neuralforecast does.
+
+        When ``use_boxcox=True`` the series is Box-Cox transformed first (the
+        lambda is chosen once by profile likelihood) and the raw series is kept
+        for the conformal path.
+
+        Args:
+            y (jnp.ndarray): Univariate series, shape ``(T,)`` with
+                ``T >= input_size + h``.
+            X (jnp.ndarray | None): Exogenous regressors. Not supported; must
+                be ``None``.
+
+        Returns:
+            DeepNPTS: ``self`` with ``model_`` populated.
+
+        Raises:
+            NotImplementedError: If ``X`` is not ``None``.
+            ValueError: If ``y`` is not 1-D, if it is shorter than
+                ``input_size + h``, if ``use_boxcox=True`` and ``y`` contains a
+                value ``<= 0``, or if ``loss`` is an unknown registry name.
+            RuntimeError: If a non-finite training loss is observed (the
+                training run diverged).
+        """
         if X is not None:
             raise NotImplementedError("Exogenous variables are not supported.")
         y = jnp.asarray(y, dtype=jnp.float32)
@@ -183,7 +241,33 @@ class DeepNPTS(BaseForecaster):
         X: jnp.ndarray | None = None,
         level: list[int | float] | None = None,
     ) -> dict:
-        """Forecast ``h`` steps (``1 <= h <= self.h``) from the fitted context."""
+        """Forecast ``h`` steps from the fitted context.
+
+        The network is direct-decoded for ``self.h`` steps and the first ``h``
+        are returned.
+        Forecasts are mapped back from the Box-Cox space when
+        ``use_boxcox=True``.
+
+        Args:
+            h (int): Forecast horizon, ``1 <= h <= self.h``.
+            X (jnp.ndarray | None): Exogenous regressors. Ignored.
+            level (list[int | float] | None): Confidence levels in (0, 100),
+                e.g. ``[80, 95]``. When given, conformal intervals come from
+                ``BaseForecaster.conformity_scores``, which re-fits the model on
+                every cross-validation (CV) window under ``vmap``; requires
+                ``self.conformal_params``. Expect minutes per call on this
+                model, scaling with ``n_windows`` and ``max_steps``.
+
+        Returns:
+            dict: ``"mean"`` (shape ``(h,)``) plus ``"lo-{lv}"`` and
+            ``"hi-{lv}"`` (shape ``(h,)``) for each level when ``level`` is
+            given.
+
+        Raises:
+            RuntimeError: If called before ``fit``.
+            ValueError: If ``h < 1``, if ``h > self.h``, or if ``level`` is
+                given while ``self.conformal_params`` is ``None``.
+        """
         if self.model_ is None or self._context is None:
             raise RuntimeError("Call fit(y) before predict(h).")
         if h < 1:
@@ -223,7 +307,33 @@ class DeepNPTS(BaseForecaster):
         level: list[int | float] | None = None,
         fitted: bool = False,
     ) -> dict:
-        """Stateless fit-then-predict on ``y``. Optionally add ``"fitted"``."""
+        """Fit on ``y`` and forecast ``h`` steps in one call.
+
+        Equivalent to ``self.fit(y).predict(h=h, level=level)``; the fitted
+        state stays on the estimator.
+
+        Args:
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            h (int): Forecast horizon, ``1 <= h <= self.h``.
+            X (jnp.ndarray | None): Exogenous regressors. Not supported; must
+                be ``None``.
+            X_future (jnp.ndarray | None): Future exogenous regressors. Not
+                supported; must be ``None``.
+            level (list[int | float] | None): Confidence levels; see
+                ``predict``.
+            fitted (bool): If ``True``, add a ``"fitted"`` key with
+                one-step-ahead in-sample predictions, shape ``(T,)``; the first
+                ``input_size`` entries are NaN.
+
+        Returns:
+            dict: ``"mean"`` (shape ``(h,)``), the interval keys when ``level``
+            is given, and ``"fitted"`` when ``fitted=True``.
+
+        Raises:
+            NotImplementedError: If ``X`` or ``X_future`` is not ``None``.
+            ValueError: Forwarded from ``fit`` and ``predict``.
+            RuntimeError: Forwarded from ``fit`` and ``predict``.
+        """
         if X is not None or X_future is not None:
             raise NotImplementedError("Exogenous variables are not supported.")
         self.fit(y)
@@ -256,8 +366,8 @@ class DeepNPTS(BaseForecaster):
     def __getstate__(self) -> dict:
         """Serialize NNX state (params + any BatchStat); rebuild GraphDef on unpickle.
 
-        A full ``nnx.split`` captures every variable — ``nnx.Param`` and, when
-        ``batch_norm=True``, ``nnx.BatchStat`` running statistics — so the round
+        A full ``nnx.split`` captures every variable, ``nnx.Param`` and, when
+        ``batch_norm=True``, ``nnx.BatchStat`` running statistics, so the round
         trip is exact regardless of the BatchNorm setting.
         """
         state = self.__dict__.copy()

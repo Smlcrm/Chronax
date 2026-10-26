@@ -1,20 +1,22 @@
 """
-tbats_core.py — TBATS (Trigonometric, Box-Cox, ARMA, Trend, Seasonal) core.
+TBATS core: trigonometric seasonality, Box-Cox transform, autoregressive
+moving-average (ARMA) errors, trend and seasonal components.
 
 Pure-JAX implementation with optax L-BFGS optimisation.  All heavy paths are
-JIT-compiled and the module-level solver constant enables XLA cache reuse
-across warm calls.
+just-in-time (JIT) compiled, and the module-level solver constant lets XLA
+(Accelerated Linear Algebra) reuse compiled kernels across warm calls.
 
 vmap-native design: every data-dependent quantity (Box-Cox lambda, harmonic
-counts, AIC selection) stays a traced ``jnp`` value end-to-end.  Because the
-selected harmonic count would otherwise determine the state-space DIMENSION,
-the state space is built at the static, config-derived maximum harmonic count
-(``k_vector_max``) and the traced selected count enters only through gain
-masks — inactive harmonics get zero gain and zero seed, so their states stay
-exactly 0 and the padded model is numerically identical to the sliced one.
+counts, Akaike information criterion (AIC) selection) stays a traced ``jnp``
+value end-to-end.  Because the selected harmonic count would otherwise
+determine the state-space dimension, the state space is built at the static,
+config-derived maximum harmonic count (``k_vector_max``) and the traced
+selected count enters only through gain masks: inactive harmonics get zero
+gain and zero seed, so their states stay exactly 0 and the padded model is
+numerically identical to the sliced one.
 
-Public API
-----------
+Public functions
+----------------
 - find_harmonics        : AIC-based harmonic count selection (traced count)
 - tbats_model_generator : fit a single TBATS specification
 - tbats_model           : convenience wrapper (no ARMA)
@@ -85,7 +87,7 @@ def _boxcox(y: jnp.ndarray, lam: Optional[float]) -> jnp.ndarray:
 
 
 def _boxcox_raw(y: jnp.ndarray, lam: jnp.ndarray) -> jnp.ndarray:
-    """Box-Cox transform **without** ``_ensure_pos`` — use when *y* is already positive."""
+    """Box-Cox transform **without** ``_ensure_pos``; use when *y* is already positive."""
     lam = jnp.asarray(lam, dtype=y.dtype)
     return jnp.where(jnp.abs(lam) < 1e-8, jnp.log(y), (jnp.power(y, lam) - 1.0) / lam)
 
@@ -101,7 +103,7 @@ def _inv_boxcox(y: jnp.ndarray, lam: Optional[float]) -> jnp.ndarray:
 # ── Guerrero lambda selection ──────────────────────────────────────────
 
 def _guerrero_lambda(y: jnp.ndarray, season_length: int, lower: float, upper: float) -> jnp.ndarray:
-    """Select Box-Cox lambda via the Guerrero CV method.
+    """Select Box-Cox lambda via the Guerrero coefficient-of-variation method.
 
     Returns a ``jnp`` scalar so the selection traces under vmap (the candidate
     lambda grid is config-derived and therefore concrete even under trace).
@@ -243,7 +245,7 @@ def find_harmonics(y: jnp.ndarray, m: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
     ).astype(jnp.int32)
 
     # Deseasonalise: betas are fit on the detrended z, but the returned
-    # series is y minus the SEASONAL fit only (trend intact — the next
+    # series is y minus the SEASONAL fit only (trend intact; the next
     # period's search re-detrends with its own rolling mean).
     col_mask = (jnp.arange(2 * max_harmonics) < 2 * num_harmonics).astype(fourier.dtype)
     X_best = fourier * col_mask
@@ -475,7 +477,7 @@ def update_g(
 
     ``k_vector_max`` (when given) fixes the per-season block LAYOUT of the
     padded state space, while the possibly-traced ``k_vector`` bounds the
-    ACTIVE gain positions inside each block — harmonics beyond ``k_vector``
+    ACTIVE gain positions inside each block; harmonics beyond ``k_vector``
     keep zero gain, so their states never activate.  When omitted, layout ==
     active (the unpadded legacy behaviour).
     """
@@ -599,17 +601,16 @@ _calc_filter_core = _calc_filter_impl
 # L-BFGS Parameter Optimisation
 # ═══════════════════════════════════════════════════════════════════════
 
-# Convergence-gated L-BFGS: run at least _MIN_OPTIM_STEPS, then continue while the
-# per-observation best-loss improvement stays above _OPTIM_FTOL, stopping after
-# _OPTIM_PATIENCE consecutive stalled steps or at the _MAX_OPTIM_STEPS cap. The
-# A fixed-step scan leaves TBATS badly under-converged on trend-heavy and long
-# series, while the gate charges each cell only the steps it needs — fast-m cells
-# stop early, large-m cells run to the cap. The PATIENCE counter is load-bearing: a
-# bare "improvement < tol" test stops on a single L-BFGS line-search misfire
-# (best_loss flat for one step) and returns a barely-optimized result. The FTOL is
-# scaled
-# by n because the objective is n·log(sse). Under conformity_scores' vmap the loop
-# runs until every CV window stalls.
+# Convergence-gated L-BFGS: run at least _MIN_OPTIM_STEPS, then continue while
+# the per-observation best-loss improvement stays above _OPTIM_FTOL, and stop
+# after _OPTIM_PATIENCE consecutive stalled steps or at the _MAX_OPTIM_STEPS cap.
+# A fixed step count would leave trend-heavy and long series under-converged
+# while over-paying on short ones; the gate charges each series only the steps
+# it needs. The patience counter is load-bearing: a bare "improvement < tol"
+# test stops on a single L-BFGS line-search misfire (best_loss flat for one
+# step) and returns a barely-optimised result. The tolerance is scaled by n
+# because the objective is n*log(sse). Under the cross-validation (CV) vmap of
+# conformity_scores the loop runs until every CV window stalls.
 _MIN_OPTIM_STEPS = 30
 _MAX_OPTIM_STEPS = 150
 _OPTIM_PATIENCE = 10
@@ -766,8 +767,8 @@ def tbats_model_generator(
     """Fit a single TBATS specification (Box-Cox + optimisation + filter).
 
     ``k_vector`` may be a traced array (per-season selected harmonic counts)
-    ONLY when ``k_vector_max`` — the static, config-derived per-season layout
-    ceiling — is also given; the state space is then built at ``k_vector_max``
+    ONLY when ``k_vector_max``, the static, config-derived per-season layout
+    ceiling, is also given; the state space is then built at ``k_vector_max``
     and ``k_vector`` acts purely through gain masks.  Without ``k_vector_max``,
     ``k_vector`` must be concrete and defines the layout itself (legacy
     unpadded behaviour, used when callers fix the harmonic counts).
@@ -789,7 +790,7 @@ def tbats_model_generator(
     # Non-positive data disables the transform lax-natively (independently per
     # vmap batch member): the filter then runs on the RAW series, and only the
     # REPORTED lambda becomes the NaN sentinel that downstream transforms read
-    # as "identity" — the candidate stays a valid, honestly-optimized model.
+    # as "identity"; the candidate stays a valid, honestly-optimised model.
     if use_boxcox:
         y_pos = _ensure_pos(y)
         bc_disabled = jnp.any(y <= 0)
@@ -875,7 +876,7 @@ def tbats_model_generator(
         # Raw roundtrip: at lam_init this is exactly the pre-transform seed
         # (a negative trend slope stays negative). A lambda that later makes
         # any seed component non-transformable yields a NaN objective, which
-        # the finite-guard scores 1e20 — the optimizer avoids that region
+        # the finite-guard scores 1e20, so the optimizer avoids that region
         # rather than fitting a sign-flipped seed.
         x0_untransformed_pos = _inv_boxcox(x0_hat, lam_init)
         y_pos_log_sum = jnp.where(
@@ -892,7 +893,7 @@ def tbats_model_generator(
     kv_active = jnp.asarray(k_vector, dtype=jnp.int32)
 
     # Dummy keeps JIT signatures consistent regardless of Box-Cox branch;
-    # y_fit is always passed for real — it is the bc_disabled fallback series.
+    # y_fit is always passed for real; it is the bc_disabled fallback series.
     _y_pos = y_pos if use_boxcox else y_fit
 
     uhat = _run_lbfgs_optim(
@@ -915,7 +916,7 @@ def tbats_model_generator(
     idx = 0
     if use_boxcox:
         # optim_lambda_raw (finite) drives the final transforms; the REPORTED
-        # lambda carries the NaN sentinel when the transform was disabled —
+        # lambda carries the NaN sentinel when the transform was disabled;
         # downstream (tbats_forecast, _bc_original_scale) reads NaN as identity.
         optim_lambda_raw = optim_params[idx]; idx += 1
         optim_lambda = jnp.where(bc_disabled, jnp.asarray(jnp.nan, dtype=dtype), optim_lambda_raw)
@@ -963,15 +964,17 @@ def tbats_model_generator(
     log_likelihood = n_eff * jnp.log(sigma2 + 1e-12)
     if use_boxcox:
         # y_pos_log_sum is already zeroed when the transform is disabled; the
-        # where is belt-and-braces. lam_candidate (the Guerrero-init lambda,
-        # not the optimized one) is retained deliberately: the optimized-lambda
-        # form is SF-faithful but the A/B showed it regresses airline/co2-class
-        # holdout selection (IC != holdout) — parked, documented divergence.
+        # where is belt-and-braces. The adjustment uses lam_candidate (the
+        # Guerrero-initialised lambda), not the optimised lambda that
+        # statsforecast uses. This is a deliberate divergence: the optimised
+        # form gives candidates a lower AIC that does not translate into
+        # better holdout forecasts.
         bc_adjustment = 2.0 * (lam_candidate - 1.0) * y_pos_log_sum
         log_likelihood = log_likelihood - jnp.where(bc_disabled, 0.0, bc_adjustment)
 
-    # Seed-state dof counts the ACTIVE (possibly traced) harmonics, not the
-    # padded layout — keeps AIC identical to the unpadded model.
+    # Seed-state degrees of freedom count the ACTIVE (possibly traced)
+    # harmonics, not the padded layout, which keeps AIC identical to the
+    # unpadded model.
     n_seed_states = 1 + adj_phi + 2 * jnp.sum(kv_active) + p + q
     kval = optim_params.size + n_seed_states
     if use_boxcox and optim_lambda is not None:
@@ -1038,12 +1041,15 @@ def tbats_model(
 # ═══════════════════════════════════════════════════════════════════════
 
 def _trend_grid(use_trend, use_damped_trend):
-    """Trend/damped candidate combinations. None on either axis means "search
-    both". ⚠ The default (both None) deliberately OMITS the (True, True)
-    damped candidate: A/B on the benchmark showed adding it regresses
-    airline/synth-multi holdout (chronax's damped fit underperforms SF's
-    there) while its AIC wins selection — the IC != holdout class. The
-    damped candidate is only searched when the caller asks for it."""
+    """Return the (use_trend, use_damped_trend) candidate combinations.
+
+    ``None`` on an axis means "search both". The default grid (both ``None``)
+    deliberately omits the damped candidate ``(True, True)``: its AIC often
+    wins the selection while its holdout forecasts are worse than the
+    undamped ones. The damped candidate is fitted only when the caller asks
+    for it: ``use_damped_trend=True``, or ``use_trend=True`` with
+    ``use_damped_trend=None``.
+    """
     if use_trend is None:
         if use_damped_trend is None:
             return [(False, False), (True, False)]
@@ -1082,12 +1088,14 @@ def tbats_selection(
     Candidates can differ in state dimension (trend on/off), so the returned
     dict carries the full ``candidates`` list plus the traced ``best`` index;
     ``tbats_forecast``/``compute_sigmah`` forecast every candidate and
-    row-select the winner (the AutoCES pattern).  Leaves whose shapes agree
+    row-select the winner.  Leaves whose shapes agree
     across all candidates (scalars and n-shaped ones always do) are also
     exposed at the top level, winner-selected, for direct inspection.
 
-    ``use_boxcox`` follows the StatsForecast/R convention: ``None`` tries both
-    off and on, ``True`` forces on, ``False`` forces off.
+    ``use_boxcox`` follows the statsforecast/R convention: ``None`` tries both
+    off and on, ``True`` forces on, ``False`` forces off. ``use_arma_errors``
+    is recorded on each candidate but no ARMA coefficients are fitted here
+    (``ar_coeffs``/``ma_coeffs`` are always ``None``).
 
     ``early_stop_patience``/``early_stop_tol`` are accepted for backward
     compatibility and ignored (early stopping is not vmap-compatible).
@@ -1117,7 +1125,7 @@ def tbats_selection(
         _tbats_debug(f"[TBATS][select] k_vector={kv} kvmax={kvmax} "
                      f"time={time.perf_counter() - t_sel0:.4f}s")
 
-    # ── Candidate grid (static config; SF/R-convention Box-Cox mapping) ─
+    # ── Candidate grid (static config; statsforecast/R Box-Cox convention) ─
     if use_boxcox is None:
         B = [False, True]
     elif use_boxcox:
@@ -1129,14 +1137,14 @@ def tbats_selection(
 
     combos = [(bcx, t, use_arma_errors) for bcx in B for t in T]
 
-    # Pre-build seasonal blocks once (shared across candidates), in the
-    # generator's dtype — building them in y.dtype skewed the selection-path
-    # AIC against direct float64 fits.
+    # Pre-build seasonal blocks once (shared across candidates) in the
+    # generator's float64 dtype, so the selection-path AIC equals a direct
+    # float64 fit of the same candidate.
     seasonal_blocks = _build_seasonal_blocks(
         periods, jnp.asarray(kvmax, dtype=jnp.int32), jnp.float64
     )
 
-    # ── Evaluate all candidates (static config loop — vmap-compatible) ──
+    # ── Evaluate all candidates (static config loop, vmap-compatible) ──
     candidates = []
     for bcx, (trend, damped), arma in combos:
         t_cand = time.perf_counter()
@@ -1158,8 +1166,8 @@ def tbats_selection(
     # ── argmin selection; NaN AICs masked to +inf ───────────────────────
     # Box-Cox candidates degrade lax-natively on non-positive data (fitted on
     # the raw series; only their REPORTED lambda is the NaN sentinel), so they
-    # remain valid competitors — the extra lambda dof costs them +2 AIC vs
-    # their non-Box-Cox twin, which then wins the auto grid deterministically.
+    # remain valid competitors; the extra lambda parameter costs them +2 AIC
+    # against their non-Box-Cox twin, which then wins the auto grid.
     aics = jnp.stack([jnp.asarray(c["aic"]) for c in candidates])
     invalid = jnp.isnan(aics)
     best = jnp.argmin(jnp.where(invalid, jnp.inf, aics))
@@ -1235,7 +1243,7 @@ def tbats_forecast(mod: Dict, h: int) -> Dict[str, jnp.ndarray]:
     Accepts either a single fitted candidate (``tbats_model_generator``
     output) or a ``tbats_selection`` result: for the latter, every candidate
     is forecast with its own static config and the winner's row is selected
-    with ``jnp.take`` — candidate state dimensions may differ, so the traced
+    with ``jnp.take``: candidate state dimensions may differ, so the traced
     ``best`` index can never be dispatched on directly.
     """
     h = int(h)

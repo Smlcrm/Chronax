@@ -45,7 +45,7 @@ def _interval_mean(y: jnp.ndarray) -> jnp.ndarray:
 
 
 def _ses_sse(alpha: jnp.ndarray, x: jnp.ndarray) -> jnp.ndarray:
-    """Return the sum of squared one-step errors for SES."""
+    """Return the sum of squared one-step errors for simple exponential smoothing (SES)."""
     complement = 1.0 - alpha
     init_carry = (x[0], jnp.array(0.0, dtype=x.dtype))
 
@@ -269,15 +269,13 @@ def _adida_point(
 
     The aggregation level is data-dependent, so all shapes stay static:
     positions map to chunk ids, sums land in a fixed length-n buffer via
-    segment_sum, and SES runs over the masked ``n_chunks`` prefix.
+    ``segment_sum``, and simple exponential smoothing (SES) runs over the
+    masked ``n_chunks`` prefix.
 
-    Jitted at module level: the masked-SES helpers below define their
-    ``fori_loop``/``cond`` bodies *inside* the function, so eager dispatch would
-    rebuild four fresh closures per call and pjit — which keys on callable identity —
-    would recompile an identical jaxpr every time. One stable jitted callable also
-    fuses the eager segment_sum chain. ``h`` is the
-    only static; the aggregation level stays traced (shapes are kept static by
-    ``segment_sum(num_segments=n)`` + masking).
+    Jitted at module level with ``h`` as the only static argument. The
+    masked-SES helpers define their ``fori_loop``/``cond`` bodies inside the
+    function; one stable jitted callable keeps pjit (which keys its cache on
+    callable identity) from retracing fresh closures on every call.
     """
     n = y.shape[0]
     mean_interval = _interval_mean(y)
@@ -444,30 +442,30 @@ def _predict_in_sample_adida(
 
 
 class ADIDA(BaseForecaster):
+    """Aggregate-Disaggregate Intermittent Demand Approach (ADIDA).
+
+    Aggregates the series temporally to reduce the number of zeros, fits
+    SES with an optimized alpha at the aggregated level, and spreads the
+    forecast back to the original level with equal weights. Forecast
+    intervals are conformal only; fitted intervals use the residual standard
+    error. Fitted values are expensive (one SES fit per time step) and emit a
+    ``UserWarning``.
+
+    References:
+        - [Nikolopoulos, K., Syntetos, A. A., Boylan, J. E., Petropoulos, F., & Assimakopoulos, V. (2011). An aggregate-disaggregate intermittent demand approach (ADIDA) to forecasting: an empirical proposition and analysis. Journal of the Operational Research Society, 62(3), 544-554.](https://researchportal.bath.ac.uk/en/publications/an-aggregate-disaggregate-intermittent-demand-approach-adida-to-f).
+
+    Args:
+        alias (str): Custom name of the model. Defaults to ``"ADIDA"``.
+        prediction_intervals (Optional[ConformalIntervals]): Configuration for
+            conformal prediction intervals; required for ``level``. Defaults
+            to ``None``.
+    """
+
     def __init__(
         self,
         alias: str = "ADIDA",
         prediction_intervals: Optional[ConformalIntervals] = None,
     ) -> None:
-        """ADIDA model.
-
-        Aggregate-Dissagregate Intermittent Demand Approach: Uses temporal aggregation to reduce the
-        number of zero observations. Once the data has been agregated, it uses the optimized SES to
-        generate the forecasts at the new level. It then breaks down the forecast to the original
-        level using equal weights.
-
-        ADIDA specializes on sparse or intermittent series are series with very few non-zero observations.
-        They are notoriously hard to forecast, and so, different methods have been developed
-        especifically for them.
-
-        References:
-            - [Nikolopoulos, K., Syntetos, A. A., Boylan, J. E., Petropoulos, F., & Assimakopoulos, V. (2011). An aggregate–disaggregate intermittent demand approach (ADIDA) to forecasting: an empirical proposition and analysis. Journal of the Operational Research Society, 62(3), 544-554.](https://researchportal.bath.ac.uk/en/publications/an-aggregate-disaggregate-intermittent-demand-approach-adida-to-f).
-
-        Args:
-            alias (str, optional): Custom name of the model. Defaults to "ADIDA".
-            prediction_intervals (Optional[ConformalIntervals], optional): Information to compute conformal prediction intervals.
-                By default, the model will compute the native prediction intervals. Defaults to None.
-        """
         self.alias = alias
         self.prediction_intervals = prediction_intervals
         self.only_conformal_intervals = True
@@ -490,14 +488,20 @@ class ADIDA(BaseForecaster):
     ) -> "ADIDA":
         """Fit the ADIDA model.
 
-        Fit an ADIDA to a time series (numpy array) `y`.
+        Stores the point forecast in ``model_``. When ``prediction_intervals``
+        is set, conformity scores are computed and cached for :meth:`predict`.
 
         Args:
-            y (np.ndarray): Clean time series of shape (t, ).
-            X (Optional[np.ndarray], optional): Optional exogenous variables. Defaults to None.
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            X (Optional[jnp.ndarray]): Exogenous regressors, shape ``(T, F)``.
+                Only forwarded to ``conformity_scores``. Defaults to ``None``.
 
         Returns:
-            ADIDA: ADIDA fitted model.
+            ADIDA: ``self``.
+
+        Raises:
+            ValueError: If ``prediction_intervals`` is set and the series is
+                too short for 2 cross-validation (CV) windows.
         """
         return _fit_adida(self, y, X)
 
@@ -507,27 +511,41 @@ class ADIDA(BaseForecaster):
         X: Optional[jnp.ndarray] = None,
         level: Optional[List[int]] = None,
     ) -> ForecastDict:
-        """Predict with fitted ADIDA.
+        """Predict with the fitted ADIDA model.
 
         Args:
             h (int): Forecast horizon.
-            X (Optional[np.ndarray], optional): Optional exogenous of shape (h, n_x). Defaults to None.
-            level (Optional[List[int]], optional): Confidence levels (0-100) for prediction intervals. Defaults to None.
+            X (Optional[jnp.ndarray]): Future exogenous regressors, shape
+                ``(h, F)``. Ignored. Defaults to ``None``.
+            level (Optional[List[int]]): Confidence levels in (0, 100), e.g.
+                ``[80, 95]``. Requires ``prediction_intervals``. Defaults to
+                ``None``.
 
         Returns:
-            dict: Dictionary with entries `mean` for point predictions and `level_*` for probabilistic predictions.
+            dict: ``"mean"`` (shape ``(h,)``, flat) plus
+            ``"lo-{lv}"``/``"hi-{lv}"`` per level when ``level`` is given.
+
+        Raises:
+            ValueError: If called before ``fit``, or if ``level`` is given
+                without ``prediction_intervals``.
         """
         self._require_fitted()
         return self._predict_impl(self, h, X, level)
 
     def predict_in_sample(self, level: Optional[List[int]] = None) -> ForecastDict:
-        """Access fitted ADIDA insample predictions.
+        """Return the in-sample fitted values of the fitted model.
+
+        Recomputes the fitted values from the stored training series; this is
+        expensive and emits a ``UserWarning``.
 
         Args:
-            level (Optional[List[int]], optional): Confidence levels (0-100) for prediction intervals. Defaults to None.
+            level (Optional[List[int]]): Confidence levels in (0, 100).
+                Defaults to ``None``.
 
         Returns:
-            dict: Dictionary with entries `fitted` for point predictions and `level_*` for probabilistic predictions.
+            dict: ``"fitted"`` (shape ``(T,)``, first value NaN) plus
+            ``"fitted-lo-{lv}"``/``"fitted-hi-{lv}"`` per level when ``level``
+            is given.
         """
         return _predict_in_sample_adida(self, level)
 
@@ -540,56 +558,30 @@ class ADIDA(BaseForecaster):
         level: Optional[List[int]] = None,
         fitted: bool = False,
     ) -> ForecastDict:
-        """Memory Efficient ADIDA predictions.
-
-        This method avoids memory burden due from object storage.
-        It is analogous to `fit_predict` without storing information.
-        It assumes you know the forecast horizon in advance.
+        """Stateless fit+predict in one call.
 
         Args:
-            y (np.ndarray): Clean time series of shape (n,).
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
             h (int): Forecast horizon.
-            X (Optional[np.ndarray], optional): Optional insample exogenous of shape (t, n_x). Defaults to None.
-            X_future (Optional[np.ndarray], optional): Optional exogenous of shape (h, n_x). Defaults to None.
-            level (Optional[List[int]], optional): Confidence levels (0-100) for prediction intervals. Defaults to None.
-            fitted (bool, optional): Whether or not to return insample predictions. Defaults to False.
+            X (Optional[jnp.ndarray]): In-sample exogenous regressors, shape
+                ``(T, F)``. Only forwarded to ``conformity_scores``. Defaults
+                to ``None``.
+            X_future (Optional[jnp.ndarray]): Future exogenous regressors,
+                shape ``(h, F)``. Ignored. Defaults to ``None``.
+            level (Optional[List[int]]): Confidence levels in (0, 100).
+                Requires ``prediction_intervals``. Defaults to ``None``.
+            fitted (bool): Whether to return in-sample fitted values under
+                ``"fitted"`` (expensive, emits a ``UserWarning``). Defaults to
+                ``False``.
 
         Returns:
-            dict: Dictionary with entries `mean` for point predictions and `level_*` for probabilistic predictions.
+            dict: ``"mean"`` (shape ``(h,)``); ``"fitted"`` (shape ``(T,)``)
+            when ``fitted``; ``"lo-{lv}"``/``"hi-{lv}"`` per level when
+            ``level`` is given, plus ``"fitted-lo-{lv}"``/``"fitted-hi-{lv}"``
+            when both are set.
+
+        Raises:
+            ValueError: If ``level`` is given without ``prediction_intervals``,
+                or if the series is too short for 2 CV windows.
         """
         return self._forecast_impl(self, y, h, X, X_future, level, fitted)
-
-# # Test Cases
-# def test():
-#     # simple increasing series
-#     y = jnp.arange(24.0)
-
-#     ci = ConformalIntervals(method="conformal_distribution")
-#     model = ADIDA(prediction_intervals=ci)
-
-#     fitted_model = model.fit(y)
-
-#     result = fitted_model.predict(h=12, level=[60, 75])
-#     forecast = fitted_model.forecast(y, h=12, level=[80, 95])
-
-#     # ---- Assertions ----
-#     assert "mean" in result, "Missing mean forecast"
-#     assert len(result["mean"]) == 12, "Forecast length mismatch"
-
-#     for lvl in [60, 75]:
-#         assert f"lo-{lvl}" in result, f"Missing lower bound for {lvl}% interval"
-#         assert f"hi-{lvl}" in result, f"Missing upper bound for {lvl}% interval"
-#         assert len(result[f"lo-{lvl}"]) == 12, f"Lower interval {lvl}% has wrong length"
-#         assert len(result[f"hi-{lvl}"]) == 12, f"Upper interval {lvl}% has wrong length"
-
-#     for lvl in [80, 95]:
-#         assert f"lo-{lvl}" in forecast, f"Missing lower bound for {lvl}% interval"
-#         assert f"hi-{lvl}" in forecast, f"Missing upper bound for {lvl}% interval"
-#         assert len(forecast[f"lo-{lvl}"]) == 12, f"Lower interval {lvl}% has wrong length"
-#         assert len(forecast[f"hi-{lvl}"]) == 12, f"Upper interval {lvl}% has wrong length"
-
-#     print("Test passed!")
-
-
-# if __name__ == "__main__":
-#     test()

@@ -1,11 +1,12 @@
-"""Window construction and JIT/scan training for MLP.
+"""Window construction and JIT/scan training for the multilayer perceptron (MLP)
+forecaster.
 
 Windows are scaled per-window (scaler stats on the insample target; per-channel
 scaling on historical and future-known exog) and the whole training loop is one ``nnx.scan``
 so it stays ``vmap``-traceable for ``BaseForecaster.conformity_scores``. Point
 and multi-quantile losses are computed in scaled space; distribution losses
-(``GMM``) are evaluated against the ORIGINAL-scale target with the predicted
-parameters mapped out of scaled space via ``scale_decouple`` — the network
+(Gaussian mixture model, ``GMM``) are evaluated against the ORIGINAL-scale target with the predicted
+parameters mapped out of scaled space via ``scale_decouple``, the network
 optimizes in the scaler's normalized range while the likelihood lives in data
 units. The MLP forward is fully deterministic (no dropout), so the only RNG
 stream is the batch-index sampling; inference needs no key, and repeated
@@ -84,7 +85,7 @@ def _scale_exog(windows: jnp.ndarray, scaler, stats_len: int | None = None) -> j
     # SPREAD-based floor bounds |scaled| <= range/(frac*range) = 1/frac by
     # construction (the shift lies inside [min, max]). frac sits ~15x below the
     # Gaussian scale/range ratio (~0.15 at these window lengths), so ordinary
-    # covariates — including level-offset ones like temperature in Kelvin —
+    # covariates, including level-offset ones like temperature in Kelvin,
     # never trip it, while degenerate spans (scale/range ~ 1e-9) always do.
     # Covariate values are known inputs, so the bound may read the full window;
     # the CENTERING stays insample-span.
@@ -169,7 +170,7 @@ def train_on_windows(net, y_windows, target_mask, *, h, input_size, max_steps,
     """Train ``net`` in place on prebuilt window arrays via one ``nnx.scan``.
 
     Accepts pooled windows from any number of series (cross-learning); batch
-    sampling is uniform over the pooled set — with replacement when there are
+    sampling is uniform over the pooled set, with replacement when there are
     fewer windows than ``windows_batch_size``, without replacement otherwise.
     Returns per-step losses.
     """
@@ -241,7 +242,7 @@ def train(net, y, *, h, input_size, max_steps, windows_batch_size, lr, seed, los
 
 @nnx.jit
 def _forward_det(net, insample_z, hist_z, futr_z):
-    """Inference forward. The MLP forward is deterministic — jit for dispatch speed."""
+    """Inference forward. The MLP forward is deterministic, jit for dispatch speed."""
     return net(insample_z, hist_exog=hist_z, futr_exog=futr_z)
 
 
@@ -255,7 +256,7 @@ def _broadcast_exog(full, ctx_rows, *, input_size, scaler, stats_len):
 
 def predict_step(net, y_context, *, h, input_size, scaler, hist_full=None, futr_full=None):
     """Forecast next ``h`` steps from per-series contexts, in the **original**
-    scale (point/quantile heads only — distribution heads go through
+    scale (point/quantile heads only, distribution heads go through
     ``predict_params``).
 
     ``y_context`` is ``[L]`` (one series) or ``[B, L]`` (a batch of series
@@ -280,7 +281,7 @@ def predict_step(net, y_context, *, h, input_size, scaler, hist_full=None, futr_
 def predict_params(net, y_context, *, input_size, scaler, loss_fn, hist_full=None, futr_full=None):
     """Distribution parameters for the next ``h`` steps, in the ORIGINAL scale.
 
-    ``y_context`` is ``[L]`` (one series) or ``[B, L]`` (a batch of contexts —
+    ``y_context`` is ``[L]`` (one series) or ``[B, L]`` (a batch of contexts,
     per-series tails); returns the loss's decoupled parameter tuple with arrays
     ``[h, K]`` / ``[B, h, K]`` accordingly. ``hist_full`` (``[input_size, F]``)
     and ``futr_full`` (``[input_size+h, F]``) are each shared across a batch of

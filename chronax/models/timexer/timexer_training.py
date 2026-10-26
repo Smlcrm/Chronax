@@ -3,7 +3,7 @@
 Windows are h-padded partial windows with a target mask (every window keeps at
 least one real target and the newest observations appear as training contexts;
 the zero-padded tail is masked out of the loss). The loss is computed in
-ORIGINAL scale — normalization happens inside the network (non-stationary normalization),
+ORIGINAL scale, normalization happens inside the network (non-stationary normalization),
 matching the reference's identity-scaler arrangement. The whole training loop
 is one ``nnx.scan`` so it stays ``vmap``-traceable for
 ``BaseForecaster.conformity_scores``; dropout keys advance through the scan

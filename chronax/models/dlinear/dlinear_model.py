@@ -16,30 +16,51 @@ from chronax.models.dlinear.dlinear_training import predict_step, train
 class DLinear(BaseForecaster):
     """Univariate DLinear forecaster (JAX/Flax-NNX port of neuralforecast.DLinear).
 
-    Decomposes each input window into trend (edge-padded moving average of size
-    ``moving_avg_window``) and seasonal (residual), applies one linear head to
-    each, and sums (Zeng et al., 2023). Defaults match neuralforecast 3.1.7
-    (moving_avg_window=25, max_steps=5000, learning_rate=1e-4, identity scaler,
-    MAE loss) so the benchmark harness compares both libraries at native settings.
+    Decomposes each input window into a trend (edge-padded moving average of
+    size ``moving_avg_window``) and a seasonal residual, applies one linear
+    head to each, and sums the two (Zeng et al., 2023). Defaults match
+    neuralforecast 3.1.7. There is no last-value normalization (that is
+    NLinear's trick), so a scaler shift enters the forecast through the trend
+    head, scaled by the row sums of ``w_trend``. ``float32`` throughout,
+    matching torch and neuralforecast defaults.
 
-    Maintenance Status:
+    Maintenance status:
         Active univariate forecaster. Integrates with the ``BaseForecaster``
         interface, including conformal prediction intervals via
         ``predict(level=...)``, pickle round-trip, and ``forecast(fitted=True)``.
 
-    ``moving_avg_window`` must be odd (neuralforecast's own constructor
-    constraint — which also rejects even non-positives — surfaced here as
-    ValueError) and positive (Chronax addition: neuralforecast accepts odd
-    negative values and fails only at forward).
-    ``input_size=-1`` (default; any value < 1) expands to ``3*h`` — a Chronax convenience;
-    neuralforecast requires ``input_size`` explicitly.
+    Args:
+        h (int): Forecast horizon.
+        input_size (int): Input window length. Any value ``< 1`` (default
+            ``-1``) resolves to ``3 * h``; neuralforecast requires an explicit
+            value.
+        moving_avg_window (int): Kernel size of the moving average; must be
+            odd and positive. Default ``25``.
+        max_steps (int): Number of Adam steps. Default ``5000``.
+        learning_rate (float | Callable[[int], float]): Adam learning rate, a
+            scalar or an ``optax`` schedule. Default ``1e-4``.
+        windows_batch_size (int): Rolling windows sampled per step. Default
+            ``1024``.
+        loss (str | LossFn): Registry name (``"mae"``, ``"mse"``, ``"huber"``)
+            or a callable ``(pred, target, mask=None) -> scalar``. Default
+            ``"mae"``.
+        scaler (str | Scaler): Per-window scaler: ``"identity"`` (default,
+            matches neuralforecast), ``"robust"`` (median and median absolute
+            deviation, MAD), or a ``Scaler`` instance.
+        random_seed (int): Seed for parameter init and window sampling.
+            Default ``1``.
+        alias (str): Display name. Default ``"DLinear"``.
 
-    ``scaler``: ``"identity"`` (default, matches neuralforecast) or ``"robust"``.
-    Unlike NLinear there is no last-value normalization: a scaler shift enters
-    the forecast through the trend head (the seasonal component is
-    shift-invariant; the edge-padded moving average maps y+c -> trend+c), scaled
-    by ``w_trend``'s row sums — it does not cancel. ``float32`` throughout,
-    matching torch/neuralforecast defaults.
+    Raises:
+        ValueError: If ``moving_avg_window`` is even (neuralforecast's own
+            constructor constraint, which also rejects even non-positives) or
+            not positive (a Chronax addition; neuralforecast accepts odd
+            negatives and fails at forward).
+
+    Note:
+        A callable ``loss`` or ``learning_rate`` must itself be picklable for
+        the fitted estimator to pickle. Unknown ``loss`` or ``scaler`` names
+        raise ``ValueError`` at ``fit`` time.
     """
 
     uses_exog = False
@@ -48,9 +69,9 @@ class DLinear(BaseForecaster):
                  max_steps: int = 5000, learning_rate: Union[float, Callable[[int], float]] = 1e-4,
                  windows_batch_size: int = 1024, loss: Union[str, LossFn] = "mae",
                  scaler: Union[str, Scaler] = "identity", random_seed: int = 1, alias: str = "DLinear"):
-        # Even check FIRST: NF's `% 2 == 0` guard also catches 0/-2/-4 (Python
-        # modulo), so even non-positives are NF parity; only ODD negatives slip
-        # through NF (failing later at forward) — those are the Chronax addition.
+        # Even check FIRST: neuralforecast's `% 2 == 0` guard also catches 0/-2/-4 (Python
+        # modulo), so even non-positives are neuralforecast parity; only ODD negatives slip
+        # through neuralforecast (failing later at forward), those are the Chronax addition.
         if moving_avg_window % 2 == 0:
             raise ValueError(f"moving_avg_window must be odd (uneven); got {moving_avg_window}. "
                              "Matches neuralforecast's constructor constraint.")
@@ -88,8 +109,29 @@ class DLinear(BaseForecaster):
                           rngs=nnx.Rngs(self.random_seed))
 
     def fit(self, y: jnp.ndarray, X: jnp.ndarray | None = None) -> "DLinear":
-        """Fit on a 1-D series. Raises NotImplementedError on exog; ValueError if
-        y is not 1-D or shorter than input_size+h; RuntimeError on divergence."""
+        """Fit the network on a 1-D series.
+
+        Builds the network and runs ``max_steps`` Adam steps over rolling
+        windows of length ``input_size + h``, sampled per step the way
+        neuralforecast does.
+
+        Args:
+            y (jnp.ndarray): Univariate series, shape ``(T,)`` with
+                ``T >= input_size + h``.
+            X (jnp.ndarray | None): Exogenous regressors. Not supported; must
+                be ``None``.
+
+        Returns:
+            DLinear: ``self`` with ``model_`` populated.
+
+        Raises:
+            NotImplementedError: If ``X`` is not ``None``.
+            ValueError: If ``y`` is not 1-D, if it is shorter than
+                ``input_size + h``, or if ``loss`` or ``scaler`` is an unknown
+                registry name.
+            RuntimeError: If a non-finite training loss is observed (the
+                training run diverged).
+        """
         if X is not None:
             raise NotImplementedError("Exogenous variables are not supported.")
         y = jnp.asarray(y, dtype=jnp.float32)
@@ -109,7 +151,30 @@ class DLinear(BaseForecaster):
 
     def predict(self, h: int, X: jnp.ndarray | None = None,
                 level: list[int | float] | None = None) -> dict:
-        """Forecast h steps (1 <= h <= self.h). ``level`` -> inherited conformal path."""
+        """Forecast ``h`` steps from the fitted context.
+
+        The network is direct-decoded for ``self.h`` steps and the first ``h``
+        are returned.
+
+        Args:
+            h (int): Forecast horizon, ``1 <= h <= self.h``.
+            X (jnp.ndarray | None): Exogenous regressors. Ignored.
+            level (list[int | float] | None): Confidence levels in (0, 100),
+                e.g. ``[80, 95]``. When given, conformal intervals come from
+                ``BaseForecaster.conformity_scores``, which re-fits the model on
+                every cross-validation (CV) window under ``vmap``; requires
+                ``self.conformal_params``.
+
+        Returns:
+            dict: ``"mean"`` (shape ``(h,)``) plus ``"lo-{lv}"`` and
+            ``"hi-{lv}"`` (shape ``(h,)``) for each level when ``level`` is
+            given.
+
+        Raises:
+            RuntimeError: If called before ``fit``.
+            ValueError: If ``h < 1``, if ``h > self.h``, or if ``level`` is
+                given while ``self.conformal_params`` is ``None``.
+        """
         if self.model_ is None or self._context is None:
             raise RuntimeError("Call fit(y) before predict(h).")
         if h < 1:
@@ -133,7 +198,33 @@ class DLinear(BaseForecaster):
     def forecast(self, y: jnp.ndarray, h: int, X: jnp.ndarray | None = None,
                  X_future: jnp.ndarray | None = None, level: list[int | float] | None = None,
                  fitted: bool = False) -> dict:
-        """Stateless fit-then-predict; ``fitted=True`` adds one-step-ahead fitted values."""
+        """Fit on ``y`` and forecast ``h`` steps in one call.
+
+        Equivalent to ``self.fit(y).predict(h=h, level=level)``; the fitted
+        state stays on the estimator.
+
+        Args:
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            h (int): Forecast horizon, ``1 <= h <= self.h``.
+            X (jnp.ndarray | None): Exogenous regressors. Not supported; must
+                be ``None``.
+            X_future (jnp.ndarray | None): Future exogenous regressors. Not
+                supported; must be ``None``.
+            level (list[int | float] | None): Confidence levels; see
+                ``predict``.
+            fitted (bool): If ``True``, add a ``"fitted"`` key with
+                one-step-ahead in-sample predictions, shape ``(T,)``; the first
+                ``input_size`` entries are NaN.
+
+        Returns:
+            dict: ``"mean"`` (shape ``(h,)``), the interval keys when ``level``
+            is given, and ``"fitted"`` when ``fitted=True``.
+
+        Raises:
+            NotImplementedError: If ``X`` or ``X_future`` is not ``None``.
+            ValueError: Forwarded from ``fit`` and ``predict``.
+            RuntimeError: Forwarded from ``fit`` and ``predict``.
+        """
         if X is not None or X_future is not None:
             raise NotImplementedError("Exogenous variables are not supported.")
         self.fit(y)
@@ -162,8 +253,8 @@ class DLinear(BaseForecaster):
 
     def __getstate__(self) -> dict:
         """Serialize NNX Param state only and rebuild the GraphDef via
-        _build_net() on load — smaller payload and robust to flax-internal
-        GraphDef changes across versions (same convention as KAN/NLinear)."""
+        ``_build_net()`` on load: a smaller payload that does not depend on
+        flax-internal GraphDef layout (same convention as KAN and NLinear)."""
         state = self.__dict__.copy()
         if state.get("model_") is not None:
             _, full_state = nnx.split(state["model_"])

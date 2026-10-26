@@ -1,4 +1,4 @@
-"""Chronax TiDE — JAX/Flax port of Nixtla NeuralForecast's TiDE model."""
+"""Chronax TiDE: JAX/Flax port of Nixtla neuralforecast's TiDE model."""
 
 from chronax.models.tide.data import (
     RobustScaler,

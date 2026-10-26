@@ -1,7 +1,7 @@
 """iTransformer forecasting model (univariate, JAX/Flax-NNX port of neuralforecast.iTransformer)."""
 import flax
 
-# Pinned to flax 0.10.x — NNX is pre-1.0 and the scan / Optimizer / LayerNorm
+# Pinned to flax 0.10.x, NNX is pre-1.0 and the scan / Optimizer / LayerNorm
 # APIs have churned across minor versions. Loud failure here beats silent
 # miscompilation on a newer flax.
 if not flax.__version__.startswith("0.10"):

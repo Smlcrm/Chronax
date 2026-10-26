@@ -8,6 +8,26 @@ from chronax import utils
 __all__ = ['TSB']
 
 class TSB(BaseForecaster):
+    """Teunter-Syntetos-Babai (TSB) method for intermittent demand.
+
+    Smooths the demand probability (every period, rate ``alpha_p``) and the
+    demand size (on non-zero periods, rate ``alpha_d``) with simple exponential
+    smoothing (SES) and forecasts their product as a flat line. Prediction
+    intervals are conformal only; in-sample fitted intervals use the residual
+    standard error.
+
+    Args:
+        alpha_d (float): Smoothing rate for the demand size, in (0, 1).
+        alpha_p (float): Smoothing rate for the demand probability, in (0, 1).
+        alias (str): Custom name of the model. Defaults to ``"TSB"``.
+        conformal_params (ConformalIntervals | None): Configuration for
+            conformal prediction intervals; required for ``level``. Defaults
+            to ``None``.
+
+    Raises:
+        ValueError: If ``alpha_d`` or ``alpha_p`` is not a number in (0, 1).
+    """
+
     uses_exog = False
 
     def __init__(
@@ -56,8 +76,8 @@ class TSB(BaseForecaster):
             tsb_step, (demand_init, prob_init), (y, prob_indicators)
         )
 
-        # First fitted value is undefined (no prior observation) — NaN, which
-        # the nansum inside calculate_sigma excludes; denominator is n.
+        # The first fitted value has no prior observation and is NaN; the
+        # nansum inside calculate_sigma excludes it and the denominator is n.
         fitted_vals = prob_fitted * demand_fitted
         fitted_vals = fitted_vals.at[0].set(jnp.nan)
         residuals = y - fitted_vals
@@ -77,6 +97,19 @@ class TSB(BaseForecaster):
     _tsb_core_jit = jax.jit(_tsb_core.__func__, static_argnums=(1, 2, 3, 4))
 
     def fit(self, y: jnp.ndarray, X: jnp.ndarray | None = None):
+        """Fit the TSB model.
+
+        Stores the final demand and probability levels, the fitted values,
+        the residual standard error and the training series in ``model_``.
+
+        Args:
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            X (jnp.ndarray | None): Exogenous regressors, shape ``(T, F)``.
+                Ignored. Defaults to ``None``.
+
+        Returns:
+            TSB: ``self``.
+        """
         y = utils.ensure_float(y)
         mod = TSB._tsb_core_jit(y, h=1, alpha_d=self.alpha_d, alpha_p=self.alpha_p, fitted=True)
         mod['y_train'] = y
@@ -84,6 +117,26 @@ class TSB(BaseForecaster):
         return self
 
     def predict(self, h: int, X: jnp.ndarray | None = None, level: list[int] | None = None):
+        """Predict with the fitted TSB model.
+
+        Args:
+            h (int): Forecast horizon.
+            X (jnp.ndarray | None): Future exogenous regressors, shape
+                ``(h, F)``. Only forwarded to ``conformity_scores``. Defaults
+                to ``None``.
+            level (list[int] | None): Confidence levels in (0, 100), e.g.
+                ``[80, 95]``. Requires ``conformal_params``. Defaults to
+                ``None``.
+
+        Returns:
+            dict: ``"mean"`` (shape ``(h,)``, float32) plus
+            ``"lo-{lv}"``/``"hi-{lv}"`` per level when ``level`` is given.
+
+        Raises:
+            ValueError: If called before ``fit``; if ``level`` is given
+                without ``conformal_params``; or if the training series is
+                too short for 2 cross-validation (CV) windows.
+        """
         if self.model_ is None:
             raise ValueError("Model must be fitted before calling predict()")
 
@@ -102,6 +155,20 @@ class TSB(BaseForecaster):
         return res
 
     def predict_in_sample(self, level: list[int] | None = None):
+        """Return the in-sample fitted values of the fitted model.
+
+        Args:
+            level (list[int] | None): Confidence levels in (0, 100). Defaults
+                to ``None``.
+
+        Returns:
+            dict: ``"fitted"`` (shape ``(T,)``, first value NaN) plus
+            ``"fitted-lo-{lv}"``/``"fitted-hi-{lv}"`` per level when ``level``
+            is given.
+
+        Raises:
+            ValueError: If called before ``fit``.
+        """
         if self.model_ is None:
             raise ValueError("Model must be fitted before calling predict_in_sample()")
 
@@ -119,6 +186,31 @@ class TSB(BaseForecaster):
         level: list[int] | None = None,
         fitted: bool = False,
     ):
+        """Stateless fit+predict in one call.
+
+        Args:
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            h (int): Forecast horizon.
+            X (jnp.ndarray | None): In-sample exogenous regressors, shape
+                ``(T, F)``. Only forwarded to ``conformity_scores``. Defaults
+                to ``None``.
+            X_future (jnp.ndarray | None): Future exogenous regressors, shape
+                ``(h, F)``. Ignored. Defaults to ``None``.
+            level (list[int] | None): Confidence levels in (0, 100). Requires
+                ``conformal_params``. Defaults to ``None``.
+            fitted (bool): Whether to return in-sample fitted values under
+                ``"fitted"``. Defaults to ``False``.
+
+        Returns:
+            dict: ``"mean"`` (shape ``(h,)``); ``"fitted"`` (shape ``(T,)``)
+            when ``fitted``; ``"lo-{lv}"``/``"hi-{lv}"`` per level when
+            ``level`` is given, plus ``"fitted-lo-{lv}"``/``"fitted-hi-{lv}"``
+            when both are set.
+
+        Raises:
+            ValueError: If ``level`` is given without ``conformal_params``, or
+                if the series is too short for 2 CV windows.
+        """
         y = utils.ensure_float(y)
         out = TSB._tsb_core_jit(y=y, h=h, alpha_d=self.alpha_d, alpha_p=self.alpha_p, fitted=fitted)
         res = {"mean": out["mean"]}
@@ -148,6 +240,23 @@ class TSB(BaseForecaster):
         level: list[int] | None = None,
         fitted: bool = False,
     ):
+        """Apply the model to a new series; delegates to :meth:`forecast`.
+
+        Args:
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            h (int): Forecast horizon.
+            X (jnp.ndarray | None): In-sample exogenous regressors, shape
+                ``(T, F)``. Defaults to ``None``.
+            X_future (jnp.ndarray | None): Future exogenous regressors, shape
+                ``(h, F)``. Ignored. Defaults to ``None``.
+            level (list[int] | None): Confidence levels in (0, 100). Defaults
+                to ``None``.
+            fitted (bool): Whether to return in-sample fitted values. Defaults
+                to ``False``.
+
+        Returns:
+            dict: Same keys as :meth:`forecast`.
+        """
         return self.forecast(y=utils.ensure_float(y), h=h, X=X, X_future=X_future, level=level, fitted=fitted)
 
     def _add_fitted_intervals(self, res: dict, sigma: float, level: list[int]) -> dict:
@@ -158,8 +267,6 @@ class TSB(BaseForecaster):
             res[f"fitted-hi-{lv}"] = res["fitted"] + z * sigma
         return res
 
-
-# test cases 
 
 if __name__ == '__main__':
 

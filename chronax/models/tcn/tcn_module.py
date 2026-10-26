@@ -1,8 +1,8 @@
-"""Flax NNX modules for the TCN forecaster (port of neuralforecast.TCN).
+"""Flax NNX modules for the temporal convolutional network (TCN) forecaster (port of neuralforecast.TCN).
 
 The building blocks are ``CausalConv1d`` (dilated causal 1-D convolution),
 ``TemporalConvolutionEncoder`` (a plain sequential stack of causal convs with
-exponentially increasing dilations), the ``MLP`` decoder, and the full
+exponentially increasing dilations), the multilayer perceptron (``MLP``) decoder, and the full
 ``TCNNet`` (encoder -> context adapter ``Linear(input_size -> h)`` over the
 time axis -> optional future-exog residual concat -> per-timestep MLP decoder).
 
@@ -59,7 +59,7 @@ class _TorchConvInit:
     def __call__(self, key, shape, dtype=jnp.float32):
         return jax.random.uniform(key, shape, dtype, minval=-self.bound, maxval=self.bound)
 
-    def __eq__(self, other):  # value equality — see _TorchLinearInit
+    def __eq__(self, other):  # value equality, see _TorchLinearInit
         return type(other) is type(self) and other.bound == self.bound
 
     def __hash__(self):
@@ -104,7 +104,8 @@ class CausalConv1d(nnx.Module):
         """x: [B, C_in, L] -> [B, C_out, L].
 
         Computed as K shifted matmuls (``out[t] = Σ_k W[:,:,k] · x[t-(K-1-k)·d]``)
-        rather than ``lax.conv_general_dilated``: the XLA CPU backend pessimizes
+        rather than ``lax.conv_general_dilated``: the XLA (Accelerated Linear Algebra)
+        CPU (central processing unit) backend pessimizes
         conv primitives inside the ``lax.scan`` training loop, while matmuls keep
         their fast dot path there. K and the shift amounts are static ctor
         config, so this traces unchanged under jit/vmap.
@@ -171,7 +172,7 @@ class MLP(nnx.Module):
     """MLP decoder head: ``num_layers`` Linears total, ReLU between.
 
     ``num_layers=1`` is a direct linear projection. For ``num_layers>=2``:
-    input Linear, ``num_layers-2`` hidden Linears, output Linear — ReLU after
+    input Linear, ``num_layers-2`` hidden Linears, output Linear, ReLU after
     every layer but the last. Dropout is omitted (TCN runs it at ``0.0``).
     """
 
@@ -212,7 +213,7 @@ class TCNNet(nnx.Module):
     Forward:
       1. concat scaled insample_y with the historical exog and the input slice
          of future-known exog as extra channels -> encoder input
-         ``[B, L, 1+H+F]`` (insample, then hist, then futr — matching the
+         ``[B, L, 1+H+F]`` (insample, then hist, then futr, matching the
          reference);
       2. ``TemporalConvolutionEncoder`` -> ``[B, L, C]``;
       3. transpose to ``[B, C, L]``, ``context_adapter = Linear(L -> h)`` over the
