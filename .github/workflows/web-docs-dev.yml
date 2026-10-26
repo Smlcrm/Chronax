@@ -47,6 +47,10 @@ env:
   # Matches what Terraform sets on the runtime services, so generation and
   # Ask AI both hit the same endpoint.
   VERTEX_LOCATION: global
+  # The builder defaults to the alias gemini-flash-latest, which Vertex AI does
+  # not serve (404 NOT_FOUND). Pin a Vertex model id. The builder's default
+  # thinking level, "minimal", needs a Gemini 3 model.
+  GEMINI_MODEL: gemini-3-flash-preview
   BUILDER_IMAGE: us-central1-docker.pkg.dev/sml-artifacts-dev/sml-web-doc-docker/docgen-builder:latest
 
 jobs:
@@ -91,6 +95,7 @@ jobs:
             -e GOOGLE_APPLICATION_CREDENTIALS \
             -e GOOGLE_CLOUD_PROJECT \
             -e GOOGLE_CLOUD_LOCATION \
+            -e GEMINI_MODEL \
             -v "${RUNNER_TEMP}:${RUNNER_TEMP}:ro" \
             -v "${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}:ro" \
             -v "${PWD}:/work" \
