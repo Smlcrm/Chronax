@@ -18,7 +18,8 @@ Architectural Role:
 
 Major Classes/Functions:
     - `AutoARIMA`: High-level automatic order-selection estimator.
-    - `ARIMA`: Fixed-order estimator backed by shared optimization kernels.
+    - (The fixed-order `ARIMA` estimator lives in `arima.py`, built on this
+      module's shared optimization kernels.)
     - `arima_fit`, `predict_arima`, `auto_arima_f`: Core fit/predict/search APIs.
     - Supporting transforms and Kalman/filtering helpers for ARIMA internals.
 
@@ -53,8 +54,6 @@ Side Effects:
 
 Author:
     Auto-documented
-Date:
-    2026-02-21
 """
 
 from __future__ import annotations
@@ -75,6 +74,7 @@ Array = jnp.ndarray
 from chronax.models.base_forecaster import BaseForecaster
 
 from chronax.utils import _quantiles
+from chronax.utils.conformal_intervals import ConformalIntervals
 
 
 # =============================================================================
@@ -228,6 +228,7 @@ def partrans(p: int, raw: Array) -> Array:
         
     return new
 
+
 def invpartrans(p: int, phi: jnp.ndarray) -> jnp.ndarray:
     """
     Inverse transform: stationary AR coefficients to unconstrained parameters.
@@ -276,6 +277,7 @@ def invpartrans(p: int, phi: jnp.ndarray) -> jnp.ndarray:
     out = jnp.arctanh(jnp.clip(out, -0.999999, 0.999999))
     
     return out
+
 
 def arima_transpar(params: Array, arma: Tuple[int, ...], trans: bool) -> Tuple[Array, Array]:
     """
@@ -348,48 +350,6 @@ def arima_transpar(params: Array, arma: Tuple[int, ...], trans: bool) -> Tuple[A
     return phi, theta
 
 
-def arima_undopars(x: Array, arma: Tuple[int, ...]) -> Array:
-    """
-    Undo parameter transform (apply partrans).
-    
-    Transforms unconstrained parameters (optimizer space) into 
-    constrained stationary coefficients (model space).
-    
-    Equivalent to arima.cpp arima_undopars().
-    
-    Args:
-        x: Unconstrained parameters (1D array)
-        arma: Tuple of ints (mp, mq, msp, msq, ns, d, D)
-        
-    Returns:
-        out: Transformed (stationary) parameters
-    """
-    # 1. Unpack Tuple (Static Integers for JAX)
-    mp, mq, msp, msq, ns, d, D = arma
-    
-    # 2. Ensure float64
-    x = jnp.asarray(x, dtype=jnp.float64)
-    
-    # Initialize output (start with copy of input)
-    # Note: In JAX 'out = x' is just a reference, but .at[].set creates the modified copy.
-    out = x
-    
-    # 3. Transform Non-Seasonal AR part
-    if mp > 0:
-        # Calls the optimized partrans function we defined earlier
-        out = out.at[:mp].set(partrans(mp, x[:mp]))
-    
-    # 4. Transform Seasonal AR part
-    # Seasonal AR parameters are stored after Non-Seasonal AR (mp) and MA (mq)
-    v = mp + mq
-    if msp > 0:
-        out = out.at[v:v+msp].set(partrans(msp, x[v:v+msp]))
-    
-    return out
-
-# =============================================================================
-# DIFFERENCING
-# =============================================================================
 
 @partial(jax.jit, static_argnames=['lag', 'differences'])
 def diff(x: Array, lag: int, differences: int) -> Array:
@@ -489,13 +449,15 @@ def getQ0(phi: Array, theta: Array, arma: Tuple[int, ...]) -> Array:
     phi = jnp.asarray(phi, dtype=jnp.float64)
     theta = jnp.asarray(theta, dtype=jnp.float64)
 
-    # 2. State Transition Matrix F (Standard Companion Form)
-    # x_{t+1} = F x_t + G e_{t+1}
+    # 2. State Transition Matrix F — must match make_arima's T on the
+    # stationary block (phi in COLUMN 0, ones on the SUPERdiagonal) so the
+    # solved P is the stationary covariance of the SAME representation the
+    # Kalman filter runs: P = T P T' + R R'.
     F = jnp.zeros((r, r), dtype=jnp.float64)
-    if p > 0: 
-        F = F.at[0, :p].set(phi)
-    if r > 1: 
-        F = F.at[jnp.arange(r - 1) + 1, jnp.arange(r - 1)].set(1.0)
+    if p > 0:
+        F = F.at[:p, 0].set(phi)
+    if r > 1:
+        F = F.at[jnp.arange(r - 1), jnp.arange(r - 1) + 1].set(1.0)
         
     # 3. Process Noise Covariance V = G * G^T
     # G = [1, theta_1, theta_2, ...]
@@ -603,18 +565,19 @@ def arima_css(y: Array, arma: Tuple[int, ...], phi: Array, theta: Array) -> Tupl
     # to match the user's specific logic (w[1:] - w[:-1]).
     w = y
     
-    # Ordinary Differencing
+    # Ordinary Differencing: w[t] = w[t] - w[t-1]; first element invalid (0).
+    # Functional concatenate form, NOT `w.at[1:].add(-w[:-1])`: that scatter
+    # reads the same buffer it writes, and XLA (jax 0.6.2 CPU) miscompiles
+    # the scatter chain when it fuses into the AR convolution below — the
+    # jitted kernel returned different residuals than eager/vmap execution
+    # (observed max Δ 0.25 on a 72-pt seasonal series), silently corrupting
+    # CSS objectives, fitted params, and ICs for every d>0, p>0 model.
     for _ in range(d):
-        # w[t] = w[t] - w[t-1]
-        # We perform this in-place-like using shifted subtraction
-        w = w.at[1:].add(-w[:-1])
-        w = w.at[0].set(0.0) # The first element becomes invalid (0)
+        w = jnp.concatenate([jnp.zeros(1, dtype=w.dtype), w[1:] - w[:-1]])
 
-    # Seasonal Differencing
+    # Seasonal Differencing: w[t] = w[t] - w[t-m]; first m elements invalid (0).
     for _ in range(D):
-        # w[t] = w[t] - w[t-m]
-        w = w.at[m:].add(-w[:-m])
-        w = w.at[:m].set(0.0) # The first m elements become invalid
+        w = jnp.concatenate([jnp.zeros(m, dtype=w.dtype), w[m:] - w[:-m]])
 
     # 3. Compute AR Part (Vectorized via Convolution)
     # The AR component is: resid[t] = w[t] - phi[0]*w[t-1] - phi[1]*w[t-2] - ...
@@ -910,10 +873,11 @@ def _kalman_filter_core(
         prediction error (innovation), its variance (F), the Kalman gain (K),
         and the posterior state and covariance. Accumulates sum of squared
         standardized errors and sum of log(F) for likelihood computation.
-        Returns the final (a, P, ssq, sumlog, nu) carry, the array of
-        standardized residuals, and the array of raw innovations. The
-        innovations are used by _forecast_from_params and predict_arima for
-        MA correction; arima_like uses only the sufficient statistics.
+        Returns the final (a, P, ssq, sumlog, nu) carry — where (a, P) is
+        the one-step-ahead prior state after the last observation, the state
+        forecasts start from — plus the array of standardized residuals and
+        the array of raw innovations. arima_like uses only the sufficient
+        statistics.
 
     Args:
         y (Array): Observed series, length n.
@@ -992,97 +956,148 @@ def _kalman_filter_core(
     return final_carry, std_resids, innovations
 
 
-# -----------------------------------------------------------------------------
-# 3. OPTIMIZED FORECAST (kalman_forecast_3)
-# -----------------------------------------------------------------------------
-@partial(jax.jit, static_argnames=['n_ahead'])
-def kalman_forecast(n_ahead: int, mod: StateSpaceModel) -> Tuple[Array, Array]:
-    """
-    Produce multi-step-ahead point forecasts and forecast standard errors from the state-space model.
+# Steady-state Kalman likelihood (large-n eager ML path). The prior covariance P_t — and
+# hence the Kalman gain K_t and innovation variance F_t — are data-independent (functions of
+# T, Z, V, P0 only). Convergence speed is set by the MA (invertibility) root. Routed fits
+# converge fast (measured: within ~40 steps), so _STEADYSTATE_BURNIN = 512 is a >10x margin;
+# the _use_steadystate d+D<=1 gate keeps out the over-differenced region where the MA root
+# reaches the unit circle and the gain never converges, and the exact full filter is always
+# used for the forecast and reported likelihood, so the residual boundary case forecasts
+# exactly regardless. The burn-in runs the full covariance filter on every optimizer
+# evaluation, so k0 is a per-eval cost, not a one-time one. _STEADYSTATE_MIN_N gates the
+# switch and is >= the burn-in so k0 < n on the routed path.
+_STEADYSTATE_BURNIN = 512
+_STEADYSTATE_MIN_N = 2048
 
-    Detailed Description:
-        Starting from the model's initial state (a0, P0) in mod, iterates
-        n_ahead steps: at each step computes the one-step-ahead forecast
-        (Z @ a) and its variance (Z P Z'), then updates state to (T @ a, T P T' + V).
-        Returns the array of point forecasts and the array of forecast standard
-        errors (square roots of the variances). Used by _predict_core,
-        _forecast_from_params, and _fused_forecast_kernel. The starting state
-        is typically a0/P0 from make_arima (structural forecast) rather than
-        the filtered state at end of sample; MA correction is applied
-        separately when needed.
+
+def _use_steadystate(n_obs: int, arma: Tuple[int, ...]) -> bool:
+    """Whether the eager ML objective should use the frozen-gain filter: long, non-seasonal,
+    at most single-differenced series. Seasonal state memory (period m) can exceed the burn-in,
+    and over-differencing (d + D >= 2) drives the MA roots to/past the invertibility boundary
+    where the frozen gain never converges and the objective is unreliable; both keep the exact
+    full filter. n_obs and arma are concrete at the eager call sites."""
+    p, q, P, Q, m, d, D = arma
+    return (n_obs > _STEADYSTATE_MIN_N) and (P == 0) and (Q == 0) and (D == 0) and (d + D <= 1)
+
+
+def _kalman_filter_steadystate(
+    y: Array, mod: StateSpaceModel, k0: int
+) -> Tuple[Array, Array, Array, Array, Array]:
+    """
+    Steady-state Kalman likelihood carry for long series.
+
+    Runs the exact prior-form filter for the first k0 observations (reusing
+    _kalman_filter_core), then freezes the gain and innovation variance and
+    propagates the remaining n - k0 steps with a fixed-coefficient linear
+    recurrence a_{t+1} = (T - T K Z') a_t + (T K) y_t plus scalar accumulation
+    of the standardized squared innovations. The per-step O(r^2..r^3)
+    covariance update is skipped on the tail, which is the speed win. Two
+    lax.scans and pure ops only, so it is reverse-differentiable (the ML
+    optimizer differentiates this objective) and vmap-traceable.
+
+    Exact only where the gain has converged by k0. Convergence speed is set by
+    the MA (invertibility) root and slows as it nears the unit circle
+    (theta -> +/-1, the over-differencing signature); past the k0 margin the
+    frozen tail carries a small per-step bias, so its error GROWS with the tail
+    length n - k0 — long series are the risk, not the safe case. Callers that
+    need an exact result near that boundary (the forecast, the reported
+    likelihood) use _kalman_filter_core directly.
 
     Args:
-        n_ahead (int): Number of steps to forecast; must be static for JIT.
-        mod (StateSpaceModel): Model with T, Z, V and starting state (a0, P0).
+        y (Array): Observed (mean/drift-adjusted) series, length n.
+        mod (StateSpaceModel): State-space model (T, Z, V, a0, P0).
+        k0 (int): Static burn-in length; must satisfy k0 < n.
 
     Returns:
-        Tuple[Array, Array]: (forecasts, se), each of shape (n_ahead,). forecasts
-            are point predictions; se are forecast standard errors.
+        Tuple[Array, Array, Array, Array, Array]: (a_final, P_frozen, ssq,
+            sumlog, nu) — the same likelihood carry _kalman_filter_core's final
+            carry holds (P_frozen is the converged prior covariance).
+    """
+    T, Z, V = mod.T, mod.Z, mod.V
+    n = y.shape[0]
 
-    Raises:
-        None.
+    # Phase 1 — burn-in: the exact filter over the first k0 steps.
+    (a_k0, P_k0, ssq_b, sumlog_b, nu_b), _, _ = _kalman_filter_core(y[:k0], mod)
 
-    Side Effects:
-        None. Implemented with jax.lax.scan.
+    # Freeze the converged gain / innovation variance from the prior covariance at k0.
+    M_inf = P_k0 @ Z
+    F_inf = jnp.dot(Z, M_inf)
+    safe_F = jnp.where(F_inf < 1e-9, 1e-9, F_inf)
+    K_inf = M_inf / safe_F
+    logF = jnp.log(safe_F)
+    A_froz = T - jnp.outer(T @ K_inf, Z)
+    TK = T @ K_inf
 
-    Example:
-        >>> fc, se = kalman_forecast(12, mod)
+    # Phase 2 — frozen-gain tail; no covariance update.
+    def tail_step(carry: Tuple[Array, Array], y_t: Array) -> Tuple[Tuple[Array, Array], None]:
+        a, ssq = carry
+        v = y_t - jnp.dot(Z, a)
+        a_next = A_froz @ a + TK * y_t
+        return (a_next, ssq + v * v / safe_F), None
+
+    (a_n, ssq_tail), _ = jax.lax.scan(tail_step, (a_k0, 0.0), y[k0:])
+    n_tail = n - k0
+    ssq = ssq_b + ssq_tail
+    sumlog = sumlog_b + n_tail * logF
+    nu = nu_b + n_tail
+    return a_n, P_k0, ssq, sumlog, nu
+
+
+# -----------------------------------------------------------------------------
+# 3. FORECAST FROM FILTERED STATE
+# -----------------------------------------------------------------------------
+@partial(jax.jit, static_argnames=['n_ahead'])
+def _kalman_forecast_from_state(
+    n_ahead: int, mod: StateSpaceModel, a_start: Array, P_start: Array
+) -> Tuple[Array, Array]:
+    """
+    Multi-step-ahead point forecasts and variances from a filtered state.
+
+    Detailed Description:
+        Starting from a ONE-STEP-AHEAD PRIOR state (a, P) — exactly what
+        _kalman_filter_core's final carry holds after filtering the training
+        series — iterates n_ahead steps: reads forecast = Z @ a and
+        variance = Z P Z', then advances (a, P) to (T @ a, T P T' + V).
+        Read-then-advance from the prior is algebraically identical to
+        R/statsforecast's advance-then-read from the last posterior state.
+        Because the state carries the AR, MA, and differencing memory, the
+        output is the full ARIMA forecast of the (mean/drift-adjusted) series
+        on its original integration scale; only the deterministic component
+        must be added back by the caller.
+
+    Args:
+        n_ahead (int): Number of steps to forecast; static for JIT.
+        mod (StateSpaceModel): Model supplying T, Z, V.
+        a_start (Array): One-step-ahead prior state mean, shape (rd,).
+        P_start (Array): One-step-ahead prior state covariance, shape (rd, rd).
+
+    Returns:
+        Tuple[Array, Array]: (forecasts, variances), each of shape (n_ahead,).
+            Variances are in innovation-variance units (multiply by sigma2 for
+            forecast variances).
 
     Notes:
-        Role: Core deterministic forecast from state-space; combined with
-        MA innovation correction and deterministic terms for full ARIMA forecast.
+        Role: The single forecast recursion behind predict_arima and
+        _forecast_from_params.
     """
-    T, Z, V, a_start, P_start = mod.T, mod.Z, mod.V, mod.a0, mod.P0
-    
-    # Define the recursive step
+    T, Z, V = mod.T, mod.Z, mod.V
+
     def step(
         carry: Tuple[Array, Array],
         _: None,
     ) -> Tuple[Tuple[Array, Array], Tuple[Array, Array]]:
-        """
-        Advance state and covariance one step and compute one-step-ahead forecast and variance.
-
-        Detailed Description:
-            Applies the transition a_next = T @ a_curr, P_next = T @ P_curr @ T' + V,
-            then computes forecast = Z @ a_next and variance = Z @ P_next @ Z'.
-            Returns the new (a_next, P_next) as carry and (forecast, variance) as
-            output for jax.lax.scan in kalman_forecast.
-
-        Args:
-            carry: (a_curr, P_curr) current state mean and covariance.
-            _: Unused (scan over None with length n_ahead).
-
-        Returns:
-            New carry (a_next, P_next) and output (forecast, variance).
-
-        Notes:
-            Role: Inner step of kalman_forecast; JAX-pure for JIT.
-        """
+        """Read the forecast at the current prior state, then advance it."""
         a_curr, P_curr = carry
-        
-        # 1. Predict Next State (Mean)
+        forecast = jnp.dot(Z, a_curr)
+        variance = jnp.dot(Z, P_curr @ Z)
         a_next = T @ a_curr
-        
-        # 2. Predict Next Covariance
-        # P_{t+1} = T P_t T' + V
         P_next = V + (T @ P_curr @ T.T)
-        
-        # 3. Calculate Outputs
-        # y_hat = Z * a_next
-        forecast = jnp.dot(Z, a_next)
-        
-        # Variance = Z P_next Z'
-        # Optimized: Vector-Matrix-Vector product is cheaper than Outer Product summation
-        variance = jnp.dot(Z, P_next @ Z)
-        
         return (a_next, P_next), (forecast, variance)
 
-    # Run Scan
-    # We pass 'None' as the input sequence because we just want to tick 'n_ahead' times
-    # length=n_ahead ensures the loop runs correct number of times
-    _, (forecasts, se) = jax.lax.scan(step, (a_start, P_start), None, length=n_ahead)
-    
-    return forecasts, se
+    _, (forecasts, variances) = jax.lax.scan(
+        step, (a_start, P_start), None, length=n_ahead
+    )
+    return forecasts, variances
 
 # =============================================================================
 # OPTIMIZATION KERNELS (Standardized)
@@ -1142,11 +1157,59 @@ def _compute_metrics(loglik: Array, sigma2: Array, n_obs: Array, n_params: int) 
     # Return JAX arrays (do not cast to float)
     return {
         "aic": aic, 
-        "aicc": aicc, 
+        "aicc": aicc,
         "bic": bic,
-        "loglik": loglik, 
+        "loglik": loglik,
         "sigma2": sigma2
     }
+
+
+# Generosity factors for the intercept/drift box constraint. Wide
+# enough to never bind on a legitimate fit, narrow relative to the runaway
+# magnitudes the unconstrained LBFGS produces (drift ~ -3e5 on scale-100 data).
+_DRIFT_BOUND_FACTOR = 25.0
+_MEAN_BOUND_FACTOR = 3.0
+
+
+def _intercept_bounds(
+    y: Array, d: int, D: int, ns: int
+) -> Tuple[Array, Array]:
+    """Data-physical box constraint for the mean/drift coefficient.
+
+    The mean/drift is an unconstrained parameter jointly optimized with the
+    ARMA coefficients; a poorly-conditioned LBFGS step can drive it to a
+    non-physical value (observed: drift = -2.96e5 on a scale-~100 d=1 series),
+    which the drift ramp then compounds over the horizon into a ~1e8
+    forecast. This returns a generous but finite ``(lo, hi)``
+    the coefficient is clipped to, both inside the objective (via
+    :func:`_unpack_and_adjust`, so the optimizer converges to the true small
+    value rather than wandering off) and post-fit on the raw parameter vector
+    the forecast kernel reads.
+
+    For a **drift** (``d + D >= 1``) the coefficient is a constant on the
+    ``(d, D)``-differenced series and must stay near that series' mean (a drift
+    integrates over the horizon, so it has to be tight); for a **stationary
+    mean** (``d + D == 0``) it must lie within a few ranges of the observed
+    level. ``d``, ``D``, ``ns`` are static config ints so the differencing loops
+    are static and the whole function is vmap-native.
+    """
+    yd = y
+    for _ in range(int(d)):
+        yd = yd[1:] - yd[:-1]
+    for _ in range(int(D)):
+        yd = yd[int(ns):] - yd[: -int(ns)]
+    if (int(d) + int(D)) >= 1:
+        # The drift coefficient is the PER-STEP slope of the deterministic
+        # ramp; a seasonal difference spans ns steps, so the mean seasonal
+        # difference corresponds to a per-step drift of mean/ns.
+        per_step = ns if (int(D) == 1 and int(ns) > 1 and int(d) == 0) else 1
+        center = jnp.nanmean(yd) / per_step
+        scale = jnp.nanstd(yd) / per_step + jnp.abs(center) + 1e-8
+        width = _DRIFT_BOUND_FACTOR * scale
+        return center - width, center + width
+    rng = jnp.nanmax(y) - jnp.nanmin(y) + 1e-8
+    return jnp.nanmin(y) - _MEAN_BOUND_FACTOR * rng, jnp.nanmax(y) + _MEAN_BOUND_FACTOR * rng
+
 
 def _unpack_and_adjust(
     params: Array,
@@ -1168,8 +1231,8 @@ def _unpack_and_adjust(
         Subtracts the exogenous contribution (X @ beta) and the intercept
         from y when applicable, using jax.lax.cond for JIT. Returns the
         adjusted series and the expanded phi, theta for use in arima_css or
-        make_arima. Used by _objective_css, _objective_ml, _forecast_from_params,
-        and _fused_forecast_kernel.
+        make_arima, plus the clipped intercept/drift coefficient. Used by
+        _objective_css, _objective_ml, arima_fit, and _forecast_from_params.
 
     Args:
         params (Array): Full parameter vector (ARMA + ncxreg).
@@ -1181,9 +1244,12 @@ def _unpack_and_adjust(
         include_mean (bool): Whether to subtract intercept.
 
     Returns:
-        Tuple[Array, Array, Array]: (y_adj, phi, theta). y_adj is the series
-            after subtracting X@beta and optionally the intercept; phi and
-            theta are the expanded AR and MA coefficient arrays.
+        Tuple[Array, Array, Array, Array]: (y_adj, phi, theta, intercept).
+            y_adj is the series after subtracting X@beta and the deterministic
+            component (constant mean for d+D==0, drift ramp for d+D==1,
+            nothing for d+D>=2); phi and theta are the expanded AR and MA
+            coefficient arrays; intercept is the clipped, include_mean-gated
+            mean/drift coefficient the forecast kernels add back.
 
     Raises:
         None. Shape fixes ensure no index errors inside JIT.
@@ -1192,7 +1258,7 @@ def _unpack_and_adjust(
         None. Pure function.
 
     Example:
-        >>> y_adj, phi, theta = _unpack_and_adjust(params, y, xreg, arma, ncxreg, n_exog, True)
+        >>> y_adj, phi, theta, c = _unpack_and_adjust(params, y, xreg, arma, ncxreg, n_exog, True)
 
     Notes:
         Role: Single unpacking and adjustment path for objectives and
@@ -1256,11 +1322,32 @@ def _unpack_and_adjust(
     # Because we padded safe_coefs, indexing at n_exog is ALWAYS valid.
     # If n_exog=0 and include_mean=False, it picks the dummy 0.0 we added.
     intercept_val = jax.lax.dynamic_index_in_dim(safe_coefs, n_exog, keepdims=False)
-    
-    # Final adjustment only if include_mean is truly active
-    y_adj = y_adj - jnp.where(include_mean, intercept_val, 0.0)
-            
-    return y_adj, phi, theta
+
+    # Box-constrain the mean/drift inside the objective so the
+    # optimizer converges to the true (small) value instead of a runaway (which
+    # the d>0 forecast integrator amplifies to ~1e8). No-op for well-behaved
+    # fits — the true optimum sits well inside the bound.
+    _lo, _hi = _intercept_bounds(y, d, D, ns)
+    intercept_val = jnp.clip(intercept_val, _lo, _hi)
+
+    # Deterministic component, R semantics. d and D come from the static
+    # `arma` tuple so the branch is trace-safe; `include_mean` can be a traced
+    # value on the objective path, so it gates through jnp.where (when it is
+    # False, ncxreg == 0 and intercept_val is the padded dummy 0.0 anyway):
+    #   d+D == 0 — constant mean, subtracted as a constant;
+    #   d+D == 1 — drift, subtracted as the linear ramp c*t so differencing
+    #              leaves a DEMEANED series for the ARMA part to fit (a
+    #              constant would be annihilated by the differencing and leave
+    #              the drift contaminating the differenced series' mean);
+    #   d+D >= 2 — no deterministic term (as in R's arima).
+    gated_intercept = jnp.where(include_mean, intercept_val, 0.0)
+    if d + D == 0:
+        y_adj = y_adj - gated_intercept
+    elif d + D == 1:
+        t_ramp = jnp.arange(1, y.shape[0] + 1, dtype=jnp.float64)
+        y_adj = y_adj - gated_intercept * t_ramp
+
+    return y_adj, phi, theta, gated_intercept
 
 def _objective_css(
     params: Array,
@@ -1311,7 +1398,7 @@ def _objective_css(
         Role: CSS branch of ARIMA estimation; provides fast initial fit for
         hybrid CSS-ML or CSS-only estimation.
     """
-    y_adj, phi, theta = _unpack_and_adjust(params, y, xreg, arma, ncxreg, n_exog, include_mean)
+    y_adj, phi, theta, _ = _unpack_and_adjust(params, y, xreg, arma, ncxreg, n_exog, include_mean)
     sigma2, _ = arima_css(y_adj, arma, phi, theta)
     return jnp.log(sigma2 + 1e-8)
 
@@ -1367,10 +1454,45 @@ def _objective_ml(
         Role: ML branch of ARIMA estimation; used for final fit quality and
         in hybrid CSS-ML after CSS warm start.
     """
-    y_adj, phi, theta = _unpack_and_adjust(params, y, xreg, arma, ncxreg, n_exog, include_mean)
+    y_adj, phi, theta, _ = _unpack_and_adjust(params, y, xreg, arma, ncxreg, n_exog, include_mean)
     mod = make_arima(phi, theta, delta, arma)
     ssq, sumlog, nu, _ = arima_like(y_adj, mod, arma)
     
+    safe_nu = jnp.maximum(nu, 1.0)
+    safe_ssq = jnp.maximum(ssq, 1e-8)
+    nll = safe_nu * jnp.log(safe_ssq / safe_nu) + sumlog
+    return 0.5 * nll
+
+def _objective_ml_ss(
+    params: Array,
+    y: Array,
+    xreg: Optional[Array],
+    delta: Array,
+    arma: Tuple[int, ...],
+    ncxreg: int,
+    n_exog: int,
+    include_mean: bool,
+    **kwargs: Any,
+) -> float:
+    """
+    ML negative-log-likelihood via the steady-state Kalman filter (large-n eager path).
+
+    Identical to _objective_ml but evaluates the likelihood with
+    _kalman_filter_steadystate (frozen-gain tail) instead of the full filter,
+    which is what makes each optimizer evaluation cheap. Matches _objective_ml
+    (value and gradient) to machine precision when the MA roots sit inside the
+    invertibility boundary by margin — the common case — and stays close enough
+    to place the optimizer at the same optimum otherwise; near the boundary
+    (theta -> +/-1) the frozen tail is approximate. Only the fitted parameters
+    flow out of here: the forecast and the reported likelihood/IC are always
+    recomputed with the exact full filter, so a fit near the boundary still
+    forecasts and scores exactly. Same signature as _objective_ml so the fit
+    kernels accept it as a drop-in loss_fn.
+    """
+    y_adj, phi, theta, _ = _unpack_and_adjust(params, y, xreg, arma, ncxreg, n_exog, include_mean)
+    mod = make_arima(phi, theta, delta, arma)
+    _, _, ssq, sumlog, nu = _kalman_filter_steadystate(y_adj, mod, _STEADYSTATE_BURNIN)
+
     safe_nu = jnp.maximum(nu, 1.0)
     safe_ssq = jnp.maximum(ssq, 1e-8)
     nll = safe_nu * jnp.log(safe_ssq / safe_nu) + sumlog
@@ -1467,9 +1589,184 @@ def _fit_model_bfgs(
         method='BFGS',
         options={'maxiter': maxiter}
     )
-    
+
     # 3. Return Optimized Parameters
     return results.x
+
+
+# Fast-path (forecast) optimizer budget — config-static scan lengths.
+_FAST_LBFGS_MEMORY = 10
+_FAST_LBFGS_LS_STEPS = 20
+# Early-exit rule for the fast-path while_loop: stop after _FAST_LBFGS_PATIENCE
+# consecutive iterations whose EVALUATED loss fails to improve the running best
+# by a relative _FAST_LBFGS_FTOL (scipy L-BFGS-B factr=1e7 equivalent). maxiter
+# stays the hard cap, so no run does more work than the old fixed budget.
+_FAST_LBFGS_FTOL = 2.22e-9
+_FAST_LBFGS_PATIENCE = 2
+
+
+@partial(jax.jit, static_argnames=['loss_fn', 'arma', 'maxiter'])
+def _fit_model_scan(
+    init_params: Array,
+    y: Array,
+    xreg: Optional[Array],
+    delta: Array,
+    loss_fn: Callable[[Array], float],
+    arma: Tuple[int, ...],
+    ncxreg: int,
+    n_exog: int,
+    include_mean: bool,
+    maxiter: int,
+) -> Array:
+    """
+    Batch-stable fixed-budget L-BFGS for the one-shot forecast fast path.
+
+    Detailed Description:
+        Drop-in replacement for _fit_model_bfgs on the forecast fast path.
+        jax.scipy's BFGS returns an inconsistent (fun, x) pair when its zoom
+        line search fails (nit=1/status=3 on seasonal-MA specs like
+        (1,1,1)(0,1,1)[12]), so the fast path — the code conformity_scores
+        vmaps — uses this pure-lax optimizer instead (optax.lbfgs + zoom
+        linesearch with best-iterate tracking): a failed search can never
+        return a worse-than-init point. Same pattern as the GARCH optax
+        fallback.
+
+        The loop is a convergence-gated lax.while_loop rather than a fixed-length
+        lax.scan, which would pay every one of `maxiter` O(n) CSS steps even when the
+        fit converges in a fraction of them — costly on long series. Exit fires after
+        _FAST_LBFGS_PATIENCE consecutive evaluated losses that fail to
+        improve the best by a relative _FAST_LBFGS_FTOL; `maxiter` remains
+        the hard cap, so cost is never above the old fixed budget. Per-lane
+        SEMANTICS are identical between eager and vmapped runs: `done`
+        latches on the PREVIOUS trip (the latching trip's own update still
+        lands) and converged lanes ride along frozen while other vmap lanes
+        finish; numerics agree to vmap-lowering noise (measured 4.5e-11 —
+        batched reductions associate differently, the pre-existing class).
+        ⚠ Because the exit test thresholds a lowering-sensitive loss, a ~ULP
+        eager-vs-vmap loss difference near ftol can in principle flip one exit and
+        bifurcate a trajectory — accepted repo-wide for convergence-gated
+        optimizers, so endpoints are compared on accuracy, not bits.
+        Non-finite losses count as
+        non-improving, so a diverging run exits after PATIENCE trips and
+        returns the tracked best (or init) exactly as before.
+
+        Best-iterate tracking stores the point the loss was EVALUATED at
+        (not the post-update point), and the final iterate is evaluated once
+        after the scan so it also competes; a diverging run therefore never
+        returns anything worse than init_params.
+
+    Args:
+        init_params (Array): Initial parameter vector (ARMA + regression).
+        y (Array): Training series.
+        xreg (Optional[Array]): Exogenous matrix or None.
+        delta (Array): Differencing polynomial.
+        loss_fn (Callable[[Array], float]): Scalar objective; called with
+            (p, y, xreg, delta, arma, ncxreg, n_exog, include_mean).
+        arma (Tuple[int, ...]): ARMA structure (static for JIT).
+        ncxreg (int): Number of regression coefficients.
+        n_exog (int): Number of exogenous columns.
+        include_mean (bool): Whether intercept is included.
+        maxiter (int): L-BFGS step budget (static: derives from config only).
+
+    Returns:
+        Array: Best parameter vector found, same shape as init_params.
+
+    Raises:
+        None.
+
+    Side Effects:
+        None. Pure optimization.
+
+    Notes:
+        Role: Optimizer for ARIMA.forecast / AutoARIMA.forecast fast paths —
+        the code conformity_scores vmaps. arima_fit (fit/predict path) keeps
+        jax.scipy BFGS; it never runs under vmap.
+    """
+    def objective(p: Array) -> Array:
+        return loss_fn(p, y, xreg, delta, arma, ncxreg, n_exog, include_mean)
+
+    value_and_grad_fn = jax.value_and_grad(objective)
+
+    solver = optax.lbfgs(
+        memory_size=_FAST_LBFGS_MEMORY,
+        linesearch=optax.scale_by_zoom_linesearch(
+            max_linesearch_steps=_FAST_LBFGS_LS_STEPS,
+            initial_guess_strategy="one",
+        ),
+    )
+
+    # ftol floored at 8*eps(dtype): a relative tolerance below the dtype's
+    # resolution is unreachable and would disable the exit (the AutoCES f32
+    # tolerance lesson). init_params.dtype is concrete at trace time.
+    ftol = max(_FAST_LBFGS_FTOL, 8.0 * float(jnp.finfo(init_params.dtype).eps))
+
+    def _lbfgs_cond(carry):
+        _, _, _, _, it, _, done = carry
+        return (it < maxiter) & jnp.logical_not(done)
+
+    def _lbfgs_body(carry):
+        params, state, best_params, best_loss, it, stall, done = carry
+        loss, grads = value_and_grad_fn(params)
+        grads = jnp.where(jnp.isfinite(grads), grads, 0.0)
+        updates, new_state = solver.update(
+            grads, state, params, value=loss, grad=grads, value_fn=objective)
+        new_params = optax.apply_updates(params, updates)
+        improved = jnp.isfinite(loss) & (loss < best_loss)
+        # "meaningful" = improves the best by more than ftol relative. A first
+        # finite loss against best_loss=inf always counts; NaN/inf losses never
+        # do (so divergence accumulates stall instead of resetting it).
+        denom = jnp.maximum(jnp.maximum(jnp.abs(best_loss), jnp.abs(loss)), 1.0)
+        meaningful = improved & jnp.where(
+            jnp.isfinite(best_loss), (best_loss - loss) / denom > ftol, True)
+        new_stall = jnp.where(meaningful, 0, stall + 1)
+        new_done = done | (new_stall >= _FAST_LBFGS_PATIENCE)
+        new_best_params = jnp.where(improved, params, best_params)
+        new_best_loss = jnp.where(improved, loss, best_loss)
+        # Freeze on the PREVIOUS trip's latch: the trip that trips `done` still
+        # commits its own update (eager exit happens after it), and under vmap a
+        # converged lane rides along as a no-op. For a lane that instead runs out
+        # of `maxiter` without latching, per-lane parity is carried by JAX's
+        # batched-while lowering itself (the entire carry is re-selected on the
+        # entry predicate per lane) — the freeze alone does not cover that case.
+        frz = done
+        return (jnp.where(frz, params, new_params),
+                jax.tree_util.tree_map(
+                    lambda o, n: jnp.where(frz, o, n), state, new_state),
+                jnp.where(frz, best_params, new_best_params),
+                jnp.where(frz, best_loss, new_best_loss),
+                jnp.where(frz, it, it + 1),
+                jnp.where(frz, stall, new_stall),
+                new_done)
+
+    init_loss = objective(init_params)
+    safe_init_loss = jnp.where(jnp.isfinite(init_loss), init_loss, jnp.inf)
+    carry0 = (init_params, solver.init(init_params), init_params, safe_init_loss,
+              jnp.asarray(0, jnp.int32), jnp.asarray(0, jnp.int32),
+              jnp.asarray(False))
+    final_params, _, best_params, best_loss, _, _, _ = lax.while_loop(
+        _lbfgs_cond, _lbfgs_body, carry0)
+
+    final_loss = objective(final_params)
+    take_final = jnp.isfinite(final_loss) & (final_loss < best_loss)
+    return jnp.where(take_final, final_params, best_params)
+
+
+# Jitted aliases for the EAGER post-processing call sites only.
+# Both raw functions build their `lax.cond` / `lax.scan` bodies as fresh closures,
+# so an eager call recompiles an identical jaxpr every time — 16 of the 17 compiles
+# a fresh-instance `AutoARIMA.forecast` pays (one cond + one scan per candidate of
+# the stepwise search), plus two per eager `ARIMA.fit()`.
+#
+# The RAW functions must stay in place: `_unpack_and_adjust` is also called from
+# inside `_objective_css`/`_objective_ml`, which pass `ncxreg`/`n_exog`/`include_mean`
+# as *traced* ints — `static_argnames` on the shared symbol raises "Non-hashable
+# static arguments ... DynamicJaxprTracer". Jitting only the eager sites also leaves
+# every existing compiled kernel's jaxpr byte-identical — no nested pjit inside the
+# programs that contain `arima_css`, which must keep its current fusion.
+_unpack_and_adjust_jit = partial(
+    jax.jit, static_argnames=['arma', 'ncxreg', 'n_exog', 'include_mean']
+)(_unpack_and_adjust)
+_kalman_filter_core_jit = jax.jit(_kalman_filter_core)
 
 
 def arima_fit(
@@ -1480,6 +1777,7 @@ def arima_fit(
     include_mean: bool = True,
     method: str = "CSS-ML",
     optim_control: Optional[Dict[str, Any]] = None,
+    steadystate: bool = True,
 ) -> Dict[str, Any]:
     """
     Fit an ARIMA model to a univariate series and return coefficients, metrics, and diagnostics.
@@ -1559,15 +1857,18 @@ def arima_fit(
         init_params = init_params.at[narma + n_exog].set(jnp.nanmean(x))
 
     # B. Drift (d+D == 1)
-    # Always initialize drift with the mean of the differenced series.
-    # The optimizer will shrink it toward zero if the trend is not significant.
+    # Initialize the per-step drift from the mean of the differenced series;
+    # a seasonal difference spans `period` steps, so its mean corresponds to
+    # a per-step slope of mean/period.
     if use_drift:
         if D == 1 and period > 1:
             dx = x[period:] - x[:-period]
+            per_step = period
         else:
             dx = x[1:] - x[:-1]
-        
-        mean_dx = jnp.nanmean(dx)
+            per_step = 1
+
+        mean_dx = jnp.nanmean(dx) / per_step
         init_params = init_params.at[narma + n_exog].set(mean_dx)
 
     # Optimization Settings
@@ -1579,7 +1880,6 @@ def arima_fit(
     current_params = init_params
     
     # Helper to call the JIT kernel
-    # Note: We use _fit_model_lbfgs because optax.lbfgs IS the BFGS implementation
     def run_bfgs(
         start_params: Array,
         loss_func: Callable[..., float],
@@ -1592,18 +1892,52 @@ def arima_fit(
         )
 
     if "CSS" in method:
-        # Split iterations for hybrid method
-        css_iter = maxiter // 2 if method == "CSS-ML" else maxiter
-        current_params = run_bfgs(current_params, _objective_css, css_iter)
-        
-    if "ML" in method: 
-        ml_iter = maxiter // 2 if method == "CSS-ML" else maxiter
-        current_params = run_bfgs(current_params, _objective_ml, ml_iter)
+        # Each phase gets the FULL budget (R gives its CSS and ML optim
+        # phases independent default budgets; splitting starved both).
+        current_params = run_bfgs(current_params, _objective_css, maxiter)
 
-    # 4. POST-PROCESSING
-    y_adj, phi, theta = _unpack_and_adjust(current_params, x, xreg, arma, ncxreg, n_exog, include_mean)
+    if "ML" in method:
+        # Long non-seasonal series use the steady-state likelihood (frozen-gain
+        # tail, exact after burn-in) so each optimizer evaluation avoids the
+        # full-series covariance recursion. AutoARIMA's stepwise search passes
+        # steadystate=False so its candidate ICs and selected fit stay on the
+        # exact objective (the frozen tail's tiny near-boundary bias must not
+        # perturb order selection).
+        use_ss = steadystate and _use_steadystate(n_obs, arma)
+        ml_obj = _objective_ml_ss if use_ss else _objective_ml
+        current_params = run_bfgs(current_params, ml_obj, maxiter)
+
+    # The mean/drift coefficient is estimated unreliably by the ARMA optimizer — a
+    # poorly-conditioned BFGS step can drive it to a wrong-sign runaway that the d>0
+    # forecast ramp then amplifies over the horizon. Replace it with its
+    # closed form, which is well-conditioned and what R's joint estimate converges
+    # to anyway:
+    #   * drift (d+D==1): per-step mean of the (seasonally-)differenced series;
+    #   * stationary mean (d+D==0): the sample mean, clipped to the data range.
+    # For well-behaved fits the optimizer already sits at this value, so it is a
+    # no-op; it only rescues the degenerate runaways. Applied BEFORE the loglik /
+    # IC computation below so order selection scores the corrected model.
+    if include_mean:
+        _mi = narma + n_exog
+        if use_drift:
+            if D == 1 and period > 1:
+                _dx, _ps = x[period:] - x[:-period], period
+            else:
+                _dx, _ps = x[1:] - x[:-1], 1
+            current_params = current_params.at[_mi].set(jnp.nanmean(_dx) / _ps)
+        elif (d + D) == 0:
+            _ilo, _ihi = _intercept_bounds(x, d, D, period)
+            current_params = current_params.at[_mi].set(
+                jnp.clip(current_params[_mi], _ilo, _ihi))
+        else:
+            # d+D >= 2: no deterministic term (R semantics) — pin the inert
+            # slot to zero so reports cannot suggest otherwise.
+            current_params = current_params.at[_mi].set(0.0)
+
+    # 4. POST-PROCESSING (eager: use the jitted aliases — see their definition)
+    y_adj, phi, theta, _ = _unpack_and_adjust_jit(current_params, x, xreg, arma, ncxreg, n_exog, include_mean)
     mod = make_arima(phi, theta, delta, arma)
-    (_, _, ssq, sumlog, nu), resid, innovations = _kalman_filter_core(y_adj, mod)
+    (a_final, P_final, ssq, sumlog, nu), resid, innovations = _kalman_filter_core_jit(y_adj, mod)
     
     sigma2 = jnp.where(nu > 0, ssq / nu, jnp.inf)
     
@@ -1614,14 +1948,20 @@ def arima_fit(
     metrics = _compute_metrics(loglik, sigma2, nu, n_params_total)
     success = jnp.isfinite(loglik) & (sigma2 > 0)
     
-    # Extract the optimized drift from fitted params (not the initial guess)
+    # Extract the optimized drift from fitted params (not the initial guess).
+    # Kept as a jnp scalar: float() here forced a device sync on every fit and
+    # concretized under tracing; downstream use is arithmetic-only.
     if use_drift:
-        drift_coef = float(current_params[narma + n_exog])
+        drift_coef = current_params[narma + n_exog]
     
     return {
         "coef": current_params,
-        **metrics, 
+        **metrics,
         "model": mod,
+        # One-step-ahead prior state after the last observation — the state
+        # predict_arima forecasts from.
+        "a_final": a_final,
+        "P_final": P_final,
         "residuals": resid,
         "innovations": innovations,
         "y_adj": y_adj,
@@ -1631,213 +1971,11 @@ def arima_fit(
         "n_obs_train": n_obs,
         "use_drift": use_drift,
         "drift_coef": drift_coef,
-        "success": success 
+        "success": success
     }
 # =============================================================================
-# SHARED PREDICTION KERNEL (JIT)
+# FORECASTING
 # =============================================================================
-
-@partial(jax.jit, static_argnames=['n_ahead', 'narma', 'n_exog'])
-def _predict_core(
-    mod: StateSpaceModel, 
-    params: Array, 
-    n_ahead: int, 
-    newxreg: Array, 
-    narma: int,
-    n_exog: int,
-    sigma2: float
-) -> Tuple[Array, Array]:
-    """
-    Compute n_ahead-step forecasts and standard errors from a fitted state-space model and parameters.
-
-    Detailed Description:
-        Runs the structural Kalman forecast (kalman_forecast) from the model's
-        initial state to get the stochastic component, then adds the
-        deterministic part (newxreg @ exog_coefs). Forecast standard errors
-        are the Kalman forecast variances scaled by sigma2. Used by
-        predict_arima for both single and batch models (via _predict_batch_kernel).
-        Does not apply MA innovation correction; the caller adds that when
-        the model has MA terms and innovations are available.
-
-    Args:
-        mod (StateSpaceModel): Fitted state-space model (T, Z, V, a0, P0).
-        params (Array): Full coefficient vector (ARMA + n_exog).
-        n_ahead (int): Forecast horizon (static for JIT).
-        newxreg (Array): Exogenous matrix for horizon, shape (n_ahead, n_exog).
-        narma (int): Number of ARMA parameters.
-        n_exog (int): Number of exogenous coefficients (after ARMA block).
-        sigma2 (float): Residual variance from fit.
-
-    Returns:
-        Tuple[Array, Array]: (forecasts, se), each shape (n_ahead,).
-
-    Raises:
-        None.
-
-    Side Effects:
-        None. JIT-compiled kernel.
-
-    Notes:
-        Role: Shared prediction math for single and batched ARIMA models.
-    """
-    # 1. Kalman Forecast (Stochastic Part)
-    forecast_component, cov_component = kalman_forecast(n_ahead, mod)
-    
-    # 2. Exogenous/Mean (Deterministic Part)
-    xm = jnp.zeros(n_ahead, dtype=jnp.float64)
-    
-    if n_exog > 0:
-        # Extract coefs after the ARMA block
-        # dynamic_slice ensures shape stability for JIT
-        # shape: (n_exog,)
-        exog_coefs = lax.dynamic_slice(params, (narma,), (n_exog,))
-        
-        # Matrix multiplication: X @ beta
-        # newxreg shape: (n_ahead, n_exog)
-        xm = jnp.dot(newxreg, exog_coefs)
-
-    # 3. Combine & Scale
-    final_pred = forecast_component + xm
-    final_se = jnp.sqrt(cov_component * sigma2)
-    
-    return final_pred, final_se
-
-# Batch Kernel (Vmap over batch dimension 0)
-_predict_batch_kernel = jax.vmap(
-    _predict_core, 
-    in_axes=(
-        0,    # mod: Batched StateSpaceModel (T has shape (B, r, r))
-        0,    # params: Batched coefficients (B, n_params)
-        None, # n_ahead: Shared horizon
-        0,    # newxreg: Batched regressors (B, n_ahead, n_exog)
-        None, # narma
-        None, # n_exog
-        0     # sigma2: Batched variance (B,)
-    )
-)
-
-# =============================================================================
-# SHARED RECONSTRUCTION: Undo differencing using the delta polynomial
-# =============================================================================
-
-def _reconstruct_forecast(
-    raw_pred: Array,
-    y_train: Array,
-    arma: Tuple[int, ...],
-    h: int,
-) -> Array:
-    """
-    Integrate (undo) differencing so forecasts are on the original series scale.
-
-    Detailed Description:
-        When d>0 or D>0, the model is fitted on differenced data and Kalman
-        forecasts are in differenced space. This function applies the inverse
-        of the combined differencing operator: it rebuilds the positive
-        differencing polynomial (1-B)^d * (1-B^m)^D and uses it as a
-        recurrence y[n+k] = raw[k] + sum(diffc[j] * y[n+k-1-j]) over the last
-        nd values of y_train and the h forecast slots. Correctly handles
-        d>0, D>0, and combined cases. Used by predict_arima callers (e.g.
-        ARIMA/AutoARIMA) after obtaining raw_pred from the core predictor.
-
-    Args:
-        raw_pred (Array): Forecasts in differenced space, length h.
-        y_train (Array): Training series (before or after differencing,
-            depending on caller; typically the adjusted series used for fit).
-        arma (Tuple[int, ...]): (p, q, P, Q, m, d, D) to rebuild delta.
-        h (int): Forecast horizon (length of raw_pred).
-
-    Returns:
-        Array: Forecasts on the original (integrated) scale, length h.
-
-    Raises:
-        None. Uses numpy for the recurrence then converts to JAX array.
-
-    Side Effects:
-        None. Does not mutate inputs.
-
-    Example:
-        >>> fc_orig = _reconstruct_forecast(raw_fc, y_adj, arma, 12)
-
-    Notes:
-        Role: Converts differenced-space predictions to level forecasts for
-        integrated ARIMA models; required whenever d + D > 0.
-    """
-    p, q, P, Q, m, d, D = arma
-    
-    if d + D == 0:
-        return raw_pred
-    
-    # Rebuild the positive differencing polynomial coefficients
-    # diffc = coefficients of (1-B)^d * (1-B^m)^D, excluding the leading 1
-    poly = np.array([1.0])
-    for _ in range(d):
-        poly = np.convolve(poly, [1.0, -1.0])
-    for _ in range(D):
-        seas = np.zeros(m + 1)
-        seas[0] = 1.0
-        seas[m] = -1.0
-        poly = np.convolve(poly, seas)
-    
-    # diffc = -poly[1:] (positive form for inverse filter)
-    diffc = -poly[1:]
-    nd = len(diffc)
-    
-    # Build extended series: last nd values of training + h forecast slots
-    tail = np.array(y_train[-nd:], dtype=np.float64) if nd <= len(y_train) else np.array(y_train, dtype=np.float64)
-    raw_np = np.array(raw_pred, dtype=np.float64)
-    
-    # Extend with forecast values
-    extended = np.concatenate([tail, np.zeros(h)])
-    offset = len(tail)
-    
-    for k in range(h):
-        val = raw_np[k]
-        for j in range(min(nd, offset + k)):
-            val += diffc[j] * extended[offset + k - 1 - j]
-        extended[offset + k] = val
-    
-    return jnp.array(extended[offset:])
-
-
-# =============================================================================
-# FUSED FORECAST KERNEL (Single XLA Dispatch: BFGS params -> forecasts)
-# =============================================================================
-
-@partial(jax.jit, static_argnames=['arma', 'ncxreg', 'n_exog', 'include_mean', 'n_ahead'])
-def _fused_forecast_kernel(
-    params: Array,
-    y: Array,
-    delta: Array,
-    arma: Tuple[int, ...],
-    ncxreg: int,
-    n_exog: int,
-    include_mean: bool,
-    n_ahead: int,
-) -> Array:
-    """
-    Fused kernel: params -> phi/theta -> state-space -> forecast.
-    Skips all metric computation (AIC, BIC, sigma2, loglik, residuals).
-    Single XLA dispatch eliminates multiple Python-to-XLA roundtrips.
-    """
-    # 1. Unpack params to phi, theta
-    y_adj, phi, theta = _unpack_and_adjust(params, y, None, arma, ncxreg, n_exog, include_mean)
-
-    # 2. Build state-space model (fresh initial state a0, P0)
-    mod = make_arima(phi, theta, delta, arma)
-
-    # 3. Structural Kalman forecast from initial state
-    forecasts, _ = kalman_forecast(n_ahead, mod)
-
-    # 4. Add deterministic component (intercept/drift)
-    narma_total = sum(arma[:4])
-    if ncxreg > 0:
-        reg_matrix = jnp.ones((n_ahead, ncxreg), dtype=jnp.float64)
-        exog_coefs = lax.dynamic_slice(params, (narma_total,), (ncxreg,))
-        xm = jnp.dot(reg_matrix, exog_coefs)
-        forecasts = forecasts + xm
-
-    return forecasts
-
 
 @partial(jax.jit, static_argnames=['arma', 'ncxreg', 'n_exog', 'include_mean', 'n_ahead'])
 def _forecast_from_params(
@@ -1851,100 +1989,47 @@ def _forecast_from_params(
     n_ahead: int,
 ) -> Array:
     """
-    Fully fused forecast kernel: params → forecast in a single XLA dispatch.
-    
-    Combines all post-BFGS steps:
-    1. Unpack params → phi, theta (once)
-    2. Build state-space model (once)  
-    3. Run Kalman filter on training data → innovations
-    4. Kalman forecast from trained state
-    5. MA innovation correction
-    6. Deterministic component (intercept/drift)
-    
-    This replaces 5+ separate function calls that previously required
-    multiple XLA dispatches and redundant computation.
+    Fused forecast kernel: params -> forecast in a single XLA dispatch.
+
+    Runs the Kalman filter over the (mean/drift-adjusted) training series and
+    forecasts from the END-OF-SAMPLE filtered state, so the fitted AR and
+    seasonal-AR dynamics, the MA memory, and the differencing integration all
+    live in the state and shape the forecast path. The deterministic
+    component (constant mean for d+D==0, drift ramp for d+D==1) is added
+    back at the end. Output is on the same scale as `y`.
+
+    Returns:
+        Tuple[Array, Array]: (forecasts, se) — the point forecasts and their
+        standard errors (scaled by the filter's own sigma2 = ssq/nu).
     """
-    narma_total = sum(arma[:4])
-    
-    # 1. Unpack params to phi, theta, adjusted y (ONCE)
-    y_adj, phi, theta = _unpack_and_adjust(params, y, None, arma, ncxreg, n_exog, include_mean)
-    
-    # 2. Build state-space model (ONCE)
+    _, _, _, _, _ns, d, D = arma
+
+    # 1. Unpack params, adjust the series, build the state space (ONCE)
+    y_adj, phi, theta, intercept = _unpack_and_adjust(
+        params, y, None, arma, ncxreg, n_exog, include_mean
+    )
     mod = make_arima(phi, theta, delta, arma)
-    
-    # 3. Structural Kalman forecast from initial state (fresh a0, P0)
-    # This matches the original approach: forecast from a0=zeros, not trained state
-    forecasts, _ = kalman_forecast(n_ahead, mod)
-    
-    # 4. Run Kalman filter on training data ONLY to extract innovations
-    # for MA correction (the filter state itself is not used for forecasting)
-    _, _, innovations = _kalman_filter_core(y_adj, mod)
-    
-    # 5. MA innovation correction (inline vectorized)
-    q_total = theta.shape[0]
-    n_train = innovations.shape[0]
-    # Apply MA correction if model has MA terms (q_total is static, known at trace time)
-    if q_total > 0:
-        # q_total (from arma) is always << n_train for valid models
-        rev_tail = jax.lax.dynamic_slice(innovations, (n_train - q_total,), (q_total,))[::-1]
-        corr_vals = jnp.zeros(n_ahead, dtype=jnp.float64)
-        for k in range(min(n_ahead, q_total)):
-            corr_vals = corr_vals.at[k].set(
-                jnp.dot(theta[k:], rev_tail[:q_total - k])
-            )
-        forecasts = forecasts + corr_vals
-    
-    # 6. Deterministic component (intercept/drift)
-    if ncxreg > 0:
-        reg_matrix = jnp.ones((n_ahead, ncxreg), dtype=jnp.float64)
-        exog_coefs = lax.dynamic_slice(params, (narma_total,), (ncxreg,))
-        xm = jnp.dot(reg_matrix, exog_coefs)
-        forecasts = forecasts + xm
-    
-    return forecasts
 
+    # 2. Filter the training series; the final carry is the one-step-ahead
+    # prior state after the last observation. Always the exact full filter: the
+    # frozen-gain state estimate is inaccurate near the MA invertibility boundary,
+    # and this single pass is a negligible fraction of the fit cost.
+    (a_final, P_final, ssq, _sumlog, nu), _, _ = _kalman_filter_core(y_adj, mod)
 
-def _ma_innovation_correction(
-    raw_pred: Array,
-    theta_expanded: Array,
-    innovations: Array,
-    n_ahead: int,
-) -> Array:
-    """
-    Add MA innovation correction to structural Kalman forecast.
-    The Kalman forecast from a0=zeros misses the decaying MA contribution
-    from recent innovations. For forecast step k, past innovations weighted
-    by the expanded MA polynomial are added.
-    
-    Vectorized: for step k, corr[k] = sum_{j=k}^{q-1} theta[j] * innov[n-1-(j-k)]
-    which equals dot(theta[k:], innov[n-1:n-1-(q-k):-1]) = dot(theta[k:], reversed tail)
-    """
-    q_total = theta_expanded.shape[0]
-    if q_total == 0:
-        return raw_pred
-    
-    n_train = innovations.shape[0]
-    # Reverse the last q_total innovations: [innov[n-1], innov[n-2], ..., innov[n-q]]
-    tail_len = min(q_total, n_train)
-    rev_tail = innovations[n_train - tail_len:][::-1]  # shape (tail_len,)
-    # Pad if needed (when n_train < q_total)
-    if tail_len < q_total:
-        rev_tail = jnp.concatenate([rev_tail, jnp.zeros(q_total - tail_len, dtype=jnp.float64)])
-    
-    # For step k: corr[k] = dot(theta[k:], rev_tail[:q_total-k])
-    # This is a correlation/convolution operation
-    corr = jnp.correlate(rev_tail, theta_expanded, mode='full')
-    # The correlation output at index q_total-1+k gives sum_{j} theta[j] * rev_tail[j+k]
-    # We want sum_{j=k}^{q-1} theta[j] * rev_tail[j-k] = correlate result at offset 0..n_ahead-1
-    # Actually: corr[k] = sum_j theta[j] * rev_tail[j+k] isn't right. Let me do it directly.
-    # For k=0: dot(theta[0:], rev_tail[0:]) = dot(theta, rev_tail)
-    # For k=1: dot(theta[1:], rev_tail[0:q-1]) 
-    # This is a simple loop but vectorized per-step with slicing
-    steps = min(n_ahead, q_total)
-    corr_vals = jnp.zeros(n_ahead, dtype=jnp.float64)
-    for k in range(steps):
-        corr_vals = corr_vals.at[k].set(jnp.dot(theta_expanded[k:], rev_tail[:q_total - k]))
-    return raw_pred + corr_vals
+    # 3. Forecast from the filtered state.
+    forecasts, var_units = _kalman_forecast_from_state(n_ahead, mod, a_final, P_final)
+    sigma2 = jnp.where(nu > 0, ssq / nu, jnp.inf)
+    se = jnp.sqrt(var_units * sigma2)
+
+    # 4. Deterministic component (mean / drift ramp; nothing for d+D>=2).
+    n = y.shape[0]
+    if d + D == 0:
+        forecasts = forecasts + intercept
+    elif d + D == 1:
+        ramp = jnp.arange(n + 1, n + n_ahead + 1, dtype=jnp.float64)
+        forecasts = forecasts + intercept * ramp
+
+    return forecasts, se
 
 
 # =============================================================================
@@ -1961,31 +2046,28 @@ def predict_arima(
     Produce n_ahead-step forecasts (and optionally standard errors) from a fitted ARIMA model.
 
     Detailed Description:
-        Dispatches on whether model["coef"] is 1D (single model) or 2D (batch).
-        For a single model: builds the regressor matrix (intercept and/or
-        newxreg), calls _predict_core for structural forecast and SE, then
-        applies MA innovation correction if the model has MA terms and
-        innovations are stored. For a batch: prepares batched newxreg and
-        calls _predict_batch_kernel; MA correction is not applied in the
-        batch path. When the model was fitted with drift (use_drift True),
-        intercept/drift is included in the regressor matrix when newxreg is
-        None. Returns (pred, se) if se_fit else pred.
+        Forecasts from the end-of-sample filtered state stored by arima_fit
+        (model["a_final"], model["P_final"]), so the AR/seasonal-AR and MA
+        dynamics and the differencing integration are all carried by the
+        state; adds the deterministic component (exogenous regression,
+        constant mean for d+D==0, or drift ramp for d+D==1). Standard errors
+        are the forecast-variance recursion seeded from the filtered
+        covariance, scaled by sigma2. Returns (pred, se) if se_fit else pred.
 
     Args:
         model (Dict[str, Any]): Fitted model dict from arima_fit (coef, model,
-            arma, sigma2, use_drift, drift_coef, innovations, etc.).
+            a_final, P_final, arma, sigma2, use_drift, n_obs_train, ...).
         n_ahead (int): Forecast horizon.
-        newxreg (Optional[Array]): Future exogenous values; if None and
-            n_exog > 0, a constant/intercept column is used.
+        newxreg (Optional[Array]): Future exogenous values for models fitted
+            with xreg; the deterministic mean/drift needs no newxreg.
         se_fit (bool): If True, return (pred, se); otherwise pred only.
 
     Returns:
-        Union[Array, Tuple[Array, Array]]: Forecasts array, or (forecasts, se)
-            when se_fit is True. Single model: shapes (n_ahead,) and (n_ahead,);
-            batch: (batch_size, n_ahead) and (batch_size, n_ahead).
+        Union[Array, Tuple[Array, Array]]: Forecasts array of shape
+            (n_ahead,), or (forecasts, se) when se_fit is True.
 
     Raises:
-        ValueError: If newxreg shape is invalid for batch mode.
+        ValueError: If newxreg has the wrong number of columns.
 
     Side Effects:
         None. Does not mutate model.
@@ -1994,79 +2076,51 @@ def predict_arima(
         >>> pred, se = predict_arima(fit, 12, newxreg=None, se_fit=True)
 
     Notes:
-        Role: Public prediction API for both fixed-order and AutoARIMA
-        fitted models; supports single and batch prediction.
+        Role: Public prediction API for fixed-order and AutoARIMA fitted
+        models.
     """
     params = model["coef"]
-    
-    # Check if model uses drift
+    mod = model["model"]
+    arma = model["arma"]
+    narma = sum(arma[:4])
+    d, D = arma[5], arma[6]
+    n_reg = params.shape[0] - narma
     use_drift = model.get("use_drift", False)
-    drift_coef = model.get("drift_coef", 0.0)
-    
-    # CASE 1: SINGLE MODEL (1D Params)
-    if params.ndim == 1:
-        mod = model["model"]
-        arma = model["arma"]
-        narma = sum(arma[:4])
-        n_exog = params.shape[0] - narma
-        
-        # Prepare Exogenous (Single) - now drift is NOT in xreg
-        if n_exog > 0:
-            if newxreg is None:
-                reg_matrix = jnp.ones((n_ahead, 1), dtype=jnp.float64)  # Intercept
-            else:
-                newxreg = jnp.asarray(newxreg, dtype=jnp.float64)
-                if newxreg.ndim == 1: newxreg = newxreg.reshape(-1, 1)
-                # Pad intercept if needed
-                if newxreg.shape[1] < n_exog:
-                    reg_matrix = jnp.hstack([newxreg, jnp.ones((n_ahead, 1))])
-                else:
-                    reg_matrix = newxreg
-        else:
-            reg_matrix = jnp.zeros((n_ahead, 0), dtype=jnp.float64)
-            
-        # Call Fast Single Kernel (structural forecast from a0=zeros)
-        pred, se = _predict_core(mod, params, n_ahead, reg_matrix, narma, n_exog, model["sigma2"])
-        
-        # MA innovation correction from training data
-        innovations = model.get("innovations", None)
-        if innovations is not None:
-            _, theta_expanded = arima_transpar(params[:narma], arma, trans=True)
-            pred = _ma_innovation_correction(pred, theta_expanded, innovations, n_ahead)
-        
-        return (pred, se) if se_fit else pred
 
-    # CASE 2: BATCH MODEL (2D Params)
-    else:
-        # Unpack Batch
-        mod = model["model"] # T is (Batch, r, r)
-        sigma2 = model["sigma2"]
-        narma = sum(model["arma"][:4])
-        batch_size, n_total_params = params.shape
-        n_exog = n_total_params - narma
-        
-        # Prepare Exogenous (Batch)
-        if n_exog > 0:
+    pred, var = _kalman_forecast_from_state(
+        n_ahead, mod, model["a_final"], model["P_final"]
+    )
+
+    # Deterministic component. The coefficient layout after the ARMA block is
+    # [exog..., intercept] (matching _unpack_and_adjust).
+    if n_reg > 0:
+        n_exog_cols = n_reg - 1 if (use_drift or (d + D) == 0) else n_reg
+        if n_exog_cols > 0:
             if newxreg is None:
-                # Broadcast Intercept: (Batch, Horizon, 1)
-                reg_matrix = jnp.ones((batch_size, n_ahead, 1), dtype=jnp.float64)
-            else:
-                xreg_arr = jnp.asarray(newxreg, dtype=jnp.float64)
-                
-                # SMART BROADCASTING
-                # If user passed (Horizon, n_exog) but model is Batch -> Broadcast to (Batch, Horizon, n_exog)
-                if xreg_arr.ndim == 2 and xreg_arr.shape[0] == n_ahead:
-                    reg_matrix = jnp.broadcast_to(xreg_arr, (batch_size, n_ahead, xreg_arr.shape[1]))
-                elif xreg_arr.ndim == 3:
-                    reg_matrix = xreg_arr
-                else:
-                    raise ValueError(f"Invalid newxreg shape for batch: {xreg_arr.shape}")
-        else:
-            reg_matrix = jnp.zeros((batch_size, n_ahead, 0), dtype=jnp.float64)
-            
-        # Call Vmapped Kernel
-        preds, se = _predict_batch_kernel(mod, params, n_ahead, reg_matrix, narma, n_exog, sigma2)
-        return (preds, se) if se_fit else preds
+                raise ValueError(
+                    f"model was fitted with {n_exog_cols} exogenous column(s); "
+                    "pass newxreg with future values to predict"
+                )
+            newxreg = jnp.asarray(newxreg, dtype=jnp.float64)
+            if newxreg.ndim == 1:
+                newxreg = newxreg.reshape(-1, 1)
+            if newxreg.shape[1] != n_exog_cols:
+                raise ValueError(
+                    f"newxreg has {newxreg.shape[1]} column(s); model expects {n_exog_cols}"
+                )
+            pred = pred + jnp.dot(newxreg, params[narma:narma + n_exog_cols])
+        intercept = params[narma + n_exog_cols] if (use_drift or (d + D) == 0) else None
+        if use_drift:
+            n_train = model["n_obs_train"]
+            ramp = jnp.arange(n_train + 1, n_train + n_ahead + 1, dtype=jnp.float64)
+            pred = pred + intercept * ramp
+        elif (d + D) == 0 and intercept is not None:
+            pred = pred + intercept
+
+    if se_fit:
+        se = jnp.sqrt(var * model["sigma2"])
+        return pred, se
+    return pred
 
 # =============================================================================
 # UNIT ROOT TESTS
@@ -2432,6 +2486,27 @@ def nsdiffs(x: Array, period: int, max_D: int = 1, alpha: float = 0.64) -> int:
 
 
 
+def _min_arma_root(coef_narma: np.ndarray, arma: Tuple[int, ...]) -> float:
+    """Minimum modulus over the fitted AR and MA polynomial roots.
+
+    Expands the (unconstrained-space) ARMA coefficients to their effective
+    values, trims trailing near-zero terms, and returns the smallest root
+    modulus across the AR polynomial 1 - phi(z) and the MA polynomial
+    1 + theta(z) (2.0 when neither has active terms). Host-side numpy — used
+    only by the eager order search and final-refit admissibility check.
+    """
+    phi_eff, theta_eff = arima_transpar(jnp.asarray(coef_narma), arma, trans=True)
+    minroot = 2.0
+    for vec, sign in ((np.asarray(phi_eff), -1.0), (np.asarray(theta_eff), 1.0)):
+        nz = np.abs(vec) > 1e-8
+        if nz.any():
+            trimmed = vec[: np.max(np.where(nz)[0]) + 1]
+            roots = np.polynomial.polynomial.polyroots(np.append(1.0, sign * trimmed))
+            if roots.size > 0:
+                minroot = min(minroot, np.abs(roots).min())
+    return float(minroot)
+
+
 class ARIMAResult(NamedTuple):
     """
     ARIMAResult
@@ -2536,16 +2611,42 @@ def myarima(
         order=order, 
         seasonal={'order': seasonal_order, 'period': period}, 
         xreg=xreg,
-        include_mean=constant, 
-        method=method
+        include_mean=constant,
+        method=method,
+        steadystate=False,   # exact objective for candidate IC comparison
     )
 
-    # 2. Extract Exact Metrics
-    # These were computed in _compute_metrics using the full Kalman Log-Likelihood
-    aic_val = fit['aic']
-    bic_val = fit['bic']
-    aicc_val = fit['aicc']
+    # 2. Candidate-ranking metrics.
+    # method=="CSS" is the approximation-mode search: candidates are ranked by
+    # the CSS IC (nstar*log(sigma2_css) + 2*npar, Hyndman-Khandakar) so the
+    # stepwise walk visits the same neighbours as the reference search; any
+    # other method ranks by the exact Kalman ICs from the fit.
     success = fit['success']
+    if method.upper() == "CSS":
+        arma_t = fit["arma"]
+        mp_, mq_, msp_, msq_, ns_, d_, D_ = arma_t
+        narma_ = mp_ + mq_ + msp_ + msq_
+        ncxreg_ = int(fit["coef"].shape[0]) - narma_
+        n_exog_ = max(ncxreg_ - (1 if constant else 0), 0)
+        delta_ = fit["delta"]
+        css_obj = _objective_css(
+            fit["coef"], jnp.asarray(x, dtype=jnp.float64), xreg, delta_,
+            arma_t, ncxreg_, n_exog_, constant,
+        )
+        sigma2_css = jnp.exp(css_obj)
+        nstar = x.shape[0] - d_ - D_ * ns_
+        npar = narma_ + ncxreg_ + 1
+        aic_val = nstar * jnp.log(sigma2_css) + 2.0 * npar
+        bic_val = aic_val + npar * (jnp.log(nstar) - 2.0)
+        aicc_val = jnp.where(
+            nstar - npar - 1 != 0,
+            aic_val + 2.0 * npar * (npar + 1) / (nstar - npar - 1),
+            jnp.inf,
+        )
+    else:
+        aic_val = fit['aic']
+        bic_val = fit['bic']
+        aicc_val = fit['aicc']
 
     # 3. Decision Logic (IC Selection)
     # Mapping string names to values using jnp.where for JIT compatibility
@@ -2555,11 +2656,24 @@ def myarima(
         jnp.where(ic == "aicc", aicc_val, aic_val))
     )
 
-    # 4. Global Failure Mask
-    # If the optimizer failed or variance is non-positive, invalidate the model.
-    # This prevents the search algorithm from selecting degenerate models.
-    mask = success & jnp.isfinite(chosen_ic)
-    
+    # 4. Near-unit-root veto (Hyndman-Khandakar): reject candidates whose
+    # fitted AR or MA polynomial has a root with modulus below 1.01 — such
+    # fits sit on the (non-)stationarity/invertibility boundary and forecast
+    # erratically even when their in-sample IC looks good. Host-side numpy is
+    # fine: myarima only runs inside the eager order search.
+    p_ord, _, q_ord = order
+    P_ord, _, Q_ord = seasonal_order
+    narma = p_ord + q_ord + P_ord + Q_ord
+    minroot = (
+        _min_arma_root(np.asarray(fit["coef"])[:narma], fit["arma"])
+        if narma > 0 else 2.0
+    )
+
+    # 5. Global Failure Mask
+    # If the optimizer failed, the variance is non-positive, or the roots sit
+    # inside the veto band, invalidate the model so the search rejects it.
+    mask = success & jnp.isfinite(chosen_ic) & (minroot >= 1.01)
+
     return ARIMAResult(
         loglik=jnp.where(mask, fit['loglik'], -jnp.inf),
         sigma2=jnp.where(mask, fit['sigma2'], jnp.inf),
@@ -2678,7 +2792,8 @@ def search_arima(
                                 "ic": current_ic,
                                 "sigma2": float(res.sigma2),
                                 "loglik": float(res.loglik),
-                                "arma": (p, q, P, Q, period, d, D)
+                                "arma": (p, q, P, Q, period, d, D),
+                                "constant": (K == 1)
                             }
 
     if best_res is None:
@@ -2731,7 +2846,7 @@ def _aa_denormalize(y_norm: jnp.ndarray, mean: jnp.ndarray, std: jnp.ndarray) ->
 
     Detailed Description:
         Applies the inverse of _aa_standardize: y = y_norm * std + mean. Used
-        after predict_arima or _reconstruct_forecast when the model was fit
+        after predict_arima or _forecast_from_params when the model was fit
         on standardized data, so that returned forecasts have the same units
         and scale as the original training series. Broadcasts if mean/std are
         scalars and y_norm is a vector.
@@ -2839,7 +2954,7 @@ def auto_arima_f(
     
     # --- Phase 1: Handle Edge Cases ---
     if is_constant(x):
-        return arima_fit(x, order=(0, 0, 0), include_mean=allowmean, method=method)
+        return arima_fit(x, order=(0, 0, 0), include_mean=allowmean, method=method, steadystate=False)
     
     m = period if seasonal else 1
     
@@ -2874,8 +2989,11 @@ def auto_arima_f(
     
     # --- Phase 3: Model Search ---
     # Use CSS-only for fast candidate evaluation; final refit uses full method
-    search_method = "CSS"
-    
+    # Approximation rule (Hyndman-Khandakar): search with CSS (scored by the
+    # CSS-approximation IC inside myarima) only when the series is long or
+    # strongly seasonal; otherwise search with the full method and exact ICs.
+    search_method = "CSS" if (x.shape[0] > 150 or m > 12) else method
+
     # Helper to convert ARIMAResult to dict
     def _to_dict(res: ARIMAResult, p_: int, q_: int, P_: int, Q_: int) -> Dict[str, Any]:
         """
@@ -2905,6 +3023,8 @@ def auto_arima_f(
             "arma": (p_, q_, P_, Q_, m, d_val, D_val), "success": bool(res.success)
         }
     
+    tried: list = []
+
     # Full Grid Search
     if not stepwise:
         bestfit = search_arima(
@@ -2913,81 +3033,146 @@ def auto_arima_f(
             max_order=max_order, ic=ic, method=search_method, xreg=xreg,
             allow_drift=allowdrift, allow_mean=allowmean
         )
-    # Stepwise Search
+    # Stepwise Search (Hyndman-Khandakar: 5 starting models, 17 moves per
+    # round — single steps, diagonal steps, and the constant toggle — with a
+    # visited-set so no candidate is ever fitted twice; the scan restarts
+    # from the first move after every improvement. max_order restricts the
+    # grid search only, not the stepwise walk.)
     else:
         p = min(start_p, max_p)
         q = min(start_q, max_q)
         P = min(start_P, eff_max_P) if m > 1 else 0
         Q = min(start_Q, eff_max_Q) if m > 1 else 0
-        
+
         constant = (allowdrift and d_val + D_val == 1) or (allowmean and d_val + D_val == 0)
-        
-        res = myarima(
-            x, order=(p, d_val, q), seasonal_order=(P, D_val, Q), period=m,
-            constant=constant, ic=ic, method=search_method, xreg=xreg
-        )
-        bestfit = _to_dict(res, p, q, P, Q)
-        
-        # Try null model
-        res = myarima(
-            x, order=(0, d_val, 0), seasonal_order=(0, D_val, 0), period=m,
-            constant=constant, ic=ic, method=search_method, xreg=xreg
-        )
-        fit = _to_dict(res, 0, 0, 0, 0)
+        can_toggle = constant
+
+        visited: set = set()
+        k_count = 0
+
+        def _try_candidate(p_: int, q_: int, P_: int, Q_: int, const_: bool) -> Dict[str, Any]:
+            nonlocal k_count
+            visited.add((p_, q_, P_, Q_, const_))
+            k_count += 1
+            res_ = myarima(
+                x, order=(p_, d_val, q_), seasonal_order=(P_, D_val, Q_), period=m,
+                constant=const_, ic=ic, method=search_method, xreg=xreg
+            )
+            fit_ = _to_dict(res_, p_, q_, P_, Q_)
+            fit_["constant"] = const_
+            tried.append(fit_)
+            return fit_
+
+        # Starting models: user start orders, the null model, a pure-AR seed,
+        # a pure-MA seed, and (when a constant is admissible) the bare
+        # no-constant null.
+        bestfit = _try_candidate(p, q, P, Q, constant)
+        fit = _try_candidate(0, 0, 0, 0, constant)
         if fit["ic"] < bestfit["ic"]:
             bestfit = fit
             p = q = P = Q = 0
-        
-        k = 2
-        improved = True
-        while improved and k < nmodels:
-            improved = False
-            variations = [
-                (p-1, q, P, Q), (p+1, q, P, Q),
-                (p, q-1, P, Q), (p, q+1, P, Q),
-                (p, q, P-1, Q), (p, q, P+1, Q),
-                (p, q, P, Q-1), (p, q, P, Q+1),
-            ]
-            
-            for new_p, new_q, new_P, new_Q in variations:
-                if (0 <= new_p <= max_p and 0 <= new_q <= max_q and
-                    0 <= new_P <= eff_max_P and 0 <= new_Q <= eff_max_Q and
-                    new_p + new_q + new_P + new_Q <= max_order):
-                    
-                    res = myarima(
-                        x, order=(new_p, d_val, new_q), seasonal_order=(new_P, D_val, new_Q), period=m,
-                        constant=constant, ic=ic, method=search_method, xreg=xreg
-                    )
-                    fit = _to_dict(res, new_p, new_q, new_P, new_Q)
-                    k += 1
-                    
-                    if fit["ic"] < bestfit["ic"]:
-                        bestfit = fit
-                        p, q, P, Q = new_p, new_q, new_P, new_Q
-                        improved = True
-                        break
+        if max_p > 0 or eff_max_P > 0:
+            p_ = int(max_p > 0)
+            P_ = int(m > 1 and eff_max_P > 0)
+            if (p_, 0, P_, 0, constant) not in visited:
+                fit = _try_candidate(p_, 0, P_, 0, constant)
+                if fit["ic"] < bestfit["ic"]:
+                    bestfit = fit
+                    p, P, q, Q = p_, P_, 0, 0
+        if max_q > 0 or eff_max_Q > 0:
+            q_ = int(max_q > 0)
+            Q_ = int(m > 1 and eff_max_Q > 0)
+            if (0, q_, 0, Q_, constant) not in visited:
+                fit = _try_candidate(0, q_, 0, Q_, constant)
+                if fit["ic"] < bestfit["ic"]:
+                    bestfit = fit
+                    q, Q, p, P = q_, Q_, 0, 0
+        if constant and (0, 0, 0, 0, False) not in visited:
+            fit = _try_candidate(0, 0, 0, 0, False)
+            if fit["ic"] < bestfit["ic"]:
+                bestfit = fit
+                p = q = P = Q = 0
 
-    # --- Phase 4: Final Refit (THE FIX) ---
-    # Re-run arima_fit on the best order to get coefficients and residuals
-    
-    final_p, final_q, final_P, final_Q, _, _, _ = bestfit["arma"]
-    
-    # Re-derive constant based on bestfit results or logic
-    # (Simplified: assume allowdrift/allowmean logic holds for best model)
-    use_constant = (allowdrift and d_val + D_val == 1) or (allowmean and d_val + D_val == 0)
-    
-    final_model = arima_fit(
-        x, 
-        order=(final_p, d_val, final_q),
-        seasonal={'order': (final_P, D_val, final_Q), 'period': m},
-        xreg=xreg,
-        include_mean=use_constant,
-        method=method
+        improved = True
+        while improved and k_count < nmodels:
+            improved = False
+            moves = [
+                (p, q, P - 1, Q, constant), (p, q, P, Q - 1, constant),
+                (p, q, P + 1, Q, constant), (p, q, P, Q + 1, constant),
+                (p, q, P - 1, Q - 1, constant), (p, q, P - 1, Q + 1, constant),
+                (p, q, P + 1, Q - 1, constant), (p, q, P + 1, Q + 1, constant),
+                (p - 1, q, P, Q, constant), (p, q - 1, P, Q, constant),
+                (p + 1, q, P, Q, constant), (p, q + 1, P, Q, constant),
+                (p - 1, q - 1, P, Q, constant), (p - 1, q + 1, P, Q, constant),
+                (p + 1, q - 1, P, Q, constant), (p + 1, q + 1, P, Q, constant),
+            ]
+            if can_toggle:
+                moves.append((p, q, P, Q, not constant))
+            for new_p, new_q, new_P, new_Q, new_c in moves:
+                if k_count >= nmodels:
+                    break
+                if not (0 <= new_p <= max_p and 0 <= new_q <= max_q and
+                        0 <= new_P <= eff_max_P and 0 <= new_Q <= eff_max_Q):
+                    continue
+                if (new_p, new_q, new_P, new_Q, new_c) in visited:
+                    continue
+                fit = _try_candidate(new_p, new_q, new_P, new_Q, new_c)
+                if fit["ic"] < bestfit["ic"]:
+                    bestfit = fit
+                    p, q, P, Q, constant = new_p, new_q, new_P, new_Q, new_c
+                    improved = True
+                    break
+
+    # --- Final refit with the full method, walking the candidate ranking ---
+    # The search fits candidates with the (cheaper) search method; the final
+    # model is re-fit with the full method. An exact-method endpoint can land
+    # on the near-unit-root veto band even when the search endpoint did not,
+    # so walk the tried candidates in search-IC order and accept the first
+    # whose exact refit is admissible (finite likelihood + roots outside the
+    # veto band) — the same fallback statsforecast runs after an
+    # approximation-mode search.
+    default_constant = (allowdrift and d_val + D_val == 1) or (allowmean and d_val + D_val == 0)
+    ranked = sorted(
+        (f for f in tried if np.isfinite(f["ic"])), key=lambda f: f["ic"]
     )
-    
-    # Carry over the precise IC calculated during search if desired, 
-    # though arima_fit recalculates it.
-    
+    candidates = ranked if ranked else [bestfit]
+
+    final_model = None
+    for cand in candidates[:10]:
+        c_p, c_q, c_P, c_Q, _, _, _ = cand["arma"]
+        c_const = cand.get("constant", default_constant)
+        fit_try = arima_fit(
+            x,
+            order=(c_p, d_val, c_q),
+            seasonal={'order': (c_P, D_val, c_Q), 'period': m},
+            xreg=xreg,
+            include_mean=c_const,
+            method=method,
+            steadystate=False,   # exact objective for candidate IC comparison
+        )
+        if not bool(fit_try["success"]):
+            continue
+        narma_c = c_p + c_q + c_P + c_Q
+        if narma_c > 0 and _min_arma_root(
+            np.asarray(fit_try["coef"])[:narma_c], fit_try["arma"]
+        ) < 1.01:
+            continue
+        final_model = fit_try
+        break
+    if final_model is None:
+        # Every ranked candidate failed the exact-method admissibility check —
+        # fall back to the search winner's spec unvetoed rather than raising.
+        c_p, c_q, c_P, c_Q, _, _, _ = bestfit["arma"]
+        final_model = arima_fit(
+            x,
+            order=(c_p, d_val, c_q),
+            seasonal={'order': (c_P, D_val, c_Q), 'period': m},
+            xreg=xreg,
+            include_mean=bestfit.get("constant", default_constant),
+            method=method,
+            steadystate=False,   # exact objective for the fallback final fit
+        )
+
     return final_model
 
 
@@ -3051,7 +3236,10 @@ class AutoARIMA(BaseForecaster):
     Notes:
         Stateful estimator; avoid concurrent mutation from multiple threads.
     """
-    uses_exog: bool = True
+    # Exogenous support is not wired end-to-end (the cached-order fast path
+    # and the CV path ignore X), so it is not advertised; passing X raises
+    # instead of silently dropping it.
+    uses_exog: bool = False
     
     def __init__(
         self,
@@ -3077,6 +3265,7 @@ class AutoARIMA(BaseForecaster):
         allowdrift: bool = True,
         allowmean: bool = True,
         period: Optional[int] = None,
+        conformal_params: Optional[ConformalIntervals] = None,
     ) -> None:
         """
         Set up AutoARIMA search bounds, options, and internal caches.
@@ -3133,6 +3322,8 @@ class AutoARIMA(BaseForecaster):
         self.allowdrift = allowdrift
         self.allowmean = allowmean
         self._user_period = period  # None = auto-detect
+        self.conformal_params = conformal_params
+        self._cs: jnp.ndarray | None = None
         self.model_: Dict[str, Any] | None = None
         self.standardize: bool = True
         self._y_mean: jnp.ndarray | None = None
@@ -3177,29 +3368,37 @@ class AutoARIMA(BaseForecaster):
         Notes:
             The first fit may trigger JAX compilation overhead.
         """
-        y_np = np.array(y)
-        y_jax = jnp.asarray(y_np, dtype=jnp.float64)
-        
-        if X is not None:
-            X = jnp.asarray(X, dtype=jnp.float64)
+        # fit() hosts the order search (numpy/scipy stepwise) and is eager by
+        # design; the vmapped CV path never calls it directly — see
+        # conformity_scores() below for how conformal CV reaches forecast().
+        y_jax = jnp.asarray(y, dtype=jnp.float64)
 
+        if X is not None:
+            raise ValueError(
+                "AutoARIMA does not currently support exogenous regressors "
+                "end-to-end; fit accepts only y (use auto_arima_f(xreg=...) "
+                "for the low-level exogenous API)."
+            )
+
+        # Everything below stays in locals until the host search succeeds:
+        # assigning traced/partial state to self earlier would leave a
+        # polluted instance behind if fit is (incorrectly) reached under a
+        # trace, which dies loudly in the search instead.
         if self.standardize:
-            y_fit, self._y_mean, self._y_std = _aa_standardize(y_jax)
+            y_fit, y_mean, y_std = _aa_standardize(y_jax)
         else:
             y_fit = y_jax
-            self._y_mean = jnp.array(0.0, dtype=jnp.float64)
-            self._y_std = jnp.array(1.0, dtype=jnp.float64)
-
-        self.y_train_ = y_fit
+            y_mean = jnp.array(0.0, dtype=jnp.float64)
+            y_std = jnp.array(1.0, dtype=jnp.float64)
 
         # Auto-detect period if not specified
         if self._user_period is None:
-            detected = detect_period(y_np, max_period=min(len(y_np) // 4, 24))
-            self.period = detected
+            n = int(y_jax.shape[0])
+            period = detect_period(np.asarray(y_jax), max_period=min(n // 4, 24))
         else:
-            self.period = self._user_period
+            period = self._user_period
 
-        self.model_ = auto_arima_f(
+        model = auto_arima_f(
             x=y_fit,
             d=self.d,
             D=self.D,
@@ -3223,9 +3422,16 @@ class AutoARIMA(BaseForecaster):
             xreg=X,
             allowdrift=self.allowdrift,
             allowmean=self.allowmean,
-            period=self.period,
+            period=period,
         )
-        
+
+        # Search succeeded — commit state to self.
+        self._y_mean = y_mean
+        self._y_std = y_std
+        self.y_train_ = y_fit
+        self.period = period
+        self.model_ = model
+
         # Cache the selected order for fast forecast() reuse
         p, q, P, Q, m, d, D = self.model_["arma"]
         self._cached_order = (p, d, q)
@@ -3245,8 +3451,56 @@ class AutoARIMA(BaseForecaster):
             seas_diff = jnp.concatenate([jnp.array([1.0]), jnp.zeros(m - 1), jnp.array([-1.0])])
             delta = jnp.convolve(delta, seas_diff)
         self._cached_delta = -delta[1:]
-        
+
+        # Pre-compute and cache conformity scores on the training series for
+        # predict() intervals (sibling convention: AutoCES/ARIMA). Runs after
+        # the order caches above, so the vmapped per-window forecast takes the
+        # traceable fixed-order fast path.
+        if self.conformal_params is not None:
+            self._cs = self.conformity_scores(y=y_jax, X=X)
+        else:
+            self._cs = None
+
         return self
+
+    def conformity_scores(
+        self, y: jnp.ndarray, X: Optional[jnp.ndarray] = None
+    ) -> jnp.ndarray:
+        """
+        Conformity scores with eager order selection, vmapped per-window refit.
+
+        Detailed Description:
+            The base-class implementation vmaps ``self.forecast`` over CV
+            windows. AutoARIMA's order search (stepwise/grid over numpy and
+            Python control flow) cannot trace, so it runs ONCE, eagerly, on
+            the full series here; the vmapped ``forecast`` then re-fits the
+            *parameters* of that fixed order independently per window via the
+            traceable CSS fast path.
+
+            Calibration caveat (shared with the other Auto models): the ORDER is
+            selected with sight of the full series,
+            including CV test windows — mildly optimistic. Parameters are
+            still honestly re-fit per window, so scores vary across windows.
+
+        Args:
+            y (jnp.ndarray): Series to score on (concrete; order selection is
+                a host-side search).
+            X (jnp.ndarray | None, optional): Optional exogenous regressors.
+
+        Returns:
+            jnp.ndarray: ``(n_windows, h)`` conformity scores.
+
+        Side Effects:
+            First call on an unfitted estimator runs ``fit`` (caches the
+            selected order) — mirroring ``forecast``'s first-call behaviour.
+        """
+        if self._cached_order is None:
+            self.fit(y, X)
+            # fit() just cached scores on exactly this y — reuse them rather
+            # than paying the n_windows CV re-fits a second time.
+            if self._cs is not None:
+                return self._cs
+        return super().conformity_scores(y, X)
     
     def forecast(self, h: int, y: jnp.ndarray, X: Optional[jnp.ndarray] = None, X_future: Optional[jnp.ndarray] = None, level: Optional[list] = None, fitted: bool = False) -> Dict[str, jnp.ndarray]:
         """
@@ -3262,11 +3516,14 @@ class AutoARIMA(BaseForecaster):
             y (jnp.ndarray): Input history series.
             X (jnp.ndarray | None, optional): Optional exogenous matrix.
             X_future (jnp.ndarray | None, optional): Future exogenous regressors (unused; included for BaseForecaster compliance). Default is None.
-            level (list | None, optional): Confidence levels (unused; included for BaseForecaster compliance). Default is None.
-            fitted (bool, optional): Whether to return fitted values (unused; included for BaseForecaster compliance). Default is False.
+            level (list | None, optional): Confidence levels (0-100) for conformal
+                prediction intervals. Requires ``conformal_params``. Default is None.
+            fitted (bool, optional): Whether to return fitted values (unused; the
+                fast path computes forecasts only). Default is False.
 
         Returns:
-            dict[str, jnp.ndarray]: Forecast dictionary containing `mean`.
+            dict[str, jnp.ndarray]: Forecast dictionary containing `mean`, plus
+            `lo-{l}`/`hi-{l}` conformal bounds when `level` is given.
 
         Raises:
             RuntimeError: Propagated from optimizer if fitting fails.
@@ -3282,54 +3539,103 @@ class AutoARIMA(BaseForecaster):
         Notes:
             Fast path intentionally uses CSS objective for low latency.
         """
-        y_jax = jnp.asarray(np.array(y), dtype=jnp.float64)
-        
+        if X is not None or X_future is not None:
+            raise ValueError(
+                "AutoARIMA does not currently support exogenous regressors "
+                "end-to-end; forecast accepts only y."
+            )
+        y_jax = jnp.asarray(y, dtype=jnp.float64)
+
         # First call: run full search to find best order, then reuse predict()
+        fitted_this_call = False
         if self._cached_order is None:
             self.fit(y_jax, X)
-            return self.predict(h, X=None)
-
-        # Subsequent calls: fast path with cached order (CSS-only for speed)
-        arma = self._cached_arma
-        p, q, P, Q, m, d, D = arma
-        include_mean = self._cached_include_mean
-        use_drift = include_mean and (d + D) == 1
-        
-        # Standardize current series for fast refit
-        if self.standardize:
-            y_fit, f_mean, f_std = _aa_standardize(y_jax)
+            fitted_this_call = True
+            res = self.predict(h, X=None)
         else:
-            y_fit = y_jax
-            f_mean = jnp.array(0.0, dtype=jnp.float64)
-            f_std = jnp.array(1.0, dtype=jnp.float64)
+            # Subsequent calls: fast path with cached order (CSS-only for
+            # speed). This branch is what conformity_scores vmaps: every op
+            # below is jnp/lax-native with config-static shapes.
+            arma = self._cached_arma
+            p, q, P, Q, m, d, D = arma
+            include_mean = self._cached_include_mean
+            use_drift = include_mean and (d + D) == 1
 
-        init_params = jnp.zeros(self._cached_narma + self._cached_ncxreg, dtype=jnp.float64) + 1e-3
-
-        if include_mean and (d + D) == 0:
-            init_params = init_params.at[self._cached_narma + self._cached_n_exog].set(jnp.nanmean(y_fit))
-        
-        if use_drift:
-            if D == 1 and m > 1:
-                dx = y_fit[m:] - y_fit[:-m]
+            # Standardize current series for fast refit
+            if self.standardize:
+                y_fit, f_mean, f_std = _aa_standardize(y_jax)
             else:
-                dx = y_fit[1:] - y_fit[:-1]
-            init_params = init_params.at[self._cached_narma + self._cached_n_exog].set(jnp.nanmean(dx))
-        
-        current_params = _fit_model_bfgs(
-            init_params, y_fit, None, self._cached_delta, _objective_css,
-            self._cached_arma, self._cached_ncxreg, self._cached_n_exog, include_mean, 50
-        )
-        
-        # Fused forecast: single XLA dispatch for params → forecast
-        raw_fc = _forecast_from_params(
-            current_params, y_fit, self._cached_delta,
-            self._cached_arma, self._cached_ncxreg, self._cached_n_exog, include_mean, h
-        )
-        
-        fc_norm = _reconstruct_forecast(raw_fc, y_fit, self._cached_arma, h)
-        fc = _aa_denormalize(fc_norm, f_mean, f_std)
-        return {"mean": fc}
-    
+                y_fit = y_jax
+                f_mean = jnp.array(0.0, dtype=jnp.float64)
+                f_std = jnp.array(1.0, dtype=jnp.float64)
+
+            init_params = jnp.zeros(self._cached_narma + self._cached_ncxreg, dtype=jnp.float64) + 1e-3
+
+            if include_mean and (d + D) == 0:
+                init_params = init_params.at[self._cached_narma + self._cached_n_exog].set(jnp.nanmean(y_fit))
+
+            if use_drift:
+                if D == 1 and m > 1:
+                    dx = y_fit[m:] - y_fit[:-m]
+                    per_step = m
+                else:
+                    dx = y_fit[1:] - y_fit[:-1]
+                    per_step = 1
+                init_params = init_params.at[self._cached_narma + self._cached_n_exog].set(jnp.nanmean(dx) / per_step)
+
+            current_params = _fit_model_scan(
+                init_params, y_fit, None, self._cached_delta, _objective_css,
+                self._cached_arma, self._cached_ncxreg, self._cached_n_exog, include_mean, 100
+            )
+
+            # Closed-form mean/drift pin (same rescue as arima_fit).
+            if include_mean:
+                _mi = self._cached_narma + self._cached_n_exog
+                if use_drift:
+                    current_params = current_params.at[_mi].set(jnp.nanmean(dx) / per_step)
+                elif (d + D) >= 2:
+                    current_params = current_params.at[_mi].set(0.0)
+
+            # Fused forecast: single XLA dispatch for params → forecast
+            raw_fc, raw_se = _forecast_from_params(
+                current_params, y_fit, self._cached_delta,
+                self._cached_arma, self._cached_ncxreg, self._cached_n_exog, include_mean, h
+            )
+
+            # raw_fc is on the training-series scale: the state space's
+            # differencing rows integrate internally.
+            fc = _aa_denormalize(raw_fc, f_mean, f_std)
+            res = {"mean": fc}
+            res["_se"] = raw_se * (f_std if self.standardize else jnp.array(1.0, dtype=jnp.float64))
+
+        se_arr = res.pop("_se", None)
+        if level is None:
+            return res
+
+        level = sorted(level)
+        if self.conformal_params is None:
+            if se_arr is None:
+                # First call routed through fit()+predict(); reuse predict's
+                # analytic interval path directly.
+                return self.predict(h, X=None, level=tuple(level))
+            z_scores = _quantiles(level)
+            for i, lv in enumerate(level):
+                res[f"lo-{lv}"] = res["mean"] - z_scores[i] * se_arr
+                res[f"hi-{lv}"] = res["mean"] + z_scores[i] * se_arr
+            return res
+        if h != self.conformal_params.h:
+            raise ValueError(
+                f"h={h} does not match conformal_params.h={self.conformal_params.h}; "
+                "conformity scores cover exactly conformal_params.h steps."
+            )
+        if fitted_this_call and self._cs is not None:
+            # fit() above just cached scores on exactly this y — don't pay
+            # the n_windows CV re-fits a second time.
+            cs = self._cs
+        else:
+            cs = self.conformity_scores(y=y_jax, X=X)
+        return self.add_confidence_intervals(res, cs, level, self.conformal_params.method)
+
     def predict(
         self,
         h: int,
@@ -3367,33 +3673,59 @@ class AutoARIMA(BaseForecaster):
         """
         if self.model_ is None:
             raise RuntimeError("Model not fitted. Call fit() first.")
-        
-        if X is not None:
-            X = jnp.asarray(X, dtype=jnp.float64)
 
-        preds = predict_arima(self.model_, n_ahead=h, newxreg=X, se_fit=(level is not None))
-        
+        if X is not None:
+            raise ValueError(
+                "AutoARIMA does not currently support exogenous regressors "
+                "end-to-end; predict accepts only h."
+            )
+
+        # Conformal intervals take over whenever conformal_params is set;
+        # analytic z-score intervals remain the fallback. Standard errors are
+        # only computed when the analytic path will actually use them.
+        use_conformal = level is not None and self.conformal_params is not None
+        preds = predict_arima(
+            self.model_, n_ahead=h, newxreg=X,
+            se_fit=(level is not None and not use_conformal),
+        )
+
         if isinstance(preds, tuple):
             mean_pred, se_pred = preds
         else:
             mean_pred, se_pred = preds, None
 
-        fc_norm = _reconstruct_forecast(mean_pred, self.y_train_, self.model_["arma"], h)
-        mean_orig = _aa_denormalize(fc_norm, self._y_mean, self._y_std)
+        # mean_pred is on the training-series scale (integration lives in the
+        # state space).
+        mean_orig = _aa_denormalize(mean_pred, self._y_mean, self._y_std)
 
-        # Standard Errors
+        # Standard Errors. The state-space (make_arima) already bakes the
+        # differencing into T/Z, so kalman_forecast returns the integrated-series
+        # forecast SE directly; the old sqrt(cumsum(se^2)) here integrated a
+        # SECOND time (double count). se_pred is already the correct per-horizon
+        # SE — just rescale to the original units.
         if se_pred is not None:
-            p, q, P, Q, m, d, D = self.model_["arma"]
-            if d + D > 0:
-                se_scaled = jnp.sqrt(jnp.cumsum(se_pred**2))
-            else:
-                se_scaled = se_pred
-            se_orig = se_scaled * self._y_std
-        
+            se_orig = se_pred * self._y_std
+        else:
+            se_orig = None
+
         result = {}
         result["mean"] = mean_orig
-        
-        if level is not None:
+
+        if use_conformal:
+            level = sorted([level] if isinstance(level, int) else list(level))
+            if self._cs is None:
+                raise ValueError(
+                    "Conformity scores are not available. Fit the model (fit(...)) "
+                    "with `conformal_params` set so predict() can use cached scores."
+                )
+            if h != self.conformal_params.h:
+                raise ValueError(
+                    f"h={h} does not match conformal_params.h={self.conformal_params.h}; "
+                    "conformity scores cover exactly conformal_params.h steps."
+                )
+            return self.add_confidence_intervals(result, self._cs, level, self.conformal_params.method)
+
+        if level is not None and se_orig is not None:
             if isinstance(level, int): level = (level,)
             z_scores = _quantiles(level)
             for i, lv in enumerate(level):
@@ -3432,342 +3764,3 @@ class AutoARIMA(BaseForecaster):
         if self.model_ is None: return "Model not fitted"
         p, q, P, Q, m, d, D = self.model_["arma"]
         return f"ARIMA({p},{d},{q})({P},{D},{Q})[{m}] | AICc: {self.model_.get('aicc', 0.0):.4f}"
-
-class ARIMA(BaseForecaster):
-    """
-    ARIMA
-
-    Description:
-        Fixed-order ARIMA forecaster backed by shared JAX optimization kernels.
-
-    Attributes:
-        uses_exog (bool): Indicates exogenous support.
-        model_ (dict[str, Any] | None): Fitted model payload.
-        _delta (Array): Cached differencing polynomial.
-        _arma (tuple[int, ...]): Cached ARMA metadata tuple.
-
-    Args:
-        order (tuple[int, int, int]): Non-seasonal order `(p, d, q)`.
-        seasonal_order (tuple[int, int, int]): Seasonal order `(P, D, Q)`.
-        period (int): Seasonal period.
-        include_mean (bool): Include deterministic mean/drift term.
-        method (str): Optimization method selector.
-        alias (str): Friendly model label.
-        standardize (bool): Normalize series during fitting.
-
-    Methods:
-        fit(): Fit model parameters.
-        forecast(): One-shot fit-and-forecast.
-        predict(): Forecast from fitted state.
-
-    Returns:
-        Provides mean forecasts and optional interval bands.
-
-    Example:
-        >>> model = ARIMA(order=(1, 1, 1))
-        >>> model.fit(jnp.array([1.0, 2.0, 3.0, 4.0]))
-
-    Notes:
-        Stateful estimator; mutable instance attributes are not thread-safe.
-    """
-    uses_exog: bool = True
-    
-    def __init__(
-        self,
-        order: Tuple[int, int, int] = (0, 0, 0),
-        seasonal_order: Tuple[int, int, int] = (0, 0, 0),
-        period: int = 1,
-        include_mean: bool = True,
-        method: str = "CSS",
-        alias: str = "ARIMA",
-        standardize: bool = True,
-    ) -> None:
-        """
-        Set up fixed-order ARIMA and precompute differencing and ARMA metadata.
-
-        Detailed Description:
-            Stores order, seasonal_order, period, include_mean, method, and
-            alias. Precomputes and caches the differencing polynomial (_delta),
-            ARMA structure tuple (_arma), and parameter counts (_narma,
-            _ncxreg, _n_exog) so that fit() and forecast() do not recompute
-            them. Initializes model_ to None and optional standardization
-            stats (_y_mean, _y_std). No fitting is performed.
-
-        Args:
-            order (Tuple[int, int, int]): (p, d, q).
-            seasonal_order (Tuple[int, int, int]): (P, D, Q).
-            period (int): Seasonal period.
-            include_mean (bool): Include intercept/drift.
-            method (str): CSS, ML, or CSS-ML.
-            alias (str): Display name.
-            standardize (bool): Whether to standardize series in fit/forecast.
-
-        Returns:
-            None.
-
-        Side Effects:
-            Sets instance attributes; no I/O.
-
-        Notes:
-            Role: Constructor for fixed-order ARIMA; caches enable fast
-            one-shot forecast() without refitting.
-        """
-        self.order = order
-        self.seasonal_order = seasonal_order
-        self.period = period
-        self.include_mean = include_mean
-        self.method = method
-        self.alias = alias
-        self.model_: Dict[str, Any] | None = None
-        self.standardize = standardize
-        self._y_mean: jnp.ndarray | None = None
-        self._y_std: jnp.ndarray | None = None
-
-        # Pre-compute and cache the delta polynomial (depends only on order/period)
-        p, d, q = order
-        P, D, Q = seasonal_order
-        delta = jnp.array([1.0], dtype=jnp.float64)
-        for _ in range(d):
-            delta = jnp.convolve(delta, jnp.array([1.0, -1.0]))
-        for _ in range(D):
-            seas_diff = jnp.concatenate([jnp.array([1.0]), jnp.zeros(period - 1), jnp.array([-1.0])])
-            delta = jnp.convolve(delta, seas_diff)
-        self._delta: Array = -delta[1:]
-        self._arma: tuple[int, ...] = (p, q, P, Q, period, d, D)
-        self._narma: int = p + q + P + Q
-        n_exog = 0
-        self._ncxreg: int = n_exog + (1 if include_mean else 0)
-        self._n_exog: int = n_exog
-
-    def fit(self, y: jnp.ndarray, X: Optional[jnp.ndarray] = None) -> "ARIMA":
-        """
-        Estimate ARIMA parameters and store the fitted model and training state.
-
-        Detailed Description:
-            Optionally standardizes y (and caches _y_mean, _y_std), then calls
-            arima_fit with the instance's order, seasonal_order, period,
-            include_mean, and method. Stores the returned dict in model_ and
-            ensures model_["arma"] has the correct tuple. Saves y_fit as
-            y_train_ for use in predict (e.g. for _reconstruct_forecast).
-            Returns self for method chaining.
-
-        Args:
-            y (jnp.ndarray): Training target series.
-            X (Optional[jnp.ndarray]): Optional exogenous regressors (same length as y).
-
-        Returns:
-            ARIMA: self, with model_ and y_train_ set.
-
-        Raises:
-            None. Optimizer failure is reflected in model_["success"].
-
-        Side Effects:
-            Mutates model_, y_train_, _y_mean, _y_std.
-
-        Example:
-            >>> model = ARIMA(order=(1, 1, 1)); model.fit(y)
-
-        Notes:
-            Role: Single fit entry point for fixed-order ARIMA; required
-            before predict() and for reproducible forecast().
-        """
-        y_jax = jnp.asarray(np.array(y), dtype=jnp.float64)
-        if X is not None:
-            X = jnp.asarray(X, dtype=jnp.float64)
-
-        # Standardize training series if enabled
-        if self.standardize:
-            y_fit, self._y_mean, self._y_std = _aa_standardize(y_jax)
-        else:
-            y_fit = y_jax
-            self._y_mean = jnp.array(0.0, dtype=jnp.float64)
-            self._y_std = jnp.array(1.0, dtype=jnp.float64)
-
-        self.y_train_ = y_fit
-
-        seasonal = {'order': self.seasonal_order, 'period': self.period}
-        
-        self.model_ = arima_fit(
-            y_fit, order=self.order, seasonal=seasonal,
-            include_mean=self.include_mean, method=self.method, xreg=X
-        )
-        
-        p, d, q = self.order
-        P, D, Q = self.seasonal_order
-        self.model_['arma'] = (p, q, P, Q, self.period, d, D)
-        
-        return self
-
-    def forecast(self, h: int, y: jnp.ndarray, X: Optional[jnp.ndarray] = None, X_future: Optional[jnp.ndarray] = None, level: Optional[list] = None, fitted: bool = False) -> Dict[str, jnp.ndarray]:
-        """
-        Fit the fixed-order model on the given series and return h-step forecasts in one shot.
-
-        Detailed Description:
-            Standardizes y if standardize is True, then runs BFGS (CSS and/or
-            ML) using the cached _delta and _arma without building the full
-            arima_fit result (no AIC/BIC/residuals). Uses _forecast_from_params
-            for a single XLA dispatch from params to forecasts, then
-            _reconstruct_forecast to integrate differencing and _aa_denormalize
-            to map back to original scale. Exogenous X is not used in this fast
-            path. Returns a dict with key "mean" containing the forecast array.
-            Useful when only point forecasts are needed and fitting state is
-            not retained.
-
-        Args:
-            h (int): Forecast horizon.
-            y (jnp.ndarray): Training series (used only for this call).
-            X (Optional[jnp.ndarray]): Exogenous regressors; not used in current fast path.
-            X_future (Optional[jnp.ndarray]): Future exogenous regressors (unused; included for BaseForecaster compliance). Default is None.
-            level (list | None, optional): Confidence levels (unused; included for BaseForecaster compliance). Default is None.
-            fitted (bool, optional): Whether to return fitted values (unused; included for BaseForecaster compliance). Default is False.
-
-        Returns:
-            Dict[str, jnp.ndarray]: {"mean": array of shape (h,)}.
-
-        Raises:
-            None.
-
-        Side Effects:
-            None. Does not mutate instance state (no fit cache update).
-
-        Example:
-            >>> out = model.forecast(12, jnp.array([1.0, 2.0, 3.0, 4.0]))
-
-        Notes:
-            Role: One-shot fit-and-forecast for fixed-order ARIMA with
-            minimal Python/XLA overhead; no model_ update.
-        """
-        y_jax = jnp.asarray(np.array(y), dtype=jnp.float64)
-
-        # Standardize input series for fast one-shot fit if enabled
-        if self.standardize:
-            y_fit, f_mean, f_std = _aa_standardize(y_jax)
-        else:
-            y_fit = y_jax
-            f_mean = jnp.array(0.0, dtype=jnp.float64)
-            f_std = jnp.array(1.0, dtype=jnp.float64)
-        p, d, q = self.order
-        P, D, Q = self.seasonal_order
-        
-        # --- BFGS optimization (same as arima_fit, but uses cached delta) ---
-        use_drift = self.include_mean and (d + D) == 1
-        init_params = jnp.zeros(self._narma + self._ncxreg, dtype=jnp.float64) + 1e-3
-        
-        if self.include_mean and (d + D) == 0:
-            init_params = init_params.at[self._narma + self._n_exog].set(jnp.nanmean(y_fit))
-        
-        if use_drift:
-            if D == 1 and self.period > 1:
-                dx = y_fit[self.period:] - y_fit[:-self.period]
-            else:
-                dx = y_fit[1:] - y_fit[:-1]
-            init_params = init_params.at[self._narma + self._n_exog].set(jnp.nanmean(dx))
-
-        method = self.method.upper()
-        current_params = init_params
-        maxiter = 50  # Reduced: CSS converges fast for low-order models
-        
-        if "CSS" in method:
-            css_iter = maxiter // 2 if method == "CSS-ML" else maxiter
-            current_params = _fit_model_bfgs(
-                current_params, y_fit, None, self._delta, _objective_css,
-                self._arma, self._ncxreg, self._n_exog, self.include_mean, css_iter
-            )
-        if "ML" in method:
-            ml_iter = maxiter // 2 if method == "CSS-ML" else maxiter
-            current_params = _fit_model_bfgs(
-                current_params, y_fit, None, self._delta, _objective_ml,
-                self._arma, self._ncxreg, self._n_exog, self.include_mean, ml_iter
-            )
-
-        # --- Fused forecast: single XLA dispatch for params → forecast ---
-        raw_fc = _forecast_from_params(
-            current_params, y_fit, self._delta,
-            self._arma, self._ncxreg, self._n_exog, self.include_mean, h
-        )
-
-        # --- Reconstruction using delta polynomial inverse filter ---
-        fc_norm = _reconstruct_forecast(raw_fc, y_fit, self._arma, h)
-        fc = _aa_denormalize(fc_norm, f_mean, f_std)
-
-        return {"mean": fc}
-
-    def predict(
-        self,
-        h: int,
-        X: Optional[jnp.ndarray] = None,
-        level: int | tuple[int, ...] | None = None,
-    ) -> Dict[str, jnp.ndarray]:
-        """
-        Produce h-step forecasts (and optional interval bands) from the fitted model.
-
-        Detailed Description:
-            Requires a prior fit (model_ is not None). Calls predict_arima
-            with model_, n_ahead=h, newxreg=X, and se_fit=(level is not None).
-            Reconstructs forecasts from differenced space via
-            _reconstruct_forecast and denormalizes if standardize was used.
-            When level is provided, scales standard errors for integrated
-            models (d+D>0) by cumulative sum of squared SEs and builds
-            symmetric intervals using _quantiles. Returns a dict with "mean"
-            and optionally "lo" / "hi" keys for each level.
-
-        Args:
-            h (int): Forecast horizon.
-            X (Optional[jnp.ndarray]): Future exogenous regressors; shape (h, n_exog).
-            level (int | tuple[int, ...] | None): Confidence level(s), e.g. 90 or (80, 95).
-
-        Returns:
-            Dict[str, jnp.ndarray]: At least "mean"; if level given, "lo" and "hi" per level.
-
-        Raises:
-            RuntimeError: If the model has not been fitted.
-
-        Side Effects:
-            None. Does not mutate model_.
-
-        Example:
-            >>> preds = model.predict(h=12, level=(80, 95))
-
-        Notes:
-            Role: Primary prediction API after fit(); supports intervals via level.
-        """
-        if self.model_ is None: raise RuntimeError("Model not fitted.")
-        if X is not None: X = jnp.asarray(X, dtype=jnp.float64)
-        
-        preds = predict_arima(self.model_, n_ahead=h, newxreg=X, se_fit=(level is not None))
-        
-        if isinstance(preds, tuple):
-            mean_pred, se_pred = preds
-        else:
-            mean_pred, se_pred = preds, None
-
-        # Reconstruct in standardized space
-        fc_norm = _reconstruct_forecast(mean_pred, self.y_train_, self.model_["arma"], h)
-        # Map back to original scale if standardization was used
-        if self.standardize:
-            mean_orig = _aa_denormalize(fc_norm, self._y_mean, self._y_std)
-        else:
-            mean_orig = fc_norm
-
-        if se_pred is not None:
-            p, q, P, Q, m, d, D = self.model_["arma"]
-            if d + D > 0:
-                se_scaled = jnp.sqrt(jnp.cumsum(se_pred**2))
-            else:
-                se_scaled = se_pred
-            se_orig = se_scaled * (self._y_std if self.standardize else 1.0)
-        else:
-            se_orig = None
-
-        result = {}
-        result["mean"] = mean_orig
-            
-        if level is not None and se_orig is not None:
-            if isinstance(level, int): level = (level,)
-            z_scores = _quantiles(level)
-            for i, lv in enumerate(level):
-                q = z_scores[i]
-                result[f"lo-{lv}"] = result["mean"] - q * se_orig
-                result[f"hi-{lv}"] = result["mean"] + q * se_orig
-            
-        return result

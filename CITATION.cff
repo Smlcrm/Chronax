@@ -1,0 +1,55 @@
+# Keep title, version and
+# repository-code identical to the BibTeX entry in README.md.
+# Omit `version` and `date-released` when the repository has no release.
+# Never add `doi` unless a DOI has actually been minted.
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata from this file."
+type: software
+title: "Chronax"
+abstract: "A JAX time-series forecasting library: statistical forecasting models behind one fit / predict interface."
+authors:
+  - name: "Simulacrum, Inc."
+    website: "https://smlcrm.com"
+version: "0.1.0"
+date-released: "2026-03-09"
+repository-code: "https://github.com/Smlcrm/Chronax"
+url: "https://smlcrm.com"
+license: "MIT"
+keywords:
+  - "simulacrum"
+  - "python"
+  - "jax"
+  - "time-series"
+  - "forecasting"
+  - "arima"
+  - "exponential-smoothing"
+preferred-citation:
+  type: article
+  title: "Chronax: A Jax Library for Univariate Statistical Forecasting and Conformal Inference"
+  authors:
+    - family-names: "Carey"
+      given-names: "Xan"
+    - family-names: "Deshmukh"
+      given-names: "Yash"
+    - family-names: "Huang"
+      given-names: "Aileen"
+    - family-names: "Jadhav"
+      given-names: "Sunit"
+    - family-names: "Tekawade"
+      given-names: "Omkar"
+    - family-names: "Yang"
+      given-names: "Lorraine"
+    - family-names: "Tiwary"
+      given-names: "Anvesha"
+    - family-names: "Riano"
+      given-names: "Gerardo"
+    - family-names: "Greenwald"
+      given-names: "Amy"
+    - family-names: "Goktas"
+      given-names: "Denizalp"
+  year: 2026
+  url: "https://arxiv.org/abs/2604.16719"
+  identifiers:
+    - type: other
+      value: "arXiv:2604.16719"
+      description: "The arXiv identifier of the paper"

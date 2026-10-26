@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from lstm import LSTMModel
+from chronax.models.lstm.lstm import LSTMModel
 
 
 def test_init_creates_expected_parameter_shapes():

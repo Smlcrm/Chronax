@@ -1,0 +1,240 @@
+# Generate the Chronax docs and publish them into the website repo.
+#
+# This repo no longer builds or deploys a docs image. The documentation is part
+# of the marketing site now: Smlcrm/web-website serves it at www.smlcrm.com/docs
+# from one Cloudflare Pages project, so the built site is pushed into that
+# repository's public/docs/chronax/ rather than into a documentation repository
+# of its own.
+#
+# Generation stays here: the Vertex ADC federation and the per-project GCS
+# cache both belong with the source they document.
+name: Web docs (dev)
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - 'chronax/**'
+      - 'web-docs/**'
+      - '.github/workflows/web-docs-dev.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  # Serialises doc publishes from this repo. Named after the WORKFLOW, not a
+  # Cloud Run service: the old name was "web-docs-chronax-dev", which named a
+  # per-product docs service that no longer exists — this repo has published
+  # into Smlcrm/web-website rather than deploying its own service since the
+  # unified-docs migration, and that service was decommissioned.
+  group: web-docs-publish-chronax
+  cancel-in-progress: true
+
+env:
+  PROJECT_SLUG: chronax
+  # Where the built site lands. The branch mirrors this one: dev -> dev.
+  DOCS_REPO: Smlcrm/web-website
+  DOCS_BRANCH: dev
+  # Recreated in sml-website-dev, the original died with sml-web-doc-gen-dev
+  # on 2026-08-02. The first run after that is a cold build: every module
+  # goes through Gemini. Subsequent runs only regenerate what changed.
+  CACHE_BUCKET: gs://sml-website-dev-docgen-cache/chronax
+  # Generation runs against Vertex AI through ADC. There is no API key: org
+  # policy forbids long-lived keys, and the job is already federated via WIF.
+  VERTEX_PROJECT_ID: sml-website-dev
+  # Matches what Terraform sets on the runtime services, so generation and
+  # Ask AI both hit the same endpoint.
+  VERTEX_LOCATION: global
+  # The builder defaults to the alias gemini-flash-latest, which Vertex AI does
+  # not serve (404 NOT_FOUND). Pin a Vertex model id. The builder's default
+  # thinking level, "minimal", needs a Gemini 3 model.
+  GEMINI_MODEL: gemini-3-flash-preview
+  BUILDER_IMAGE: us-central1-docker.pkg.dev/sml-artifacts-dev/sml-web-doc-docker/docgen-builder:latest
+
+jobs:
+  generate-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: sml-bootstrap-cicd
+          workload_identity_provider: projects/972498125049/locations/global/workloadIdentityPools/github-pool-sml-bootstrap-cicd/providers/github
+          service_account: github-ci-sml-bootstrap-cicd@sml-bootstrap-cicd.iam.gserviceaccount.com
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker auth
+        # Only to pull the builder image; nothing is pushed from this repo now.
+        run: gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+
+      - name: Restore the doc cache
+        run: |
+          mkdir -p .docgen-cache
+          gsutil -m rsync -r "${CACHE_BUCKET}" .docgen-cache || true
+
+      - name: Generate the docs
+        run: |
+          set -euo pipefail
+          # ADC has to resolve INSIDE the container, and every path involved is
+          # an absolute HOST path: GOOGLE_APPLICATION_CREDENTIALS, and the OIDC
+          # token file named inside that credential file. So both directories
+          # google-github-actions/auth writes to are mounted at their original
+          # paths — the workspace (where the credential file actually lands)
+          # and RUNNER_TEMP — and the env var is passed through unchanged.
+          #
+          # Mounting the workspace only at /work is what broke this: the file
+          # was present, under a path the credential chain never looks at, so
+          # generation failed with DefaultCredentialsError after ingesting the
+          # whole repo. Read-only, and no credential is ever copied.
+          docker run --rm \
+            -e GOOGLE_APPLICATION_CREDENTIALS \
+            -e GOOGLE_CLOUD_PROJECT \
+            -e GOOGLE_CLOUD_LOCATION \
+            -e GEMINI_MODEL \
+            -v "${RUNNER_TEMP}:${RUNNER_TEMP}:ro" \
+            -v "${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}:ro" \
+            -v "${PWD}:/work" \
+            -v "${PWD}/.docgen-cache:/app/.docgen-cache" \
+            "${BUILDER_IMAGE}" \
+            --repo /work --out /work/site --config /work/web-docs/docgen.toml
+        env:
+          GOOGLE_CLOUD_PROJECT: ${{ env.VERTEX_PROJECT_ID }}
+          GOOGLE_CLOUD_LOCATION: ${{ env.VERTEX_LOCATION }}
+
+      - name: Verify the site actually generated
+        run: |
+          set -euo pipefail
+          test -f site/index.html || { echo "::error::site/index.html missing"; exit 1; }
+          COUNT="$(find site -name '*.html' | wc -l)"
+          echo "generated ${COUNT} html file(s)"
+          [ "${COUNT}" -gt 1 ] || { echo "::error::only ${COUNT} page(s) generated"; exit 1; }
+
+      - name: Save the doc cache
+        run: gsutil -m rsync -d -r .docgen-cache "${CACHE_BUCKET}"
+
+      - name: Publish the site into the website repo
+        env:
+          DOCS_TOKEN: ${{ secrets.DOCGEN_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DOCS_TOKEN:-}" ]; then
+            echo "::error::DOCGEN_TOKEN is not set. It needs Contents: Read and write AND Pull requests: Read and write on ${DOCS_REPO}."
+            exit 1
+          fi
+
+          CLONE="${RUNNER_TEMP}/web-website"
+          git clone --depth 1 --branch "${DOCS_BRANCH}" \
+            "https://x-access-token:${DOCS_TOKEN}@github.com/${DOCS_REPO}.git" "${CLONE}"
+
+          # --delete so pages removed from the source disappear from the site
+          # instead of lingering as orphans nothing links to.
+          # Into <product>/next/, beside the release directories and never on top of
+          # them. A flat tree at the product folder's own level sits on the paths
+          # prod's per-release layout deletes, and every refresh of it made the next
+          # web-website test -> prod promotion conflict (web-website#73). --delete
+          # stays inside next/, so the releases next to it are never touched.
+          rsync -a --delete site/ "${CLONE}/public/docs/${PROJECT_SLUG}/next/"
+
+          # Fail here, in the repository that produced the tree, rather than in
+          # web-website's CI after a commit has landed. Same five rules its own
+          # npm run verify:docs-site enforces; standard library only, so this
+          # runner installs nothing. Read from the clone rather than vendored
+          # here because this workflow checks out a RELEASE TAG, and a vendored
+          # copy would be whatever that tag carried, or absent on a backfill.
+          python3 "${CLONE}/scripts/verify-publishable.py" "${CLONE}/public/docs"
+
+          cd "${CLONE}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A "public/docs/${PROJECT_SLUG}"
+          if git diff --cached --quiet; then
+            echo "No documentation changes to publish."
+            exit 0
+          fi
+          MSG="docs(${PROJECT_SLUG}): sync from ${GITHUB_REPOSITORY}@${GITHUB_SHA}"
+          git commit -q -m "${MSG}"
+
+          # A pull request rather than a push to the branch. web-website builds
+          # and deploys from its branches within about a minute, so a push puts
+          # an unchecked tree in front of users; a pull request runs its
+          # build-and-test (which includes verify:docs-site over the WHOLE
+          # public/docs tree) before anything lands.
+          #
+          # The old rebase-and-retry loop existed because both products pushed
+          # to one branch and could race. Branches remove the race: each run has
+          # its own, and the two products write disjoint subtrees.
+          BRANCH="docs/${PROJECT_SLUG}-${GITHUB_RUN_ID}"
+          # The commit above is already on this branch: checkout -b keeps HEAD.
+          # A second `git commit` here found nothing to commit and exited 1
+          # under `set -e`, so every run stopped here with the docs never published.
+          git checkout -q -b "${BRANCH}"
+          git push -q origin "${BRANCH}"
+
+          export GH_TOKEN="${DOCS_TOKEN}"
+          # A newer run replaces an older one still waiting for review: close the
+          # older pull requests this product opened into this branch.
+          gh pr list --repo "${DOCS_REPO}" --base "${DOCS_BRANCH}" --state open --json number,headRefName \
+              --jq ".[] | select(.headRefName | startswith(\"docs/${PROJECT_SLUG}-\")) | .number" |
+            while read -r OLD; do
+              gh pr close "${OLD}" --repo "${DOCS_REPO}" --delete-branch \
+                --comment "Replaced by a newer docs run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+                && echo "closed the older docs pull request #${OLD}"
+            done
+          PR=$(gh pr create --repo "${DOCS_REPO}" --base "${DOCS_BRANCH}" --head "${BRANCH}" \
+                 --title "${MSG}" \
+                 --body "Generated documentation from ${GITHUB_REPOSITORY}@${GITHUB_SHA}. Opened by ${GITHUB_WORKFLOW}: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} - merged automatically once its checks pass and a person approves it.")
+          echo "opened ${PR}"
+
+          # Wait for the checks ourselves. web-website's prod branch carries no
+          # required status check, so --auto would merge the moment the pull
+          # request was mergeable and the gate would be decorative.
+          # THE WAIT READS ACTIONS RUNS, NOT `gh pr checks`. DOCGEN_TOKEN is a fine-grained
+          # token, and GitHub offers fine-grained tokens no Checks permission, so the check-run
+          # rollup `gh pr checks` reads answered "Resource not accessible by personal access
+          # token" and every run stopped here (2026-09-25). The token has Actions: read, so this
+          # reads the workflow runs web-website started for the pushed commit, build-and-test and
+          # the guardrails scan among them. It passes once every run has finished without failing
+          # on two polls in a row with the same count, so a run that registers late is still
+          # waited for. Any failed, cancelled or blocked run stops it.
+          HEAD_SHA="$(git rev-parse HEAD)"
+          CHECKS_OK=0
+          LAST=""
+          for attempt in $(seq 1 60); do
+            sleep 20
+            if ! RUNS="$(gh api "repos/${DOCS_REPO}/actions/runs?head_sha=${HEAD_SHA}&per_page=100" \
+                  --jq '[.workflow_runs[] | [.status, (.conclusion // "")]]')"; then
+              echo "could not read the runs for ${HEAD_SHA} (attempt ${attempt}); waiting"
+              continue
+            fi
+            TOTAL="$(printf '%s' "${RUNS}" | jq 'length')"
+            OPEN="$(printf '%s' "${RUNS}" | jq '[.[] | select(.[0] != "completed")] | length')"
+            BAD="$(printf '%s' "${RUNS}" | jq '[.[] | select(.[0] == "completed" and ((.[1] == "success" or .[1] == "skipped" or .[1] == "neutral") | not))] | length')"
+            echo "runs for ${HEAD_SHA}: ${TOTAL}, still running ${OPEN}, failed ${BAD}"
+            [ "${BAD}" = 0 ] || break
+            if [ "${TOTAL}" != 0 ] && [ "${OPEN}" = 0 ]; then
+              [ "${LAST}" = "${TOTAL}" ] && { CHECKS_OK=1; break; }
+              LAST="${TOTAL}"
+            else
+              LAST=""
+            fi
+          done
+          if [ "${CHECKS_OK}" != "1" ]; then
+            echo "::error::checks did not pass for ${PR}. It is left OPEN and unmerged so the tree can be inspected; nothing was published."
+            exit 1
+          fi
+
+          # web-website dev requires one approving review, and this token is not exempt
+          # from it (operator decision, 2026-09-26: no bypass for a long-lived token that
+          # can write the branch). --auto merges now if the branch allows it, or queues
+          # the merge for the moment a person approves. The checks above have passed.
+          gh pr merge "${PR}" --repo "${DOCS_REPO}" --squash --delete-branch --auto
+          if [ "$(gh pr view "${PR}" --repo "${DOCS_REPO}" --json state --jq .state)" = MERGED ]; then
+            echo "Published ${PROJECT_SLUG} docs to ${DOCS_REPO}@${DOCS_BRANCH} via ${PR}"
+          else
+            echo "::notice::${PR} passed its checks and merges itself once a person approves it."
+          fi

@@ -10,6 +10,8 @@ from chronax.utils import (
     calculate_sigma,
     _calculate_intervals,
     _store_cs,
+    _add_conformal_intervals,
+    _add_predict_conformal_intervals,
     _add_fitted_pi,
 )
 from chronax.utils import ConformalIntervals
@@ -42,6 +44,9 @@ class SeasonalNaive(BaseForecaster):
         self.season_length = season_length
         self.alias = alias
         self.prediction_intervals = prediction_intervals
+        # BaseForecaster.conformity_scores reads conformal_params (see
+        # seasonal_exponential_smoothing.py for the same aliasing).
+        self.conformal_params = prediction_intervals
 
     def fit(
         self,
@@ -91,6 +96,7 @@ class SeasonalNaive(BaseForecaster):
             dict: Dictionary with entries `mean` for point predictions and
                 `level_*` for probabilistic predictions.
         """
+        self._require_fitted()
         del X
         mean = _repeat_val_seas(season_vals=self.model_["mean"], h=h)
         res: ForecastDict = {"mean": mean}
@@ -99,7 +105,7 @@ class SeasonalNaive(BaseForecaster):
             return res
         level = sorted(level)
         if self.prediction_intervals is not None:
-            res = self._add_predict_conformal_intervals(res, level)
+            res = _add_predict_conformal_intervals(self, res, level)
         else:
             k = jnp.floor(jnp.arange(h) / self.season_length)
             sigma = self.model_["sigma"]
@@ -165,7 +171,7 @@ class SeasonalNaive(BaseForecaster):
         if level is not None:
             level = sorted(level)
             if self.prediction_intervals is not None:
-                res = self._add_conformal_intervals(fcst=res, y=y, X=X, level=level)
+                res = _add_conformal_intervals(self, fcst=res, y=y, X=X, level=level)
             else:
                 k = jnp.floor(jnp.arange(h) / self.season_length)
                 residuals = y - out["fitted"]

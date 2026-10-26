@@ -229,6 +229,7 @@ class CrostonClassic(BaseForecaster):
         Returns:
             Dictionary with 'mean' and optional interval keys ('lo-XX', 'hi-XX')
         """
+        self._require_fitted()
         # Point forecast (constant across horizon for Croston Classic)
         mean = utils._repeat_val(val=self.model_["mean"][0], h=h)
         res = {"mean": mean}
@@ -326,7 +327,7 @@ class CrostonClassic(BaseForecaster):
         # Add native fitted intervals if requested
         if fitted and level is not None:
             sigma = utils.calculate_sigma(y - res["fitted"], y.size)
-            res = {**res, **utils._add_fitted_pi(
+            res = {**res, **utils._add_fitted_pi_1(
                 fitted=res["fitted"],
                 sigmah=sigma,
                 level=level

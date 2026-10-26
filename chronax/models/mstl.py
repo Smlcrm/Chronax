@@ -38,6 +38,22 @@ from chronax.models.base_forecaster import BaseForecaster
 from .stl import stl_decompose
 from chronax.utils import ConformalIntervals
 
+
+def _forecast_seasonally_adjusted(sa: jnp.ndarray, h: int) -> jnp.ndarray:
+    """Forecast the deseasonalised (trend + remainder) series ``h`` steps with Theta.
+
+    Uses Theta's STATELESS ``forecast`` (the vmap-native fit+predict path that
+    Theta's own ``conformity_scores`` vmaps) — NOT ``fit().predict()``, whose eager
+    entry has host-side control flow (``AutoTheta.fit``) that breaks under MSTL's
+    ``conformity_scores`` vmap. ``forecast`` writes nothing to the local Theta
+    instance, so no tracers leak onto it. Lazy import avoids the
+    ``chronax.models`` <-> ``mstl`` circular import.
+    """
+    from chronax.models import Theta
+
+    return Theta().forecast(y=sa, h=int(h))["mean"]
+
+
 class MSTL(BaseForecaster):
     """
     Multiple Seasonal-Trend decomposition using LOESS.
@@ -228,8 +244,13 @@ class MSTL(BaseForecaster):
                     out[key] = seas_mat[i]
             out["remainder"] = self.model_["remainder"]
         if level:
-            cs = self.conformity_scores(y)
-            out = self.add_confidence_intervals(out, cs, level, "conformal_distribution")
+            # In-sample intervals from the residual scale (see STL note): CV
+            # conformity scores are (n_windows, h) and cannot broadcast onto
+            # the (n,) fitted mean.
+            level = sorted(level)
+            sigma = utils.calculate_sigma(self.model_["remainder"],
+                                          self.model_["remainder"].shape[0])
+            out = {**out, **utils._add_fitted_pi_1(out["mean"], sigma, level)}
         return out
 
     def predict(self, h: int, X: jnp.ndarray | None = None, level: list[int | float] | None = None) -> dict:
@@ -250,6 +271,7 @@ class MSTL(BaseForecaster):
                 - "mean": Point forecasts (extrapolated trend + repeated seasonals)
                 - "lo-{level}" and "hi-{level}": Conformal prediction interval bounds for each specified level (if level is provided)
         """
+        self._require_fitted()
         h = int(h)
         y = self.model_["y"]
         trend = self.model_["trend"]
@@ -257,11 +279,15 @@ class MSTL(BaseForecaster):
         periods = self.model_["periods"]
         n = y.size
 
-        if len(periods) == 0:
-            tail = self.tail_window if self.tail_window is not None else max(5, n // 10)
-        else:
-            tail = self.tail_window if self.tail_window is not None else min(n, int(2 * periods[-1] + 1))
-        trend_fcst = utils._linear_extrapolate_tail(trend, tail, h)
+        # Forecast the seasonally-adjusted series (trend + remainder) with a real
+        # in-house forecaster (Theta — vmap-native, reference-grade) instead of a
+        # bare linear-tail trend extrapolation that DROPS the remainder. This
+        # captures non-linear trend + remainder autocorrelation and matches
+        # statsforecast's MSTL (forecast the deseasonalised series with a model,
+        # then re-add the cyclic seasonal). `tail_window` is inert, kept for
+        # backward compatibility.
+        sa = trend + self.model_["remainder"]
+        sa_fcst = _forecast_seasonally_adjusted(sa, h)
 
         if seas_mat.size:
             seas_fcst = jnp.zeros(h, dtype=y.dtype)
@@ -270,7 +296,7 @@ class MSTL(BaseForecaster):
         else:
             seas_fcst = jnp.zeros(h, dtype=y.dtype)
 
-        out = {"mean": trend_fcst + seas_fcst}
+        out = {"mean": sa_fcst + seas_fcst}
         if level:
             cs = self.conformity_scores(y)
             out = self.add_confidence_intervals(out, cs, level, "conformal_distribution")

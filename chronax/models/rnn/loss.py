@@ -13,9 +13,11 @@ All shapes follow the ``[B, H, output_size]`` convention used by the model.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Callable, Optional
 
 import jax.numpy as jnp
+
+LossFn = Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray]
 
 
 # ---------------------------------------------------------------------------
@@ -88,3 +90,25 @@ def masked_mse(
     losses = (y - y_hat) ** 2
     weights = _compute_weights(y=y, mask=mask, horizon_weight=horizon_weight)
     return _weighted_mean(losses=losses, weights=weights)
+
+
+LOSSES = {
+    "mae": masked_mae,
+    "mse": masked_mse,
+}
+
+
+def resolve(loss):
+    """Return a callable loss from either a registry string or a callable.
+
+    Mirrors :func:`chronax.models.gru.gru_losses.resolve`. Raises ``ValueError``
+    for unknown strings, naming the registered options.
+    """
+    if callable(loss):
+        return loss
+    if loss not in LOSSES:
+        raise ValueError(
+            f"Unknown loss {loss!r}. Available: {sorted(LOSSES)}. "
+            "Pass a callable for custom losses."
+        )
+    return LOSSES[loss]

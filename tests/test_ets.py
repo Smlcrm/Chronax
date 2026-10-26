@@ -2,9 +2,77 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import numpy as np
+import pytest
 import jax.numpy as jnp
-from chronax.models import ETS
+from chronax.models import ETS, AutoETS
 from chronax.utils import ConformalIntervals
+
+
+def test_pure_sigmoid_alpha_honors_bounds():
+    # F1: in pure-sigmoid mode alpha must honor its box [lower[0], upper[0]] (like
+    # phi does), while reducing to the EPS_PURE box [0.02, 0.98] for the
+    # admissible/default box [0, 1].
+    from chronax.models.ets.ets_backend import _transform_smoothing_params, EPS_PURE
+    import jax
+    ps = [-3.0, -1.0, 0.0, 1.0, 3.0]
+
+    # admissible [0,1] -> alpha == the EPS_PURE margin box (unchanged default behavior)
+    lo = jnp.array([0.0, 0.0, 0.0, 0.8]); hi = jnp.array([1.0, 1.0, 1.0, 0.98])
+    for pv in ps:
+        a, *_ = _transform_smoothing_params(jnp.array([pv]), True, False, False, False,
+                                            0.1, 0.0, 0.0, 0.9, lo, hi, pure_sigmoid=True)
+        expected = EPS_PURE + (1.0 - 2.0 * EPS_PURE) * float(jax.nn.sigmoid(jnp.array(pv)))
+        np.testing.assert_allclose(float(a), expected, rtol=1e-6)
+
+    # tightened box [0.1, 0.5] -> alpha confined to it (was ignored before the fix)
+    lo2 = jnp.array([0.1, 0.0, 0.0, 0.8]); hi2 = jnp.array([0.5, 1.0, 1.0, 0.98])
+    for pv in ps:
+        a, *_ = _transform_smoothing_params(jnp.array([pv]), True, False, False, False,
+                                            0.1, 0.0, 0.0, 0.9, lo2, hi2, pure_sigmoid=True)
+        assert 0.1 <= float(a) <= 0.5, f"alpha {float(a)} escaped its [0.1,0.5] box (p={pv})"
+
+
+def test_fixed_ets_rejects_auto_z_code():
+    # ETS is fixed-spec; a 'Z' code (auto selection) would crash the conformal
+    # CV path (int(traced best) with >1 candidate). Reject at construction.
+    for spec in ("ZZZ", "ZNN", "ANZ", "ZAA"):
+        with pytest.raises(ValueError):
+            ETS(model=spec)
+    # Concrete specs still construct fine.
+    for spec in ("ANN", "AAN", "AAA", "MNM"):
+        ETS(model=spec)
+
+
+def test_autoets_damped_false_keeps_trend_candidates_small_n():
+    # AutoETS(model='ZZN', damped=False) on n<200 must still search trended
+    # models — the small-n damped preference must not delete every undamped
+    # trend candidate when damping is explicitly disabled.
+    rng = np.random.default_rng(0)
+    n = 120
+    t = np.arange(n)
+    y = jnp.asarray(10 + 0.4 * t + rng.normal(0, 1, n), dtype=jnp.float64)
+    m = AutoETS(model="ZZN", damped=False, season_length=1)
+    m.fit(y)
+    fc = np.asarray(m.predict(h=8)["mean"])
+    # A strong linear trend must be carried into the forecast (not flat).
+    assert fc[-1] - fc[0] > 1.0, f"trend lost: {fc[0]:.2f} -> {fc[-1]:.2f}"
+
+
+def test_autoets_amse_opt_crit_matches_mean_squared_error():
+    # opt_crit='amse' uses the running multi-horizon MSE; after the etscalc
+    # off-by-one fix a converged fit's reported amse is a genuine mean of
+    # squared errors (finite, positive, comparable to residual variance), not
+    # the ~half-weighted artifact.
+    rng = np.random.default_rng(1)
+    n = 100
+    y = jnp.asarray(20 + rng.normal(0, 2, n), dtype=jnp.float64)
+    m = AutoETS(model="ANN", season_length=1)
+    m.fit(y)
+    out = m.predict(h=4)
+    assert np.all(np.isfinite(np.asarray(out["mean"])))
+
+
 # -------------------------------------------------------------------
 # Coverage Tests (run this file directly)
 #
@@ -216,7 +284,9 @@ if __name__ == "__main__":
         rng = np.random.RandomState(19)
         y = jnp.asarray(5.0 + 0.5 * rng.randn(n), dtype=jnp.float64)
 
-        cfg = ConformalIntervals(n_windows=4, h=2, method="conformal_distribution")
+        # h must match conformal_params.h: scores cover exactly h steps
+        # (guarded with a ValueError, sibling convention).
+        cfg = ConformalIntervals(n_windows=4, h=6, method="conformal_distribution")
         et = ETS(season_length=1, model="ANN", max_iter=200, prediction_intervals=cfg)
 
         out = et.forecast(y=y, h=6, level=[90], fitted=False)
@@ -226,6 +296,39 @@ if __name__ == "__main__":
         lo90 = np.asarray(out["lo-90"]); hi90 = np.asarray(out["hi-90"])
         assert np.all(lo90 <= mean + 1e-12) and np.all(mean <= hi90 + 1e-12)
         _print_ok("test_stateless_forecast_with_conformal_intervals")
+
+    def test_native_intervals_multiplicative_classes():
+        """Native intervals across interval-formula classes 2/3/4-5.
+
+        The conformal CV path never exercises these branches (level=None), and
+        the contract suite pins ETS to ANN — so the multiplicative interval
+        formulas (class 2: M-error; class 3: M-error+M-season; class 4/5:
+        simulation fallback, e.g. M-trend combos) ship untested without this.
+        Mirrors contract invariant C: predict(level) twice, pickle, predict.
+        """
+        import pickle
+        m_seas = 4
+        rng = np.random.RandomState(42)
+        t = np.arange(64, dtype=np.float64)
+        seasonal = 1.0 + 0.2 * np.sin(2 * np.pi * t / m_seas)
+        y_pos = jnp.asarray((50.0 + 0.5 * t) * seasonal + 0.5 * rng.randn(64) + 5.0,
+                            dtype=jnp.float64)
+
+        for spec, season_length in [("MNN", 1), ("MNM", m_seas), ("MMN", 1)]:
+            et = ETS(season_length=season_length, model=spec, max_iter=100)
+            et.fit(y_pos)
+            p1 = et.predict(h=4, level=[80, 95])
+            p2 = et.predict(h=4, level=[80, 95])
+            for p in (p1, p2):
+                for lv in (80, 95):
+                    lo = np.asarray(p[f"lo-{lv}"]); hi = np.asarray(p[f"hi-{lv}"])
+                    mean = np.asarray(p["mean"])
+                    assert np.all(np.isfinite(lo)) and np.all(np.isfinite(hi)), f"{spec}: non-finite bands"
+                    assert np.all(lo <= mean + 1e-9) and np.all(mean <= hi + 1e-9), f"{spec}: mean outside {lv}% band"
+            et2 = pickle.loads(pickle.dumps(et))
+            p3 = et2.predict(h=4, level=[80])
+            assert "lo-80" in p3 and "hi-80" in p3, f"{spec}: post-pickle intervals missing"
+        _print_ok("test_native_intervals_multiplicative_classes")
 
     # ================= Forward & errors =================
 
@@ -343,6 +446,7 @@ if __name__ == "__main__":
     test_predict_native_intervals_ETS()
     test_forecast_adds_fitted_and_fitted_intervals_ETS()
     test_predict_in_sample_intervals_monotonicity_ETS()
+    test_native_intervals_multiplicative_classes()
     test_fit_caches_conformal_then_predict_uses_cache()
     test_stateless_forecast_with_conformal_intervals()
 

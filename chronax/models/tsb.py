@@ -37,7 +37,10 @@ class TSB(BaseForecaster):
         n = len(y)
         prob_indicators = utils.extract_probability(y)
 
-        demand_init = jnp.where(jnp.any(y > 0), jnp.where(y[0] > 0, y[0], 1.0), 0.0)
+        # Demand level initializes at the FIRST positive demand (the SES over
+        # compact demands starts there); a fixed placeholder init would leave
+        # a (1-alpha_d)^cnt * (init - d1) residue in the final level.
+        demand_init = jnp.where(jnp.any(y > 0), y[jnp.argmax(y > 0)], 0.0)
         prob_init = prob_indicators[0]
 
         def tsb_step(carry, inputs):
@@ -53,9 +56,12 @@ class TSB(BaseForecaster):
             tsb_step, (demand_init, prob_init), (y, prob_indicators)
         )
 
+        # First fitted value is undefined (no prior observation) — NaN, which
+        # the nansum inside calculate_sigma excludes; denominator is n.
         fitted_vals = prob_fitted * demand_fitted
+        fitted_vals = fitted_vals.at[0].set(jnp.nan)
         residuals = y - fitted_vals
-        sigma = utils.calculate_sigma(residuals, n - 1)
+        sigma = utils.calculate_sigma(residuals, n)
         forecasts = jnp.full(h, final_prob * final_demand, dtype=y.dtype)
 
         result = {
@@ -86,11 +92,13 @@ class TSB(BaseForecaster):
 
         if level is not None:
             level = sorted(level)
-            if self.conformal_params is not None:
-                cs = self.conformity_scores(y=self.model_['y_train'], X=X)
-                res = self.add_confidence_intervals(res, cs, level, self.conformal_params.method)
-            else:
-                res = {**res, **self._calculate_intervals(mean, self.model_['sigma'], h, level)}
+            if self.conformal_params is None:
+                raise ValueError(
+                    "You must instantiate the class with `conformal_params` "
+                    "to calculate prediction intervals"
+                )
+            cs = self.conformity_scores(y=self.model_['y_train'], X=X)
+            res = self.add_confidence_intervals(res, cs, level, self.conformal_params.method)
         return res
 
     def predict_in_sample(self, level: list[int] | None = None):
@@ -120,11 +128,13 @@ class TSB(BaseForecaster):
 
         if level is not None:
             level = sorted(level)
-            if self.conformal_params is not None:
-                cs = self.conformity_scores(y=y, X=X)
-                res = self.add_confidence_intervals(res, cs, level, self.conformal_params.method)
-            else:
-                res = {**res, **self._calculate_intervals(out["mean"], out["sigma"], h, level)}
+            if self.conformal_params is None:
+                raise ValueError(
+                    "You must instantiate the class with `conformal_params` "
+                    "to calculate prediction intervals"
+                )
+            cs = self.conformity_scores(y=y, X=X)
+            res = self.add_confidence_intervals(res, cs, level, self.conformal_params.method)
             if fitted:
                 res = self._add_fitted_intervals(res, out["sigma"], level)
         return res
@@ -139,18 +149,6 @@ class TSB(BaseForecaster):
         fitted: bool = False,
     ):
         return self.forecast(y=utils.ensure_float(y), h=h, X=X, X_future=X_future, level=level, fitted=fitted)
-
-    def _calculate_intervals(self, mean: jnp.ndarray, sigma: float, h: int, level: list[int]) -> dict:
-        """Native prediction intervals: intervals grow with sqrt(h)."""
-        sigmah = sigma * jnp.sqrt(jnp.arange(1, h + 1))
-        z_scores = jnp.array([utils._jax_norm_ppf(0.5 + lv / 200) for lv in level])
-
-        intervals = {}
-        for i, lv in enumerate(reversed(level)):
-            intervals[f"lo-{lv}"] = mean - z_scores[len(level) - 1 - i] * sigmah
-        for i, lv in enumerate(level):
-            intervals[f"hi-{lv}"] = mean + z_scores[i] * sigmah
-        return intervals
 
     def _add_fitted_intervals(self, res: dict, sigma: float, level: list[int]) -> dict:
         """Add constant-width intervals to fitted values."""

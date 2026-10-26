@@ -437,7 +437,11 @@ def _jit_optimize_theta(y: jnp.ndarray, model_type: int, x0: jnp.ndarray,
         updates, new_state = adam_opt.update(grads, state, p)
         new_p = optax.apply_updates(p, updates)
         improved = jnp.isfinite(loss) & (loss < best_loss)
-        best_p = jnp.where(improved, new_p, best_p)
+        # Track the EVALUATED point p (where `loss` was measured), not the
+        # post-update new_p — best_loss corresponds to p, so storing new_p
+        # mismatches the pair and seeds L-BFGS from the wrong iterate. Matches
+        # the L-BFGS phase below and the ETS backend's convention.
+        best_p = jnp.where(improved, p, best_p)
         best_loss = jnp.where(improved, loss, best_loss)
         return (new_p, new_state, best_p, best_loss), None
 
@@ -912,7 +916,9 @@ def _forecast_from_model(obj: dict, h: int, level: list | None = None, n_samples
     # Prediction intervals via Monte Carlo (not called under vmap — level is None)
     if level is not None:
         sigma = jnp.std(obj["residuals"][3:], ddof=1)
-        mt_int = int(model_type_int) if not isinstance(model_type_int, (jnp.ndarray, jax.Array)) else 0
+        # Eager path (level is not None ⇒ not under the CV vmap): read the
+        # winning variant's int so DSTM/DOTM sample their own dynamics.
+        mt_int = int(model_type_int)
         samples = _compute_pi_samples(
             last_state,
             mt_int,
@@ -1111,7 +1117,12 @@ def _forward_theta(fitted_model: dict, y: jnp.ndarray) -> dict:
         Fitted model dict for the new series.
     """
     m = fitted_model["m"]
-    model = fitted_model["modeltype"]
+    # The stored "modeltype" string is fits[0]'s ("STM") after an auto merge;
+    # the winning variant is carried by model_type_int. forward() is eager.
+    if "model_type_int" in fitted_model:
+        model = ModelType._name_map[int(fitted_model["model_type_int"])]
+    else:
+        model = fitted_model["modeltype"]
     initial_smoothed = fitted_model["par"]["initial_smoothed"]
     alpha = fitted_model["par"]["alpha"]
     theta = fitted_model["par"]["theta"]
@@ -1145,7 +1156,7 @@ def __getattr__(name: str):
         If the attribute is not found.
     """
     if name in ("AutoTheta", "Theta"):
-        from auto_theta import AutoTheta, Theta  # noqa: F811
+        from chronax.models.theta.auto_theta import AutoTheta, Theta  # noqa: F811
         if name == "AutoTheta":
             return AutoTheta
         return Theta

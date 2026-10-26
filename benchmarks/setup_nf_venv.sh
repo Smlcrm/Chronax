@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Create the isolated venv used by benchmarks/gru_benchmark.py to run Nixtla
+# Create the isolated venv used by benchmarks/neural/run.py to run Nixtla
 # neuralforecast in a subprocess. Keeps torch + Lightning out of the main
 # Chronax dev environment.
 #
@@ -19,4 +19,4 @@ benchmarks/.venv-nf/bin/pip install -r benchmarks/requirements-nf.txt
 
 echo
 echo "Done. Run the benchmark with:"
-echo "  .venv/bin/python benchmarks/gru_benchmark.py"
+echo "  python benchmarks/neural/run.py"
