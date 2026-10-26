@@ -270,6 +270,27 @@ class TestMLPNet:
                      hidden_size=8, outputsize_multiplier=1, rngs=nnx.Rngs(0))
         assert net.mlp[0].kernel.shape[0] == 12 + 3 * (12 + 4)
 
+    def test_first_layer_width_includes_hist_and_futr(self):
+        # NF flatten order/width: input + hist*input + futr*(input+h).
+        net = MLPNet(h=4, input_size=12, hist_exog_size=2, futr_exog_size=3,
+                     num_layers=2, hidden_size=8, outputsize_multiplier=1,
+                     rngs=nnx.Rngs(0))
+        assert net.mlp[0].kernel.shape[0] == 12 + 2 * 12 + 3 * (12 + 4)
+
+    def test_forward_concat_order_hist_before_futr(self):
+        # A weight transplant depends on the flatten order matching the reference
+        # (insample -> hist -> futr): swapping the two exog blocks in the input
+        # must change the output, proving hist and futr occupy distinct columns.
+        net = MLPNet(h=2, input_size=3, hist_exog_size=1, futr_exog_size=1,
+                     num_layers=1, hidden_size=4, outputsize_multiplier=1,
+                     rngs=nnx.Rngs(0))
+        z = jnp.ones((1, 3, 1))
+        hist = jnp.asarray([[[1.0], [2.0], [3.0]]])          # [1, L, 1]
+        futr = jnp.asarray([[[4.0], [5.0], [6.0], [7.0], [8.0]]])  # [1, L+h, 1]
+        a = net(z, hist_exog=hist, futr_exog=futr)
+        b = net(z, hist_exog=futr[:, :3], futr_exog=jnp.concatenate([hist, futr[:, 3:]], axis=1))
+        assert not bool(jnp.allclose(a, b))
+
     def test_forward_shape(self):
         net = MLPNet(h=4, input_size=12, num_layers=2, hidden_size=8,
                      outputsize_multiplier=3, rngs=nnx.Rngs(0))
@@ -367,6 +388,20 @@ class TestMLPTraining:
             return train(net, _make_y(), h=4, input_size=12, max_steps=3,
                          windows_batch_size=16, lr=1e-3, seed=seed,
                          loss_fn=GMM(n_components=1), scaler=IdentityScaler())
+        out = jax.vmap(run)(jnp.arange(2))
+        assert out.shape == (2, 3) and bool(jnp.all(jnp.isfinite(out)))
+
+    def test_train_with_hist_exog_is_vmap_traceable(self):
+        # Conformal never exercises the hist path (temporal exog -> native
+        # intervals), but rule 2 still requires the forward+train to trace.
+        T, F = 60, 2
+        hist = jnp.asarray(np.random.RandomState(0).randn(T, F), jnp.float32)
+        def run(seed):
+            net = MLPNet(h=4, input_size=12, hist_exog_size=F, num_layers=2,
+                         hidden_size=8, outputsize_multiplier=1, rngs=nnx.Rngs(0))
+            return train(net, _make_y(T), h=4, input_size=12, max_steps=3,
+                         windows_batch_size=16, lr=1e-3, seed=seed,
+                         loss_fn=mae, scaler=IdentityScaler(), hist_exog=hist)
         out = jax.vmap(run)(jnp.arange(2))
         assert out.shape == (2, 3) and bool(jnp.all(jnp.isfinite(out)))
 
@@ -535,6 +570,74 @@ class TestMLPModel:
         with pytest.raises(ValueError, match="futr_exog"):
             m.predict(h=4)
 
+    def test_hist_exog_fit_predict(self):
+        # Historical exog (X): known only over the input span; predict needs no
+        # future X (uses the last input_size rows stored at fit).
+        rng = np.random.RandomState(0)
+        T, F = 60, 2
+        X = jnp.asarray(rng.randn(T, F), jnp.float32)
+        m = _tiny().fit(_make_y(T), X=X)
+        assert m._hist_size == F and m.model_.mlp[0].kernel.shape[0] == 12 + F * 12
+        out = m.predict(h=4)
+        assert out["mean"].shape == (4,) and bool(jnp.all(jnp.isfinite(out["mean"])))
+
+    def test_hist_and_futr_exog_together(self):
+        rng = np.random.RandomState(1)
+        T, Fh, Ff = 60, 2, 3
+        X = jnp.asarray(rng.randn(T, Fh), jnp.float32)
+        xf = jnp.asarray(rng.randn(T, Ff), jnp.float32)
+        m = _tiny().fit(_make_y(T), X=X, futr_exog=xf)
+        assert m.model_.mlp[0].kernel.shape[0] == 12 + Fh * 12 + Ff * (12 + 4)
+        out = m.predict(h=4, futr_exog=jnp.asarray(rng.randn(4, Ff), jnp.float32))
+        assert out["mean"].shape == (4,)
+
+    def test_hist_exog_2d_panel_shared(self):
+        # A 2-D fit cross-learns one net; hist exog is shared across columns.
+        rng = np.random.RandomState(2)
+        T, F, N = 60, 2, 3
+        y = jnp.asarray(rng.randn(T, N), jnp.float32)
+        X = jnp.asarray(rng.randn(T, F), jnp.float32)
+        out = _tiny().fit(y, X=X).predict(h=4)
+        assert out["mean"].shape == (4, N)
+
+    def test_hist_exog_misaligned_raises(self):
+        X = jnp.asarray(np.random.RandomState(0).randn(50, 2), jnp.float32)
+        with pytest.raises(ValueError, match="historical exog.*align"):
+            _tiny().fit(_make_y(60), X=X)
+
+    def test_hist_exog_forecast_threads_X(self):
+        rng = np.random.RandomState(3)
+        T, F = 60, 2
+        X = jnp.asarray(rng.randn(T, F), jnp.float32)
+        r = _tiny().forecast(_make_y(T), 4, X=X)
+        assert r["mean"].shape == (4,)
+
+    def test_hist_exog_conformal_refused(self):
+        # Temporal exog (hist here) -> native intervals only; conformal is refused
+        # both at predict(level=) and at conformity_scores(X=) (the latter keeps a
+        # passed X out of the base CV vmap, where it could not raise under trace).
+        rng = np.random.RandomState(0)
+        T, F = 60, 2
+        X = jnp.asarray(rng.randn(T, F), jnp.float32)
+        m = _tiny().fit(_make_y(T), X=X)
+        m.conformal_params = ConformalIntervals(n_windows=2, h=4)
+        with pytest.raises(ValueError, match="temporal"):
+            m.predict(h=4, level=[80])
+        with pytest.raises(ValueError, match="temporal"):
+            _tiny().conformity_scores(_make_y(T), X=X)
+
+    def test_hist_exog_gmm_native_intervals_and_pickle(self):
+        # Native (GMM) intervals coexist with hist exog and survive a pickle
+        # round-trip (the hist branch rebuilds from the restored _hist_size).
+        rng = np.random.RandomState(0)
+        T, F = 60, 2
+        X = jnp.asarray(rng.randn(T, F), jnp.float32)
+        m = _tiny(loss=GMM(n_components=2)).fit(_make_y(T), X=X)
+        o1 = m.predict(h=4, level=[80])
+        assert {"mean", "lo-80", "hi-80"} <= set(o1)
+        o2 = pickle.loads(pickle.dumps(m)).predict(h=4, level=[80])
+        np.testing.assert_array_equal(np.asarray(o1["mean"]), np.asarray(o2["mean"]))
+
     def test_rejects_3d_y(self):
         with pytest.raises(ValueError, match="1-D or 2-D"):
             _tiny().fit(jnp.ones((30, 2, 2)))
@@ -684,3 +787,107 @@ class TestMLPMultivariate:
         o3 = m2.predict(h=4, level=[90])
         for k in o1:
             np.testing.assert_array_equal(np.asarray(o1[k]), np.asarray(o3[k]))
+
+
+# === Refit compile-cache gates (module-level nnx.jit _train_scan) ===
+import io as _io
+import logging as _logging
+import re as _re
+
+_COMPILE_LOG_RE = _re.compile(r"Compiling ")
+
+
+def _count_compiles(fn):
+    """Run fn under jax.log_compiles and return (result, n_xla_compilations)."""
+    buf = _io.StringIO()
+    handler = _logging.StreamHandler(buf)
+    loggers = [
+        _logging.getLogger("jax._src.dispatch"),
+        _logging.getLogger("jax._src.interpreters.pxla"),
+    ]
+    with jax.log_compiles(True):
+        for lg in loggers:
+            lg.addHandler(handler)
+        try:
+            out = fn()
+            jax.block_until_ready(out)
+        finally:
+            for lg in loggers:
+                lg.removeHandler(handler)
+    return out, len(_COMPILE_LOG_RE.findall(buf.getvalue()))
+
+
+def test_count_compiles_canary():
+    # Live-fire proof _count_compiles can still see a compile: a fresh jit'd
+    # closure always compiles (pjit keys on callable identity), so the counter
+    # must report >=1. Guards test_refit_does_not_recompile against going
+    # vacuously green if a jax bump renames the log message or logger paths.
+    def fresh():
+        @jax.jit
+        def f(x):
+            return x * 4.0 - 3.0
+        return f(jnp.ones((2, 5)))
+
+    _, n = _count_compiles(fresh)
+    assert n >= 1
+
+
+def test_refit_does_not_recompile():
+    # The training program is a module-level nnx.jit keyed on config graphdefs
+    # (value-__eq__ initializers and the memoized optax transform) and operand
+    # shapes — a refit AND a fresh same-config instance must hit the cache with
+    # zero XLA compiles; fit #2 is counted directly (no uncounted settle call).
+    y = jnp.asarray(np.sin(np.arange(40) / 5.0), jnp.float32)
+    kw = dict(h=4, input_size=8, max_steps=3, windows_batch_size=4, random_seed=0)
+    m = MLP(**kw)
+    m.fit(y)                                     # first fit pays the one compile
+    _, n_refit = _count_compiles(lambda: (m.fit(y), None)[1])
+    assert n_refit == 0
+    m2 = MLP(**kw)
+    _, n_fresh = _count_compiles(lambda: (m2.fit(y), None)[1])
+    assert n_fresh == 0
+
+
+def test_mqloss_pinball_value_nf_sum():
+    # err = y - yhat. Pred zeros, target 2: sum_q max(q*2, (q-1)*2) =
+    # 0.2 + 1.0 + 1.8 = 3.0 — neuralforecast's effective reduction (its
+    # 1/len(quantiles) factor is dead), matching the trainer's masked branch.
+    from chronax.models.mlp.mlp_losses import MultiQuantileLoss
+
+    loss = MultiQuantileLoss((0.1, 0.5, 0.9))
+    assert float(loss(jnp.zeros((1, 1, 3)), jnp.array([[2.0]]))) == pytest.approx(3.0)
+
+
+def test_exog_scale_floor_bounds_degenerate_windows():
+    # A near-constant stats span (all-night zero runs; jitter-constant channel)
+    # collapses the robust scale toward its epsilon; without the floor,
+    # regime-shifted horizon values scale to 1e4-class inputs (the diurnal-
+    # covariate divergence class). The floor bounds |scaled| by construction.
+    from chronax.models.mlp.mlp_training import build_exog_windows, _scale_exog
+    from chronax.models.mlp.mlp_scaler import resolve_scaler
+
+    t = np.arange(240)
+    day = (np.sin(t / 12.0) > 0.6).astype(np.float32) * 7000.0     # zero runs > L
+    const = np.full(240, 1.0, np.float32)
+    const[::37] = 0.997                                             # f32-jitter constant
+    Xp = np.stack([day, const], axis=1)
+    w = build_exog_windows(jnp.asarray(Xp), 24, 12, 240 - 24, "full")
+    z = _scale_exog(w, resolve_scaler("robust"), stats_len=24)
+    assert bool(jnp.all(jnp.isfinite(z)))
+    assert float(jnp.max(jnp.abs(z))) <= 105.0   # bound = 1/frac (+slack)
+
+
+def test_exog_scale_floor_inert_on_offset_covariate():
+    # Level-offset covariates (temperature-in-Kelvin class: mean >> spread) must
+    # NOT trip the floor: the spread-based form compares like with like, so the
+    # transform is bit-identical to the unfloored insample-robust scaling. A
+    # magnitude-based floor would fire on every window here and compress the
+    # channel ~10x.
+    from chronax.models.mlp.mlp_training import _scale_exog
+    rng = np.random.RandomState(3)
+    w = jnp.asarray(100.0 + 2.0 * rng.randn(4, 12, 2), jnp.float32)   # 100 +- 2
+    sc = RobustScaler()
+    shift, scale = sc.stats(w[:, :8], axis=1)
+    unfloored = (w - shift) / scale
+    np.testing.assert_array_equal(np.asarray(_scale_exog(w, sc, stats_len=8)),
+                                  np.asarray(unfloored))

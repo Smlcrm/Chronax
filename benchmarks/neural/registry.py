@@ -2,12 +2,12 @@
 
 A model is benchmarkable iff it is a ``chronax.models`` ``BaseForecaster`` whose
 ``__init__`` accepts ``h``, ``input_size``, and ``random_seed`` — the neural
-windowed-model signature. That filter naturally selects the neural ports and
-excludes statistical models (no ``input_size``), models with a different
-constructor convention (e.g. ``XLSTM``), and non-``BaseForecaster`` classes.
+windowed-model signature — and is not in ``_EXCLUDE``. That filter naturally
+selects the neural ports and excludes statistical models (no ``input_size``) and
+non-``BaseForecaster`` classes.
 
 Every such model is a JAX port of the same-named ``neuralforecast`` class, so the
-NF name is the identity. Nothing is hardcoded: dropping a faithful port into
+NF name is the identity. Nothing else is hardcoded: dropping a faithful port into
 ``chronax/models/__init__.py`` makes it appear in the benchmark automatically.
 """
 from __future__ import annotations
@@ -21,6 +21,13 @@ if TYPE_CHECKING:
 
 _CORE_ARGS = {"h", "input_size", "random_seed"}
 
+# Explicit paired-run exclusions (owner decision, 2026-07-06): Chronax ``XLSTM``
+# is an xLSTMTime-inspired time-axis adaptation, NOT architecture-1:1 with NF's
+# ``xLSTM`` — the paired accept-gate comparison is not meaningful. Its ctor gained
+# ``h``/``input_size``/``random_seed`` NF-alias params (XLSTM re-enablement), so
+# the signature filter alone no longer excludes it; the exclusion is now explicit.
+_EXCLUDE = {"XLSTM"}
+
 
 def _discover() -> dict[str, type]:
     """Map benchmarkable model name -> Chronax class, from chronax.models."""
@@ -30,7 +37,7 @@ def _discover() -> dict[str, type]:
     names = getattr(models, "__all__", None) or dir(models)
     out: dict[str, type] = {}
     for name in names:
-        if name.startswith("_"):
+        if name.startswith("_") or name in _EXCLUDE:
             continue
         try:
             obj = getattr(models, name)  # may trigger a lazy import

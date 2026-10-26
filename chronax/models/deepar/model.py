@@ -146,20 +146,27 @@ def make_trainer(model, lr=1e-3, weight_decay=1e-5):
 _FORECAST_CACHE: dict = {}
 
 
-def _get_forecast_fn(model: DeepAR_EncDec, H: int):
-    key = (type(model).__name__, model.hidden, model.dropout_rate, model.min_sigma, H)
+def _get_forecast_fn(model: DeepAR_EncDec, H: int, use_lags: bool = True):
+    key = (type(model).__name__, model.hidden, model.dropout_rate, model.min_sigma,
+           H, use_lags)
     if key not in _FORECAST_CACHE:
         mc = type(model)
 
         def _run(params, path_keys, y_last, h0, c0, buf_init, xf_dec_safe, x_static):
             # buf_init:    [_BUF_SIZE]  — last _BUF_SIZE history values
             # xf_dec_safe: [H, 2]       — precomputed lag-H and lag-2H
+            #              (use_lags=False: [H, F] user futr_exog, possibly F=0)
             # Decoder xf_step = [lag1, lag7, lagH, lag2H] ← dim 4 (matches training)
             def step_fn(carry, inp):
                 (y_prev, h, c, buf), (xf_safe, k) = carry, inp
-                lag1 = buf[-2]   # lag-1 relative to y_prev  (buf[-1] == y_prev)
-                lag7 = buf[0]    # lag-7 (oldest element in 8-element buffer)
-                xf   = jnp.concatenate([jnp.array([lag1, lag7]), xf_safe])  # [4]
+                if use_lags:
+                    lag1 = buf[-2]   # lag-1 relative to y_prev  (buf[-1] == y_prev)
+                    lag7 = buf[0]    # lag-7 (oldest element in 8-element buffer)
+                    xf   = jnp.concatenate([jnp.array([lag1, lag7]), xf_safe])  # [4]
+                elif xf_safe.shape[0] > 0:
+                    xf = xf_safe     # user-provided future exog only
+                else:
+                    xf = None        # no decoder exog at all (matches training)
                 mu, sigma, h_new, c_new = model.apply(
                     params, y_prev, xf, x_static, h, c, True, method=mc.one_step)
                 y_next  = mu + sigma * random.normal(k, (), jnp.float32)
@@ -285,11 +292,17 @@ def forecast_mc(
     seed: int = 2025,
     scaler=None,
     input_size: int = None,
+    use_lags: bool = True,
 ) -> jnp.ndarray:
     """Monte Carlo forecast. Returns sample paths [N, H].
 
     Lag-1/7 are tracked via a rolling buffer in the scan carry so predicted
     values are correctly used as lags in later decode steps.
+
+    Set ``use_lags=False`` for models trained WITHOUT the lag-feature
+    augmentation (e.g. via the DeepARForecaster/train.py pipeline) — the
+    encoder/decoder then see only the user-provided exogenous features,
+    matching the feature width the params were trained with.
     """
     if scaler is not None:
         y_mean, y_std = scaler
@@ -298,23 +311,31 @@ def forecast_mc(
     enc_len = input_size if input_size is not None else y_hist.shape[0]
     y_enc   = y_hist[-enc_len:]
 
-    # Compute lag features; buf_init carries last _BUF_SIZE normalised values
-    xf_enc, xf_dec_safe, buf_init = _forecast_lags(y_hist, enc_len, H)
-
     xf_enc_hist = (x_f_hist[-enc_len:] if (x_f_hist is not None and input_size is not None)
                    else x_f_hist)
-    xf_enc_final = (jnp.concatenate([xf_enc_hist, xf_enc], -1)
-                    if xf_enc_hist is not None else xf_enc)        # [enc_len, 4]
 
-    # x_f_future (user) merged with safe lags only (lag-1/7 come from buffer at runtime)
-    xf_fut_safe = (jnp.concatenate([x_f_future, xf_dec_safe], -1)
-                   if x_f_future is not None else xf_dec_safe)     # [H, 2]
+    if use_lags:
+        # Compute lag features; buf_init carries last _BUF_SIZE normalised values
+        xf_enc, xf_dec_safe, buf_init = _forecast_lags(y_hist, enc_len, H)
+
+        xf_enc_final = (jnp.concatenate([xf_enc_hist, xf_enc], -1)
+                        if xf_enc_hist is not None else xf_enc)        # [enc_len, 4]
+
+        # x_f_future (user) merged with safe lags only (lag-1/7 come from buffer at runtime)
+        xf_fut_safe = (jnp.concatenate([x_f_future, xf_dec_safe], -1)
+                       if x_f_future is not None else xf_dec_safe)     # [H, 2]
+    else:
+        # No lag augmentation: feature layout matches the training pipeline
+        buf_init     = jnp.zeros(_BUF_SIZE, dtype=y_hist.dtype)  # unused carry
+        xf_enc_final = xf_enc_hist                               # may be None
+        xf_fut_safe  = (x_f_future if x_f_future is not None
+                        else jnp.zeros((H, 0), dtype=y_hist.dtype))
 
     model_cls = type(model)
     hT, cT    = model.apply(params, y_enc, xf_enc_final, x_static, method=model_cls.encode)
 
     path_keys = random.split(random.PRNGKey(seed), N)
-    sample_fn = _get_forecast_fn(model, H)
+    sample_fn = _get_forecast_fn(model, H, use_lags)
     paths     = sample_fn(params, path_keys, y_hist[-1], hT, cT,
                           buf_init, xf_fut_safe, x_static)
 

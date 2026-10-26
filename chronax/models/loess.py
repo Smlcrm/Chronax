@@ -125,6 +125,11 @@ def loess_window_jump(
     n = y.shape[0]
     window = int(window) | 1
     jump = max(1, int(jump))
+    # A window of 1 has no neighbours to regress against; the local linear
+    # fit collapses to the point itself, i.e. the deg-0 identity. (deg is a
+    # static int, so this branch is resolved at trace time.)
+    if window == 1:
+        deg = 0
 
     Xw = _sliding_windows_1d(y, window)           # (n, window)
     offsets, base_w = _tricube_weights(window)    # (window,)
@@ -159,8 +164,10 @@ def loess_window_jump(
         med = jnp.median(resid)
         mad = jnp.median(jnp.abs(resid - med)) + 1e-12
         u = resid / (6.0 * mad + 1e-12)
-        row = jnp.where(jnp.abs(u) < 1.0, (1 - u**2) ** 2, 0.0)  # (n,)
-        return jnp.repeat(row[:, None], repeats=window, axis=1)  # (n, window)
+        row = jnp.where(jnp.abs(u) < 1.0, (1 - u**2) ** 2, 0.0)  # (n,) per-point weights
+        # Centered windows of the per-point weights align each observation's
+        # own bisquare weight with its column in Xw (same windowing).
+        return _sliding_windows_1d(row, window)  # (n, window)
 
     def run_once(rw):
         # compute yhat only at anchors

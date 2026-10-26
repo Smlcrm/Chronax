@@ -52,8 +52,10 @@ class NHITS(BaseForecaster):
     panel ``(T, n_series)``; a 2-D fit cross-learns one global network over
     all columns (channel-independent — each column is forecast from its own
     tail context) and predictions follow the input rank. Future-known
-    exogenous inputs are supported (``uses_exog = True``; shared across
-    columns on a 2-D fit); historical and static exog are not modeled. Point
+    (``futr_exog=``) and historical (``X=``) exogenous inputs are supported
+    (``uses_exog = True``; shared across columns on a 2-D fit; each block pools
+    hist exog at its stack rate, matching the reference); static exog is not
+    modeled. Point
     (``"mae"``/``"mse"``/``"huber"``), multi-quantile (``MultiQuantileLoss``), or
     Gaussian-mixture (``GMM``) losses; with a GMM head the model is a
     probabilistic forecaster whose intervals come from seeded Monte-Carlo
@@ -95,10 +97,12 @@ class NHITS(BaseForecaster):
         self.alias = alias
         self.conformal_params: ConformalIntervals | None = None
         self.model_: NHITSNet | None = None
+        self._hist_size = 0
         self._futr_size = 0
         self._contexts = None
         self._train_y = None
         self._train_rank = None
+        self._hist_ctx = None
         self._futr_ctx = None
 
     # ---- helpers -------------------------------------------------------------
@@ -116,11 +120,12 @@ class NHITS(BaseForecaster):
 
     @property
     def _has_temporal_exog(self) -> bool:
-        return self._futr_size > 0
+        return self._futr_size > 0 or self._hist_size > 0
 
     def _build_net(self) -> NHITSNet:
         return NHITSNet(
-            h=self.h, input_size=self.input_size, futr_exog_size=self._futr_size,
+            h=self.h, input_size=self.input_size, hist_exog_size=self._hist_size,
+            futr_exog_size=self._futr_size,
             n_blocks=self.n_blocks, mlp_units=self.mlp_units,
             n_pool_kernel_size=self.n_pool_kernel_size,
             n_freq_downsample=self.n_freq_downsample,
@@ -134,10 +139,6 @@ class NHITS(BaseForecaster):
 
     # ---- fit -----------------------------------------------------------------
     def fit(self, y, X=None, *, futr_exog=None) -> "NHITS":
-        if X is not None:
-            raise NotImplementedError(
-                "NHITS supports future-known exog only; pass futr_exog="
-            )
         y = jnp.asarray(y, dtype=jnp.float32)
         if y.ndim not in (1, 2):
             raise ValueError(f"y must be 1-D or 2-D (T, n_series); got shape {y.shape}.")
@@ -148,10 +149,16 @@ class NHITS(BaseForecaster):
                 f"Series length {y2.shape[0]} too short for input_size={self.input_size} "
                 f"(need at least input_size+1)."
             )
+        # X = historical exog (T, F): known only over the input span. futr_exog =
+        # future-known exog (T, F): also supplied for the horizon at predict.
+        hist_exog = None if X is None else jnp.asarray(X, jnp.float32)
+        if hist_exog is not None and hist_exog.shape[0] != y2.shape[0]:
+            raise ValueError(f"X (historical exog) must align with y at fit (len {y2.shape[0]}); got {hist_exog.shape[0]}.")
         futr_exog = None if futr_exog is None else jnp.asarray(futr_exog, jnp.float32)
         if futr_exog is not None and futr_exog.shape[0] != y2.shape[0]:
             raise ValueError(f"futr_exog must align with y at fit (len {y2.shape[0]}); got {futr_exog.shape[0]}.")
 
+        self._hist_size = 0 if hist_exog is None else int(hist_exog.shape[1])
         self._futr_size = 0 if futr_exog is None else int(futr_exog.shape[1])
 
         L, h = self.input_size, self.h
@@ -165,9 +172,14 @@ class NHITS(BaseForecaster):
             w, m = build_windows(y2[:, j], L, h)
             windows.append(w)
             masks.append(m)
+        n_win = windows[0].shape[0]
+        hist_pooled = None
+        if hist_exog is not None:
+            hw = build_exog_windows(hist_exog, L, h, n_win, "input")
+            hist_pooled = jnp.concatenate([hw] * n_series)
         futr_pooled = None
         if futr_exog is not None:
-            fw = build_exog_windows(futr_exog, L, h, windows[0].shape[0], "full")
+            fw = build_exog_windows(futr_exog, L, h, n_win, "full")
             futr_pooled = jnp.concatenate([fw] * n_series)
         net = self._build_net()
         train_on_windows(
@@ -176,12 +188,13 @@ class NHITS(BaseForecaster):
             windows_batch_size=self.windows_batch_size, lr=self.learning_rate,
             num_lr_decays=self.num_lr_decays, seed=self.random_seed,
             loss_fn=self._loss_fn, scaler=self._scaler,
-            futr_windows=futr_pooled,
+            hist_windows=hist_pooled, futr_windows=futr_pooled,
         )
         self.model_ = net
         self._contexts = y2[-L:, :].T                       # [N, L]
         self._train_y = y
         self._train_rank = y.ndim
+        self._hist_ctx = None if hist_exog is None else hist_exog[-L:]   # [L, F]
         self._futr_ctx = None if futr_exog is None else futr_exog[-L:]
         return self
 
@@ -217,7 +230,7 @@ class NHITS(BaseForecaster):
         futr_full = self._assemble_futr_full(futr_exog)
         full = predict_step(
             self.model_, self._contexts, h=self.h, input_size=self.input_size,
-            scaler=self._scaler, futr_full=futr_full,
+            scaler=self._scaler, hist_full=self._hist_ctx, futr_full=futr_full,
         )                                                     # [N, h_train, mult]
         if full.shape[-1] == 1:
             fcst = {"mean": self._orient(full[:, :h, 0])}
@@ -237,7 +250,7 @@ class NHITS(BaseForecaster):
         distr_args = predict_params(
             self.model_, self._contexts, input_size=self.input_size,
             scaler=self._scaler, loss_fn=loss,
-            futr_full=self._assemble_futr_full(futr_exog),
+            hist_full=self._hist_ctx, futr_full=self._assemble_futr_full(futr_exog),
         )                                                     # arrays [N, h_train, K]
         fcst = {"mean": self._orient(loss.analytic_mean(distr_args)[:, :h])}
         if level is not None:
@@ -288,9 +301,10 @@ class NHITS(BaseForecaster):
     # ---- forecast ------------------------------------------------------------
     def forecast(self, y, h, X=None, X_future=None, *, futr_exog=None,
                  level=None, fitted=False) -> dict:
-        """Stateless fit-then-predict. ``X`` is unsupported (NHITS models
-        future-known exog only); ``X_future`` = future-known exog for the horizon
-        ``(h, F)``; ``futr_exog`` = its history ``(T, F)``."""
+        """Stateless fit-then-predict. ``X`` = historical exog ``(T, F)`` (known
+        only over the input span); ``X_future`` = future-known exog for the
+        horizon ``(h, F)``; ``futr_exog`` = the future-known exog history
+        ``(T, F)``."""
         self.fit(y, X=X, futr_exog=futr_exog)
         result = self.predict(h=h, futr_exog=X_future, level=level)
         if fitted:
@@ -304,6 +318,14 @@ class NHITS(BaseForecaster):
                 "Conformal intervals are supported on 1-D fits only; a 2-D "
                 "(multi-series) fit's intervals are the native quantile surfaces "
                 "(loss=MultiQuantileLoss([...]) or loss=GMM(...) with predict(level=...))."
+            )
+        if X is not None:
+            # Temporal exog (hist here) -> native (quantile/GMM) intervals, not
+            # conformal — same refusal as _add_conformal. Guarding here keeps a
+            # passed X out of the base CV vmap, where it could not raise under trace.
+            raise ValueError(
+                "Conformal intervals are not supported with temporal (historical/future) exog. "
+                "Use loss=MultiQuantileLoss([...]) or loss=GMM(...) for native intervals, or omit level."
             )
         return super().conformity_scores(y, X)
 
@@ -349,7 +371,7 @@ class NHITS(BaseForecaster):
             saved = m[1]
             state["model_"] = None
             self.__dict__.update(state)
-            net = self._build_net()           # uses restored _futr_size/loss
+            net = self._build_net()           # uses restored _hist_size/_futr_size/loss
             nnx.update(net, saved)
             self.model_ = net
             return

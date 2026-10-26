@@ -128,7 +128,12 @@ jobs:
 
           # --delete so pages removed from the source disappear from the site
           # instead of lingering as orphans nothing links to.
-          rsync -a --delete site/ "${CLONE}/public/docs/${PROJECT_SLUG}/"
+          # Into <product>/next/, beside the release directories and never on top of
+          # them. A flat tree at the product folder's own level sits on the paths
+          # prod's per-release layout deletes, and every refresh of it made the next
+          # web-website test -> prod promotion conflict (web-website#73). --delete
+          # stays inside next/, so the releases next to it are never touched.
+          rsync -a --delete site/ "${CLONE}/public/docs/${PROJECT_SLUG}/next/"
 
           # Fail here, in the repository that produced the tree, rather than in
           # web-website's CI after a commit has landed. Same five rules its own
@@ -159,39 +164,72 @@ jobs:
           # to one branch and could race. Branches remove the race: each run has
           # its own, and the two products write disjoint subtrees.
           BRANCH="docs/${PROJECT_SLUG}-${GITHUB_RUN_ID}"
+          # The commit above is already on this branch: checkout -b keeps HEAD.
+          # A second `git commit` here found nothing to commit and exited 1
+          # under `set -e`, so every run stopped here with the docs never published.
           git checkout -q -b "${BRANCH}"
-          git commit -q -m "${MSG}"
           git push -q origin "${BRANCH}"
 
           export GH_TOKEN="${DOCS_TOKEN}"
+          # A newer run replaces an older one still waiting for review: close the
+          # older pull requests this product opened into this branch.
+          gh pr list --repo "${DOCS_REPO}" --base "${DOCS_BRANCH}" --state open --json number,headRefName \
+              --jq ".[] | select(.headRefName | startswith(\"docs/${PROJECT_SLUG}-\")) | .number" |
+            while read -r OLD; do
+              gh pr close "${OLD}" --repo "${DOCS_REPO}" --delete-branch \
+                --comment "Replaced by a newer docs run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+                && echo "closed the older docs pull request #${OLD}"
+            done
           PR=$(gh pr create --repo "${DOCS_REPO}" --base "${DOCS_BRANCH}" --head "${BRANCH}" \
                  --title "${MSG}" \
-                 --body "Generated documentation from ${GITHUB_REPOSITORY}@${GITHUB_SHA}. Opened by ${GITHUB_WORKFLOW}: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} - merged automatically once this repository's checks pass.")
+                 --body "Generated documentation from ${GITHUB_REPOSITORY}@${GITHUB_SHA}. Opened by ${GITHUB_WORKFLOW}: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} - merged automatically once its checks pass and a person approves it.")
           echo "opened ${PR}"
 
           # Wait for the checks ourselves. web-website's prod branch carries no
           # required status check, so --auto would merge the moment the pull
           # request was mergeable and the gate would be decorative.
-          # A pull_request check does not exist the instant the pull request
-          # does, and `gh pr checks` exits non-zero while none are reported. So
-          # retry that specific case, and treat anything else as a real failure.
+          # THE WAIT READS ACTIONS RUNS, NOT `gh pr checks`. DOCGEN_TOKEN is a fine-grained
+          # token, and GitHub offers fine-grained tokens no Checks permission, so the check-run
+          # rollup `gh pr checks` reads answered "Resource not accessible by personal access
+          # token" and every run stopped here (2026-09-25). The token has Actions: read, so this
+          # reads the workflow runs web-website started for the pushed commit, build-and-test and
+          # the guardrails scan among them. It passes once every run has finished without failing
+          # on two polls in a row with the same count, so a run that registers late is still
+          # waited for. Any failed, cancelled or blocked run stops it.
+          HEAD_SHA="$(git rev-parse HEAD)"
           CHECKS_OK=0
-          for attempt in 1 2 3 4 5 6; do
-            sleep 15
-            if gh pr checks "${PR}" --repo "${DOCS_REPO}" --watch --interval 20; then
-              CHECKS_OK=1
-              break
-            fi
-            if gh pr checks "${PR}" --repo "${DOCS_REPO}" 2>&1 | grep -qi "no checks"; then
-              echo "no checks registered yet (attempt ${attempt}); waiting"
+          LAST=""
+          for attempt in $(seq 1 60); do
+            sleep 20
+            if ! RUNS="$(gh api "repos/${DOCS_REPO}/actions/runs?head_sha=${HEAD_SHA}&per_page=100" \
+                  --jq '[.workflow_runs[] | [.status, (.conclusion // "")]]')"; then
+              echo "could not read the runs for ${HEAD_SHA} (attempt ${attempt}); waiting"
               continue
             fi
-            break
+            TOTAL="$(printf '%s' "${RUNS}" | jq 'length')"
+            OPEN="$(printf '%s' "${RUNS}" | jq '[.[] | select(.[0] != "completed")] | length')"
+            BAD="$(printf '%s' "${RUNS}" | jq '[.[] | select(.[0] == "completed" and ((.[1] == "success" or .[1] == "skipped" or .[1] == "neutral") | not))] | length')"
+            echo "runs for ${HEAD_SHA}: ${TOTAL}, still running ${OPEN}, failed ${BAD}"
+            [ "${BAD}" = 0 ] || break
+            if [ "${TOTAL}" != 0 ] && [ "${OPEN}" = 0 ]; then
+              [ "${LAST}" = "${TOTAL}" ] && { CHECKS_OK=1; break; }
+              LAST="${TOTAL}"
+            else
+              LAST=""
+            fi
           done
           if [ "${CHECKS_OK}" != "1" ]; then
             echo "::error::checks did not pass for ${PR}. It is left OPEN and unmerged so the tree can be inspected; nothing was published."
             exit 1
           fi
 
-          gh pr merge "${PR}" --repo "${DOCS_REPO}" --squash --delete-branch
-          echo "Published ${PROJECT_SLUG} docs to ${DOCS_REPO}@${DOCS_BRANCH} via ${PR}"
+          # web-website dev requires one approving review, and this token is not exempt
+          # from it (operator decision, 2026-09-26: no bypass for a long-lived token that
+          # can write the branch). --auto merges now if the branch allows it, or queues
+          # the merge for the moment a person approves. The checks above have passed.
+          gh pr merge "${PR}" --repo "${DOCS_REPO}" --squash --delete-branch --auto
+          if [ "$(gh pr view "${PR}" --repo "${DOCS_REPO}" --json state --jq .state)" = MERGED ]; then
+            echo "Published ${PROJECT_SLUG} docs to ${DOCS_REPO}@${DOCS_BRANCH} via ${PR}"
+          else
+            echo "::notice::${PR} passed its checks and merges itself once a person approves it."
+          fi

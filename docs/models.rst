@@ -181,6 +181,10 @@ Deep Learning
    :members:
    :undoc-members:
 
+.. autoclass:: chronax.models.FEDformer
+   :members:
+   :undoc-members:
+
 .. autoclass:: chronax.models.KAN
    :members:
    :undoc-members:
@@ -198,6 +202,14 @@ Deep Learning
    :undoc-members:
 
 .. autoclass:: chronax.models.BiTCN
+   :members:
+   :undoc-members:
+
+.. autoclass:: chronax.models.TCN
+   :members:
+   :undoc-members:
+
+.. autoclass:: chronax.models.StemGNN
    :members:
    :undoc-members:
 

@@ -105,11 +105,29 @@ class HINT(BaseForecaster):
 
     Conformal intervals follow the base-class contract on 1-D fits only; a
     hierarchical fit's intervals are the native reconciled-sample quantiles.
-    Exogenous inputs are not supported. The passed ``model`` is used purely as
-    a configuration carrier and is never fitted or mutated.
+    ``predict(level=...)`` always emits those native quantiles — per-window
+    distributional uncertainty, which does not widen for out-of-sample
+    distribution shift. HINT adds value only when ``S`` encodes real
+    aggregation: for data with no hierarchy (a single series, or ``S = I``
+    with nothing to reconcile) prefer the base model directly —
+    :class:`~chronax.models.mlp.MLP` with a point loss supports calibrated
+    conformal intervals via ``conformal_params``. On a 1-D HINT fit,
+    calibrated intervals can be layered manually::
+
+        hint.conformal_params = ConformalIntervals(h=h, n_windows=4)
+        cs = hint.conformity_scores(y)          # CV residuals, (n_windows, h)
+        fcst = hint.fit(y).predict(h=h)
+        fcst = BaseForecaster.add_confidence_intervals(
+            fcst, cs, level=[80], method="conformal_distribution")
+
+    Historical exogenous inputs are supported (``fit(y, X=(T, F))``,
+    ``uses_exog = True``): the shared-calendar covariate is broadcast to every
+    hierarchy series through the base model's historical-exog path. The passed
+    ``model`` is used purely as a configuration carrier and is never fitted or
+    mutated.
     """
 
-    uses_exog = False
+    uses_exog = True
 
     def __init__(self, h: int, S, model, reconciliation: str = "BottomUp",
                  alias: str = "HINT"):
@@ -149,11 +167,13 @@ class HINT(BaseForecaster):
         self._contexts = None
         self._train_y = None
         self._train_rank = None
+        self._hist_size = 0
+        self._hist_ctx = None
 
     # ---- fit -----------------------------------------------------------------
     def fit(self, y, X=None) -> "HINT":
-        if X is not None:
-            raise ValueError("HINT does not support exogenous inputs; fit with y only.")
+        # X = historical exog (T, F): a shared-calendar covariate broadcast to
+        # every hierarchy series by the base model's 2-D hist path.
         y = jnp.asarray(y, dtype=jnp.float32)
         n_total = self.S.shape[0]
         if y.ndim == 1:
@@ -179,9 +199,11 @@ class HINT(BaseForecaster):
         # MLP's own 2-D fit (pooled h-padded windows). The fit runs on a clone,
         # so the passed config-carrier stays pristine.
         base = self.model.new()
-        base.fit(y2)
+        base.fit(y2, X=X)
         self.model_ = base.model_
         self._contexts = base._contexts        # [n_total, L]
+        self._hist_size = base._hist_size      # 0 when no exog; drives the pickle rebuild width
+        self._hist_ctx = base._hist_ctx        # [L, F] shared covariate tail, or None
         self._train_y = y
         self._train_rank = rank
         return self
@@ -195,7 +217,10 @@ class HINT(BaseForecaster):
         if self.model_ is None or self._contexts is None:
             raise RuntimeError("Call fit(y) before predict(h).")
         if X is not None:
-            raise ValueError("HINT does not support exogenous inputs.")
+            raise ValueError(
+                "HINT consumes historical exog at fit (fit(y, X=...)); predict takes no X "
+                "(the covariate is historical-only, so no horizon values are needed)."
+            )
         if h < 1:
             raise ValueError(f"h must be a positive integer; got {h}.")
         if h > self.h:
@@ -206,7 +231,7 @@ class HINT(BaseForecaster):
         loss = cfg._loss_fn
         distr_args = predict_params(
             self.model_, self._contexts, input_size=cfg.input_size,
-            scaler=cfg._scaler, loss_fn=loss,
+            scaler=cfg._scaler, loss_fn=loss, hist_full=self._hist_ctx,
         )                                                     # arrays [n_total, h_train, K]
         mean = loss.analytic_mean(distr_args)                 # [n_total, h_train]
         sp = None if self.SP is None else jnp.asarray(self.SP, mean.dtype)
@@ -226,9 +251,11 @@ class HINT(BaseForecaster):
 
     # ---- forecast ------------------------------------------------------------
     def forecast(self, y, h, X=None, X_future=None, level=None, fitted=False) -> dict:
-        """Stateless fit-then-predict on the hierarchy matrix ``y``."""
+        """Stateless fit-then-predict on the hierarchy matrix ``y``. ``X`` =
+        historical exog ``(T, F)`` (shared calendar); HINT is historical-only, so
+        ``X_future`` is unsupported."""
         if X_future is not None:
-            raise ValueError("HINT does not support exogenous inputs.")
+            raise ValueError("HINT models historical exog only (no future-known pathway); pass X=, not X_future=.")
         if fitted:
             raise NotImplementedError("fitted=True is not supported by HINT.")
         self.fit(y, X=X)
@@ -237,6 +264,14 @@ class HINT(BaseForecaster):
     # ---- conformal -----------------------------------------------------------
     def conformity_scores(self, y, X=None) -> jnp.ndarray:
         y = jnp.asarray(y)
+        if X is not None:
+            # Historical exog uses the native reconciled-sample intervals, not
+            # conformal; guarding here keeps a passed X out of the base CV vmap,
+            # where the refusal could not raise under trace.
+            raise ValueError(
+                "Conformal intervals are not supported with historical exog; use the native "
+                "reconciled-sample intervals (predict(level=...) without conformal_params), or omit X."
+            )
         if y.ndim != 1:
             raise ValueError(
                 "Conformal intervals are supported on 1-D fits only; a hierarchical "
@@ -264,7 +299,12 @@ class HINT(BaseForecaster):
             saved = m[1]
             state["model_"] = None
             self.__dict__.update(state)
-            net = self.model._build_net()
+            # self.model is the never-mutated config carrier (its _hist_size
+            # stays 0); rebuild from a clone carrying the fitted hist width so
+            # the saved params (with the hist-widened first layer) update cleanly.
+            cfg = self.model.new()
+            cfg._hist_size = self._hist_size
+            net = cfg._build_net()
             nnx.update(net, saved)
             self.model_ = net
             return

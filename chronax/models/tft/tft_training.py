@@ -7,57 +7,129 @@ training loop is one ``nnx.scan`` so it stays ``vmap``-traceable for
 """
 from __future__ import annotations
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import optax
 from flax import nnx
 
+import chronax.models.tft.tft_losses as _losses
 from chronax.models.tft.tft_losses import LossFn, MultiQuantileLoss
 from chronax.models.tft.tft_module import TFTNet
 
 
-def build_windows(y: jnp.ndarray, input_size: int, h: int) -> jnp.ndarray:
-    """Rolling windows ``[n_windows, input_size+h]`` of ``y`` (step 1)."""
-    window = input_size + h
-    n = y.shape[0] - window + 1
+def build_windows(y: jnp.ndarray, input_size: int, h: int) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """NF-parity rolling windows over ``y`` right-padded with ``h`` zeros.
+
+    NF pads the training series with ``ConstantPad1d((0, h), 0)`` before
+    windowing, keeping every window with >=1 valid target point and masking the
+    padded tail out of the loss. Those partial windows put the insample contexts
+    ending at the very last observations into training; a full-window-only form
+    drops exactly those newest contexts, which costs accuracy on trending series.
+
+    Returns ``(windows [n, input_size+h], target_mask [n, h])`` with
+    ``n = len(y) - input_size``; mask is 1.0 where the target position is a
+    real observation and 0.0 in the zero-padded tail.
+    """
+    T = y.shape[0]
+    n = T - input_size
     if n <= 0:
-        raise ValueError(f"Series length {y.shape[0]} too short for input_size={input_size}, h={h}.")
+        raise ValueError(f"Series length {T} too short for input_size={input_size}.")
+    window = input_size + h
+    y_pad = jnp.concatenate([y, jnp.zeros((h,), y.dtype)])
     idx = jnp.arange(window)[None, :] + jnp.arange(n)[:, None]
-    return y[idx]
+    target_mask = (idx[:, input_size:] < T).astype(y.dtype)
+    return y_pad[idx], target_mask
 
 
 def build_exog_windows(arr: jnp.ndarray, input_size: int, h: int, n_windows: int, span: str) -> jnp.ndarray:
-    """Rolling windows of an exog array ``[T, F]``.
+    """Rolling windows of an exog array ``[T, F]`` (right-padded with ``h`` zero
+    rows, mirroring `build_windows` — NF pads the whole temporal tensor, so late
+    windows see zeros in the padded region of exog channels too).
 
     ``span="input"`` -> ``[n, input_size, F]`` (encoder window); ``span="full"`` ->
     ``[n, input_size+h, F]`` (future-known spanning input + horizon).
     """
     length = input_size if span == "input" else input_size + h
+    arr_pad = jnp.concatenate([arr, jnp.zeros((h, arr.shape[1]), arr.dtype)])
     idx = jnp.arange(length)[None, :] + jnp.arange(n_windows)[:, None]
-    return arr[idx]
+    return arr_pad[idx]
 
 
-def _scale_exog(windows: jnp.ndarray, scaler) -> jnp.ndarray:
-    """Per-channel per-window robust scaling of ``[B, T, F]`` exog."""
-    shift, scale = scaler.stats(windows, axis=1)        # [B, 1, F]
-    return scaler.transform(windows, shift, scale)
+_EXOG_SCALE_FLOOR_FRAC = 0.01  # floor = frac * window range  =>  |scaled| <= 1/frac
 
 
-def forward_loss(net, y_windows, *, h, input_size, scaler, loss_fn,
+def _scale_exog(windows: jnp.ndarray, scaler, stats_len: int | None = None) -> jnp.ndarray:
+    """Per-channel per-window robust scaling of ``[B, T, F]`` exog.
+
+    ``stats_len`` restricts the STATISTICS to the first ``stats_len`` positions
+    (the insample span) while transforming the whole window — NF's
+    ``_normalization`` masks the horizon out of the scaler stats. ``None`` keeps
+    full-span stats (insample-span windows only).
+    """
+    stats_src = windows if stats_len is None else windows[:, :stats_len]
+    shift, scale = scaler.stats(stats_src, axis=1)      # [B, 1, F]
+    # A near-constant stats span collapses the robust scale to its epsilon, and
+    # any regime-shifted value in the window then divides to a 1e5-scale input
+    # (diurnal covariates: an all-night span before a daytime horizon). The
+    # SPREAD-based floor bounds |scaled| <= range/(frac*range) = 1/frac by
+    # construction (the shift lies inside [min, max]). frac sits ~15x below the
+    # Gaussian scale/range ratio (~0.15 at these window lengths), so ordinary
+    # covariates — including level-offset ones like temperature in Kelvin —
+    # never trip it, while degenerate spans (scale/range ~ 1e-9) always do.
+    # Covariate values are known inputs, so the bound may read the full window;
+    # the CENTERING stays insample-span.
+    rng_full = (jnp.max(windows, axis=1, keepdims=True)
+                - jnp.min(windows, axis=1, keepdims=True))
+    return scaler.transform(windows, shift,
+                            jnp.maximum(scale, _EXOG_SCALE_FLOOR_FRAC * rng_full))
+
+
+# Elementwise forms of the registry point losses, for NF-parity masked reduction
+# (NF losses compute sum(loss*mask)/sum(mask) — `_weighted_mean`). Keyed by the
+# registry function OBJECTS so a user's custom callable that happens to share a
+# name falls through to the custom branch instead of being shadowed.
+_ELEMENTWISE = {
+    _losses.mae: lambda e: jnp.abs(e),
+    _losses.mse: lambda e: e * e,
+    _losses.huber: lambda e: jnp.where(jnp.abs(e) <= 1.0, 0.5 * e * e, jnp.abs(e) - 0.5),
+}
+
+
+def forward_loss(net, y_windows, target_mask=None, *, h, input_size, scaler, loss_fn,
                  hist_windows=None, futr_windows=None, stat=None, deterministic=False):
-    """Scale, forward, and reduce a point/quantile loss in scaled space."""
+    """Scale, forward, and reduce a point/quantile loss in scaled space.
+
+    ``target_mask [B, h]`` marks real target positions (0 in the NF h-padded
+    tail); the loss is the masked mean over valid elements, matching NF's
+    ``_weighted_mean``. ``None`` means all-valid.
+    """
     insample = y_windows[:, :input_size]                # [B, L]
     target = y_windows[:, input_size:]                  # [B, h]
     shift, scale = scaler.stats(insample, axis=1)       # [B, 1]
     insample_z = scaler.transform(insample, shift, scale)[..., None]   # [B, L, 1]
     target_z = scaler.transform(target, shift, scale)   # [B, h]
     hist_z = _scale_exog(hist_windows, scaler) if hist_windows is not None else None
-    futr_z = _scale_exog(futr_windows, scaler) if futr_windows is not None else None
+    futr_z = (_scale_exog(futr_windows, scaler, stats_len=input_size)
+              if futr_windows is not None else None)
     pred = net(insample_z, hist_exog=hist_z, futr_exog=futr_z, stat_exog=stat,
                deterministic=deterministic)             # [B, h, mult]
+    if target_mask is None:
+        target_mask = jnp.ones_like(target_z)
+    denom = jnp.sum(target_mask)
     if isinstance(loss_fn, MultiQuantileLoss):
-        return loss_fn(pred, target_z)
-    return loss_fn(pred[..., 0], target_z)
+        q = jnp.asarray(loss_fn.quantiles, dtype=pred.dtype)          # [Q]
+        err = target_z[..., None] - pred                               # [B, h, Q]
+        ql = jnp.maximum(q * err, (q - 1.0) * err)
+        # NF quirk kept: MQLoss's 1/len(quantiles) hits a [1,1,1,Q] tensor
+        # (len==1), so NF SUMS over quantiles and means over valid positions.
+        return jnp.sum(ql * target_mask[..., None]) / denom
+    ew = _ELEMENTWISE.get(loss_fn)
+    if ew is not None:
+        return jnp.sum(ew(pred[..., 0] - target_z) * target_mask) / denom
+    # Custom callable: zero out masked errors; denominator stays the callable's own.
+    return loss_fn(jnp.where(target_mask > 0, pred[..., 0], target_z), target_z)
 
 
 def _finite_or_raise(losses: jnp.ndarray) -> jnp.ndarray:
@@ -74,10 +146,51 @@ def _finite_or_raise(losses: jnp.ndarray) -> jnp.ndarray:
     return losses
 
 
+@functools.lru_cache(maxsize=None)
+def _adam(lr: float):
+    """One optax transform per learning rate. The optimizer's graphdef embeds the
+    transform object, so a fresh ``optax.adam`` per fit would make same-config
+    optimizers unequal and defeat the cross-fit ``_train_scan`` cache."""
+    return optax.adam(lr)
+
+
+@functools.partial(nnx.jit, static_argnames=("h", "input_size", "scaler", "loss_fn"))
+def _train_scan(net, optimizer, y_windows, target_mask, batch_idx,
+                hist_w, futr_w, stat_w, *, h, input_size, scaler, loss_fn):
+    """The whole training loop as one cached program.
+
+    Module-level so the traced/compiled program is reused across ``fit()`` calls:
+    the jit cache keys on the net/optimizer graphdefs (value-``__eq__``
+    initializers, the ``_adam`` and scaler singletons make same-config instances
+    equal), the static config args, and operand shapes -- never on data. A
+    per-call scan closure would retrace and recompile every fit, because pjit
+    caches on the callable's identity.
+    """
+
+    @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
+    def step(carry, idx):
+        net, opt = carry
+        yb = y_windows[idx]
+        mb = target_mask[idx]
+        hb = hist_w[idx] if hist_w is not None else None
+        fb = futr_w[idx] if futr_w is not None else None
+        sb = stat_w[idx] if stat_w is not None else None
+        loss, grads = nnx.value_and_grad(
+            lambda m: forward_loss(m, yb, mb, h=h, input_size=input_size, scaler=scaler,
+                                   loss_fn=loss_fn, hist_windows=hb, futr_windows=fb,
+                                   stat=sb, deterministic=False)
+        )(net)
+        opt.update(grads)
+        return (net, opt), loss
+
+    _, losses = step((net, optimizer), batch_idx)
+    return losses
+
+
 def train(net, y, *, h, input_size, max_steps, windows_batch_size, lr, seed, loss_fn, scaler,
           hist_exog=None, futr_exog=None, stat_exog=None):
     """Train ``net`` in place via one ``nnx.scan``. Returns per-step losses."""
-    y_windows = build_windows(y, input_size, h)
+    y_windows, target_mask = build_windows(y, input_size, h)
     n = y_windows.shape[0]
     hist_w = build_exog_windows(hist_exog, input_size, h, n, "input") if hist_exog is not None else None
     futr_w = build_exog_windows(futr_exog, input_size, h, n, "full") if futr_exog is not None else None
@@ -90,24 +203,10 @@ def train(net, y, *, h, input_size, max_steps, windows_batch_size, lr, seed, los
         sample = lambda k: jax.random.permutation(k, n)[:windows_batch_size]
     batch_idx = jax.vmap(sample)(step_keys)             # [max_steps, B]
 
-    optimizer = nnx.Optimizer(net, optax.adam(lr), wrt=nnx.Param)
-
-    @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
-    def step(carry, idx):
-        net, opt = carry
-        yb = y_windows[idx]
-        hb = hist_w[idx] if hist_w is not None else None
-        fb = futr_w[idx] if futr_w is not None else None
-        sb = stat_w[idx] if stat_w is not None else None
-        loss, grads = nnx.value_and_grad(
-            lambda m: forward_loss(m, yb, h=h, input_size=input_size, scaler=scaler,
-                                   loss_fn=loss_fn, hist_windows=hb, futr_windows=fb,
-                                   stat=sb, deterministic=False)
-        )(net)
-        opt.update(grads)
-        return (net, opt), loss
-
-    _, losses = step((net, optimizer), batch_idx)
+    optimizer = nnx.Optimizer(net, _adam(lr), wrt=nnx.Param)
+    losses = _train_scan(net, optimizer, y_windows, target_mask, batch_idx,
+                         hist_w, futr_w, stat_w,
+                         h=h, input_size=input_size, scaler=scaler, loss_fn=loss_fn)
     return _finite_or_raise(losses)
 
 
@@ -128,7 +227,8 @@ def predict_step(net, y_context, *, h, input_size, scaler,
     shift, scale = scaler.stats(insample, axis=1)
     insample_z = scaler.transform(insample, shift, scale)[..., None]   # [1, L, 1]
     hist_z = _scale_exog(hist_context[None], scaler) if hist_context is not None else None
-    futr_z = _scale_exog(futr_full[None], scaler) if futr_full is not None else None
+    futr_z = (_scale_exog(futr_full[None], scaler, stats_len=input_size)
+              if futr_full is not None else None)
     stat_b = stat[None] if stat is not None else None
     pred_z = _forward_det(net, insample_z, hist_z, futr_z, stat_b)[0]  # [h, mult]
     return scaler.inverse(pred_z, shift[0, 0], scale[0, 0])

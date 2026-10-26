@@ -4,8 +4,11 @@ Covers the Informer subpackage in banner sections (Losses, Scaler, Layers,
 Module, Training, Model, Namespace), matching the ``test_<model>.py``
 convention used elsewhere in ``tests/``.
 """
+import io
+import logging
 import math
 import pickle
+import re
 
 import jax
 import jax.numpy as jnp
@@ -59,11 +62,13 @@ def test_mqloss_multiplier_and_requires_median():
 
 def test_mqloss_pinball_value():
     # err = y - yhat. For q and a single (h=1) point with pred all zeros, target=2:
-    # QL = mean_q max(q*2, (q-1)*2) = mean_q q*2  -> mean of {0.2,1.0,1.8} = 1.0
+    # QL = sum_q max(q*2, (q-1)*2) = sum of {0.2,1.0,1.8} = 3.0 — NF's effective
+    # reduction (its 1/len(quantiles) factor is dead), matching the trainer's
+    # masked inline branch.
     loss = MultiQuantileLoss((0.1, 0.5, 0.9))
     pred = jnp.zeros((1, 1, 3))
     target = jnp.array([[2.0]])
-    assert float(loss(pred, target)) == pytest.approx(1.0)
+    assert float(loss(pred, target)) == pytest.approx(3.0)
 
 
 def test_mqloss_pickles():
@@ -274,13 +279,15 @@ def test_prob_attention_masked_differs_from_unmasked():
 
 def test_attention_layer_matches_manual_dense_in_clamped_regime():
     # n_head=2, L=8, factor=3 -> clamped regime (see above tests): _prob_attention's
-    # output per head exactly equals dense attention regardless of sample_key. This test
-    # therefore also guards the head-reassembly deviation documented on AttentionLayer:
-    # if the implementation flattened [B,H,L,E] straight to [B,L,hid] (the Nixtla-main
-    # bug, which interleaves heads and time) instead of transposing to [B,L,H,E] first,
-    # `out` would differ from this manually-reassembled `expected`.
+    # output per head exactly equals dense attention regardless of sample_key. The
+    # manual reference reassembles heads in the ALIGNED convention (transpose to
+    # [B,L,H,E] before flattening), so the layer is pinned to
+    # attention_mixing="official" here — the "nf" default flattens head-major
+    # memory directly and is a genuinely different function at n_head > 1
+    # (guarded by test_attention_mixing_modes_differ_at_multi_head).
     B, L, hidden, n_head = 2, 8, 8, 2
-    layer = AttentionLayer(hidden_size=hidden, n_head=n_head, factor=3, mask_flag=False, rngs=nnx.Rngs(0))
+    layer = AttentionLayer(hidden_size=hidden, n_head=n_head, factor=3, mask_flag=False,
+                           mixing="official", rngs=nnx.Rngs(0))
     x = jnp.asarray(np.random.RandomState(5).randn(B, L, hidden), jnp.float32)
     out = layer(x, x, x, sample_key=jax.random.PRNGKey(7))
 
@@ -302,15 +309,36 @@ def test_attention_layer_divisibility_error():
 
 
 def test_conv_layer_halves_length():
-    # Distilling conv: length-preserving circular conv -> BN -> ELU -> maxpool(k=3,s=2,pad=1).
-    # Output length (L-1)//2 + 1, exercised for even, odd, and small L.
+    # Distilling conv, NF-parity: torch Conv1d(k=3, padding=2, circular) EXPANDS the
+    # sequence to L+2 (NF pins padding=2; the paper repo's padding is torch-version-
+    # conditional), then BN -> ELU -> maxpool(k=3,s=2,pad=1) gives (L+1)//2 + 1.
+    # Exercised for even, odd, and small L.
     c_in = 4
     layer = ConvLayer(c_in, rngs=nnx.Rngs(0))
-    for L, expected in [(12, 6), (13, 7), (7, 4)]:
+    for L, expected in [(12, 7), (13, 8), (7, 5)]:
         x = jnp.asarray(np.random.RandomState(0).randn(2, L, c_in), jnp.float32)
         out = layer(x, use_running_average=False)
         assert out.shape == (2, expected, c_in)
         assert bool(jnp.all(jnp.isfinite(out)))
+
+
+def test_conv_layer_gemm_matches_conv_primitive():
+    # The distil conv is expressed as 3 shifted GEMMs, because XLA-CPU lowers
+    # `convolution` at these shapes to its naive emitter inside the training scan.
+    # This pins the GEMM form to the conv primitive on the same padded input
+    # and parameters.
+    c_in = 16
+    layer = ConvLayer(c_in, rngs=nnx.Rngs(0))
+    x = jax.random.normal(jax.random.PRNGKey(1), (4, 30, c_in), dtype=jnp.float32)
+    out = layer(x, use_running_average=True)
+    xp = jnp.concatenate([x[:, -2:], x, x[:, :2]], axis=1)
+    ref = jax.lax.conv_general_dilated(
+        xp, layer.conv.kernel.value, window_strides=(1,), padding="VALID",
+        dimension_numbers=("NHC", "HIO", "NHC")) + layer.conv.bias.value
+    ref = layer.norm(ref, use_running_average=True)
+    ref = jax.nn.elu(ref)
+    ref = nnx.max_pool(ref, window_shape=(3,), strides=(2,), padding=((1, 1),))
+    np.testing.assert_allclose(np.asarray(out), np.asarray(ref), atol=1e-4)
 
 
 def test_conv_layer_batchstat_updates():
@@ -373,9 +401,11 @@ from chronax.models.informer.informer_module import (  # noqa: E402
 
 
 def test_distilled_length():
-    assert distilled_length(72, 1) == 36
-    assert distilled_length(13, 1) == 7
-    assert distilled_length(72, 2) == 18
+    # NF-parity: each conv expands L -> L+2 (circular padding=2) before the
+    # stride-2 pool, so one distil step maps L -> (L+1)//2 + 1.
+    assert distilled_length(72, 1) == 37
+    assert distilled_length(13, 1) == 8
+    assert distilled_length(72, 2) == 20
 
 
 def test_encoder_distil_output_length():
@@ -495,7 +525,22 @@ def _make_y(n=200):
 
 
 def test_build_windows_shape():
-    assert build_windows(_make_y(60), 36, 12).shape == (60 - 48 + 1, 48)
+    w, m = build_windows(_make_y(60), 36, 12)
+    assert w.shape == (60 - 36, 48) and m.shape == (60 - 36, 12)
+
+
+def test_build_windows_nf_padding_semantics():
+    # NF parity (NEU-A1): series right-padded with h zeros; n = T - input_size
+    # windows; every window with >=1 real target point is kept, padded tail
+    # masked out of the loss.
+    y = jnp.arange(1.0, 11.0)                # T=10, values 1..10 (no zeros)
+    w, m = build_windows(y, input_size=3, h=2)
+    assert w.shape == (7, 5) and m.shape == (7, 2)
+    np.testing.assert_array_equal(np.asarray(w[0]), [1, 2, 3, 4, 5])
+    np.testing.assert_array_equal(np.asarray(m[0]), [1, 1])
+    np.testing.assert_array_equal(np.asarray(w[6]), [7, 8, 9, 10, 0])   # padded tail
+    np.testing.assert_array_equal(np.asarray(m[6]), [1, 0])             # masked out
+    assert float(m.sum()) == 13.0
 
 
 def test_build_windows_too_short_raises():
@@ -504,17 +549,61 @@ def test_build_windows_too_short_raises():
 
 
 def test_build_exog_windows_full_span_shape():
-    n = 60 - 48 + 1
+    n = 60 - 36
     arr = jnp.asarray(np.random.RandomState(0).randn(60, 2), jnp.float32)
     assert build_exog_windows(arr, 36, 12, n, "full").shape == (n, 48, 2)
 
 
+def test_exog_scaling_stats_use_insample_span_only():
+    # Exog CENTERING comes from the insample span only; the scale is the
+    # insample robust scale unless the degeneracy floor binds — the floor
+    # deliberately reads the FULL window's spread (a regime-shifted horizon
+    # after a near-constant insample span is exactly the case it exists for).
+    # Pin the whole contract in closed form, bitwise.
+    from chronax.models.informer.informer_training import (
+        _EXOG_SCALE_FLOOR_FRAC, _scale_exog,
+    )
+    rng = np.random.RandomState(0)
+    L, h, F = 8, 4, 2
+    w = jnp.asarray(rng.randn(3, L + h, F), jnp.float32)
+    w = w.at[:, L:, :].add(1e4)          # massive horizon regime shift
+    sc = RobustScaler()
+    shift, scale = sc.stats(w[:, :L], axis=1)            # insample-span stats
+    rng_full = jnp.max(w, axis=1, keepdims=True) - jnp.min(w, axis=1, keepdims=True)
+    expected = (w - shift) / jnp.maximum(scale, _EXOG_SCALE_FLOOR_FRAC * rng_full)
+    np.testing.assert_array_equal(np.asarray(_scale_exog(w, sc, stats_len=L)),
+                                  np.asarray(expected))
+
+
+def test_masked_loss_ignores_padded_tail():
+    # A window whose padded target cell is masked must contribute only its
+    # real points to the loss (NF `_weighted_mean` semantics).
+    net = _net()
+    y = jnp.asarray(np.arange(1.0, 61.0), jnp.float32)   # T=60
+    w, m = build_windows(y, 36, 12)
+    kw = dict(h=12, input_size=36, scaler=RobustScaler(), loss_fn=mae,
+              sample_key=jax.random.PRNGKey(0), deterministic=True)
+    full = forward_loss(net, w, m, **kw)
+    w_poison = w.at[-1, -1].set(1e6)     # last target cell of the last window is padded
+    poisoned = forward_loss(net, w_poison, m, **kw)
+    np.testing.assert_allclose(float(full), float(poisoned), rtol=0, atol=1e-6)
+
+
 def test_forward_loss_scalar_finite():
     net = _net()
-    w = build_windows(_make_y(), 36, 12)
+    w, _ = build_windows(_make_y(), 36, 12)
     loss = forward_loss(net, w[:8], h=12, input_size=36, scaler=RobustScaler(),
                         loss_fn=mae, sample_key=jax.random.PRNGKey(0), deterministic=True)
     assert loss.shape == () and bool(jnp.isfinite(loss))
+
+
+def test_same_config_nets_share_graphdef():
+    # Value-__eq__ on the picklable initializers makes same-config graphdefs
+    # EQUAL, so the module-level @nnx.jit _forward_det cache hits across nets
+    # built by a later fit instead of recompiling per instance.
+    gd_a, _ = nnx.split(_net())
+    gd_b, _ = nnx.split(_net())
+    assert gd_a == gd_b
 
 
 def test_train_decreases_loss():
@@ -627,9 +716,142 @@ def test_predict_smaller_h_slices_larger_raises():
 
 def test_short_series_and_2d_raise():
     with pytest.raises(ValueError, match="too short|short"):
-        _tiny().fit(_make_y(40))
+        _tiny().fit(_make_y(36))  # T == input_size: zero windows
     with pytest.raises(ValueError, match="1-D"):
         _tiny().fit(jnp.ones((200, 2), jnp.float32))
+
+
+def test_fit_at_minimum_length_nf_parity():
+    # NF trains on h-padded partial windows: one window (T = input_size+1) is
+    # enough to fit. The old gate demanded T >= input_size+h.
+    m = _tiny().fit(_make_y(37))
+    pred = m.predict(h=12)["mean"]
+    assert pred.shape == (12,)
+    assert bool(jnp.all(jnp.isfinite(pred)))
+
+
+_COMPILE_LOG_RE = re.compile(r"Compiling ")
+
+
+def _count_compiles(fn):
+    """Run fn under jax.log_compiles and return (result, n_xla_compilations)."""
+    buf = io.StringIO()
+    handler = logging.StreamHandler(buf)
+    loggers = [
+        logging.getLogger("jax._src.dispatch"),
+        logging.getLogger("jax._src.interpreters.pxla"),
+    ]
+    with jax.log_compiles(True):
+        for lg in loggers:
+            lg.addHandler(handler)
+        try:
+            out = fn()
+            jax.block_until_ready(out)
+        finally:
+            for lg in loggers:
+                lg.removeHandler(handler)
+    return out, len(_COMPILE_LOG_RE.findall(buf.getvalue()))
+
+
+def test_count_compiles_canary():
+    # Live-fire proof _count_compiles can still see a compile: a fresh jit'd
+    # closure always compiles (pjit keys on callable identity), so the counter
+    # must report >=1. Guards test_refit_does_not_recompile against going
+    # vacuously green if a jax bump renames the log message or logger paths.
+    def fresh():
+        @jax.jit
+        def f(x):
+            return x * 5.0 - 2.0
+        return f(jnp.ones((4, 3)))
+
+    _, n = _count_compiles(fresh)
+    assert n >= 1
+
+
+def test_refit_does_not_recompile():
+    # The training program is a module-level nnx.jit keyed on config graphdefs
+    # (value-__eq__ initializers, _adam/scaler singletons) and operand shapes —
+    # a refit AND a fresh same-config instance must hit the cache with zero XLA
+    # compiles; fit #2 is counted directly (no uncounted settle call).
+    y = _make_y(60)
+    m = _tiny(max_steps=3, windows_batch_size=4)
+    m.fit(y)                                     # first fit pays the one compile
+    _, n_refit = _count_compiles(lambda: m.fit(y)._train_y)
+    assert n_refit == 0
+    m2 = _tiny(max_steps=3, windows_batch_size=4)
+    _, n_fresh = _count_compiles(lambda: m2.fit(y)._train_y)
+    assert n_fresh == 0
+
+
+def test_attention_mixing_modes_identical_at_single_head():
+    # At n_head == 1 the official transpose is a no-op, so both flatten
+    # conventions must produce the same forward.
+    from chronax.models.informer.informer_module import InformerNet
+
+    x = jnp.asarray(np.random.RandomState(0).randn(2, 12, 1), jnp.float32)
+    outs = []
+    for mode in ("nf", "official"):
+        net = InformerNet(h=4, input_size=12, label_len=6, hidden_size=16, n_head=1,
+                          conv_hidden_size=8, dropout=0.0, attention_mixing=mode,
+                          rngs=nnx.Rngs(0))
+        outs.append(np.asarray(net(x, sample_key=jax.random.PRNGKey(0),
+                                   deterministic=True, use_running_average=True)))
+    np.testing.assert_array_equal(outs[0], outs[1])
+
+
+def test_attention_mixing_modes_differ_at_multi_head():
+    # At n_head > 1 the nf flatten reinterprets head-major memory — the two
+    # conventions are genuinely different functions of the same weights.
+    from chronax.models.informer.informer_module import InformerNet
+
+    x = jnp.asarray(np.random.RandomState(0).randn(2, 12, 1), jnp.float32)
+    outs = []
+    for mode in ("nf", "official"):
+        net = InformerNet(h=4, input_size=12, label_len=6, hidden_size=16, n_head=2,
+                          conv_hidden_size=8, dropout=0.0, attention_mixing=mode,
+                          rngs=nnx.Rngs(0))
+        outs.append(np.asarray(net(x, sample_key=jax.random.PRNGKey(0),
+                                   deterministic=True, use_running_average=True)))
+    assert not np.allclose(outs[0], outs[1])
+
+
+def test_attention_mixing_pickle_roundtrip_and_legacy_default():
+    m = _tiny(attention_mixing="official", max_steps=3, windows_batch_size=4).fit(_make_y(60))
+    m2 = pickle.loads(pickle.dumps(m))
+    assert m2.attention_mixing == "official"
+    np.testing.assert_array_equal(np.asarray(m.predict(h=12)["mean"]),
+                                  np.asarray(m2.predict(h=12)["mean"]))
+    # Estimators pickled before the flag existed carry no attention_mixing key;
+    # they were built with the official transpose and must restore that way.
+    state = m.__getstate__()
+    del state["attention_mixing"]
+    legacy = Informer.__new__(Informer)
+    legacy.__setstate__(state)
+    assert legacy.attention_mixing == "official"
+
+
+def test_dropout_masks_fresh_per_scan_step_and_det_repeatable():
+    # Dropout RNG must advance per nnx.scan step even at a FIXED ProbSparse
+    # sample_key (the streams are independent); and the deterministic path with
+    # a fixed key must be exactly repeatable (the _forward_det contract).
+    from chronax.models.informer.informer_module import InformerNet
+
+    net = InformerNet(h=4, input_size=12, label_len=6, hidden_size=16, n_head=2,
+                      conv_hidden_size=8, dropout=0.5, rngs=nnx.Rngs(0))
+    x = jnp.ones((2, 12, 1))
+    fixed = jax.random.PRNGKey(7)
+
+    @nnx.scan(in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
+    def step(carry, _):
+        return carry, carry(x, sample_key=fixed, deterministic=False,
+                            use_running_average=False)
+
+    _, outs = step(net, jnp.arange(3))
+    assert not np.allclose(np.asarray(outs[0]), np.asarray(outs[1]))
+
+    a = net(x, sample_key=fixed, deterministic=True, use_running_average=True)
+    b = net(x, sample_key=fixed, deterministic=True, use_running_average=True)
+    np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
 
 
 def test_predict_before_fit_raises():
@@ -776,7 +998,7 @@ def test_fitted_with_exog_not_implemented():
 
 
 def test_vmap_forecast_matches_python_loop():
-    # conformity_scores vmaps forecast over windows (xlstm pattern, test_xlstmtime.py:174)
+    # conformity_scores vmaps forecast over windows
     B, T, h = 4, 120, 6
     y_batch = jnp.stack([_make_y(T) * (i + 1) for i in range(B)])
     m = Informer(h=h, input_size=18, hidden_size=8, n_head=2, conv_hidden_size=8,
@@ -805,3 +1027,55 @@ def test_importable_from_models_namespace():
 
     assert PublicInformer is Informer
     assert "Informer" in chronax.models.__all__
+
+
+def test_exog_scale_floor_bounds_degenerate_windows():
+    # A near-constant stats span (all-night zero runs; jitter-constant channel)
+    # collapses the robust scale toward its epsilon; without the floor,
+    # regime-shifted horizon values scale to 1e4-class inputs (the diurnal-
+    # covariate divergence class). The floor bounds |scaled| by construction.
+    from chronax.models.informer.informer_training import build_exog_windows, _scale_exog
+    from chronax.models.informer.informer_scaler import resolve_scaler
+
+    t = np.arange(240)
+    day = (np.sin(t / 12.0) > 0.6).astype(np.float32) * 7000.0     # zero runs > L
+    const = np.full(240, 1.0, np.float32)
+    const[::37] = 0.997                                             # f32-jitter constant
+    Xp = np.stack([day, const], axis=1)
+    w = build_exog_windows(jnp.asarray(Xp), 24, 12, 240 - 24, "full")
+    z = _scale_exog(w, resolve_scaler("robust"), stats_len=24)
+    assert bool(jnp.all(jnp.isfinite(z)))
+    assert float(jnp.max(jnp.abs(z))) <= 105.0   # bound = 1/frac (+slack)
+
+
+def test_fit_survives_degenerate_diurnal_covariate():
+    # Regression smoke for the GEFCom class: raw-scale diurnal covariates whose
+    # all-zero insample spans previously produced 1e5-class scaled inputs and
+    # diverged training within the first steps. The invariant test above is the
+    # fails-when-reverted guard; this pins the end-to-end fit surviving.
+    t = np.arange(240 + 12)
+    day = (np.sin(t / 12.0) > 0.6).astype(np.float32) * 7000.0
+    rng = np.random.RandomState(0)
+    y = (0.3 + day[:240] / 20000.0 + 0.02 * rng.randn(240)).astype(np.float32)
+    m = Informer(h=12, input_size=24, hidden_size=16, n_head=2, conv_hidden_size=8,
+                 max_steps=40, learning_rate=1e-4, scaler_type="robust",
+                 windows_batch_size=32, random_seed=0)
+    m.fit(jnp.asarray(y), futr_exog=jnp.asarray(day[:240, None]))
+    pred = m.predict(h=12, futr_exog=jnp.asarray(day[240:, None]))["mean"]
+    assert bool(jnp.all(jnp.isfinite(pred)))
+
+
+def test_exog_scale_floor_inert_on_offset_covariate():
+    # Level-offset covariates (temperature-in-Kelvin class: mean >> spread) must
+    # NOT trip the floor: the spread-based form compares like with like, so the
+    # transform is bit-identical to the unfloored insample-robust scaling. A
+    # magnitude-based floor would fire on every window here and compress the
+    # channel ~10x.
+    from chronax.models.informer.informer_training import _scale_exog
+    rng = np.random.RandomState(3)
+    w = jnp.asarray(100.0 + 2.0 * rng.randn(4, 12, 2), jnp.float32)   # 100 +- 2
+    sc = RobustScaler()
+    shift, scale = sc.stats(w[:, :8], axis=1)
+    unfloored = (w - shift) / scale
+    np.testing.assert_array_equal(np.asarray(_scale_exog(w, sc, stats_len=8)),
+                                  np.asarray(unfloored))

@@ -235,3 +235,48 @@ def test_holt():
 
 if __name__ == '__main__':
     test_holt()
+
+def test_m_error_native_interval_width_is_relative_scale():
+    # M-error native widths use the relative-residual sigma once multiplied
+    # by |mean|; an absolute-residual sigma double-scales by the series level.
+    import numpy as np
+    import jax.numpy as jnp
+    from chronax.models import Holt
+    rng = np.random.default_rng(0)
+    y = jnp.asarray(500.0 + np.cumsum(rng.normal(0.5, 1.0, 150)), dtype=jnp.float64)
+    m = Holt(error_type='M')
+    res = m.forecast(y=y, h=5, level=[95])
+    width = np.asarray(res["hi-95"]) - np.asarray(res["lo-95"])
+    mean = np.asarray(res["mean"])
+    # Sane relative width: a few percent of the level, never level-squared.
+    assert np.all(width > 0)
+    assert np.all(width < 0.5 * np.abs(mean)), (
+        f"M-error interval width {width[0]:.1f} vs mean {mean[0]:.1f} — "
+        "absolute-sigma double scaling"
+    )
+
+
+def test_fixed_phi_damps_the_recursion_and_the_forecast():
+    import numpy as np
+    import jax.numpy as jnp
+    from chronax.models import Holt
+    rng = np.random.default_rng(1)
+    y = jnp.asarray(10.0 + 0.8 * np.arange(120) + rng.normal(0, 0.5, 120), dtype=jnp.float64)
+    m = Holt(damped=True, phi=0.8)
+    res = m.forecast(y=y, h=6)
+    fc = np.asarray(res["mean"])
+    inc = np.diff(fc)
+    ratios = inc[1:] / inc[:-1]
+    np.testing.assert_allclose(ratios, 0.8, rtol=1e-5)
+
+
+def test_multiplicative_error_rejects_nonpositive_data():
+    import numpy as np
+    import jax.numpy as jnp
+    import pytest
+    from chronax.models import Holt, HoltWinters
+    y = jnp.asarray(np.array([1.0, 2.0, -1.0, 3.0] * 10))
+    with pytest.raises(ValueError):
+        Holt(error_type='M').fit(y)
+    with pytest.raises(ValueError):
+        HoltWinters(season_length=4, error_type='M').fit(y)

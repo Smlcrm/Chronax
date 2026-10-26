@@ -31,13 +31,14 @@ from chronax.models.informer.informer_layers import (
 def distilled_length(input_size: int, n_conv: int) -> int:
     """Sequence length remaining after ``n_conv`` distilling ``ConvLayer``s.
 
-    Each conv applies ``L -> (L-1)//2 + 1`` (the stride-2 maxpool arithmetic from
-    ``ConvLayer``). Pure Python int arithmetic on static shapes, so callers (e.g.
-    the training/model wrappers) can size buffers without invoking the net.
+    Each conv applies ``L -> (L+1)//2 + 1`` (NF-parity circular padding=2 conv
+    expands to L+2, then the stride-2 maxpool arithmetic from ``ConvLayer``).
+    Pure Python int arithmetic on static shapes, so callers (e.g. the
+    training/model wrappers) can size buffers without invoking the net.
     """
     L = input_size
     for _ in range(n_conv):
-        L = (L - 1) // 2 + 1
+        L = (L + 1) // 2 + 1
     return L
 
 
@@ -56,13 +57,14 @@ class TransEncoder(nnx.Module):
 
     def __init__(
         self, *, encoder_layers: int, hidden_size: int, n_head: int, conv_hidden_size: int,
-        factor: int, dropout: float, activation: str = "gelu", distil: bool, rngs: nnx.Rngs,
+        factor: int, dropout: float, activation: str = "gelu", distil: bool,
+        mixing: str = "nf", rngs: nnx.Rngs,
     ) -> None:
         self.distil = distil
         self.attn_layers = [
             TransEncoderLayer(
                 hidden_size=hidden_size, n_head=n_head, conv_hidden_size=conv_hidden_size,
-                factor=factor, dropout=dropout, activation=activation, rngs=rngs,
+                factor=factor, dropout=dropout, activation=activation, mixing=mixing, rngs=rngs,
             )
             for _ in range(encoder_layers)
         ]
@@ -104,12 +106,13 @@ class TransDecoder(nnx.Module):
 
     def __init__(
         self, *, decoder_layers: int, hidden_size: int, n_head: int, conv_hidden_size: int,
-        factor: int, dropout: float, activation: str = "gelu", c_out: int, rngs: nnx.Rngs,
+        factor: int, dropout: float, activation: str = "gelu", c_out: int,
+        mixing: str = "nf", rngs: nnx.Rngs,
     ) -> None:
         self.layers = [
             TransDecoderLayer(
                 hidden_size=hidden_size, n_head=n_head, conv_hidden_size=conv_hidden_size,
-                factor=factor, dropout=dropout, activation=activation, rngs=rngs,
+                factor=factor, dropout=dropout, activation=activation, mixing=mixing, rngs=rngs,
             )
             for _ in range(decoder_layers)
         ]
@@ -153,7 +156,7 @@ class InformerNet(nnx.Module):
         self, *, h, input_size, label_len, hidden_size=128, n_head=4, factor=3,
         conv_hidden_size=32, encoder_layers=2, decoder_layers=1, distil=True,
         dropout=0.05, activation="gelu", futr_exog_size=0, outputsize_multiplier=1,
-        rngs: nnx.Rngs,
+        attention_mixing="nf", rngs: nnx.Rngs,
     ) -> None:
         self.h = h
         self.input_size = input_size
@@ -173,12 +176,13 @@ class InformerNet(nnx.Module):
         self.encoder = TransEncoder(
             encoder_layers=encoder_layers, hidden_size=hidden_size, n_head=n_head,
             conv_hidden_size=conv_hidden_size, factor=factor, dropout=dropout,
-            activation=activation, distil=distil, rngs=rngs,
+            activation=activation, distil=distil, mixing=attention_mixing, rngs=rngs,
         )
         self.decoder = TransDecoder(
             decoder_layers=decoder_layers, hidden_size=hidden_size, n_head=n_head,
             conv_hidden_size=conv_hidden_size, factor=factor, dropout=dropout,
-            activation=activation, c_out=outputsize_multiplier, rngs=rngs,
+            activation=activation, c_out=outputsize_multiplier, mixing=attention_mixing,
+            rngs=rngs,
         )
 
     def __call__(self, insample_y, futr_exog=None, *, sample_key,

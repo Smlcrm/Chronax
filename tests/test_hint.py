@@ -224,9 +224,37 @@ class TestHINTFitPredict:
         with pytest.raises(ValueError, match="columns"):
             _hint().fit(_hier_y()[:, :2])
 
-    def test_rejects_exog(self):
-        with pytest.raises(ValueError, match="exog"):
-            _hint().fit(_hier_y(), X=jnp.ones((72, 2)))
+    def test_hist_exog_fit_predict(self):
+        # X = shared-calendar historical exog, broadcast to every hierarchy
+        # series by the base model's 2-D hist path; predict needs no future X.
+        X = jnp.asarray(np.random.RandomState(1).randn(72, 2), jnp.float32)
+        m = _hint().fit(_hier_y(), X=X)
+        assert m._hist_size == 2
+        out = m.predict(h=4)
+        assert out["mean"].shape == (4, 3) and bool(jnp.all(jnp.isfinite(out["mean"])))
+
+    def test_hist_exog_forecast_threads_X_and_rejects_futr(self):
+        X = jnp.asarray(np.random.RandomState(1).randn(72, 2), jnp.float32)
+        assert _hint().forecast(_hier_y(), 4, X=X)["mean"].shape == (4, 3)
+        with pytest.raises(ValueError, match="future-known"):
+            _hint().forecast(_hier_y(), 4, X_future=X[:4])
+
+    def test_hist_exog_predict_and_conformity_reject_X(self):
+        X = jnp.asarray(np.random.RandomState(1).randn(72, 2), jnp.float32)
+        m = _hint().fit(_hier_y(), X=X)
+        with pytest.raises(ValueError, match="predict takes no X"):
+            m.predict(h=4, X=X)
+        with pytest.raises(ValueError, match="historical exog"):
+            _hint().conformity_scores(_hier_y()[:, 0], X=X)
+
+    def test_hist_exog_pickle_roundtrip(self):
+        # The pickle rebuild reads _hist_size off HINT (self.model is the
+        # never-mutated config carrier), so the hist-widened net restores cleanly.
+        X = jnp.asarray(np.random.RandomState(1).randn(72, 2), jnp.float32)
+        m = _hint().fit(_hier_y(), X=X)
+        o1 = m.predict(h=4)["mean"]
+        o2 = pickle.loads(pickle.dumps(m)).predict(h=4)["mean"]
+        np.testing.assert_array_equal(np.asarray(o1), np.asarray(o2))
 
     def test_h_gt_trained_raises(self):
         m = _hint().fit(_hier_y())

@@ -115,13 +115,11 @@ class HistoricAverage(BaseForecaster):
             "sigma": utils.calculate_sigma(residuals, len(y) - 1),
             "n": len(y),
         }
-        
-        # Fast conformity: vmap over dynamic slices
-        @jax.jit
-        def forecast_fn(y_full, X_full, te, h):
-            return jnp.full((h,), jnp.nanmean(y_full[:te]), dtype=jnp.float32)
-        
-        self.forecast_fn = forecast_fn
+        # Cache conformity scores on the REAL series at fit. Scoring the fitted
+        # values instead would score a CONSTANT series — they are all equal to the
+        # historical mean — whose CV residuals are ~0, giving zero-width intervals.
+        if self.conformal_params is not None:
+            self._cs = self.conformity_scores(y)
         return self
 
     def predict(self, h: int, X: jnp.ndarray | None = None, level: list[int] | None = None) -> dict:
@@ -142,6 +140,7 @@ class HistoricAverage(BaseForecaster):
                 - "lo-{l}" / "hi-{l}": Interval bounds for each level l
                   (only present when level is not None).
         """
+        self._require_fitted()
         mean = jnp.full((h,), self.model_["mean"][0], dtype=jnp.float32)
         res = {"mean": mean}
         
@@ -152,7 +151,7 @@ class HistoricAverage(BaseForecaster):
             
             if self.conformal_params is not None:
                 res = self.add_confidence_intervals(
-                    res, self.conformity_scores(self.model_["fitted"], X=None), level, "conformal_distribution"
+                    res, self._cs, level, self.conformal_params.method
                 )
             else:
                 # res = {**res, **utils._calculate_intervals(mean, sigmah, level)}
@@ -227,7 +226,8 @@ class HistoricAverage(BaseForecaster):
             
             if self.conformal_params is not None:
                 res = self.add_confidence_intervals(
-                    res, self.conformity_scores(y, X=None), level, "conformal_distribution"
+                    res, self.conformity_scores(y, X=None), level,
+                    self.conformal_params.method
                 )
             else:
                 # res = {**res, **utils._calculate_intervals(out["mean"], sigmah, level)}

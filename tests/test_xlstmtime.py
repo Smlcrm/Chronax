@@ -10,9 +10,11 @@ A. **xLSTMTime extensions** (via the full :class:`XLSTM` forecaster): RevIN
 
 B. **FlashRNN-aligned backend optimization** (arXiv 2412.07752): the depthwise
    causal conv, the input-hoisting refactor (vectorized ``*_block_forward`` must
-   equal the per-step ``*_block_step`` AR-decode path), and the paper-faithful
-   sLSTM cell semantics (forget gate exp|sigmoid x stabilizer per_head|per_cell)
-   validated against an independent NumPy reference of Eq. 12-15, plus vmap-safety.
+   equal the per-step ``*_block_step`` AR-decode path), and the sLSTM cell
+   semantics (forget gate exp|sigmoid x stabilizer per_head|per_cell) validated
+   against a NumPy transcription of the IMPLEMENTATION's semantics — Eq. 12-15
+   PLUS the chronax floor/clip deviations. This pins self-consistency, NOT
+   canon fidelity. Plus vmap-safety.
 """
 from __future__ import annotations
 
@@ -393,6 +395,229 @@ def test_slstm_paper_faithful_is_vmappable():
         np.asarray(vm.astype(jnp.float32)), np.asarray(seq.astype(jnp.float32)),
         rtol=2e-2, atol=2e-2,
     )
+
+
+# ===========================================================================
+# NF-convention constructor aliases (neural benchmark harness protocol)
+# ===========================================================================
+
+
+def test_nf_alias_params_map_onto_native_names():
+    m = XLSTM(h=24, input_size=72, random_seed=7)
+    assert m.ctx_len == 72
+    assert m.seed == 7
+    assert m.horizon == 24
+    # direct mode satisfied by `h` alone (no separate `horizon` needed)
+    md = XLSTM(h=24, decode_mode="direct")
+    assert md.horizon == 24
+
+
+def test_nf_alias_h_conflicting_with_horizon_raises():
+    with pytest.raises(ValueError, match="horizon"):
+        XLSTM(h=24, horizon=12)
+    m = XLSTM(h=24, horizon=24)  # equal values are not a conflict
+    assert m.horizon == 24
+
+
+def test_nf_alias_ar_predictions_unchanged():
+    """In AR mode `h` only records the configured horizon: cfg.horizon feeds
+    direct-mode branches exclusively, so fitted params and predictions must be
+    bit-identical with or without the alias."""
+    y = jnp.sin(jnp.arange(48, dtype=jnp.float32) / 4.0)
+    base = XLSTM(ctx_len=16, n_epochs=2, seed=0).fit(y)
+    alias = XLSTM(ctx_len=16, n_epochs=2, seed=0, h=6).fit(y)
+    np.testing.assert_array_equal(
+        np.asarray(base.predict(h=6)["mean"]),
+        np.asarray(alias.predict(h=6)["mean"]),
+    )
+
+
+def test_nf_alias_max_steps_sets_total_optimizer_steps():
+    """`max_steps` must be the exact total optimizer step count (NF semantics),
+    overriding the epochs-derived budget — observable as len(losses)."""
+    y = jnp.sin(jnp.arange(60, dtype=jnp.float32) / 4.0)
+    m = XLSTM(input_size=16, n_epochs=100, max_steps=7).fit(y)
+    assert m.model_["losses"].shape[0] == 7
+
+
+def test_nf_alias_learning_rate_maps_to_lr():
+    assert XLSTM(learning_rate=0.01).lr == 0.01
+
+
+def test_ar_decode_with_revin_returns_original_scale():
+    """AR decode with RevIN must denormalize: training wraps the out_proj head in
+    revin_denormalize (xlstm_forward), so raw rollout emissions are in normalized
+    space — decode() must map them back and roll the recurrence in normalized
+    space. Regression test against an AR/RevIN scale mismatch."""
+    y = 500.0 + jnp.sin(jnp.arange(64, dtype=jnp.float32) / 3.0) * 5.0
+    m = XLSTM(ctx_len=16, n_epochs=2, seed=0, use_revin=True)
+    m.fit(y)
+    pred = m.predict(h=4)["mean"]
+    assert bool(jnp.all(jnp.abs(pred - 500.0) < 250.0)), f"pred not in original scale: {pred}"
+
+
+def test_harness_protocol_construct_fit_predict():
+    """The neural benchmark worker constructs cls(h=..., input_size=...,
+    random_seed=..., **params) then fit(y) / predict(h)["mean"]
+    in the neural benchmark worker."""
+    y = jnp.asarray(np.random.default_rng(0).normal(size=60), jnp.float32)
+    m = XLSTM(h=4, input_size=16, random_seed=1, n_epochs=1)
+    m.fit(y)
+    mean = m.predict(h=4)["mean"]
+    assert mean.shape == (4,)
+    assert bool(jnp.all(jnp.isfinite(mean)))
+
+
+def test_xlstm_pickle_roundtrip():
+    """Fitted-estimator pickle round-trip (long-standing deferred gap): the
+    params-only __getstate__/__setstate__ path must survive serialization with
+    bit-identical predictions from the restored estimator."""
+    import pickle
+
+    y = jnp.sin(jnp.arange(48, dtype=jnp.float32) / 4.0)
+    m = XLSTM(ctx_len=16, n_epochs=2, seed=0).fit(y)
+    p1 = np.asarray(m.predict(h=6)["mean"])
+    m2 = pickle.loads(pickle.dumps(m))
+    p2 = np.asarray(m2.predict(h=6)["mean"])
+    np.testing.assert_array_equal(p1, p2)
+
+
+# ===========================================================================
+# Fitted fast path, conformity tails, compute dtype
+# ===========================================================================
+
+from chronax.utils import ConformalIntervals
+import chronax.models.xlstm.xlstm_backend as _backend
+
+_REVIEW_H = 24
+_REVIEW_NW = 4
+
+
+def _trend_seasonal_series(n=600, seed=0):
+    rng = np.random.RandomState(seed)
+    t = np.arange(n, dtype=np.float32)
+    y = 50.0 + 0.15 * t + 4.0 * np.sin(2 * np.pi * t / 24) + 0.5 * rng.randn(n)
+    return jnp.asarray(y, jnp.float32)
+
+
+@pytest.fixture(scope="module")
+def fitted_conformal_model():
+    """One shared fitted paper-profile model with conformal params (read-only
+    in every test below — never mutate it)."""
+    m = XLSTM(
+        ctx_len=64, num_layers=2, embed_dim=32, num_heads=4,
+        block_types=("slstm", "slstm"), use_revin=True,
+        use_decomposition=True, decode_mode="direct", horizon=_REVIEW_H,
+        max_steps=50, seed=0,
+        conformal_params=ConformalIntervals(n_windows=_REVIEW_NW, h=_REVIEW_H,
+                                            method="conformal_distribution"),
+    )
+    m.fit(_trend_seasonal_series())
+    return m
+
+
+def test_fitted_forecast_level_emits_intervals(fitted_conformal_model):
+    """The fitted fast path must emit intervals, not silently drop `level`
+    (the stateless-path gate does not cover it)."""
+    m = fitted_conformal_model
+    out = m.forecast(y=_trend_seasonal_series(), h=_REVIEW_H, level=[90])
+    assert "lo-90" in out and "hi-90" in out and "mean" in out
+    assert bool(jnp.all(out["lo-90"] <= out["hi-90"]))
+
+
+def test_forecast_fitted_true_raises(fitted_conformal_model):
+    """X3: `fitted=True` was silently ignored on both paths; it must raise."""
+    with pytest.raises(NotImplementedError, match="fitted"):
+        fitted_conformal_model.forecast(
+            y=_trend_seasonal_series(), h=_REVIEW_H, fitted=True
+        )
+
+
+def test_conformity_scores_use_true_context_tails(fitted_conformal_model):
+    """Scores must equal what forecast() produces from the TRUE series prefix per
+    window, not from the base class's edge-masked (plateau) array: under the base
+    implementation window 0's context ends in (nw-1)*h constant values, which
+    inflates its scores several-fold."""
+    m = fitted_conformal_model
+    y = _trend_seasonal_series()
+    cs = np.asarray(m.model_["_cs"])
+    n = int(y.shape[0])
+    base_train_end = n - _REVIEW_NW * _REVIEW_H
+    for i in range(_REVIEW_NW):
+        train_end = base_train_end + i * _REVIEW_H
+        expected_fc = m.forecast(y=y[:train_end], h=_REVIEW_H)["mean"]
+        expected = np.asarray(y[train_end:train_end + _REVIEW_H] - expected_fc)
+        np.testing.assert_allclose(
+            cs[i], expected, rtol=1e-4, atol=1e-4,
+            err_msg=f"window {i} scores not from the true context",
+        )
+
+
+def test_conformity_scores_unfitted_falls_back_to_base(fitted_conformal_model):
+    """The contract suite calls .new().conformity_scores on an UNFITTED clone;
+    that path must keep base semantics (stateless fit-per-window under vmap)."""
+    mm = fitted_conformal_model.new()
+    mm.model_ = {}
+    mm.max_steps = 5  # keep the per-window vmapped re-fits cheap
+    cs = mm.conformity_scores(_trend_seasonal_series(n=200))
+    assert cs.shape == (_REVIEW_NW, _REVIEW_H)
+    assert bool(jnp.all(jnp.isfinite(cs)))
+
+
+def test_revin_denormalize_guards_zero_gamma():
+    """X6: canonical RevIN divides by gamma + eps^2 — a trained-to-zero gamma
+    must not produce inf."""
+    p = {"gamma": jnp.zeros((1,)), "beta": jnp.zeros((1,))}
+    stats = {"mu": jnp.zeros((1,)), "sigma": jnp.ones((1,))}
+    out = _backend.revin_denormalize(jnp.ones((4,)), p, stats)
+    assert bool(jnp.all(jnp.isfinite(out)))
+
+
+def test_conformity_scores_pad_regime_short_series():
+    """X2 pad regime (adversarial-review finding 1): when train_end < ctx_len,
+    tails are left-edge-padded to the static ctx length. Scores must be finite,
+    correctly shaped, and window-varying — the true-context equivalence claim
+    is deliberately scoped to the no-pad regime."""
+    h, nw = 12, 4
+    y = _trend_seasonal_series(n=80)  # base_train_end = 80-48 = 32 < ctx 64
+    m = XLSTM(
+        ctx_len=64, num_layers=1, embed_dim=16, num_heads=2,
+        max_steps=5, seed=0,
+        conformal_params=ConformalIntervals(n_windows=nw, h=h),
+    )
+    m.fit(y)  # fit shrinks ctx for n=80; force the pad path via a fresh call
+    cs = m.conformity_scores(y)
+    assert cs.shape[1] == h and cs.shape[0] >= 2
+    assert bool(jnp.all(jnp.isfinite(cs)))
+    assert not bool(jnp.allclose(cs[0], cs[-1]))
+
+
+def test_stateless_forecast_level_emits_intervals():
+    """X3 companion (adversarial-review finding 14): XLSTM's STATELESS
+    forecast(level=...) is in no fleet gate — pin it here. Routes through the
+    slow path (tmp fit -> predict(level))."""
+    m = XLSTM(
+        ctx_len=16, num_layers=1, embed_dim=16, num_heads=2,
+        max_steps=5, seed=0,
+        conformal_params=ConformalIntervals(n_windows=2, h=6),
+    )
+    out = m.forecast(y=_trend_seasonal_series(n=120), h=6, level=[80])
+    assert "lo-80" in out and "hi-80" in out
+    assert bool(jnp.all(out["lo-80"] <= out["hi-80"]))
+
+
+def test_compute_dtype_default_f32_and_bf16_optin():
+    """Compute dtype is config-static and defaults to float32, since bf16 is a
+    marked XLA-CPU pessimization; bf16 stays opt-in for GPU."""
+    y = _trend_seasonal_series(n=200)
+    m32 = XLSTM(ctx_len=32, max_steps=5, seed=0).fit(y)
+    m16 = XLSTM(ctx_len=32, max_steps=5, seed=0, compute_dtype="bfloat16").fit(y)
+    p32 = np.asarray(m32.predict(h=6)["mean"])
+    p16 = np.asarray(m16.predict(h=6)["mean"])
+    assert np.all(np.isfinite(p32)) and np.all(np.isfinite(p16))
+    assert not np.array_equal(p32, p16)  # dtype genuinely flows into compute
+    with pytest.raises(ValueError, match="compute_dtype"):
+        XLSTM(compute_dtype="float16")
 
 
 if __name__ == "__main__":

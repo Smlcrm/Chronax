@@ -4,7 +4,10 @@ Covers the TCN subpackage in banner sections (Losses, Scaler, Module, Training,
 Model, Namespace), matching the ``test_<model>.py`` convention used elsewhere
 in ``tests/``.
 """
+import io
+import logging
 import pickle
+import re
 
 import jax
 import jax.numpy as jnp
@@ -57,9 +60,11 @@ def test_mqloss_multiplier_median_and_pickle():
 
 
 def test_mqloss_pinball_value():
-    # err = y - yhat; pred zeros, target 2 -> mean_q q*2 = mean{0.2,1.0,1.8} = 1.0
+    # err = y - yhat; pred zeros, target 2 -> sum_q q*2 = sum{0.2,1.0,1.8} = 3.0 —
+    # NF's effective reduction (its 1/len(quantiles) factor is dead), matching
+    # the trainer's masked inline branch.
     loss = MultiQuantileLoss((0.1, 0.5, 0.9))
-    assert float(loss(jnp.zeros((1, 1, 3)), jnp.array([[2.0]]))) == pytest.approx(1.0)
+    assert float(loss(jnp.zeros((1, 1, 3)), jnp.array([[2.0]]))) == pytest.approx(3.0)
 
 
 # === Scaler ===
@@ -204,16 +209,24 @@ def test_build_windows_nf_padding_semantics():
 
 
 def test_exog_scaling_stats_use_insample_span_only():
-    # Exog statistics come from the insample span only; the horizon slice is
-    # transformed with those stats but never feeds them.
-    from chronax.models.tcn.tcn_training import _scale_exog
+    # Exog CENTERING comes from the insample span only; the scale is the
+    # insample robust scale unless the degeneracy floor binds — the floor
+    # deliberately reads the FULL window's spread (a regime-shifted horizon
+    # after a near-constant insample span is exactly the case it exists for).
+    # Pin the whole contract in closed form, bitwise.
+    from chronax.models.tcn.tcn_training import (
+        _EXOG_SCALE_FLOOR_FRAC, _scale_exog,
+    )
     rng = np.random.RandomState(0)
     L, h, F = 8, 4, 2
     w = jnp.asarray(rng.randn(3, L + h, F), jnp.float32)
-    a = _scale_exog(w, RobustScaler(), stats_len=L)
-    w2 = w.at[:, L:, :].add(1e4)         # perturb horizon slice massively
-    b = _scale_exog(w2, RobustScaler(), stats_len=L)
-    np.testing.assert_array_equal(np.asarray(a[:, :L]), np.asarray(b[:, :L]))
+    w = w.at[:, L:, :].add(1e4)          # massive horizon regime shift
+    sc = RobustScaler()
+    shift, scale = sc.stats(w[:, :L], axis=1)            # insample-span stats
+    rng_full = jnp.max(w, axis=1, keepdims=True) - jnp.min(w, axis=1, keepdims=True)
+    expected = (w - shift) / jnp.maximum(scale, _EXOG_SCALE_FLOOR_FRAC * rng_full)
+    np.testing.assert_array_equal(np.asarray(_scale_exog(w, sc, stats_len=L)),
+                                  np.asarray(expected))
 
 
 def test_masked_loss_ignores_padded_tail():
@@ -267,6 +280,21 @@ def test_train_is_vmap_traceable():
     assert out.shape == (3, 4) and bool(jnp.all(jnp.isfinite(out)))
 
 
+def test_train_with_hist_exog_is_vmap_traceable():
+    # Conformal never exercises the hist path (temporal exog -> native intervals),
+    # but rule 2 still requires the forward+train to trace.
+    y = _make_y()
+    hist = jnp.asarray(np.random.RandomState(0).randn(y.shape[0], 2), jnp.float32)
+    def run(seed):
+        net = TCNNet(h=12, input_size=36, hist_exog_size=2, encoder_hidden_size=8,
+                     decoder_hidden_size=8, rngs=nnx.Rngs(0))
+        return train(net, y, h=12, input_size=36, max_steps=4, windows_batch_size=16,
+                     lr=1e-3, seed=seed, loss_fn=resolve("mae"),
+                     scaler=resolve_scaler("identity"), hist_exog=hist)
+    out = jax.vmap(run)(jnp.arange(3))
+    assert out.shape == (3, 4) and bool(jnp.all(jnp.isfinite(out)))
+
+
 # === Model ===
 
 from chronax.models.base_forecaster import BaseForecaster  # noqa: E402
@@ -279,6 +307,63 @@ def _tiny(**kw):
                 max_steps=20, windows_batch_size=64, random_seed=0)
     base.update(kw)
     return TCN(**base)
+
+
+_COMPILE_LOG_RE = re.compile(r"Compiling ")
+
+
+def _count_compiles(fn):
+    """Run fn under jax.log_compiles and return (result, n_xla_compilations)."""
+    buf = io.StringIO()
+    handler = logging.StreamHandler(buf)
+    loggers = [
+        logging.getLogger("jax._src.dispatch"),
+        logging.getLogger("jax._src.interpreters.pxla"),
+    ]
+    with jax.log_compiles(True):
+        for lg in loggers:
+            lg.addHandler(handler)
+        try:
+            out = fn()
+            jax.block_until_ready(out)
+        finally:
+            for lg in loggers:
+                lg.removeHandler(handler)
+    return out, len(_COMPILE_LOG_RE.findall(buf.getvalue()))
+
+
+def test_count_compiles_canary():
+    # Live-fire proof _count_compiles can still see a compile: a fresh jit'd
+    # closure always compiles (pjit keys on callable identity), so the counter
+    # must report >=1. If a jax bump renames the "Compiling " message or the
+    # logger paths, this fails instead of letting test_refit_does_not_recompile
+    # go vacuously green on a counter that matches nothing.
+    def fresh():
+        @jax.jit
+        def f(x):
+            return x * 3.0 - 1.0
+        return f(jnp.ones((2, 5)))
+
+    _, n = _count_compiles(fresh)
+    assert n >= 1
+
+
+def test_refit_does_not_recompile():
+    # The training program is a module-level nnx.jit whose cache keys on config
+    # graphdefs (value-__eq__ initializers, _adam/scaler singletons) and operand
+    # shapes — never on data or call-site closures. A refit AND a fresh
+    # same-config instance must both hit the cache with zero XLA compiles;
+    # fit #2 is counted directly (no uncounted settle call). No dropout-freshness
+    # companion test — deliberately: the TCN forward is deterministic and the
+    # only RNG (batch-index sampling) runs eagerly outside the jitted program.
+    y = _make_y(60)
+    m = _tiny(max_steps=3, windows_batch_size=4)
+    m.fit(y)                                     # first fit pays the one compile
+    _, n_refit = _count_compiles(lambda: m.fit(y)._train_y)
+    assert n_refit == 0
+    m2 = _tiny(max_steps=3, windows_batch_size=4)
+    _, n_fresh = _count_compiles(lambda: m2.fit(y)._train_y)
+    assert n_fresh == 0
 
 
 def test_tcn_is_base_forecaster_and_uses_exog():
@@ -361,11 +446,6 @@ def test_predict_before_fit_raises():
         _tiny().predict(h=12)
 
 
-def test_fit_X_not_implemented():
-    with pytest.raises(NotImplementedError, match="futr_exog"):
-        _tiny().fit(_make_y(), X=jnp.ones((200, 1), jnp.float32))
-
-
 def test_repeated_predict_identical():
     m = _tiny().fit(_make_y())
     a = np.asarray(m.predict(h=12)["mean"])
@@ -394,6 +474,68 @@ def test_futr_exog_fit_predict_shapes():
     out = m.predict(h=12, futr_exog=jnp.asarray(np.random.RandomState(2).randn(12, 2), jnp.float32))
     assert out["mean"].shape == (12,)
     assert bool(jnp.all(jnp.isfinite(out["mean"])))
+
+
+def test_hist_exog_fit_predict():
+    # Historical exog (X): joins the encoder channels over the input span;
+    # predict needs no future X (encoder-only, not in the decoder residual).
+    y = _make_y(240)
+    X = jnp.asarray(np.random.RandomState(1).randn(y.shape[0], 2), jnp.float32)
+    m = _tiny(max_steps=10).fit(y, X=X)
+    # encoder in_channels = 1 + hist; decoder input = encoder_hidden + 0 (hist
+    # is encoder-only, so the decoder is untouched).
+    assert m._hist_size == 2
+    assert m.model_.hist_encoder.layers[0].weight.value.shape[1] == 1 + 2
+    assert m.model_.mlp_decoder.layers[0].in_features == m.encoder_hidden_size
+    out = m.predict(h=12)
+    assert out["mean"].shape == (12,) and bool(jnp.all(jnp.isfinite(out["mean"])))
+
+
+def test_hist_and_futr_exog_together():
+    # Encoder sees 1 + hist + futr channels; decoder residual carries futr only.
+    y = _make_y(240)
+    X = jnp.asarray(np.random.RandomState(1).randn(y.shape[0], 2), jnp.float32)
+    xf = jnp.asarray(np.random.RandomState(2).randn(y.shape[0], 3), jnp.float32)
+    m = _tiny(max_steps=10).fit(y, X=X, futr_exog=xf)
+    assert m.model_.hist_encoder.layers[0].weight.value.shape[1] == 1 + 2 + 3
+    assert m.model_.mlp_decoder.layers[0].in_features == m.encoder_hidden_size + 3
+    out = m.predict(h=12, futr_exog=jnp.asarray(np.random.RandomState(3).randn(12, 3), jnp.float32))
+    assert out["mean"].shape == (12,)
+
+
+def test_hist_exog_misaligned_raises():
+    y = _make_y(240)
+    X = jnp.asarray(np.random.RandomState(1).randn(y.shape[0] - 5, 2), jnp.float32)
+    with pytest.raises(ValueError, match="historical exog.*align"):
+        _tiny(max_steps=5).fit(y, X=X)
+
+
+def test_hist_exog_forecast_threads_X():
+    y = _make_y(240)
+    X = jnp.asarray(np.random.RandomState(1).randn(y.shape[0], 2), jnp.float32)
+    r = _tiny(max_steps=10).forecast(y, 12, X=X)
+    assert r["mean"].shape == (12,)
+
+
+def test_hist_exog_conformal_refused():
+    # Temporal exog -> native (quantile) intervals only; conformal is refused
+    # both at predict(level=) and conformity_scores(X=).
+    y = _make_y(240)
+    X = jnp.asarray(np.random.RandomState(1).randn(y.shape[0], 2), jnp.float32)
+    m = _tiny(max_steps=10).fit(y, X=X)
+    m.conformal_params = ConformalIntervals(h=12, n_windows=3)
+    with pytest.raises(ValueError, match="temporal"):
+        m.predict(h=12, level=[80])
+    with pytest.raises(ValueError, match="temporal"):
+        _tiny(max_steps=5).conformity_scores(y, X=X)
+
+
+def test_hist_exog_mq_native_intervals():
+    y = _make_y(240)
+    X = jnp.asarray(np.random.RandomState(1).randn(y.shape[0], 2), jnp.float32)
+    m = _tiny(max_steps=10, loss=MultiQuantileLoss([0.1, 0.5, 0.9])).fit(y, X=X)
+    out = m.predict(h=12, level=[80])
+    assert {"mean", "lo-80", "hi-80"} <= set(out)
 
 
 def test_futr_required_at_predict_raises():
@@ -501,3 +643,38 @@ def test_importable_from_models_namespace():
 
     assert PublicTCN is TCN
     assert "TCN" in chronax.models.__all__
+
+
+def test_exog_scale_floor_bounds_degenerate_windows():
+    # A near-constant stats span (all-night zero runs; jitter-constant channel)
+    # collapses the robust scale toward its epsilon; without the floor,
+    # regime-shifted horizon values scale to 1e4-class inputs (the diurnal-
+    # covariate divergence class). The floor bounds |scaled| by construction.
+    from chronax.models.tcn.tcn_training import build_exog_windows, _scale_exog
+    from chronax.models.tcn.tcn_scaler import resolve_scaler
+
+    t = np.arange(240)
+    day = (np.sin(t / 12.0) > 0.6).astype(np.float32) * 7000.0     # zero runs > L
+    const = np.full(240, 1.0, np.float32)
+    const[::37] = 0.997                                             # f32-jitter constant
+    Xp = np.stack([day, const], axis=1)
+    w = build_exog_windows(jnp.asarray(Xp), 24, 12, 240 - 24, "full")
+    z = _scale_exog(w, resolve_scaler("robust"), stats_len=24)
+    assert bool(jnp.all(jnp.isfinite(z)))
+    assert float(jnp.max(jnp.abs(z))) <= 105.0   # bound = 1/frac (+slack)
+
+
+def test_exog_scale_floor_inert_on_offset_covariate():
+    # Level-offset covariates (temperature-in-Kelvin class: mean >> spread) must
+    # NOT trip the floor: the spread-based form compares like with like, so the
+    # transform is bit-identical to the unfloored insample-robust scaling. A
+    # magnitude-based floor would fire on every window here and compress the
+    # channel ~10x.
+    from chronax.models.tcn.tcn_training import _scale_exog
+    rng = np.random.RandomState(3)
+    w = jnp.asarray(100.0 + 2.0 * rng.randn(4, 12, 2), jnp.float32)   # 100 +- 2
+    sc = RobustScaler()
+    shift, scale = sc.stats(w[:, :8], axis=1)
+    unfloored = (w - shift) / scale
+    np.testing.assert_array_equal(np.asarray(_scale_exog(w, sc, stats_len=8)),
+                                  np.asarray(unfloored))
