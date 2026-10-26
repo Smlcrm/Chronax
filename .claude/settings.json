@@ -1,0 +1,15 @@
+{
+  "extraKnownMarketplaces": {
+    "simulacrum": {
+      "source": {
+        "source": "github",
+        "repo": "Smlcrm/infra-agent-platform"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "sml-core@simulacrum": true,
+    "sml-oss@simulacrum": true
+  }
+}
+

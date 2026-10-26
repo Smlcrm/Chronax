@@ -185,3 +185,8 @@ docs/superpowers/
 
 # JAX persistent compile cache (benchmark harness, worker.py build_thread_env)
 benchmarks/.jax-compilation-cache/
+
+# The agent platform wiring is tracked; everything else under .claude/ stays local.
+!.claude/
+.claude/*
+!.claude/settings.json
