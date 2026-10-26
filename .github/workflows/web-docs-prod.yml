@@ -53,6 +53,10 @@ env:
   # Matches what Terraform sets on the runtime services, so generation and
   # Ask AI both hit the same endpoint.
   VERTEX_LOCATION: global
+  # The builder defaults to the alias gemini-flash-latest, which Vertex AI does
+  # not serve (404 NOT_FOUND). Pin a Vertex model id. The builder's default
+  # thinking level, "minimal", needs a Gemini 3 model.
+  GEMINI_MODEL: gemini-3-flash-preview
   BUILDER_IMAGE: us-central1-docker.pkg.dev/sml-artifacts-dev/sml-web-doc-docker/docgen-builder:latest
 
 jobs:
@@ -67,14 +71,21 @@ jobs:
 
       - name: Resolve the version being documented
         id: version
+        # The tag and the dispatch input come in through env, never as ${{ }}
+        # inside the script, so the shell reads them as data before the check.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_PUBLISHED_AT: ${{ github.event.release.published_at }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            VERSION="${{ inputs.version }}"
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            VERSION="${INPUT_VERSION}"
             RELEASED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           else
-            VERSION="${{ github.event.release.tag_name }}"
-            RELEASED="${{ github.event.release.published_at }}"
+            VERSION="${RELEASE_TAG}"
+            RELEASED="${RELEASE_PUBLISHED_AT}"
           fi
           # The tag becomes a directory name and a JSON value, verbatim.
           if ! printf '%s' "${VERSION}" | grep -Eq '^[A-Za-z0-9._-]+$'; then
@@ -130,14 +141,16 @@ jobs:
             -e GOOGLE_APPLICATION_CREDENTIALS \
             -e GOOGLE_CLOUD_PROJECT \
             -e GOOGLE_CLOUD_LOCATION \
+            -e GEMINI_MODEL \
             -v "${RUNNER_TEMP}:${RUNNER_TEMP}:ro" \
             -v "${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}:ro" \
             -v "${PWD}:/work" \
             -v "${PWD}/.docgen-cache:/app/.docgen-cache" \
             "${BUILDER_IMAGE}" \
             --repo /work --out /work/site --config /work/web-docs/docgen.toml \
-            --version "${{ steps.version.outputs.version }}"
+            --version "${DOCS_VERSION}"
         env:
+          DOCS_VERSION: ${{ steps.version.outputs.version }}
           GOOGLE_CLOUD_PROJECT: ${{ env.VERTEX_PROJECT_ID }}
           GOOGLE_CLOUD_LOCATION: ${{ env.VERTEX_LOCATION }}
 
