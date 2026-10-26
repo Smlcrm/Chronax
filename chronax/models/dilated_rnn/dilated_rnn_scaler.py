@@ -1,7 +1,7 @@
 """Per-window scaler for DilatedRNN: RobustScaler (median / MAD).
 
 neuralforecast's ``DilatedRNN`` defaults to ``scaler_type="robust"``, which is
-``TemporalNorm`` with ``robust_statistics`` — median as the shift and the median
+``TemporalNorm`` with ``robust_statistics``, median as the shift and the median
 absolute deviation as the scale, computed over the TIME axis of each insample
 window, with the same statistics reused to scale the target and to invert the
 prediction.
@@ -19,8 +19,8 @@ from typing import Protocol, runtime_checkable
 
 import jax.numpy as jnp
 
-# scipy.stats.norm.ppf(0.75) — relates MAD to std under normality. Matches the
-# constant NF's robust_statistics uses for its MAD==0 fallback.
+# scipy.stats.norm.ppf(0.75), relates MAD to std under normality. Matches the
+# constant neuralforecast's robust_statistics uses for its MAD==0 fallback.
 _MAD_TO_STD = 0.6744897501960817
 _EPS = 1e-6
 
@@ -56,7 +56,7 @@ def _masked_mean(x: jnp.ndarray, mask: jnp.ndarray | None, axis: int) -> jnp.nda
 
 
 class IdentityScaler:
-    """No-op scaler — the ``scaler_type="identity"`` path."""
+    """No-op scaler, the ``scaler_type="identity"`` path."""
 
     def stats(
         self, x: jnp.ndarray, axis: int = 1, mask: jnp.ndarray | None = None
@@ -73,7 +73,7 @@ class IdentityScaler:
 
 
 class StandardScaler:
-    """Mean / population-std scaler — the ``scaler_type="standard"`` path."""
+    """Mean / population-std scaler, the ``scaler_type="standard"`` path."""
 
     def stats(
         self, x: jnp.ndarray, axis: int = 1, mask: jnp.ndarray | None = None
@@ -93,7 +93,7 @@ class StandardScaler:
 class RobustScaler:
     """Median + MAD scaler with 0.6745*std fallback when MAD=0.
 
-    Mirrors NF ``robust_statistics``: the fallback uses the Gaussian relationship
+    Mirrors neuralforecast ``robust_statistics``: the fallback uses the Gaussian relationship
     ``MAD ~= 0.6745*sigma`` to estimate MAD when the empirical MAD degenerates to
     zero (e.g. a near-constant window), then forces any remaining zero to 1.0 and
     adds ``eps``.

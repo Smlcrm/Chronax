@@ -1,4 +1,5 @@
-"""Window construction and JIT-compiled training/predict steps for the GRU."""
+"""Window construction and JIT-compiled training/predict steps for the gated recurrent
+unit (GRU) forecaster."""
 from __future__ import annotations
 
 import jax
@@ -70,7 +71,7 @@ def train(
 
     The training loop runs as a single `nnx.scan`, which makes the entire
     function `jax.vmap`-traceable. Mutable Flax NNX state (model parameters,
-    optimizer momentum) flows through the scan as `nnx.Carry` — NNX handles
+    optimizer momentum) flows through the scan as `nnx.Carry`, NNX handles
     the graph-vs-state separation internally.
 
     Per-step batches are pre-sampled outside the scan so the body is a pure
@@ -83,7 +84,7 @@ def train(
     windows = build_windows(y, input_size, h)
     n_windows = windows.shape[0]
 
-    # Pre-sample per-step batch indices. One choice() call → [max_steps, B];
+    # Pre-sample per-step batch indices. One choice() call -> [max_steps, B];
     # the scan then iterates over the leading axis.
     key = jax.random.PRNGKey(seed)
     batch_idx = jax.random.choice(

@@ -1,8 +1,9 @@
 """Flax NNX modules for the KAN forecaster.
 
-Faithful port of neuralforecast.KAN's KANLinear: each layer learns the activation
-on every input edge as a B-spline. Weights are kept in torch layout so the
-weight-parity gate is a pure copy. Univariate; all-float32.
+Port of neuralforecast.KAN's KANLinear: each layer learns the activation on
+every input edge as a B-spline. Weights are kept in torch layout, so a
+neuralforecast state_dict copies over without transposing. Univariate;
+all-float32.
 """
 from __future__ import annotations
 
@@ -20,7 +21,7 @@ class _Grid(nnx.Variable):
 
 def build_grid(in_features: int, grid_size: int, spline_order: int,
                grid_range: tuple[float, float]) -> jnp.ndarray:
-    """Deterministic knot grid [in_features, grid_size + 2*spline_order + 1] (NF kan.py:42-51)."""
+    """Deterministic knot grid ``[in_features, grid_size + 2*spline_order + 1]`` (as in neuralforecast)."""
     lo, hi = grid_range
     h = (hi - lo) / grid_size
     knots = jnp.arange(-spline_order, grid_size + spline_order + 1, dtype=jnp.float32) * h + lo
@@ -38,7 +39,7 @@ def b_splines(x: jnp.ndarray, grid: jnp.ndarray, spline_order: int) -> jnp.ndarr
 
 
 def _kaiming_uniform(key, shape, fan_in: int, a: float) -> jnp.ndarray:
-    """torch.nn.init.kaiming_uniform_ for a weight whose fan_in is given explicitly."""
+    """``torch.nn.init.kaiming_uniform_`` for a weight whose fan_in is given explicitly."""
     gain = math.sqrt(2.0 / (1.0 + a * a))            # calculate_gain('leaky_relu', a)
     bound = math.sqrt(3.0) * gain / math.sqrt(fan_in)
     return jax.random.uniform(key, shape, jnp.float32, minval=-bound, maxval=bound)
@@ -46,7 +47,10 @@ def _kaiming_uniform(key, shape, fan_in: int, a: float) -> jnp.ndarray:
 
 def _curve2coeff(x_pts: jnp.ndarray, y: jnp.ndarray, grid: jnp.ndarray,
                  spline_order: int) -> jnp.ndarray:
-    """Least-squares spline coeffs. x_pts:[N, in], y:[N, in, out] -> [out, in, coeff] (NF kan.py:132-162)."""
+    """Least-squares spline coeffs (neuralforecast ``curve2coeff``).
+
+    x_pts:[N, in], y:[N, in, out] -> [out, in, coeff].
+    """
     A = jnp.transpose(b_splines(x_pts, grid, spline_order), (1, 0, 2))   # [in, N, coeff]
     B = jnp.transpose(y, (1, 0, 2))                                       # [in, N, out]
     sol = jax.vmap(lambda a, b: jnp.linalg.lstsq(a, b)[0])(A, B)          # [in, coeff, out]
@@ -75,7 +79,7 @@ class KANLinear(nnx.Module):
             self.spline_scaler = nnx.Param(
                 _kaiming_uniform(ks, (out_features, in_features), in_features, math.sqrt(5) * scale_spline)
             )
-        # spline_weight via curve2coeff on noise at the interior grid points (NF kan.py:75-90)
+        # spline_weight via curve2coeff on noise at the interior grid points, as in neuralforecast
         noise = (jax.random.uniform(kn, (grid_size + 1, in_features, out_features), jnp.float32) - 0.5) \
                 * scale_noise / grid_size
         x_pts = grid.T[spline_order:-spline_order]                        # [grid_size+1, in]

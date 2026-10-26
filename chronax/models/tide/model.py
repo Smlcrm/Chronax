@@ -1,9 +1,9 @@
 """JAX/Flax TiDE model.
 
-Faithful port of Nixtla NeuralForecast's ``TiDE`` (Time-series Dense Encoder).
-Pure JAX/Flax/Optax — no PyTorch, no scipy.
+Faithful port of Nixtla neuralforecast's ``TiDE`` (Time-series Dense Encoder).
+Pure JAX/Flax/Optax: no PyTorch, no scipy.
 
-Architecture:
+Architecture::
 
     x        ← insample_y                               # [B, L]
     x_skip   ← Dense(h * output_size)(x)               # [B, h, output_size]
@@ -45,7 +45,7 @@ class TiDEConfig:
     Attributes:
         h: Forecast horizon.
         input_size: History window length ``L``.
-        hidden_size: MLP hidden width for encoder/decoder blocks.
+        hidden_size: Multilayer perceptron (MLP) hidden width for encoder/decoder blocks.
         decoder_output_dim: Per-step output dimension of the dense decoder.
         temporal_decoder_dim: Hidden size of the temporal decoder MLP block.
         dropout: Dropout rate (0 = disabled).
@@ -56,7 +56,7 @@ class TiDEConfig:
         futr_exog_size: Number of future exogenous features ``F``.
         hist_exog_size: Number of historic exogenous features ``X``.
         stat_exog_size: Number of static exogenous features ``S``.
-        output_size: Outputs per step — 1 for point forecasts.
+        output_size: Outputs per step; 1 for point forecasts.
     """
 
     h: int = 24

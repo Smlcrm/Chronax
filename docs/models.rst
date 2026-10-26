@@ -5,21 +5,21 @@ All models are importable from ``chronax.models`` and follow the
 ``fit()`` → ``predict()`` interface defined by
 :class:`~chronax.models.base_forecaster.BaseForecaster`.
 
-Base Class
+Base class
 ----------
 
 .. automodule:: chronax.models.base_forecaster
    :members:
    :undoc-members:
 
-Multi-Series
+Multi-series
 ------------
 
 .. autoclass:: chronax.models.BatchedForecaster
    :members:
    :undoc-members:
 
-Automatic Models
+Automatic models
 ----------------
 
 .. autoclass:: chronax.models.AutoARIMA
@@ -46,7 +46,7 @@ Automatic Models
    :members:
    :undoc-members:
 
-Exponential Smoothing
+Exponential smoothing
 ---------------------
 
 .. autoclass:: chronax.models.Holt
@@ -101,7 +101,7 @@ Decomposition
    :members:
    :undoc-members:
 
-Multi-Frequency
+Multi-frequency
 ---------------
 
 .. autoclass:: chronax.models.TBATS
@@ -112,7 +112,7 @@ Multi-Frequency
    :members:
    :undoc-members:
 
-Baseline Methods
+Baseline methods
 ----------------
 
 .. autoclass:: chronax.models.Naive
@@ -139,7 +139,7 @@ Baseline Methods
    :members:
    :undoc-members:
 
-Intermittent Demand
+Intermittent demand
 -------------------
 
 .. autoclass:: chronax.models.CrostonClassic
@@ -158,7 +158,7 @@ Intermittent Demand
    :members:
    :undoc-members:
 
-Deep Learning
+Deep learning
 -------------
 
 .. autoclass:: chronax.models.iTransformer
@@ -217,15 +217,11 @@ Deep Learning
    :members:
    :undoc-members:
 
+.. autoclass:: chronax.models.SOFTS
+   :members:
+   :undoc-members:
+
 .. autoclass:: chronax.models.SOFTSSharp
-   :members:
-   :undoc-members:
-
-.. autoclass:: chronax.models.TCN
-   :members:
-   :undoc-members:
-
-.. autoclass:: chronax.models.StemGNN
    :members:
    :undoc-members:
 
@@ -250,5 +246,41 @@ Deep Learning
    :undoc-members:
 
 .. autoclass:: chronax.models.TimeXer
+   :members:
+   :undoc-members:
+
+.. autoclass:: chronax.models.DLinear
+   :members:
+   :undoc-members:
+
+.. autoclass:: chronax.models.NLinear
+   :members:
+   :undoc-members:
+
+.. autoclass:: chronax.models.XLinear
+   :members:
+   :undoc-members:
+
+.. autoclass:: chronax.models.RMoK
+   :members:
+   :undoc-members:
+
+.. autoclass:: chronax.models.NBEATS
+   :members:
+   :undoc-members:
+
+.. autoclass:: chronax.models.TiDE
+   :members:
+   :undoc-members:
+
+.. autoclass:: chronax.models.TSMixer
+   :members:
+   :undoc-members:
+
+.. autoclass:: chronax.models.RNN
+   :members:
+   :undoc-members:
+
+.. autoclass:: chronax.models.DeepAR
    :members:
    :undoc-members:

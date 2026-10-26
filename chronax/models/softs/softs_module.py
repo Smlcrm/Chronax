@@ -4,8 +4,8 @@ Univariate JAX/Flax-NNX port of ``neuralforecast.SOFTS`` (Han et al. 2024,
 "SOFTS: Efficient Multivariate Time Series Forecasting with Series-Core Fusion",
 arXiv:2404.14197).
 
-SOFTS shares iTransformer's "inverted" skeleton — each *variate* (series) is a
-token, with the lookback window L embedded as the token feature vector — but
+SOFTS shares iTransformer's "inverted" skeleton, each *variate* (series) is a
+token, with the lookback window L embedded as the token feature vector, but
 replaces the O(C^2) self-attention across tokens with the O(C) **STAD** (STar
 Aggregate-Dispatch) module: every series is fused into a single global *core*
 representation, which is then dispatched back and concatenated onto each series.
@@ -38,7 +38,7 @@ class _TorchLinearInit:
     torch draws both weight and bias from ``U(-1/sqrt(fan_in), 1/sqrt(fan_in))``
     (Kaiming-uniform with ``a=sqrt(5)`` reduces to this bound). Flax's
     ``nnx.Linear`` defaults to ``lecun_normal`` instead, so matching torch here is
-    what makes training trajectories — and thus accuracy — comparable to
+    what makes training trajectories, and thus accuracy, comparable to
     neuralforecast. ``fan_in`` is the layer's ``in_features`` (the bias shares the
     weight's fan_in).
     """
@@ -66,7 +66,7 @@ def _resolve_activation(name: str):
 
 
 def _gelu(z: jnp.ndarray) -> jnp.ndarray:
-    """Exact (erf) GELU — matches torch ``F.gelu`` used inside NF's STAD."""
+    """Exact (erf) GELU, matches torch ``F.gelu`` used inside neuralforecast's STAD."""
     return jax.nn.gelu(z, approximate=False)
 
 
@@ -121,7 +121,7 @@ class RevIN(nnx.Module):
 class DataEmbeddingInverted(nnx.Module):
     """Inverted embedding: each variate's lookback becomes a token.
 
-    Mirrors NF ``DataEmbedding_inverted``: permute ``[B, L, N] -> [B, N, L]`` then
+    Mirrors neuralforecast ``DataEmbedding_inverted``: permute ``[B, L, N] -> [B, N, L]`` then
     ``Linear(input_size -> hidden_size)`` (the lookback length is the feature dim),
     followed by dropout. Exogenous/time marks are not supported (univariate, no
     covariates), so the ``x_mark`` concat path is omitted.
@@ -142,24 +142,24 @@ class DataEmbeddingInverted(nnx.Module):
 
 
 class STAD(nnx.Module):
-    """STar Aggregate-Dispatch module — SOFTS's series-core fusion block.
+    """STar Aggregate-Dispatch module, SOFTS's series-core fusion block.
 
     Replaces the encoder's self-attention. Given per-series tokens
     ``input: [B, C, d_series]`` (``d_series = hidden_size``, ``C`` = number of
     variate tokens):
 
-    1. **Set FFN** ``h = gen2(gelu(gen1(input)))`` -> ``[B, C, d_core]``.
+    1. **Set feed-forward network (FFN)** ``h = gen2(gelu(gen1(input)))`` -> ``[B, C, d_core]``.
     2. **Aggregate into a core** (pool across the ``C`` axis into a single
        representation, then broadcast it back to all ``C`` series):
 
-       - *train* (``deterministic=False``): STOCHASTIC pooling — for each
+       - *train* (``deterministic=False``): STOCHASTIC pooling, for each
          ``(batch, core-dim)`` sample one series index from ``softmax(h)`` over the
-         ``C`` axis (NF ``torch.multinomial``) and gather that series' value.
+         ``C`` axis (neuralforecast ``torch.multinomial``) and gather that series' value.
        - *eval* (``deterministic=True``): the softmax-weighted mean over the ``C``
-         axis (NF's inference branch).
+         axis (neuralforecast's inference branch).
     3. **Dispatch + fuse** ``output = gen4(gelu(gen3([input, core])))`` -> ``[B, C, d_series]``.
 
-    Cost is O(C) in the number of series, versus O(C^2) for attention — the point
+    Cost is O(C) in the number of series, versus O(C^2) for attention, the point
     of SOFTS. The multinomial sample draws a fresh key from ``rngs`` each forward;
     under the training ``nnx.scan`` the key stream is threaded through the carry
     exactly like ``nnx.Dropout``'s, so successive steps sample independently.
@@ -195,8 +195,8 @@ class STAD(nnx.Module):
             core = jnp.sum(combined * weight, axis=1, keepdims=True)  # [B, 1, d_core]
         else:
             # Training: stochastic pooling. jax.random.categorical takes LOGITS and
-            # softmaxes internally, so passing `combined` reproduces NF's
-            # softmax(combined) -> multinomial. nan_to_num matches NF exactly.
+            # softmaxes internally, so passing `combined` reproduces neuralforecast's
+            # softmax(combined) -> multinomial. nan_to_num matches neuralforecast exactly.
             logits = jnp.nan_to_num(combined)               # [B, C, d_core]
             key = self.rngs.pooling()
             idx = jax.random.categorical(key, logits, axis=1)          # [B, d_core]
@@ -210,7 +210,7 @@ class STAD(nnx.Module):
 class TransEncoderLayer(nnx.Module):
     """One SOFTS encoder layer (post-norm), STAD in place of attention.
 
-    NF ``TransEncoderLayer.forward`` (with STAD as the "attention")::
+    neuralforecast ``TransEncoderLayer.forward`` (with STAD as the "attention")::
 
         new_x, _ = STAD(x)
         x = x + dropout(new_x)
@@ -221,7 +221,7 @@ class TransEncoderLayer(nnx.Module):
 
     The two ``Conv1d(kernel_size=1)`` layers are mathematically pointwise linear
     maps over the channel axis, so they are implemented as ``nnx.Linear`` (no
-    transpose needed). ``activation`` is exact GELU (NF passes ``F.gelu``).
+    transpose needed). ``activation`` is exact GELU (neuralforecast passes ``F.gelu``).
     """
 
     def __init__(self, *, hidden_size, d_core, d_ff, dropout,
@@ -249,22 +249,22 @@ class TransEncoderLayer(nnx.Module):
 
 
 class TransEncoder(nnx.Module):
-    """Stack of ``e_layers`` encoder layers. NO final LayerNorm — see below.
+    """Stack of ``e_layers`` encoder layers. NO final LayerNorm, see below.
 
-    NF's ``common._modules.TransEncoder`` takes an OPTIONAL ``norm_layer`` and
+    neuralforecast's ``common._modules.TransEncoder`` takes an OPTIONAL ``norm_layer`` and
     applies it only ``if self.norm is not None``. SOFTS builds the encoder
     positionally::
 
         TransEncoder([TransEncoderLayer(STAD(...), ...) for l in range(e_layers)])
 
     with no ``norm_layer`` argument, so the reference has no final normalization
-    and the encoder output feeds ``projection`` directly — NF's ``state_dict``
+    and the encoder output feeds ``projection`` directly, neuralforecast's ``state_dict``
     has no ``encoder.norm.*`` entry at all.
 
     The difference is subtler than it looks, and worth stating precisely: every
     layer already ENDS in ``norm2``, so an extra final LayerNorm is near-identity
     at initialization (re-normalizing an already-normalized vector). What it is
-    not is free — its scale and bias are learnable, so it would hand the port
+    not is free, its scale and bias are learnable, so it would hand the port
     ``2 * hidden_size`` trainable parameters the reference does not have, and a
     learned per-feature affine applied immediately before the projector.
     """

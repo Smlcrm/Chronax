@@ -2,7 +2,7 @@
 
 Each loss has signature ``(pred, target, mask=None) -> scalar``. When ``mask`` is
 given it is a per-element 0/1 weight and the reduction is the masked mean
-``sum(loss*mask)/sum(mask)`` — matching neuralforecast's ``_weighted_mean``, used
+``sum(loss*mask)/sum(mask)``, matching neuralforecast's ``_weighted_mean``, used
 to drop right-padded horizon steps from the training loss.
 """
 from __future__ import annotations

@@ -39,7 +39,7 @@ class MultiQuantileLoss:
     """Multi-quantile (pinball) loss. ``__call__(pred[...,h,Q], target[...,h])``.
 
     ``QL(y, y_hat, q) = q*(y-y_hat)+ + (1-q)*(y_hat-y)+``, SUMMED over quantiles
-    and averaged over all other elements — neuralforecast's effective reduction
+    and averaged over all other elements, neuralforecast's effective reduction
     (its ``1/len(quantiles)`` factor is dead); the trainer's masked inline
     branch computes the same reduction. Quantiles are sorted, must lie in (0, 1), and must include
     0.5 (the median / ``"mean"`` head). Picklable (holds a plain tuple).
@@ -58,7 +58,7 @@ class MultiQuantileLoss:
         q = jnp.asarray(self.quantiles, dtype=pred.dtype)        # [Q]
         err = target[..., None] - pred                            # [..., h, Q]
         ql = jnp.maximum(q * err, (q - 1.0) * err)                # pinball
-        return jnp.mean(jnp.sum(ql, axis=-1))                     # NF: sum over Q, mean elsewhere
+        return jnp.mean(jnp.sum(ql, axis=-1))                     # neuralforecast: sum over Q, mean elsewhere
 
     def __eq__(self, other):  # value equality: same-quantile instances are
         return type(other) is type(self) and other.quantiles == self.quantiles
@@ -73,7 +73,7 @@ def outputsize_multiplier(loss) -> int:
 
 
 def resolve(loss: "str | LossFn | MultiQuantileLoss"):
-    """Return a callable loss from a registry string, a callable, or an MQ instance."""
+    """Return a callable loss from a registry string, a callable, or a multi-quantile (MQ) instance."""
     if callable(loss):
         return loss
     if loss not in LOSSES:

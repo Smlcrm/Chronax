@@ -56,13 +56,11 @@ def train(model: SOFTSNet, y: jnp.ndarray, *, h: int, input_size: int,
     The whole loop is one ``nnx.scan`` (carry = (model, optimizer)), which keeps the
     function ``jax.vmap``-traceable for ``BaseForecaster.conformity_scores``. Window
     sampling replicates neuralforecast's REGIME-DEPENDENT scheme (``_base_model.py``
-    training_step): when ``n_windows < windows_batch_size`` NF draws
-    ``windows_batch_size`` indices WITH replacement (oversampling with duplicates —
-    the regime small benchmark series hit, e.g. ~25 windows for AirlinePassengers at
-    input_size=72, h=24, both << the batch size); otherwise it takes a
-    without-replacement permutation of ``windows_batch_size`` windows. Getting this
-    branch right is load-bearing for accuracy parity, so we do NOT collapse it to a
-    full batch.
+    training_step): when ``n_windows < windows_batch_size`` neuralforecast draws
+    ``windows_batch_size`` indices WITH replacement (oversampling with duplicates,
+    which is the regime short series fall into); otherwise it takes a
+    without-replacement permutation of ``windows_batch_size`` windows. The branch
+    matters for accuracy parity, so it is not collapsed to a full batch.
 
     STAD's stochastic pooling and the dropout layers both draw from the model's
     ``nnx.Rngs``; because the model is the scan carry, those key streams advance per
@@ -80,11 +78,11 @@ def train(model: SOFTSNet, y: jnp.ndarray, *, h: int, input_size: int,
     step_keys = jax.random.split(key, max_steps)
 
     if n_windows < windows_batch_size:
-        # NF: torch.randint(0, n_windows, size=(windows_batch_size,)) — WITH replacement.
+        # neuralforecast: torch.randint(0, n_windows, size=(windows_batch_size,)), WITH replacement.
         def sample_one(k):
             return jax.random.choice(k, n_windows, shape=(windows_batch_size,), replace=True)
     else:
-        # NF: torch.randperm(n_windows)[:windows_batch_size] — WITHOUT replacement.
+        # neuralforecast: torch.randperm(n_windows)[:windows_batch_size], WITHOUT replacement.
         def sample_one(k):
             return jax.random.permutation(k, n_windows)[:windows_batch_size]
 

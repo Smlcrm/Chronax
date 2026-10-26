@@ -1,37 +1,42 @@
 """
 File: loss_functions.py
 
-High-level Purpose:
+High-level purpose:
     Defines reusable deterministic and probabilistic forecasting loss/metric
     functions implemented with JAX tensors for model training and evaluation.
 
-Problem Solved:
+Problem solved:
     Consolidates metric implementations in one module to enforce consistent
     error calculations across experiments, benchmarking, and validation tests.
 
-Architectural Role:
+Architectural role:
     Serves as the metrics utility layer consumed by forecasting models,
     evaluation scripts, and the corresponding test suite.
 
-Major Classes/Functions:
-    - Scale-dependent metrics: MAE, MSE, RMSE, bias, CFE, PIS, SPIS.
-    - Percentage and scaled metrics: MAPE, SMAPE, MASE-family variants.
-    - Quantile/probabilistic metrics: quantile loss, multi-quantile loss,
-      CRPS-like scaled score, coverage, calibration.
+Major classes/functions:
+    - Scale-dependent metrics: mean absolute error (MAE), mean squared error
+      (MSE), root mean squared error (RMSE), bias, cumulative forecast error
+      (CFE), period in stock (PIS), scaled PIS (SPIS).
+    - Percentage and scaled metrics: mean absolute percentage error (MAPE),
+      symmetric MAPE (SMAPE), mean absolute scaled error (MASE), mean squared
+      scaled error (MSSE), root MSSE (RMSSE).
+    - Quantile/probabilistic metrics: quantile loss, multi-quantile loss
+      (MQL), scaled variants (SQL, SMQL), a scaled continuous ranked
+      probability score (CRPS) approximation, coverage, calibration.
     - `tweedie_deviance` for generalized exponential dispersion error families.
 
-External Dependencies:
+External dependencies:
     - `jax`, `jax.numpy`
     - `jax.scipy.special.xlogy`
 
-Expected Inputs and Outputs:
+Expected inputs and outputs:
     - Input: JAX-compatible tensors for targets/predictions and optional
       auxiliary arrays (seasonal baselines, quantiles, power parameters).
     - Output: scalar or tensor metric values as `jnp.ndarray`.
 
 Example:
     >>> import jax.numpy as jnp
-    >>> from loss_functions import mean_absolute_error
+    >>> from chronax.utils.loss_functions import mean_absolute_error
     >>> y = jnp.array([1.0, 2.0, 3.0])
     >>> y_hat = jnp.array([1.2, 1.9, 2.8])
     >>> float(mean_absolute_error(y, y_hat))
@@ -41,16 +46,11 @@ Assumptions:
     - Array shapes are broadcast-compatible for each metric.
     - Inputs satisfy domain constraints for metrics that require positivity.
 
-Side Effects:
+Side effects:
     - None. Functions are pure numeric computations.
-
-Author:
-    Auto-documented
-Date:
-    2026-02-21
 """
 
-# Part 1: Scale-dependent Erros
+# Part 1: Scale-dependent errors
 import jax
 import jax.numpy as jnp
 from jax.scipy.special import xlogy
@@ -63,7 +63,7 @@ def mean_absolute_error(y: Array, y_pred: Array) -> Array:
   """
   Compute the mean absolute error between observed and predicted values.
 
-  Detailed Description:
+  Details:
       Computes the average of the absolute element-wise differences between
       the target array `y` and the prediction array `y_pred`. This is a
       scale-dependent metric: larger magnitudes in the data yield larger MAE.
@@ -81,7 +81,7 @@ def mean_absolute_error(y: Array, y_pred: Array) -> Array:
   Raises:
       None. Invalid or non-finite inputs produce non-finite output.
 
-  Side Effects:
+  Side effects:
       None. Pure function.
 
   Example:
@@ -102,7 +102,7 @@ def mean_squared_error(y: Array, y_pred: Array) -> Array:
   """
   Compute the mean squared error between observed and predicted values.
 
-  Detailed Description:
+  Details:
       Computes the average of the squared element-wise errors (y - y_pred)^2.
       MSE is scale-dependent and penalizes large errors more than MAE. It is
       differentiable everywhere and is commonly used as a training objective and
@@ -119,7 +119,7 @@ def mean_squared_error(y: Array, y_pred: Array) -> Array:
   Raises:
       None. Non-finite inputs yield non-finite output.
 
-  Side Effects:
+  Side effects:
       None. Pure function.
 
   Example:
@@ -137,7 +137,7 @@ def root_mean_squared_error(y: Array, y_pred: Array) -> Array:
   """
   Compute the root mean squared error (RMSE) between observed and predicted values.
 
-  Detailed Description:
+  Details:
       Computes the square root of the mean squared error so that the result
       is in the same units as the target variable. RMSE is scale-dependent
       and is widely used for point-forecast accuracy reporting and comparison
@@ -154,7 +154,7 @@ def root_mean_squared_error(y: Array, y_pred: Array) -> Array:
   Raises:
       None. Non-finite inputs yield non-finite output.
 
-  Side Effects:
+  Side effects:
       None. Pure function.
 
   Example:
@@ -172,7 +172,7 @@ def bias(y: Array, y_pred: Array) -> Array:
   """
   Compute the signed forecast error (prediction minus actual) at each element.
 
-  Detailed Description:
+  Details:
       Returns the element-wise difference y_pred - y, i.e. positive values
       indicate over-forecasting and negative values indicate under-forecasting.
       Used to assess systematic bias in forecasts and in inventory/stock
@@ -189,7 +189,7 @@ def bias(y: Array, y_pred: Array) -> Array:
   Raises:
       None.
 
-  Side Effects:
+  Side effects:
       None. Pure function.
 
   Example:
@@ -202,12 +202,12 @@ def bias(y: Array, y_pred: Array) -> Array:
   """
   return y_pred - y
 
-## Culmulative Forecasting Errors
+## Cumulative forecast errors
 def cfe(y: Array, y_pred: Array) -> Array:
   """
   Compute the cumulative sum of forecast errors (actual minus predicted) over time.
 
-  Detailed Description:
+  Details:
       Forms the sequence of running totals of (y - y_pred). Positive values
       indicate persistent under-forecasting (actuals exceed predictions);
       negative values indicate persistent over-forecasting. Used in inventory
@@ -216,7 +216,7 @@ def cfe(y: Array, y_pred: Array) -> Array:
   Args:
       y (Array): Observed values, typically a 1D time series.
       y_pred (Array): Predicted values; same length/shape as ``y`` for
-      meaningful interpretation.
+          meaningful interpretation.
 
   Returns:
       Array: Cumulative sum of (y - y_pred), same shape as the flattened
@@ -226,7 +226,7 @@ def cfe(y: Array, y_pred: Array) -> Array:
   Raises:
       None.
 
-  Side Effects:
+  Side effects:
       None. Pure function.
 
   Example:
@@ -243,7 +243,7 @@ def pis(y: Array, y_pred: Array) -> Array:
   """
   Compute the absolute cumulative forecast error (Period In Stock style).
 
-  Detailed Description:
+  Details:
       Takes the cumulative sum of (y - y_pred) and returns its element-wise
       absolute value. Measures the magnitude of accumulated bias over time
       regardless of direction, used in inventory contexts to quantify
@@ -260,7 +260,7 @@ def pis(y: Array, y_pred: Array) -> Array:
   Raises:
       None.
 
-  Side Effects:
+  Side effects:
       None. Pure function.
 
   Example:
@@ -277,7 +277,7 @@ def spis(y: Array, y_pred: Array) -> Array:
   """
   Compute the scaled absolute cumulative forecast error (SPIS).
 
-  Detailed Description:
+  Details:
       Computes the absolute cumulative error (PIS), then scales it by its
       mean so that the resulting sequence has mean 1.0. This yields a
       scale-independent view of how cumulative error evolves relative to
@@ -296,7 +296,7 @@ def spis(y: Array, y_pred: Array) -> Array:
   Raises:
       None. Zero mean of PIS can yield inf/nan.
 
-  Side Effects:
+  Side effects:
       None. Pure function.
 
   Example:
@@ -316,7 +316,7 @@ def mean_absolute_percentage_error(y: Array, y_pred: Array) -> Array:
   """
   Compute the mean absolute percentage error (MAPE).
 
-  Detailed Description:
+  Details:
       Computes the mean of ``|y - y_pred|`` / (``|y|`` + eps), with a small epsilon
       to avoid division by zero. MAPE is scale-independent and expressed as
       a proportion (e.g. 0.05 for 5% average error). It is undefined or
@@ -335,7 +335,7 @@ def mean_absolute_percentage_error(y: Array, y_pred: Array) -> Array:
   Raises:
       None. Zero or negative `y` are stabilized, not raised.
 
-  Side Effects:
+  Side effects:
       None. Pure function.
 
   Example:
@@ -353,7 +353,7 @@ def symmetric_mean_absolute_percentage_error(y: Array, y_pred: Array) -> Array:
   """
   Compute the symmetric mean absolute percentage error (SMAPE).
 
-  Detailed Description:
+  Details:
       Computes the mean of ``|y - y_pred|`` / (``|y|`` + ``|y_pred|``), which is
       symmetric in actual and predicted and bounded between 0 and 1. Unlike
       MAPE, it remains defined when actuals or predictions are zero (except
@@ -370,7 +370,7 @@ def symmetric_mean_absolute_percentage_error(y: Array, y_pred: Array) -> Array:
   Raises:
       None. When both y and y_pred are zero, the term is 0/0 and may be nan.
 
-  Side Effects:
+  Side effects:
       None. Pure function.
 
   Example:
@@ -389,7 +389,7 @@ def mean_absolute_scaled_error(y: Array, y_pred: Array, y_seasonal: Array) -> Ar
   """
   Compute the mean absolute scaled error (MASE) using a seasonal naive baseline.
 
-  Detailed Description:
+  Details:
       Scales the mean absolute error of the model (``|y - y_pred|``) by the mean
       absolute error of a seasonal naive forecast (``|y - y_seasonal|``). Values
       below 1.0 indicate the model outperforms the naive baseline; above 1.0
@@ -400,16 +400,16 @@ def mean_absolute_scaled_error(y: Array, y_pred: Array, y_seasonal: Array) -> Ar
       y (Array): Observed values (typically out-of-sample).
       y_pred (Array): Model predictions; same shape as `y`.
       y_seasonal (Array): Seasonal naive baseline (e.g. previous season same
-      period); same shape as ``y``. Often y_seasonal[t] = y[t - period].
+          period); same shape as ``y``. Often y_seasonal[t] = y[t - period].
 
   Returns:
-      Array: Scalar MASE. Ratio of model MAE to baseline MAE; denominator
-          is stabilized with 1e-8 internally where needed.
+      Array: Scalar MASE, the ratio of model MAE to baseline MAE. No
+          denominator stabilization: a zero baseline MAE yields inf/nan.
 
   Raises:
-      None. Zero denominator is stabilized.
+      None. A zero denominator yields inf/nan.
 
-  Side Effects:
+  Side effects:
       None. Pure function.
 
   Example:
@@ -428,7 +428,7 @@ def relative_mean_absolute_error(y: Array, y_pred: Array, y_base: Array) -> Arra
   """
   Compute the relative mean absolute error (RelMAE) against an arbitrary baseline.
 
-  Detailed Description:
+  Details:
       Divides the mean absolute error of the model (``|y - y_pred|``) by the mean
       absolute error of a baseline forecast (``|y - y_base|``). Values below 1.0
       mean the model beats the baseline; above 1.0 means the baseline is
@@ -444,9 +444,9 @@ def relative_mean_absolute_error(y: Array, y_pred: Array, y_base: Array) -> Arra
       Array: Scalar RelMAE. Ratio of model MAE to baseline MAE.
 
   Raises:
-      None. Zero denominator is stabilized.
+      None. A zero denominator yields inf/nan.
 
-  Side Effects:
+  Side effects:
       None. Pure function.
 
   Example:
@@ -465,7 +465,7 @@ def normalized_deviation(y: Array, y_pred: Array) -> Array:
   """
   Compute the normalized total absolute deviation by total observed value.
 
-  Detailed Description:
+  Details:
       Divides the sum of absolute errors (``|y - y_pred|``) by the sum of
       observed values (y). Yields a scale-independent ratio interpretable as
       total absolute error per unit of total demand/volume. Used in
@@ -482,7 +482,7 @@ def normalized_deviation(y: Array, y_pred: Array) -> Array:
   Raises:
       None. Zero sum(y) can yield inf/nan.
 
-  Side Effects:
+  Side effects:
       None. Pure function.
 
   Example:
@@ -501,7 +501,7 @@ def mean_squared_scaled_error(y: Array, y_pred: Array, y_seasonal: Array) -> Arr
   """
   Compute the mean squared scaled error (MSSE) using a seasonal baseline.
 
-  Detailed Description:
+  Details:
       Scales the mean squared error of the model by the MSE of a seasonal
       naive forecast (y vs y_seasonal). Analogous to MASE but for squared
       errors; values below 1.0 indicate the model outperforms the baseline.
@@ -518,7 +518,7 @@ def mean_squared_scaled_error(y: Array, y_pred: Array, y_seasonal: Array) -> Arr
   Raises:
       None. Zero denominator can yield inf/nan.
 
-  Side Effects:
+  Side effects:
       None. Pure function.
 
   Example:
@@ -537,7 +537,7 @@ def root_mean_squared_scaled_error(y: Array, y_pred: Array, y_seasonal: Array) -
   """
   Compute the root mean squared scaled error (RMSSE) using a seasonal baseline.
 
-  Detailed Description:
+  Details:
       Computes the element-wise squared error scaled by baseline MSE, then
       takes the mean of the square roots (so each term is in "RMSE units"
       relative to the baseline), and returns the mean of those. Produces a
@@ -555,7 +555,7 @@ def root_mean_squared_scaled_error(y: Array, y_pred: Array, y_seasonal: Array) -
   Raises:
       None. Zero denominator can yield inf/nan.
 
-  Side Effects:
+  Side effects:
       None. Pure function.
 
   Example:
@@ -574,7 +574,7 @@ def quantile_loss(y: jnp.ndarray, y_pred: jnp.ndarray, q: float) -> jnp.ndarray:
     """
     Compute the mean quantile (pinball) loss for a single quantile level.
 
-    Detailed Description:
+    Details:
         For each observation, the loss is q * (y - y_pred) when y > y_pred
         (under-prediction) and (q - 1) * (y - y_pred) when y <= y_pred
         (over-prediction). The mean over all observations is returned. This
@@ -595,7 +595,7 @@ def quantile_loss(y: jnp.ndarray, y_pred: jnp.ndarray, q: float) -> jnp.ndarray:
     Raises:
         None. q outside [0, 1] is not checked; behavior may be unintuitive.
 
-    Side Effects:
+    Side effects:
         None. Pure function.
 
     Example:
@@ -616,7 +616,7 @@ def scaled_quantile_loss(y: jnp.ndarray, y_pred: jnp.ndarray, q: float, y_season
     """
     Compute the scaled quantile loss (SQL): quantile loss normalized by baseline MAE.
 
-    Detailed Description:
+    Details:
         Computes the mean quantile (pinball) loss for level q, then divides by
         the mean absolute error of a seasonal naive baseline (y vs y_seasonal).
         This makes the metric scale-independent and comparable across series.
@@ -639,7 +639,7 @@ def scaled_quantile_loss(y: jnp.ndarray, y_pred: jnp.ndarray, q: float, y_season
     Raises:
         None.
 
-    Side Effects:
+    Side effects:
         None. Pure function.
 
     Example:
@@ -660,7 +660,7 @@ def multi_quantile_loss(y: jnp.ndarray, y_pred: jnp.ndarray, quantiles: jnp.ndar
     """
     Compute the mean multi-quantile (pinball) loss across multiple quantile levels.
 
-    Detailed Description:
+    Details:
         For each quantile level and each observation, computes the pinball
         loss (as in quantile_loss). The implementation uses broadcasting:
         errors = y - y_pred (across quantiles), then applies
@@ -669,8 +669,8 @@ def multi_quantile_loss(y: jnp.ndarray, y_pred: jnp.ndarray, quantiles: jnp.ndar
         several quantile predictions (e.g. 0.1, 0.5, 0.9).
 
     Args:
-        y (jnp.ndarray): True values. May be (N,) expanded to (N, Q) or (N, Q)
-            directly; must broadcast with y_pred.
+        y (jnp.ndarray): True values, shape (N,); expanded to (N, 1)
+            internally to broadcast against ``y_pred``.
 
         y_pred (jnp.ndarray): Predicted quantiles; shape (N, Q) for N samples
             and Q quantile levels.
@@ -683,7 +683,7 @@ def multi_quantile_loss(y: jnp.ndarray, y_pred: jnp.ndarray, quantiles: jnp.ndar
     Raises:
         None.
 
-    Side Effects:
+    Side effects:
         None. Pure function.
 
     Example:
@@ -702,7 +702,7 @@ def scaled_multi_quantile_loss(y: jnp.ndarray, y_pred_quantiles: jnp.ndarray, qu
     """
     Compute the scaled multi-quantile loss (SMQL): MQL normalized by baseline MAE.
 
-    Detailed Description:
+    Details:
         Computes the multi-quantile (pinball) loss across all quantile levels,
         then divides by the mean absolute error of a seasonal naive baseline
         (y vs y_seasonal). Yields a scale-independent score for full
@@ -722,7 +722,7 @@ def scaled_multi_quantile_loss(y: jnp.ndarray, y_pred_quantiles: jnp.ndarray, qu
     Raises:
         None.
 
-    Side Effects:
+    Side effects:
         None. Pure function.
 
     Example:
@@ -741,7 +741,7 @@ def coverage(y: jnp.ndarray, y_lo: jnp.ndarray, y_hi: jnp.ndarray) -> jnp.ndarra
     """
     Compute the empirical coverage rate of a prediction interval.
 
-    Detailed Description:
+    Details:
         Counts the fraction of observations where the true value y lies within
         the interval [y_lo, y_hi]. For a well-calibrated (1 - alpha) interval
         (e.g. 90%), coverage should be close to (1 - alpha). Used to assess
@@ -760,7 +760,7 @@ def coverage(y: jnp.ndarray, y_lo: jnp.ndarray, y_hi: jnp.ndarray) -> jnp.ndarra
     Raises:
         None.
 
-    Side Effects:
+    Side effects:
         None. Pure function.
 
     Example:
@@ -773,12 +773,12 @@ def coverage(y: jnp.ndarray, y_lo: jnp.ndarray, y_hi: jnp.ndarray) -> jnp.ndarra
     covered = (y >= y_lo) & (y <= y_hi)
     return jnp.mean(covered)
 
-## Calibrartion
+## Calibration
 def calibration(y: jnp.ndarray, y_pred: jnp.ndarray) -> jnp.ndarray:
     """
     Compute the empirical calibration rate for a quantile forecast.
 
-    Detailed Description:
+    Details:
         Returns the fraction of observations where the true value y is less
         than or equal to the predicted quantile y_pred. For a correctly
         calibrated q-quantile forecast, this fraction should be close to q.
@@ -795,7 +795,7 @@ def calibration(y: jnp.ndarray, y_pred: jnp.ndarray) -> jnp.ndarray:
     Raises:
         None.
 
-    Side Effects:
+    Side effects:
         None. Pure function.
 
     Example:
@@ -812,7 +812,7 @@ def scaled_crps(y: jnp.ndarray,y_pred: jnp.ndarray,quantiles: jnp.ndarray,) -> j
     """
     Compute a scaled approximation to the Continuous Ranked Probability Score (CRPS).
 
-    Detailed Description:
+    Details:
         Uses the multi-quantile loss (MQL) as a discrete approximation to the
         CRPS, then scales by (2 * MQL * N) / (sum of ``|y|``) so the result is
         scale-independent and comparable across series. Larger values indicate
@@ -831,7 +831,7 @@ def scaled_crps(y: jnp.ndarray,y_pred: jnp.ndarray,quantiles: jnp.ndarray,) -> j
     Raises:
         None.
 
-    Side Effects:
+    Side effects:
         None. Pure function.
 
     Example:
@@ -853,7 +853,7 @@ def tweedie_deviance(y: jnp.ndarray, y_pred: jnp.ndarray, power: float) -> jnp.n
     """
     Compute the Tweedie deviance for exponential-dispersion family distributions.
 
-    Detailed Description:
+    Details:
         Evaluates the unit deviance for the Tweedie family parameterized by
         `power`. Special cases: power=0 (Gaussian/MSE), power=1 (Poisson),
         power=2 (Gamma). For 1 < power < 2 the distribution is compound
@@ -863,23 +863,24 @@ def tweedie_deviance(y: jnp.ndarray, y_pred: jnp.ndarray, power: float) -> jnp.n
         y_pred has an extra dimension).
 
     Args:
-        y (jnp.ndarray): True observed values; shape (N,) or (N,) for
-            broadcasting. Must be non-negative for power >= 1; strictly
-            positive for power >= 2.
+        y (jnp.ndarray): True observed values; shape (N,), expanded to (N, 1)
+            when ``y_pred`` is (N, M). Must be non-negative for power >= 1;
+            strictly positive for power >= 2.
         y_pred (jnp.ndarray): Predicted values; shape (N,) or (N, M) for M
             models. Must be strictly positive.
         power (float): Tweedie power parameter: 0 (Gaussian), 1 (Poisson),
             in (1, 2) (compound Poisson-Gamma), 2 (Gamma), >2 (inverse Gaussian).
 
     Returns:
-        jnp.ndarray: Mean deviance (scalar or per-model if y_pred is (N, M)).
-            Same units as squared error for power=0.
+        jnp.ndarray: Scalar mean deviance over all observations (and over
+            models when ``y_pred`` is (N, M)). Same units as squared error
+            for power=0.
 
     Raises:
         ValueError: If power < 0; if power >= 2 and any y <= 0; if any
             y_pred <= 0.
 
-    Side Effects:
+    Side effects:
         None. Pure function.
 
     Example:
@@ -888,7 +889,7 @@ def tweedie_deviance(y: jnp.ndarray, y_pred: jnp.ndarray, power: float) -> jnp.n
 
     Notes:
         Role: Proper scoring rule for count and positive continuous targets
-        in forecasting and GLM fitting; supports heterogeneous variance
+        in forecasting and generalized linear model fitting; supports heterogeneous variance
         (e.g. variance proportional to mean^power).
     """
     if power < 0:
@@ -918,4 +919,4 @@ def tweedie_deviance(y: jnp.ndarray, y_pred: jnp.ndarray, power: float) -> jnp.n
             - y_clip * (y_pred ** (1 - power)) / (1 - power)
             + y_pred ** (2 - power) / (2 - power)
         )
-    return jnp.mean(dev)  # shape (M,)
+    return jnp.mean(dev)

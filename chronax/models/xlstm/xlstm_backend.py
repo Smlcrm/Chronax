@@ -1,4 +1,4 @@
-"""xLSTM / xLSTMTime numerics — pure-functional JAX.
+"""xLSTM / xLSTMTime numerics: pure-functional JAX.
 
 Implements mLSTM/sLSTM cells FOLLOWING Beck et al. 2024 (log-space
 stabilizer trick), with documented deviations from the NX-AI reference
@@ -7,17 +7,17 @@ raw), ``±gate_clip`` on i/f pre-activations (reference has none), exp forget
 default (reference v1.x sLSTM code is sigmoid-only), glorot/flat-bias inits
 (reference: zeros-R + powerlaw/linspace forget bias). Adds xLSTMTime-
 INSPIRED extensions (Alharthi & Mahmood 2024, adapted to time-axis
-recurrence — see the model docstring): reversible instance normalization
+recurrence, see the model docstring): reversible instance normalization
 (RevIN), learnable moving-average series decomposition, and a direct
 linear forecast head as an alternative to autoregressive decoding.
 
 Master params are held in float32. Compute dtype is config-static
-(``XLSTMConfig.compute_dtype``), DEFAULT ``"float32"``: bf16 is several times
-SLOWER on XLA-CPU for a prediction drift around 0.1% of scale, so
-``"bfloat16"`` is opt-in for GPU work, where it mirrors the canonical CUDA
-kernel's dtype policy. The stabilizer
-state m_t and the rescaled gate scalars i_stab, f_stab are kept in float32
-in either mode to bound numerical drift on long sequences.
+(``XLSTMConfig.compute_dtype``), default ``"float32"``. ``"bfloat16"`` is
+opt-in for graphics processing unit (GPU) work, where it mirrors the canonical CUDA kernel's dtype
+policy; XLA (Accelerated Linear Algebra) on the central processing unit (CPU)
+has no fast bf16 path. The stabilizer state m_t and the
+rescaled gate scalars i_stab, f_stab are kept in float32 in either mode to
+bound numerical drift on long sequences.
 
 All public functions are pure (no class state). They are intended to be
 wrapped by lru_cache'd jit builders in :mod:`xlstm_functions`.
@@ -44,9 +44,7 @@ class XLSTMConfig:
     as ``static_argnames`` to ``jax.jit``. Values flow into shape decisions
     and never get traced.
 
-    New (xLSTMTime) fields default to the original mLSTM/AR recipe so the
-    existing call sites and tests continue to produce bit-identical
-    behavior.
+    The xLSTMTime fields default to the plain mLSTM/autoregressive (AR) recipe.
     """
     embed_dim: int = 64       # D
     num_heads: int = 4        # H
@@ -57,7 +55,7 @@ class XLSTMConfig:
     gate_clip: float = 8.0
     eps: float = 1e-6
 
-    # xLSTMTime extensions (defaults preserve current behavior)
+    # xLSTMTime extensions
     block_types: Tuple[str, ...] = ("mlstm", "mlstm")  # length must equal num_layers
     use_revin: bool = False
     revin_affine: bool = True
@@ -67,14 +65,12 @@ class XLSTMConfig:
     horizon: int = 8          # static; required when decode_mode == "direct"
     use_conv1d_in_slstm: bool = False
     conv1d_kernel: int = 4
-    # sLSTM cell semantics. Defaults reproduce the original Chronax behavior;
-    # "sigmoid"/"per_cell" match the FlashRNN/xLSTM equations (Eq. 13-15,
-    # arXiv 2412.07752) for the GATE and STABILIZER only — the max(|n|,1)
-    # floor and gate_clip remain deliberate deviations (module docstring).
-    slstm_forget_gate: str = "exp"      # "exp" (current) | "sigmoid" (log-sigmoid forget)
-    slstm_stabilizer: str = "per_head"  # "per_head" (current) | "per_cell" (per Eq.15)
+    # sLSTM cell semantics. "sigmoid"/"per_cell" follow the xLSTM equations
+    # (Eq. 13-15, arXiv 2412.07752) for the gate and stabilizer only; the
+    # max(|n|,1) floor and gate_clip apply in every form (module docstring).
+    slstm_forget_gate: str = "exp"      # "exp" (raw pre-activation) | "sigmoid" (log-sigmoid)
+    slstm_stabilizer: str = "per_head"  # "per_head" | "per_cell" (Eq. 15)
     # Compute dtype for forward/backward (params master copy stays float32).
-    # "float32" default — bf16 is several times slower on XLA-CPU.
     compute_dtype: str = "float32"      # "float32" | "bfloat16"
 
     def __post_init__(self):
@@ -104,8 +100,7 @@ class XLSTMConfig:
 
 
 def _compute_dtype(cfg: "XLSTMConfig"):
-    # getattr: configs pickled before compute_dtype existed restore without the
-    # field — decode them at f32 instead of crashing.
+    # getattr: a pickled config may lack the compute_dtype field; decode at f32.
     return (
         jnp.bfloat16
         if getattr(cfg, "compute_dtype", "float32") == "bfloat16"
@@ -179,7 +174,7 @@ def _glorot(key, shape, dtype=jnp.float32):
 
 
 def _glorot_per_head(key, H, fan_in, fan_out):
-    """Glorot uniform but draw independently per head — returns shape (H, fan_in, fan_out)."""
+    """Glorot uniform drawn independently per head; returns shape (H, fan_in, fan_out)."""
     bound = jnp.sqrt(6.0 / (fan_in + fan_out))
     return random.uniform(key, (H, fan_in, fan_out), dtype=jnp.float32, minval=-bound, maxval=bound)
 
@@ -302,7 +297,7 @@ def _layer_norm(x, scale, bias, eps):
 
 
 def _per_head_norm(x, scale, bias, eps):
-    # x: (..., H, Dh) — normalize over last axis (per-head)
+    # x: (..., H, Dh); normalize over last axis (per-head)
     mean = jnp.mean(x, axis=-1, keepdims=True)
     var = jnp.var(x, axis=-1, keepdims=True)
     x_norm = (x - mean) * lax.rsqrt(var + eps)
@@ -320,9 +315,9 @@ def revin_normalize(x: jnp.ndarray, p: dict, eps: float = 1e-5):
     If ``p`` is a non-empty dict, applies learnable affine ``gamma * x_norm + beta``.
 
     The stats are stop-gradiented (canonical RevIN ``.detach()``s them). This
-    is provably accuracy-invariant here — mu/sigma are functions of the input
-    data only, never of params, so no gradient w.r.t. params flows through
-    them — and pruning the dead gradient subgraph speeds up training.
+    is accuracy-invariant here: mu/sigma are functions of the input data only,
+    never of params, so no gradient w.r.t. params flows through them. Pruning
+    the dead gradient subgraph speeds up training.
     """
     mu = lax.stop_gradient(jnp.mean(x, axis=0, keepdims=True))
     sigma = lax.stop_gradient(jnp.sqrt(jnp.var(x, axis=0, keepdims=True) + eps))
@@ -335,7 +330,7 @@ def revin_normalize(x: jnp.ndarray, p: dict, eps: float = 1e-5):
 def revin_denormalize(y: jnp.ndarray, p: dict, stats: dict, eps: float = 1e-5):
     """Inverse of :func:`revin_normalize`. y: (H,) or (H, D_in).
 
-    Divides by ``gamma + eps**2`` (canonical RevIN form) — guards a
+    Divides by ``gamma + eps**2`` (canonical RevIN form), which guards a
     trained-to-zero gamma. At gamma ~ 1 the 1e-10 shift is below f32
     resolution, so predictions are bit-identical to the unguarded form.
     """
@@ -371,7 +366,7 @@ def _block_output(h_seq, gate_in_seq, residual_seq, block_params, cfg: XLSTMConf
 
     h_seq: (..., H, Dh) raw cell outputs; gate_in_seq / residual_seq: (..., D).
     Applies per-head group-norm, flatten, SiLU gating, down-projection, residual.
-    Identical math to the per-step block tail — just batched over T.
+    Identical math to the per-step block tail, batched over T.
     """
     D = cfg.embed_dim
     h_norm = _per_head_norm(
@@ -388,7 +383,7 @@ def mlstm_recurrence_step(precomp_t, state: BlockState, cfg: XLSTMConfig):
 
     precomp_t = (q, k, v, i_pre, f_pre, o_pre): q/k/v/o_pre (H, Dh) compute-dtype,
     i_pre/f_pre (H,) float32 (already clipped). Only the C/n/m update and retrieval
-    depend on ``state`` — all input-side projections are precomputed upstream
+    depend on ``state``; all input-side projections are precomputed upstream
     (FlashRNN: apply W to all timesteps before the recurrent loop).
     """
     q, k, v, i_pre, f_pre, o_pre = precomp_t
@@ -464,15 +459,15 @@ def mlstm_block_step(block_params, x_t, state: BlockState, cfg: XLSTMConfig):
 def mlstm_block_forward(block_params, x_seq, init_state: BlockState, cfg: XLSTMConfig):
     """Run an mLSTM block over a sequence x_seq: (T, D).
 
-    Input-side ops (pre-LN, up-projection, qkv + gate projections) are computed for
+    Input-side ops (pre-layer-norm (LN), up-projection, qkv + gate projections) are computed for
     the whole sequence up front; only the C/n/m memory recurrence runs in the scan,
     and the block tail is vectorized over T. Numerically equivalent to scanning
     ``mlstm_block_step`` (the AR-decode path), up to compute-dtype reassociation.
 
-    Perf: hoisting the input GEMMs out of the (irreducibly sequential) time loop is
-    faster on CPU/XLA at the context lengths this model uses (ctx_len <= ~128; default
-    64 -> ~1.3-1.4x). Beyond ~T=256 it becomes memory-bandwidth bound and regresses
-    vs. per-step recompute; on GPU it wins at all sizes (the FlashRNN regime).
+    Hoisting the input GEMMs out of the irreducibly sequential time loop turns
+    T small matmuls into one large one, which XLA schedules on its fast dot
+    path at the short context lengths this model uses; at very long contexts
+    the hoisted activations become memory-bandwidth bound.
     """
     x_n = _layer_norm(
         x_seq, block_params["pre_ln"]["scale"], block_params["pre_ln"]["bias"], cfg.eps
@@ -489,7 +484,7 @@ def mlstm_block_forward(block_params, x_seq, init_state: BlockState, cfg: XLSTMC
     return out, final_state
 
 
-# Backward-compat alias (older tests referenced `block_step` / `block_forward`)
+# Backward-compatible aliases.
 block_step = mlstm_block_step
 block_forward = mlstm_block_forward
 
@@ -528,11 +523,11 @@ def slstm_recurrence_step(R_stacked, Wx_t, state: SLSTMBlockState, cfg: XLSTMCon
     z_t = jnp.tanh(pre[3]).astype(dtype)
 
     # Forget gate: the paper (Eq.13-15) uses log-sigmoid; "exp" keeps the raw
-    # preactivation (original Chronax behavior). cfg is static -> jit/vmap-safe.
+    # preactivation. cfg is static -> jit/vmap-safe.
     logf = jax.nn.log_sigmoid(f_pre) if cfg.slstm_forget_gate == "sigmoid" else f_pre
 
     # Stabilizer: "per_cell" keeps m per (head, cell) as in the paper (Eq.15);
-    # "per_head" broadcasts one per-head scalar and recollapses (original).
+    # "per_head" broadcasts one per-head scalar and recollapses.
     m_prev = state.m if cfg.slstm_stabilizer == "per_cell" else state.m[:, None]
     m_new = jnp.maximum(logf + m_prev, i_pre)   # (H, Dh)
     i_stab = jnp.exp(i_pre - m_new)
@@ -586,7 +581,7 @@ def _causal_conv1d(x_seq, conv_W, conv_b, kernel: int):
 
 
 def slstm_block_step(block_params, x_t, state: SLSTMBlockState, cfg: XLSTMConfig):
-    """One sLSTM block, one timestep (no conv1d — conv runs at block-forward level)."""
+    """One sLSTM block, one timestep (no conv1d; conv runs at block-forward level)."""
     D = cfg.embed_dim
     x_n = _layer_norm(x_t, block_params["pre_ln"]["scale"], block_params["pre_ln"]["bias"], cfg.eps)
     up = x_n @ block_params["up_proj"]["W"] + block_params["up_proj"]["b"]
@@ -607,7 +602,7 @@ def slstm_block_forward(block_params, x_seq, init_state: SLSTMBlockState, cfg: X
     (pre-LN, up-proj, the four W·x gate projections) are computed for the whole
     sequence up front; only R·h and the c/n/m recurrence run in the scan.
 
-    See ``mlstm_block_forward`` for the CPU large-T perf tradeoff. sLSTM is
+    See ``mlstm_block_forward`` for the hoisting trade-off. sLSTM is
     irreducibly sequential: its R·h memory mixing has no parallel-scan form (this is
     the state-tracking property), so only the per-step constant factor is reducible.
     """
@@ -704,8 +699,8 @@ def xlstm_forward(params, x_seq, cfg: XLSTMConfig):
     Returns
     -------
     (preds, final_states)
-        AR mode: preds shape (T,) float32 — per-position next-step prediction.
-        Direct mode: preds shape (cfg.horizon,) float32 — direct multi-step forecast.
+        AR mode: preds shape (T,) float32, per-position next-step prediction.
+        Direct mode: preds shape (cfg.horizon,) float32, direct multi-step forecast.
         final_states: tuple of per-block carry states (only meaningful in AR mode).
     """
     cdt = _compute_dtype(cfg)
@@ -741,8 +736,8 @@ def xlstm_forward(params, x_seq, cfg: XLSTMConfig):
     # RevIN denorm (only meaningful for the prediction part)
     if cfg.use_revin and revin_stats is not None:
         revin_p = params.get("revin", {})
-        # Direct mode: pred is (H,) — broadcasts against (1,) stats fine.
-        # AR mode: pred is (T,) — same broadcast.
+        # Direct mode: pred is (H,); broadcasts against (1,) stats.
+        # AR mode: pred is (T,); same broadcast.
         pred = revin_denormalize(pred, revin_p, revin_stats)
         pred = pred.squeeze() if pred.ndim > 1 else pred
 
@@ -759,17 +754,17 @@ def decode(params, z_tail, h_steps: int, cfg: XLSTMConfig):
     Parameters
     ----------
     params : float32 pytree.
-    z_tail : (ctx_len,) float32 — caller-normalized (z-score) when RevIN is off,
+    z_tail : (ctx_len,) float32; caller-normalized (z-score) when RevIN is off,
         RAW original-scale when RevIN is on (RevIN normalizes internally).
     h_steps : Python int (static). Number of forecast steps.
     cfg : XLSTMConfig (must have decode_mode == "ar").
 
     Returns
     -------
-    preds : (h_steps,) float32 — normalized scale when RevIN is off (caller
+    preds : (h_steps,) float32; normalized scale when RevIN is off (caller
         denormalizes with its z-score stats), original scale when RevIN is on.
 
-    ⚠ ``use_decomposition`` + AR decode is incoherent: the rollout continues
+    ``use_decomposition`` + AR decode is incoherent: the rollout continues
     from the trend branch's states only and never re-decomposes new steps.
     Decomposition is designed for ``decode_mode='direct'``.
     """

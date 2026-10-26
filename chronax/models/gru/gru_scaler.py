@@ -1,4 +1,5 @@
-"""Scaler protocol for GRU (and future neural models) + RobustScaler.
+"""Scaler protocol for the gated recurrent unit (GRU) forecaster (and future neural
+models) + RobustScaler.
 
 The protocol intentionally exposes (stats, transform, inverse) as separate
 methods so the same shift/scale can be reused for inverse-transforming
@@ -10,7 +11,7 @@ from typing import Protocol, runtime_checkable
 
 import jax.numpy as jnp
 
-# scipy.stats.norm.ppf(0.75) — relates MAD to std under normality.
+# scipy.stats.norm.ppf(0.75), relates MAD to std under normality.
 _MAD_TO_STD = 0.6744897501960817
 _EPS = 1e-6
 
@@ -48,7 +49,7 @@ def _masked_mean(x: jnp.ndarray, mask: jnp.ndarray | None, axis: int) -> jnp.nda
 class RobustScaler:
     """Median + MAD scaler with 0.6745*std fallback when MAD=0.
 
-    The fallback uses the Gaussian relationship `MAD ≈ 0.6745·σ` to estimate
+    The fallback uses the Gaussian relationship `MAD ~ 0.6745*std` to estimate
     MAD when the empirical MAD degenerates to zero (e.g. near-constant input).
     """
 

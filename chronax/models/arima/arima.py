@@ -2,9 +2,9 @@
 File: arima.py
 
 High-level Purpose:
-    Provides a production ARIMA forecaster wrapper with a stable class interface
-    for fitting and forecasting univariate time-series with optional exogenous
-    regressors.
+    Provides an autoregressive integrated moving average (ARIMA) forecaster
+    with a stable class interface for fitting and forecasting univariate
+    time series.
 
 Problem Solved:
     Encapsulates ARIMA estimation and forecasting mechanics so downstream
@@ -14,8 +14,8 @@ Problem Solved:
 Architectural Role:
     Sits at the model-interface layer of the forecasting system, delegating
     low-level estimation and Kalman/ARIMA math to `auto_arima.py` while
-    exposing a `BaseForecaster` compatible API for training, forecasting, and
-    interval prediction.
+    exposing a `BaseForecaster` compatible application programming interface
+    (API) for training, forecasting, and interval prediction.
 
 Major Classes/Functions:
     - `ARIMA`: Fixed-order ARIMA estimator with fit/forecast/predict paths.
@@ -26,14 +26,13 @@ External Dependencies:
     - Internal modules: `auto_arima`, `base_forecaster`, `utils`
 
 Expected Inputs and Outputs:
-    - Input: historical series (`jnp.ndarray`-compatible), forecast horizon, and
-      optional exogenous regressor matrices.
+    - Input: historical series (`jnp.ndarray`-compatible) and forecast horizon.
     - Output: dictionaries containing mean forecasts and optional prediction
       intervals.
 
 Example:
     >>> import jax.numpy as jnp
-    >>> from arima import ARIMA
+    >>> from chronax.models.arima import ARIMA
     >>> model = ARIMA(order=(1, 1, 1), seasonal_order=(0, 0, 0), period=1)
     >>> model.fit(jnp.array([1.0, 2.0, 2.5, 3.0]))
     >>> preds = model.predict(h=3)
@@ -77,48 +76,39 @@ Array = jnp.ndarray
 
 class ARIMA(BaseForecaster):
     """
-    ARIMA
+    Fixed-order ARIMA forecaster.
 
-    Description:
-        Represents a fixed-order ARIMA forecaster that standardizes training
-        data for optimization stability and returns forecasts in the original
-        value scale.
-
-    Attributes:
-        uses_exog (bool): Indicates support for exogenous regressors.
-        order (tuple[int, int, int]): Non-seasonal ARIMA order `(p, d, q)`.
-        seasonal_order (tuple[int, int, int]): Seasonal ARIMA order `(P, D, Q)`.
-        period (int): Seasonal period length.
-        include_mean (bool): Whether to include intercept/drift term.
-        method (str): Optimization method selector (for example `CSS`, `ML`).
-        alias (str): Display name for external reporting.
-        ``model_`` (dict[str, Any] | None): Fitted model payload after ``fit``.
-        standardize (bool): Whether to standardize data before fitting.
-        _y_mean (jnp.ndarray | None): Cached training mean for de-normalization.
-        _y_std (jnp.ndarray | None): Cached training std for de-normalization.
-        _delta (jnp.ndarray): Differencing polynomial coefficients.
-        _arma (tuple[int, ...]): Expanded ARMA metadata tuple.
-        _narma (int): Number of ARMA parameters.
-        _ncxreg (int): Number of deterministic coefficients.
-        _n_exog (int): Number of exogenous regressors.
+    Fits a seasonal ARIMA model of a given order by conditional sum of
+    squares (CSS), maximum likelihood (ML), or CSS followed by ML, on a
+    standardized copy of the series, and returns forecasts on the original
+    scale. Intervals are analytic (Gaussian, from the forecast standard
+    errors) unless ``conformal_params`` is set, in which case they are
+    conformal. Exogenous regressors are not supported: ``fit``, ``forecast``
+    and ``predict`` raise ``ValueError`` when ``X`` (or ``X_future``) is given.
 
     Args:
-        order (tuple[int, int, int]): Non-seasonal ARIMA order.
-        seasonal_order (tuple[int, int, int]): Seasonal ARIMA order.
-        period (int): Seasonal frequency.
-        include_mean (bool): Include intercept/drift component.
-        method (str): Optimization strategy label.
-        alias (str): Friendly estimator alias.
-        standardize (bool): Standardize input series before fit.
+        order (tuple[int, int, int]): Non-seasonal order ``(p, d, q)``.
+            Default ``(0, 0, 0)``.
+        seasonal_order (tuple[int, int, int]): Seasonal order ``(P, D, Q)``.
+            Default ``(0, 0, 0)``.
+        period (int): Seasonal period. Default ``1``.
+        include_mean (bool): Include a constant mean (``d + D == 0``) or a
+            drift term (``d + D == 1``). No deterministic term is fitted when
+            ``d + D >= 2``. Default ``True``.
+        method (str): Estimation method: ``"CSS"``, ``"ML"`` or ``"CSS-ML"``
+            (case-insensitive substring match on ``"CSS"`` and ``"ML"``).
+            Default ``"CSS"``.
+        alias (str): Display name. Default ``"ARIMA"``.
+        standardize (bool): Standardize the series before fitting. Default
+            ``True``.
+        conformal_params (ConformalIntervals | None): Conformal interval
+            configuration. When set, ``fit`` caches conformity scores and
+            ``predict``/``forecast`` return conformal instead of analytic
+            intervals. Default ``None``.
 
-    Methods:
-        fit(): Estimate model parameters from training data.
-        forecast(): Run one-shot fit and produce horizon forecasts.
-        predict(): Forecast from an already-fitted model.
-
-    Returns:
-        Produces forecasts and optional prediction intervals through dictionary
-        outputs keyed by `mean`, `lo-<level>`, and `hi-<level>`.
+    Attributes:
+        model_ (dict[str, Any] | None): Fitted model payload after ``fit``.
+        y_train_ (jnp.ndarray): Standardized training series after ``fit``.
 
     Example:
         >>> import jax.numpy as jnp
@@ -126,12 +116,12 @@ class ARIMA(BaseForecaster):
         >>> model.fit(jnp.array([1.0, 1.5, 2.0, 2.2]))
         >>> model.predict(h=2)["mean"]
 
-    Notes:
-        This class is stateful and not thread-safe for concurrent mutation.
+    Note:
+        The instance is stateful and not thread-safe for concurrent mutation.
     """
-    # Exogenous support is not wired end-to-end on the stateless/CV paths
-    # (X is silently ignored there), so it is not advertised; passing X
-    # raises instead of silently dropping it.
+    # Exogenous support is not wired end-to-end on the stateless and
+    # cross-validation (CV) paths (X is silently ignored there), so it is not
+    # advertised; passing X raises instead of silently dropping it.
     uses_exog: bool = False
 
     def __init__(
@@ -146,39 +136,10 @@ class ARIMA(BaseForecaster):
         conformal_params: Optional[ConformalIntervals] = None,
     ) -> None:
         """
-        Initialize a fixed-order ARIMA estimator.
+        Store the configuration and precompute the differencing polynomial.
 
-        Detailed Description:
-            Stores configuration for ARIMA estimation and precomputes static
-            differencing metadata used during optimization and forecasting.
-
-        Args:
-            order (tuple[int, int, int]): Non-seasonal order `(p, d, q)`.
-            seasonal_order (tuple[int, int, int]): Seasonal order `(P, D, Q)`.
-            period (int): Seasonal cycle length.
-            include_mean (bool): Whether to include deterministic mean/drift.
-            method (str): Objective method strategy.
-            alias (str): User-facing model name.
-            standardize (bool): Enables series standardization.
-            conformal_params (ConformalIntervals | None): Conformal prediction
-                configuration; when set, ``fit`` caches conformity scores and
-                interval requests use conformal (not analytic) bounds.
-
-        Returns:
-            None: Constructor initializes estimator state.
-
-        Raises:
-            ValueError: Propagated by downstream array operations if invalid
-                seasonal period/order combinations are provided.
-
-        Side Effects:
-            Populates model configuration and cached polynomial metadata.
-
-        Example:
-            >>> model = ARIMA(order=(1, 1, 1), seasonal_order=(0, 0, 0), period=1)
-
-        Notes:
-            Parameter validation is largely deferred to fitting kernels.
+        Constructor arguments are documented in the class docstring.
+        Parameter validation is deferred to the fitting kernels.
         """
         self.order = order
         self.seasonal_order = seasonal_order
@@ -211,34 +172,27 @@ class ARIMA(BaseForecaster):
 
     def fit(self, y: jnp.ndarray, X: Optional[jnp.ndarray] = None) -> "ARIMA":
         """
-        Fit ARIMA parameters on a training series.
+        Fit the ARIMA parameters on a training series.
 
-        Detailed Description:
-            Converts inputs to float64 JAX arrays, optionally standardizes the
-            series, delegates parameter optimization to `arima_fit`, and stores
-            fitted state for subsequent `predict` calls.
+        Casts ``y`` to float64, standardizes it when ``standardize`` is set,
+        estimates the parameters with ``arima_fit`` and stores the fitted
+        state in ``model_``. When ``conformal_params`` is set, conformity
+        scores are computed on ``y`` and cached for ``predict``.
 
         Args:
-            y (jnp.ndarray): Training target series.
-            X (jnp.ndarray | None, optional): Optional exogenous matrix aligned with ``y``.
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            X (jnp.ndarray | None): Not supported; must be ``None``.
 
         Returns:
-            ARIMA: The fitted estimator instance.
+            ARIMA: The fitted estimator (``self``).
 
         Raises:
-            RuntimeError: Propagated from fitting internals if optimization
-                fails irrecoverably.
-
-        Side Effects:
-            Mutates ``model_``, ``y_train_``, and cached normalization statistics.
+            ValueError: If ``X`` is not ``None``, or if ``conformal_params`` is
+                set and ``y`` is too short for two cross-validation windows.
 
         Example:
             >>> model = ARIMA(order=(1, 1, 1))
             >>> _ = model.fit(jnp.array([10.0, 11.0, 13.0, 12.0]))
-
-        Notes:
-            Forecast reconstruction assumes the same differencing specification
-            that was used during fitting.
         """
         # No host round-trip: np.array(y) here would concretize traced inputs and
         # break conformity_scores' vmapped forecast->fit path.
@@ -283,41 +237,42 @@ class ARIMA(BaseForecaster):
 
     def forecast(self, h: int, y: jnp.ndarray, X: Optional[jnp.ndarray] = None, X_future: Optional[jnp.ndarray] = None, level: Optional[list] = None, fitted: bool = False) -> Dict[str, jnp.ndarray]:
         """
-        Fit and forecast in one call.
+        Fit and forecast in one stateless call.
 
-        Detailed Description:
-            Runs a fast one-shot ARIMA fit followed by a fused forecast kernel.
-            This pathway skips information-criteria computation and is intended
-            for low-overhead repeated forecasting from raw history.
+        Runs a one-shot fit of the configured order with the pure-``lax``
+        L-BFGS optimizer and a fused forecast kernel, and skips the
+        information criteria. Nothing is written to the instance. This is the
+        path ``conformity_scores`` vmaps over cross-validation windows, so
+        every operation in it traces under ``jax.vmap``.
 
         Args:
             h (int): Forecast horizon.
-            y (jnp.ndarray): Source training series.
-            X (jnp.ndarray | None, optional): Exogenous regressors. The fast path currently does not use exogenous variables.
-            X_future (jnp.ndarray | None, optional): Future exogenous regressors (unused; included for BaseForecaster compliance). Default is None.
-            level (list | None, optional): Confidence levels (0-100) for conformal
-                prediction intervals. Requires ``conformal_params``. Default is None.
-            fitted (bool, optional): Whether to return fitted values (unused; the
-                fast path computes forecasts only). Default is False.
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            X (jnp.ndarray | None): Not supported; must be ``None``.
+            X_future (jnp.ndarray | None): Not supported; must be ``None``.
+            level (list[int] | None): Confidence levels in (0, 100), e.g.
+                ``[80, 95]``. Analytic Gaussian intervals unless
+                ``conformal_params`` is set, then conformal intervals.
+                Default ``None``.
+            fitted (bool): Accepted for ``BaseForecaster`` API parity; unused.
+                Default ``False``.
 
         Returns:
-            dict[str, jnp.ndarray]: Forecast dictionary containing `mean`, plus
-            `lo-{l}`/`hi-{l}` conformal bounds when `level` is given.
+            dict[str, jnp.ndarray]: ``"mean"`` (shape ``(h,)``), plus
+            ``"lo-{lv}"`` and ``"hi-{lv}"`` (shape ``(h,)``) for each level
+            when ``level`` is given.
 
         Raises:
-            RuntimeError: Propagated if optimizer objective diverges.
-
-        Side Effects:
-            None on persistent fitted state; runs transient optimization only.
+            ValueError: If ``X`` or ``X_future`` is not ``None``; if ``level``
+                is given with ``conformal_params`` set and ``h`` differs from
+                ``conformal_params.h``; or if ``y`` is too short for two
+                cross-validation windows in that case.
 
         Example:
             >>> model = ARIMA(order=(1, 0, 1))
             >>> out = model.forecast(h=3, y=jnp.array([1.0, 2.0, 2.2, 3.0]))
             >>> out["mean"].shape
             (3,)
-
-        Notes:
-            Uses cached polynomial metadata from constructor configuration.
         """
         if X is not None or X_future is not None:
             raise ValueError(
@@ -361,8 +316,8 @@ class ARIMA(BaseForecaster):
 
         # _fit_model_scan (not jax.scipy BFGS): this path runs under
         # conformity_scores' vmap; the scan optimizer is batch-stable by
-        # construction and robust to BFGS's inconsistent line-search-failure
-        # returns.
+        # construction and unaffected by BFGS's inconsistent
+        # line-search-failure returns.
         if "CSS" in method:
             current_params = _fit_model_scan(
                 current_params, y_fit, None, self._delta, _objective_css,
@@ -389,7 +344,8 @@ class ARIMA(BaseForecaster):
             else:
                 current_params = current_params.at[_mi].set(0.0)
 
-        # --- Fused forecast: single XLA dispatch for params → forecast ---
+        # Fused forecast: one XLA (Accelerated Linear Algebra) dispatch from
+        # params to forecast.
         raw_fc, raw_se = _forecast_from_params(
             current_params, y_fit, self._delta,
             self._arma, self._ncxreg, self._n_exog, self.include_mean, h
@@ -428,34 +384,35 @@ class ARIMA(BaseForecaster):
         level: int | tuple[int, ...] | None = None,
     ) -> Dict[str, jnp.ndarray]:
         """
-        Generate forecasts from a fitted ARIMA model.
+        Forecast from the fitted model.
 
-        Detailed Description:
-            Uses stored fitted parameters to produce horizon forecasts and, when
-            requested, interval bounds computed from forecast standard errors.
+        Forecasts from the end-of-sample filtered state stored by ``fit`` and
+        maps the result back to the original scale. Intervals are analytic
+        (Gaussian, from the forecast standard errors) unless
+        ``conformal_params`` is set, in which case the conformity scores
+        cached by ``fit`` are used.
 
         Args:
-            h (int): Number of future steps to predict.
-            X (jnp.ndarray | None, optional): Optional exogenous future matrix.
-            level (int | tuple[int, ...] | None, optional): Confidence levels for interval generation.
+            h (int): Forecast horizon.
+            X (jnp.ndarray | None): Not supported; must be ``None``.
+            level (int | tuple[int, ...] | None): Confidence level(s) in
+                (0, 100), e.g. ``95`` or ``(80, 95)``. Default ``None``.
 
         Returns:
-            dict[str, jnp.ndarray]: Dictionary containing `mean` and optional
-            lower/upper interval keys.
+            dict[str, jnp.ndarray]: ``"mean"`` (shape ``(h,)``), plus
+            ``"lo-{lv}"`` and ``"hi-{lv}"`` (shape ``(h,)``) for each level
+            when ``level`` is given.
 
         Raises:
-            RuntimeError: If called before `fit`.
-
-        Side Effects:
-            None. Uses cached fitted state without mutating model parameters.
+            RuntimeError: If called before ``fit``.
+            ValueError: If ``X`` is not ``None``; or, with ``level`` given and
+                ``conformal_params`` set, if no conformity scores are cached
+                or ``h`` differs from ``conformal_params.h``.
 
         Example:
             >>> model = ARIMA(order=(1, 1, 1)).fit(jnp.array([1.0, 2.0, 3.0, 4.0]))
             >>> model.predict(h=2, level=95)["mean"].shape
             (2,)
-
-        Notes:
-            Interval widths for integrated models use cumulative uncertainty.
         """
         if self.model_ is None:
             raise RuntimeError("Model not fitted.")

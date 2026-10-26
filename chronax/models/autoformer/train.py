@@ -1,25 +1,26 @@
 """Training utilities for the Chronax Autoformer model.
 
-Pure JAX/Flax/Optax — no PyTorch, no numpy.
+Pure JAX/Flax/Optax, no PyTorch, no numpy.
 
 All long-lived state is held in ``flax.training.train_state.TrainState``
 and all randomness is threaded explicitly through ``jax.random.PRNGKey``.
 
-Two training paradigms are supported and can be mixed:
+Two training loops are supported and can be mixed:
 
 1. **Batch-based** (``train_step`` / ``eval_step`` / ``train_loop``):
    Accepts pre-scaled ``{insample_y, outsample_y, sample_mask}`` dicts and
-   optimises ``masked_mae`` (or any supplied loss).  Mirrors the RNN pattern.
+   optimises ``masked_mae`` (or any supplied loss).  Mirrors the recurrent
+   neural network (RNN) pattern.
 
 2. **Window-based** (``train_window_step`` / ``eval_window_step``):
    Accepts raw ``[B, input_size + h]`` windows, applies per-window
    ``RobustScaler`` internally, then optimises a simple ``mae`` / ``mse``.
-   Used by ``AutoformerForecaster`` to match neuralforecast's training.
+   Used by :class:`Autoformer` to match neuralforecast's training.
 
 Schedule helpers follow neuralforecast knobs:
-    ``make_lr_schedule`` — StepLR-style gamma=0.5 per decay.
-    ``sample_batch_indices`` — NF-style window sampling (with/without replacement).
-    ``should_stop_early`` — patience-based early-stop check.
+    ``make_lr_schedule``: StepLR-style gamma=0.5 per decay.
+    ``sample_batch_indices``: neuralforecast-style window sampling (with/without replacement).
+    ``should_stop_early``: patience-based early-stop check.
 """
 from __future__ import annotations
 
@@ -40,7 +41,7 @@ import numpy as np
 
 
 # ---------------------------------------------------------------------------
-# Module-level caches — ensure the same apply_fn / tx objects are reused
+# Module-level caches: ensure the same apply_fn / tx objects are reused
 # across TrainState instances so JAX JIT never recompiles for the same config.
 # ---------------------------------------------------------------------------
 
@@ -116,10 +117,10 @@ def sample_batch_indices(
     batch_size: int,
     n_steps: int,
 ) -> jax.Array:
-    """Sample ``[n_steps, batch_size]`` window indices (NF-style).
+    """Sample ``[n_steps, batch_size]`` window indices (neuralforecast-style).
 
-    With replacement when ``n_train < batch_size`` (NF ``torch.randint``);
-    without replacement via permutation slice otherwise (NF ``randperm[:B]``).
+    With replacement when ``n_train < batch_size`` (neuralforecast ``torch.randint``);
+    without replacement via permutation slice otherwise (neuralforecast ``randperm[:B]``).
     """
     keys = jax.random.split(key, n_steps)
     if n_train < batch_size:
@@ -155,7 +156,8 @@ def _path_str(path) -> str:
 def _independent_leaf_reinit(params: Any, seed: int) -> Any:
     """Re-draw Dense/Conv leaves with path-folded keys (independent per leaf).
 
-    Flax ``Module.init`` consumes one PRNG stream in call order; that joint
+    Flax ``Module.init`` consumes one pseudo-random number generator (PRNG)
+    stream in call order; that joint
     distribution couples parameters even when each marginal matches the usual
     ``U(-1/sqrt(fan_in), ·)`` / kaiming families. Path-folded redraw keeps those
     families and hyperparameters but removes call-order coupling. LayerNorm
@@ -368,7 +370,7 @@ def _window_forward_loss(
     """Forward + loss on raw ``[B, input_size + h]`` windows with per-window scaling."""
     insample = windows[:, :input_size]   # [B, L]
     target = windows[:, input_size:]     # [B, h]
-    out_mask = masks[:, input_size:]     # [B, h] — 0 on NF right-pad tail
+    out_mask = masks[:, input_size:]     # [B, h]; 0 on the neuralforecast right-pad tail
     shift, scale = _SCALER.stats(insample, axis=1)   # [B, 1] each
     insample_z = _SCALER.transform(insample, shift, scale)[..., None]  # [B, L, 1]
     target_z = _SCALER.transform(target, shift, scale)                 # [B, h]
@@ -513,7 +515,7 @@ def train_loop(
     """Drive ``train_step`` / ``eval_step`` over multiple epochs.
 
     ``train_batches`` can be a list (re-iterated each epoch) or a generator
-    (exhausted after one pass — materialise it first in that case).
+    (exhausted after one pass; materialise it first in that case).
     """
     if rng is None:
         rng = jax.random.PRNGKey(0)
@@ -650,7 +652,8 @@ def train(
     loss_chunk: List[jnp.ndarray] = []
     last_loss: Optional[jnp.ndarray] = None
 
-    # Per-step JIT + external gather (full lax.scan is slower for Autoformer on CPU).
+    # Per-step JIT + external gather: a full lax.scan is slower for Autoformer
+    # on the central processing unit (CPU).
     for step in range(max_steps):
         state, loss, _ = train_window_step(
             state,

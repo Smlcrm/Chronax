@@ -26,7 +26,7 @@ from chronax.utils import ConformalIntervals
 # variance of multiplicative / strongly-trending series before modelling, then
 # invert on the output. ``lambda = 0`` is the log transform. The lambda is
 # selected once at fit time by maximizing the Box-Cox profile log-likelihood
-# (the standard MLE), kept self-contained so this module does not depend on
+# (the standard maximum likelihood estimate, MLE), kept self-contained so this module does not depend on
 # another model's internals.
 
 _BOXCOX_LAMBDA_GRID = jnp.linspace(-1.0, 2.0, 31)  # step 0.1, includes 0.0 (log)
@@ -72,16 +72,70 @@ class TimeMixer(BaseForecaster):
     """TimeMixer: Decomposable Multiscale Mixing (flax.nnx port of
     neuralforecast.TimeMixer).
 
-    Wang et al., 2024 — https://openreview.net/pdf?id=7oLshfEIC2. The input
+    Wang et al., 2024: https://openreview.net/pdf?id=7oLshfEIC2. The input
     window is repeatedly downsampled into a scale pyramid; each scale is
     instance-normalized and season/trend-decomposed, seasons mix bottom-up and
     trends top-down through small Linear+GELU chains (Past-Decomposable
     Mixing), and per-scale predictors map every scale onto the horizon before
     the outputs are summed (Future-Multipredictor Mixing). Channel-dependent
     (default) and channel-independent modes are both supported, as are
-    moving-average and DFT decompositions and avg/max/conv downsampling.
-    Exogenous inputs are not modeled. Point losses; conformal intervals.
-    ``float32`` throughout.
+    moving-average and discrete Fourier transform (DFT) decompositions and
+    avg/max/conv downsampling. Exogenous inputs are not modeled. Point
+    losses; conformal intervals. ``float32`` throughout.
+
+    Args:
+        h (int): Forecast horizon the network is trained for.
+        input_size (int): Input window length ``L``; must be divisible by
+            ``down_sampling_window ** down_sampling_layers``. ``-1`` (default)
+            resolves to ``3 * h``.
+        d_model (int): Token embedding width. Default ``32``.
+        d_ff (int): Hidden width of the mixing chains. Default ``32``.
+        dropout (float): Dropout rate. Default ``0.1``.
+        e_layers (int): Past-Decomposable Mixing blocks. Default ``4``.
+        top_k (int): Frequencies kept by the ``"dft_decomp"`` seasonal
+            extractor. Default ``5``.
+        decomp_method (str): Season/trend split, ``"moving_avg"`` or
+            ``"dft_decomp"``. Default ``"moving_avg"``.
+        moving_avg (int): Odd kernel width of the moving-average
+            decomposition. Default ``25``.
+        channel_independence (int): ``0`` mixes series channels (channel
+            dependent); ``1`` treats each series independently. Default
+            ``0``.
+        down_sampling_layers (int): Downsampling steps, giving
+            ``down_sampling_layers + 1`` scales; must be ``>= 1``. Default
+            ``1``.
+        down_sampling_window (int): Downsampling factor per step. Default
+            ``2``.
+        down_sampling_method (str): ``"avg"``, ``"max"`` or ``"conv"``.
+            Default ``"avg"``.
+        use_norm (bool): Apply per-scale instance normalization. Default
+            ``True``.
+        decoder_input_size_multiplier (float): Must give
+            ``0 < ceil(input_size * multiplier) < input_size``; otherwise
+            unused. Default ``0.5``.
+        use_boxcox (bool): Box-Cox transform the series before training
+            (lambda chosen by maximum likelihood at ``fit``) and invert on
+            output; requires strictly positive ``y``. Default ``False``.
+        loss (str | callable): ``"mae"``, ``"mse"``, ``"huber"`` or a
+            callable ``(pred, target) -> scalar``. Default ``"mae"``.
+            Unknown names raise ``ValueError`` at ``fit``.
+        max_steps (int): Optimizer steps. Default ``1000``.
+        learning_rate (float): Adam learning rate (constant). Default ``1e-3``.
+        windows_batch_size (int): Training windows per step. Default ``32``.
+        random_seed (int): Seed for parameter init, batch sampling and
+            dropout. Default ``1``.
+        alias (str): Display name. Default ``"TimeMixer"``.
+
+    Note:
+        Set ``conformal_params`` to a :class:`~chronax.utils.ConformalIntervals`
+        to enable conformal intervals. ``model_`` holds the trained network
+        after ``fit``.
+
+    Raises:
+        ValueError: ``decoder_input_size_multiplier`` out of range; unknown
+            ``decomp_method`` or ``down_sampling_method``; even
+            ``moving_avg``; ``down_sampling_layers < 1``; or ``input_size``
+            not divisible by ``down_sampling_window ** down_sampling_layers``.
     """
 
     uses_exog = False
@@ -160,6 +214,23 @@ class TimeMixer(BaseForecaster):
 
     # ---- fit -----------------------------------------------------------------
     def fit(self, y, X=None) -> "TimeMixer":
+        """Train a fresh network on ``y`` and keep the raw series.
+
+        Args:
+            y (jnp.ndarray): Univariate series, shape ``(T,)`` with
+                ``T >= input_size + 1``; strictly positive when
+                ``use_boxcox=True``.
+            X (None): Exogenous inputs are not modeled; any value raises.
+
+        Returns:
+            TimeMixer: ``self``, with ``model_`` set.
+
+        Raises:
+            NotImplementedError: ``X`` is not ``None``.
+            ValueError: ``y`` is not 1-D, ``T < input_size + 1``,
+                ``use_boxcox=True`` with a non-positive entry in ``y``, or
+                ``loss`` is an unknown name.
+        """
         if X is not None:
             raise NotImplementedError("TimeMixer does not support exogenous inputs.")
         y = jnp.asarray(y, dtype=jnp.float32)
@@ -171,11 +242,10 @@ class TimeMixer(BaseForecaster):
                 f"(need at least input_size+1)."
             )
         if self.use_boxcox:
-            # Validation and lambda selection are eager-surface operations: a
-            # user-facing fit re-selects lambda for its concrete series, while
-            # conformal-CV re-fits (traced windows of the already-validated
-            # series) reuse the frozen value — the fitted-params-reuse class,
-            # which keeps this whole method vmap-traceable.
+            # Validation and lambda selection need a concrete series. A
+            # user-facing fit re-selects lambda; the conformal cross-validation
+            # re-fits (traced windows of the already-validated series) reuse
+            # the frozen value, which keeps this method vmap-traceable.
             if not (self._bc_frozen and self._bc_lambda is not None):
                 if bool(jnp.any(y <= 0)):
                     raise ValueError(
@@ -194,12 +264,32 @@ class TimeMixer(BaseForecaster):
         )
         self.model_ = net
         # Raw series kept so conformity_scores re-applies Box-Cox through the
-        # public forecast API.
+        # public forecast method.
         self._train_y = y
         return self
 
     # ---- predict -------------------------------------------------------------
     def predict(self, h, X=None, level=None) -> dict:
+        """Forecast the first ``h`` steps of the trained horizon.
+
+        Args:
+            h (int): Steps to return, ``1 <= h <= self.h``.
+            X (None): Ignored.
+            level (list[int] | None): Confidence levels in (0, 100), e.g.
+                ``[80, 95]``; conformal intervals, ``conformal_params``
+                required.
+
+        Returns:
+            dict: ``"mean"`` (shape ``(h,)``) plus ``"lo-{lv}"`` /
+            ``"hi-{lv}"`` (shape ``(h,)``) per level when ``level`` is given.
+
+        Raises:
+            RuntimeError: Called before ``fit``.
+            ValueError: ``h < 1`` or ``h > self.h``; ``level`` while
+                ``conformal_params`` is ``None``; or, from the conformal
+                path, the series is too short for two cross-validation
+                windows.
+        """
         if self.model_ is None or self._train_y is None:
             raise RuntimeError("Call fit(y) before predict(h).")
         if h < 1:
@@ -227,9 +317,27 @@ class TimeMixer(BaseForecaster):
         return fcst
 
     def conformity_scores(self, y, X=None):
-        """Walk-forward conformity scores; with ``use_boxcox=True`` the CV
-        re-fits reuse the lambda frozen by the eager ``fit`` (selection cannot
-        run on traced windows)."""
+        """Walk-forward conformity scores (see the base class).
+
+        With ``use_boxcox=True`` the cross-validation re-fits reuse the
+        lambda frozen by the eager ``fit``, because selection cannot run on
+        traced windows.
+
+        Args:
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            X (None): Passed through to the base class; ``forecast`` refuses
+                it inside the walk-forward.
+
+        Returns:
+            jnp.ndarray: Signed residuals, shape ``(n_windows, h)``.
+
+        Raises:
+            ValueError: ``use_boxcox=True`` on an unfitted estimator;
+                ``conformal_params`` is ``None``; or the series is too short
+                for two cross-validation windows.
+            NotImplementedError: ``X`` is not ``None`` (raised by ``forecast``
+                inside the walk-forward).
+        """
         if self.use_boxcox:
             if self._bc_lambda is None:
                 raise ValueError(
@@ -244,7 +352,24 @@ class TimeMixer(BaseForecaster):
 
     # ---- forecast ------------------------------------------------------------
     def forecast(self, y, h, X=None, X_future=None, level=None, fitted=False) -> dict:
-        """Stateless fit-then-predict."""
+        """Stateless fit-then-predict.
+
+        Args:
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            h (int): Steps to return, ``1 <= h <= self.h``.
+            X (None): Must be ``None``.
+            X_future (None): Must be ``None``.
+            level (list[int] | None): Confidence levels in (0, 100).
+            fitted (bool): Also return one-step-ahead in-sample predictions.
+
+        Returns:
+            dict: As :meth:`predict`, plus ``"fitted"`` (shape ``(T,)``, the
+            first ``input_size`` entries ``NaN``) when ``fitted=True``.
+
+        Raises:
+            NotImplementedError: ``X`` or ``X_future`` is not ``None``.
+            ValueError: Any ``fit`` or ``predict`` error.
+        """
         if X is not None or X_future is not None:
             raise NotImplementedError("TimeMixer does not support exogenous inputs.")
         self.fit(y)

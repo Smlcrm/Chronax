@@ -15,9 +15,9 @@ from chronax.models.dlinear.dlinear_scaler import Scaler
 def build_windows(y: jnp.ndarray, input_size: int, h: int) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Rolling training windows with neuralforecast-style right-padding.
 
-    Right-pads ``y`` with ``h`` zeros before unfolding (NF ``padder_train =
+    Right-pads ``y`` with ``h`` zeros before unfolding (neuralforecast ``padder_train =
     ConstantPad1d((0, h))``), yielding ``len(y) - input_size`` windows of length
-    ``input_size + h`` — including ~``h`` partial-horizon windows whose context
+    ``input_size + h``, including ~``h`` partial-horizon windows whose context
     reaches the end of the series. Returns ``(windows, mask)`` where ``mask`` is
     1 on real points and 0 on the padded tail, so the loss can drop padded
     horizon steps. The insample (first ``input_size``) of every window is fully
@@ -25,7 +25,7 @@ def build_windows(y: jnp.ndarray, input_size: int, h: int) -> tuple[jnp.ndarray,
     """
     window_size = input_size + h
     n_real = y.shape[0]
-    n = n_real - input_size                              # NF keeps windows with >=1 valid outsample
+    n = n_real - input_size                              # neuralforecast keeps windows with >=1 valid outsample
     if n < 1:
         raise ValueError(f"Series length {n_real} too short for input_size={input_size}, h={h}")
     y_pad = jnp.concatenate([y, jnp.zeros((h,), y.dtype)])
@@ -57,27 +57,23 @@ def _jit_forward(model: DLinearNet, x: jnp.ndarray) -> jnp.ndarray:
 
 
 def _sample_batch_idx(step_keys: jnp.ndarray, n_windows: int, windows_batch_size: int) -> jnp.ndarray:
-    """Per-step window indices replicating NF's regimes: with-replacement when
+    """Per-step window indices replicating neuralforecast's regimes: with-replacement when
     ``n_windows < windows_batch_size``, else a uniform random subset.
 
-    The subset is the top-``windows_batch_size`` block of iid uniform keys —
-    distribution-equivalent to NF's ``randperm(n)[:k]`` (by symmetry every
-    k-subset is equally likely, and batch order is irrelevant to a mean-reduced
-    loss). Selection runs via ``np.argpartition`` on the host when the keys are
-    concrete: measured per fit at ~7k-window scale (5000 steps, the largest
-    benchmark dataset; CPU, 2026-07), sampling cost was 9.6s for a vmapped full
-    permutation, 4.6s for ``lax.top_k``, 2.3s for jitted ``jnp.argpartition``
-    and 0.4s for this hybrid — against ~0.5s for the ENTIRE training scan, as
-    measured on NLinear (one small matmul per step; sampling cost is
-    model-independent, and DLinear adds only a second matmul plus a moving
-    average per step). Under a trace of the keys
-    themselves (e.g. ``jax.jit`` over ``step_keys``, as in the equivalence test)
-    it falls back to pure-JAX ``argpartition``; note that
-    ``BaseForecaster.conformity_scores``' vmap does NOT trace the keys (the seed
-    is a static int), so conformal fits still take the host path. Both paths
-    select the same index sets from the same uniforms (up to float32 key ties at
-    the cut, where either resolution is an equally valid uniform subset).
-    Returns ``[len(step_keys), windows_batch_size]`` int32.
+    The subset is the top-``windows_batch_size`` block of iid uniform keys,
+    distribution-equivalent to neuralforecast's ``randperm(n)[:k]`` (by symmetry
+    every k-subset is equally likely, and batch order is irrelevant to a
+    mean-reduced loss). Selection runs via ``np.argpartition`` on the host when
+    the keys are concrete: host partitioning costs a small fraction of a jitted
+    full permutation or ``lax.top_k`` over all windows, and the sampling cost is
+    model-independent, so for a model whose training step is one small matmul
+    it is a visible share of the whole fit. Under a trace of the keys
+    themselves (e.g. ``jax.jit`` over ``step_keys``) it falls back to pure-JAX
+    ``argpartition``; ``BaseForecaster.conformity_scores``' vmap does NOT trace
+    the keys (the seed is a static int), so conformal fits still take the host
+    path. Both paths select the same index sets from the same uniforms (up to
+    float32 key ties at the cut, where either resolution is an equally valid
+    uniform subset). Returns ``[len(step_keys), windows_batch_size]`` int32.
     """
     if n_windows < windows_batch_size:
         def sample_one(k):

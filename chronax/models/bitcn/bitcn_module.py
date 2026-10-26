@@ -2,12 +2,12 @@
 
 Univariate JAX/Flax-NNX port of ``neuralforecast.BiTCN`` (Bidirectional
 Temporal Convolutional Network; Sprangers, Schelter & de Rijke, 2023). BiTCN
-stacks two dilated temporal convolutional networks (TCNs): a *backward* network
+stacks two dilated temporal convolutional network (TCN) branches: a *backward* network
 that encodes past observations and a *forward* network that encodes future
 covariates. This is a univariate model; Chronax (like the iTransformer /
 VanillaTransformer ports) targets the **no-exogenous** case, so only the
-backward TCN is instantiated (NF instantiates the forward TCN solely when
-``futr_exog_size > 0``). With no exogenous inputs the NF ``forward`` reduces to::
+backward TCN is instantiated (neuralforecast instantiates the forward TCN solely when
+``futr_exog_size > 0``). With no exogenous inputs the neuralforecast ``forward`` reduces to::
 
     x = drop_hist(lin_hist(insample_y))           # [B, L, 1]      -> [B, L, H]
     x = x.permute(0, 2, 1)                         #                -> [B, H, L]
@@ -53,7 +53,7 @@ class _TorchLinearInit:
 class _TorchConvInit:
     """Picklable initializer matching torch ``nn.Conv1d`` default.
 
-    NF ``CustomConv1d`` reproduces torch's default conv init explicitly:
+    neuralforecast ``CustomConv1d`` reproduces torch's default conv init explicitly:
     both weight and bias are drawn from ``U(-k, k)`` with
     ``k = sqrt(1 / (in_channels * kernel_size))``. The same scalar bound applies
     to the weight tensor ``(out, in, kernel_size)`` and the bias ``(out,)``.
@@ -69,7 +69,7 @@ class _TorchConvInit:
 
 
 def _gelu(z: jnp.ndarray) -> jnp.ndarray:
-    """Exact (erf) GELU. NF uses ``F.gelu`` (exact); ``jax.nn.gelu`` defaults to
+    """Exact (erf) GELU. neuralforecast uses ``F.gelu`` (exact); ``jax.nn.gelu`` defaults to
     the tanh approximation, so ``approximate=False`` is required for parity."""
     return jax.nn.gelu(z, approximate=False)
 
@@ -77,11 +77,11 @@ def _gelu(z: jnp.ndarray) -> jnp.ndarray:
 class CustomConv1d(nnx.Module):
     """Forward- or backward-looking causal dilated 1-D convolution.
 
-    Mirrors NF ``CustomConv1d``. Operates in torch's channel-first layout
+    Mirrors neuralforecast ``CustomConv1d``. Operates in torch's channel-first layout
     ``[B, C, L]`` via ``jax.lax.conv_general_dilated`` with dimension numbers
     ``('NCH', 'OIH', 'NCH')`` and a ``(low, high)`` causal pad:
     ``mode="backward"`` pads on the left (looks into the past), ``mode="forward"``
-    pads on the right. ``groups=1`` throughout (as in NF). Weight shape is torch's
+    pads on the right. ``groups=1`` throughout (as in neuralforecast). Weight shape is torch's
     ``(out_channels, in_channels, kernel_size)``.
     """
 
@@ -122,7 +122,7 @@ class CustomConv1d(nnx.Module):
 
 
 class TCNCell(nnx.Module):
-    """One Temporal Convolutional Network cell (NF ``TCNCell``).
+    """One Temporal Convolutional Network cell (neuralforecast ``TCNCell``).
 
     ``conv1`` is a dilated causal conv (``kernel_size=2``); ``conv2`` is a
     pointwise (``kernel_size=1``) conv widening to ``2 * in_channels`` whose
@@ -162,7 +162,7 @@ class TCNCell(nnx.Module):
 class BiTCNNet(nnx.Module):
     """Univariate BiTCN backbone: ``[B, input_size, 1] -> [B, h, 1]``.
 
-    No-exogenous case (backward TCN only). Identity scaling (NF default): the
+    No-exogenous case (backward TCN only). Identity scaling (neuralforecast default): the
     network operates in raw scale. The number of backward layers is set so the
     dilated receptive field covers the lookback window::
 
@@ -223,7 +223,7 @@ class BiTCNNet(nnx.Module):
         x = self.drop_hist(self.lin_hist(x), deterministic=deterministic)   # [B, L, H]
         x = x.transpose(0, 2, 1)                                    # [B, H, L]
 
-        # Backward TCN: thread (hidden state, skip accumulator). NF seeds out=0.
+        # Backward TCN: thread (hidden state, skip accumulator). neuralforecast seeds out=0.
         h_state = x
         out = jnp.zeros_like(x)
         for cell in self.net_bwd:

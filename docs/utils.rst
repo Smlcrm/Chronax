@@ -1,21 +1,21 @@
 Utilities
 =========
 
-Conformal Intervals
+Conformal intervals
 -------------------
 
 .. autoclass:: chronax.utils.ConformalIntervals
    :members:
    :undoc-members:
 
-Core Utilities
+Core utilities
 --------------
 
 .. automodule:: chronax.utils.utils
    :members: ensure_float, calculate_sigma, extract_demand, extract_probability, is_constant, acf, calculate_information_criteria, seasonal_decompose
    :undoc-members:
 
-Loss Functions
+Loss functions
 --------------
 
 .. automodule:: chronax.utils.loss_functions

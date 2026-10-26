@@ -4,7 +4,7 @@ Windows are scaled per-window (scaler stats on the insample target), the loss
 is computed in scaled space, and the whole training loop is one ``nnx.scan`` so
 it stays ``vmap``-traceable for ``BaseForecaster.conformity_scores``. Two RNG
 streams split off ``seed``: batch-index keys (regime-dependent window sampling)
-and per-step dropout keys for the attention dropout — shuffling batches never
+and per-step dropout keys for the attention dropout, shuffling batches never
 perturbs which attention entries drop on a given step.
 
 Optimization follows neuralforecast's default learning-rate schedule:
@@ -30,7 +30,7 @@ def build_windows(y: jnp.ndarray, input_size: int, h: int) -> tuple[jnp.ndarray,
     The series is padded with ``h`` trailing zeros before windowing, so every
     window with at least one valid target point is kept and the padded tail is
     masked out of the loss. These partial windows put insample contexts ending
-    at the very last observations into training — on trending series that is
+    at the very last observations into training, on trending series that is
     where the forecast-relevant regime lives.
 
     Returns ``(windows [n, input_size+h], target_mask [n, h])`` with

@@ -1,62 +1,44 @@
 """
-Holt's Linear Exponential Smoothing Model (SF-faithful ETS AAN/AAdN).
+Holt's linear exponential smoothing as the exponential smoothing (ETS)
+state-space models ETS(A,A,N) and ETS(A,Ad,N), following statsforecast.
 
-This module implements Holt's method as the Hyndman *innovations* state-space
-ETS(A,A,N) / ETS(A,Ad,N) model, matching ``statsforecast.Holt`` exactly:
+statsforecast's ``Holt`` equals ``AutoETS(model="AAN", damped=None)``: it fits
+both the undamped model (AAN, φ=1) and the damped model (AAdN, φ in
+[0.8, 0.98]) and returns the one with the lower corrected Akaike information
+criterion (AICc).
 
-    statsforecast `Holt` == `AutoETS(model="AAN", damped=None)` — it fits
-    BOTH the undamped model (AAN, φ=1) and the damped model (AAdN,
-    φ∈[0.8,0.98]) and returns the one with the lower AICc, per series.
-
-The recursion is the innovations form (NOT the plain component form):
+The recursion is the innovations form, not the plain component form:
 
     ŷ_t = l_{t-1} + φ·b_{t-1}
     e_t = y_t − ŷ_t                           (additive error)
     l_t = l_{t-1} + φ·b_{t-1} + α·e_t
     b_t = φ·b_{t-1} + β·e_t
 
-(multiplicative-error variant uses the relative error e_t=(y_t−ŷ_t)/ŷ_t and
-l_t=ŷ_t·(1+α·e_t), b_t=φ·b_{t-1}+β·ŷ_t·e_t — the Hyndman MAN/MAdN form).
+The multiplicative-error variant uses the relative error e_t=(y_t−ŷ_t)/ŷ_t,
+l_t=ŷ_t·(1+α·e_t) and b_t=φ·b_{t-1}+β·ŷ_t·e_t (the Hyndman MAN/MAdN form).
 
-Objective: concentrated likelihood ``n·log(SSE)`` (``+2·Σ log|ŷ_t|`` for
-multiplicative error). Optimised with the repo's vmap/jit-safe Nelder-Mead
-(`chronax.utils.utils.nelder_mead`). Initial level/trend come from an
-SF-style OLS warm-up (first ``min(10,n)`` points, 1-indexed) and are then
-jointly optimised with (α,β[,φ]) — matching statsforecast, which appends
-the initial states to its optimisation vector.
+Objective: the concentrated likelihood ``n·log(SSE)`` (sum of squared errors,
+SSE), plus ``2·Σ log|ŷ_t|`` for multiplicative error. It is minimised with the
+vmap/jit-safe Nelder-Mead in ``chronax.utils.utils.nelder_mead``. The initial
+level and trend come from a statsforecast-style ordinary least squares (OLS)
+warm-up on the first ``min(10, n)`` points (1-indexed) and are then optimised
+jointly with (α, β[, φ]), as statsforecast does.
 
 The ``damped`` constructor argument gates the candidate set:
-- ``damped=False`` → AAN only (pure undamped Holt, φ≡1).
-- ``damped=True``  → AAdN only (φ estimated in [0.8,0.98]).
-- ``damped=None``  → fit both, branchless min-AICc select (= statsforecast).
 
-Warm-time safety mirrors the ETS backend: a module-level ``lru_cache``'d
-``jax.jit`` wrapper keyed only on static scalars, with the data passed as
-traced arguments and Nelder-Mead *inside* the jit, so repeated warm calls
-reuse the compiled XLA kernel.
+- ``damped=False``: AAN only (undamped Holt, φ=1).
+- ``damped=True``: AAdN only (φ estimated in [0.8, 0.98]).
+- ``damped=None``: fit both, branchless min-AICc selection (statsforecast).
 
-Instance Attributes:
-1. season_length: int - kept for API consistency (AAN ignores it)
-2. error_type: str - 'A' (additive) or 'M' (multiplicative)
-3. damped: bool - legacy attr (False unless damped=True); selection is
-   driven by the raw constructor arg via _fit_mode
-4. phi: float | None - optional initial damping seed (used only for AAdN)
-5. alias: str
-6. conformal_params: ConformalIntervals | None
-7. allow_extended_iterations: bool
-8. iteration_scaling: str - accepted for API compat (no-op)
-9. model_: dict - fitted params (fitted, level, trend, alpha, beta, phi,
-   sigma, residuals, y_train)
+A module-level ``lru_cache``'d ``jax.jit`` wrapper is keyed only on static
+scalars; the data flows as traced arguments and Nelder-Mead runs inside the
+jit, so repeated calls with the same shapes reuse the compiled kernel.
 
-Class Attributes:
-1. uses_exog: bool - False for Holt
-
-Methods: __init__, fit, predict, predict_in_sample, forecast, forward.
-Analytical interval formulas from Hyndman et al. (2008).
+Analytical interval formulas follow Hyndman et al. (2008).
 """
 import jax
-# float64 internals for statsforecast-parity (lstsq init + recursion +
-# n·log(SSE) on large-magnitude series). The ETS backend sets the same flag.
+# float64 internals match statsforecast (OLS init, recursion and n*log(SSE)
+# on large-magnitude series).
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 from functools import lru_cache
@@ -70,7 +52,7 @@ from jax import lax
 _PHI_LOWER = 0.8
 _PHI_UPPER = 0.98
 
-# Smoothing-parameter box (sigmoid-reparametrised), matching SF [1e-4,0.9999].
+# Smoothing-parameter box (sigmoid-reparametrised), matching statsforecast.
 _PARAM_LOWER = 1e-4
 _PARAM_UPPER = 0.9999
 
@@ -79,23 +61,16 @@ _INIT_ALPHA = 0.3
 _INIT_BETA = 0.1
 _EPSILON = 1e-10
 
-# Nelder-Mead outer-iteration ceiling (flat). Empirically established
-# (full-24 worker sweeps at ceilings 100/200/400, all with
-# median(SF−CHX)≈0): (1) the repo NM does NOT meaningfully early-stop on
-# the Holt 4–5D AICc surface — warm scales ~linearly with this ceiling;
-# (2) more iterations yield no accuracy gain — Holt is model-limited at the
-# statsforecast parity wall, not optimiser-budget-limited. So a higher or
-# length-adaptive ceiling buys no accuracy and only regresses warm time;
-# 100 is the warm-safe sweet spot. The
-# `allow_extended_iterations=True` constructor flag is the explicit
-# user escape hatch for any pathological series wanting more iters.
+# Flat Nelder-Mead outer-iteration ceiling. The optimizer does not early-stop
+# on the Holt AICc surface, so fit time scales with this value;
+# `allow_extended_iterations=True` selects the extended ceiling.
 _MAX_ITER = 100
 _MAX_ITER_EXTENDED = 400
 
 # fit_mode codes (static; drive the candidate set).
-_MODE_AAN = 0   # undamped only (φ≡1)
-_MODE_AADN = 1  # damped only   (φ∈[_PHI_LOWER,_PHI_UPPER])
-_MODE_AUTO = 2  # fit both, branchless min-AICc (= statsforecast Holt)
+_MODE_AAN = 0   # undamped only (φ=1)
+_MODE_AADN = 1  # damped only (φ in [_PHI_LOWER, _PHI_UPPER])
+_MODE_AUTO = 2  # fit both, branchless min-AICc (statsforecast Holt)
 
 __all__ = ['Holt']
 
@@ -105,13 +80,13 @@ __all__ = ['Holt']
 # =============================================================================
 
 def _params_from_z(z: jnp.ndarray) -> jnp.ndarray:
-    """Unconstrained z → (α, β) ∈ (_PARAM_LOWER, _PARAM_UPPER) via sigmoid."""
+    """Map unconstrained z to (α, β) in (_PARAM_LOWER, _PARAM_UPPER) via sigmoid."""
     span = _PARAM_UPPER - _PARAM_LOWER
     return _PARAM_LOWER + span * jax.nn.sigmoid(z)
 
 
 def _z_from_params(ab: jnp.ndarray) -> jnp.ndarray:
-    """Inverse of _params_from_z (logit) — for the initial simplex point."""
+    """Inverse of _params_from_z (logit), used for the initial simplex point."""
     span = _PARAM_UPPER - _PARAM_LOWER
     frac = (ab - _PARAM_LOWER) / span
     return jnp.log(frac / (1.0 - frac))
@@ -121,9 +96,9 @@ def _holt_recursion(y, l0, b0, alpha, beta, phi, is_additive):
     """Hyndman innovations ETS(A,A,N)/(A,Ad,N) rollout via lax.scan.
 
     Returns ``(fitted, l_n, b_n, e_obj)`` where ``fitted`` is the one-step
-    in-sample prediction ŷ_t, ``(l_n,b_n)`` the final state, and ``e_obj``
+    in-sample prediction ŷ_t, ``(l_n, b_n)`` the final state, and ``e_obj``
     the per-step objective error (raw for additive, relative for
-    multiplicative — its SSE is the SF concentrated-likelihood SSE).
+    multiplicative; its SSE is statsforecast's concentrated-likelihood SSE).
     """
     dtype = y.dtype
 
@@ -162,14 +137,13 @@ def _holt_objective(fitted, e_obj, n, is_additive):
 def _fit_one_candidate(y, l0, b0, is_additive, fit_phi, fixed_phi, n_iters):
     """Fit one ETS candidate (AAN if not fit_phi, else AAdN) via Nelder-Mead.
 
-    Jointly optimises (α, β[, φ], l0, b0) — like statsforecast, which
-    appends the initial states to the optimisation vector. (l0,b0) use a
-    well-conditioned offset reparam ``l0 = l0_ols + s_l·z`` /
-    ``b0 = b0_ols + s_b·z`` with ``s_l=max(std(y),ε)``,
-    ``s_b=max(std(Δy),ε)`` so all NM coordinates are O(1) and z=0 recovers
-    the OLS warm-up exactly (the frozen-init fit stays in the feasible
-    set). Returns a result dict with a fixed pytree structure independent
-    of ``fit_phi`` (so the two candidates combine branchlessly).
+    Jointly optimises (α, β[, φ], l0, b0), as statsforecast does by appending
+    the initial states to the optimisation vector. (l0, b0) use the offset
+    reparametrisation ``l0 = l0_ols + s_l·z`` and ``b0 = b0_ols + s_b·z`` with
+    ``s_l = max(std(y), ε)`` and ``s_b = max(std(Δy), ε)``, so all Nelder-Mead
+    coordinates are O(1) and z=0 recovers the OLS warm-up exactly. Returns a
+    result dict with a fixed pytree structure independent of ``fit_phi``, so
+    the two candidates combine branchlessly.
     """
     n = len(y)
     dtype = y.dtype
@@ -196,24 +170,21 @@ def _fit_one_candidate(y, l0, b0, is_additive, fit_phi, fixed_phi, n_iters):
         obj, _ = _holt_objective(fitted, e_obj, n, is_additive)
         return obj
 
-    # SINGLE bounded NM from statsforecast's exact `initparam` start —
-    # statsforecast does NOT seek the SSE global min (multistart/over-
-    # optimisation lands lower-SSE optima that forecast far worse); it
-    # runs one bounded Nelder-Mead from this init and early-stops. We
-    # mimic that. SF initparam (m=1): α0=αL+0.2(αU−αL),
-    # β0=βL+0.1(min(αU,α0)−βL); z-state seed = 0 (OLS warm-up); φ at the
-    # band midpoint (phi_seed=0) unless an explicit phi was given.
+    # One bounded Nelder-Mead run from statsforecast's `initparam` start, no
+    # multistart (statsforecast does not seek the global SSE minimum). For
+    # m=1: α0=αL+0.2(αU−αL), β0=βL+0.1(min(αU,α0)−βL); z-state seed 0 (the
+    # OLS warm-up); φ at the band midpoint.
     a0 = _PARAM_LOWER + 0.2 * (_PARAM_UPPER - _PARAM_LOWER)
     b0_ = _PARAM_LOWER + 0.1 * (min(_PARAM_UPPER, a0) - _PARAM_LOWER)
     z_ab = _z_from_params(jnp.asarray([a0, b0_], dtype))
-    z_state = jnp.zeros(2, dtype)  # z=0 → (l0,b0)=OLS warm-up
+    z_state = jnp.zeros(2, dtype)  # z=0 gives (l0, b0) = OLS warm-up
     if fit_phi:
         # φ seed at the band midpoint (sigmoid(0)).
         z0 = jnp.concatenate([z_ab, jnp.zeros(1, dtype), z_state])
         k = 6  # α, β, φ, l0, b0, σ²
     else:
         z0 = jnp.concatenate([z_ab, z_state])
-        k = 5  # α, β, l0, b0, σ²  (φ fixed, not estimated)
+        k = 5  # α, β, l0, b0, σ² (φ fixed, not estimated)
 
     res = nelder_mead(loss, z0, max_iter=int(n_iters),
                       x_tol=1e-7, f_tol=1e-9, initial_simplex_size=0.05)
@@ -222,8 +193,9 @@ def _fit_one_candidate(y, l0, b0, is_additive, fit_phi, fixed_phi, n_iters):
                                               is_additive)
     obj, sse = _holt_objective(fitted, e_obj, n, is_additive)
 
-    # AICc on the concentrated likelihood (n·log(SSE) ≡ SF up to a constant
-    # shared by both candidates, so AICc *differences* are exact).
+    # AICc on the concentrated likelihood. n*log(SSE) equals statsforecast's
+    # value up to a constant shared by both candidates, so AICc differences
+    # are exact.
     nf = jnp.asarray(n, dtype)
     kf = jnp.asarray(k, dtype)
     aic = obj + 2.0 * kf
@@ -246,17 +218,18 @@ def _fit_one_candidate(y, l0, b0, is_additive, fit_phi, fixed_phi, n_iters):
 
 
 def _select_and_fit(y, l0, b0, is_additive, fit_mode, fixed_phi, n_iters):
-    """Fit the candidate(s) for ``fit_mode`` and branchlessly select.
+    """Fit the candidate(s) for ``fit_mode`` and select branchlessly.
 
-    fit_mode ∈ {_MODE_AAN, _MODE_AADN, _MODE_AUTO}.
-    - AAN  : φ≡1 (pure undamped Holt).
-    - AADN : if an explicit phi was given, the AAdN recursion runs AT that
-      fixed φ (states and smoothing parameters are optimised under the
-      damping the forecasts will use); else φ is optimised in
+    ``fit_mode`` is one of ``_MODE_AAN``, ``_MODE_AADN``, ``_MODE_AUTO``:
+
+    - AAN: φ=1 (undamped Holt).
+    - AADN: with an explicit phi, the AAdN recursion runs at that fixed φ
+      (states and smoothing parameters are optimised under the damping the
+      forecasts will use); otherwise φ is optimised in
       [_PHI_LOWER, _PHI_UPPER].
-    - AUTO : fit AAN and free-φ AAdN, keep the lower-AICc one via a pure
-      ``jnp.where`` over the (structurally identical) result pytrees —
-      fully vmap/jit-safe (= statsforecast Holt).
+    - AUTO: fit AAN and free-φ AAdN, keep the lower-AICc one via a
+      ``jnp.where`` over the structurally identical result pytrees
+      (vmap/jit-safe; statsforecast Holt).
     """
     if fit_mode == _MODE_AAN:
         return _fit_one_candidate(y, l0, b0, is_additive, False,
@@ -281,13 +254,12 @@ def _select_and_fit(y, l0, b0, is_additive, fit_mode, fixed_phi, n_iters):
 @lru_cache(maxsize=128)
 def _get_holt_optimizer(is_additive: bool, fit_mode: int,
                         fixed_phi: float | None, n_iters: int):
-    """Module-level cached jitted fitter (ETS-style warm pattern).
+    """Module-level cached jitted fitter.
 
-    Built ONCE per static config ``(is_additive, fit_mode, fixed_phi,
-    n_iters)``; the series ``y`` and warm-start ``(l0,b0)`` flow as
-    *traced* arguments, so repeated warm calls with the same shapes reuse
-    the compiled XLA kernel (no re-trace/recompile). No ``static_argnums``
-    on any traced value (φ handling is fully static).
+    Built once per static config ``(is_additive, fit_mode, fixed_phi,
+    n_iters)``; the series ``y`` and warm-start ``(l0, b0)`` flow as traced
+    arguments, so repeated calls with the same shapes reuse the compiled
+    kernel. No ``static_argnums`` on any traced value.
     """
     def _run(y, l0, b0):
         return _select_and_fit(y, l0, b0, is_additive, fit_mode,
@@ -296,16 +268,76 @@ def _get_holt_optimizer(is_additive: bool, fit_mode: int,
 
 
 class Holt(BaseForecaster):
-    def conformity_scores(self, y: jnp.ndarray, X: jnp.ndarray | None = None):
-        """Sequential-window CV, overriding the base vmapped path.
+    """Holt's linear exponential smoothing (statsforecast-faithful ETS AAN/AAdN).
 
-        Holt's optimizer fit under the base CV vmap batches every carry and lowers
-        the linesearch conds to select, so the same edge-masked windows run faster
-        sequentially at every scale — unlike HoltWinters, whose big-m cells amortize
-        the vmap. Scores are bit-identical: Holt's small parameter vector does not
-        show the trajectory sensitivity HW has. Windows, masking, and values are the
-        base implementation's exactly; only the execution regime changes
-        (`_conformity_scores_sequential`).
+    Fits the undamped (AAN) and/or damped (AAdN) innovations state-space
+    model by Nelder-Mead on the concentrated likelihood and, with
+    ``damped=None``, keeps the lower-AICc candidate. Native intervals use
+    the Hyndman et al. (2008) variance formulas; conformal intervals come
+    from ``BaseForecaster`` when ``conformal_params`` is set.
+
+    Parameters
+    ----------
+    season_length : int, default 1
+        Accepted for interface consistency; the AAN/AAdN model ignores it.
+    error_type : str, default 'A'
+        'A' (additive) or 'M' (multiplicative).
+    damped : bool or None, default None
+        Gates the candidate set. ``None``: fit both AAN and AAdN and keep the
+        lower AICc (statsforecast ``Holt``). ``False``: AAN only (φ=1).
+        ``True``: AAdN only (φ estimated in [0.8, 0.98], or fixed at ``phi``).
+    phi : float or None, default None
+        Fixed damping, must be in [0.8, 0.98]. Used only when
+        ``damped=True``; otherwise ignored.
+    alias : str, default "Holt"
+        Custom name for the model.
+    conformal_params : ConformalIntervals or None, default None
+        Configuration for conformal prediction intervals. ``None`` selects
+        native analytical intervals.
+    allow_extended_iterations : bool, default False
+        Raise the Nelder-Mead ceiling from 100 to 400 iterations.
+    iteration_scaling : str, default "quadratic"
+        Accepted for compatibility; validated but otherwise unused.
+
+    Attributes
+    ----------
+    damped : bool
+        ``False`` unless ``damped=True`` was passed; the candidate set is
+        driven by ``_fit_mode``, which keeps ``None`` and ``False`` distinct.
+    model_ : dict
+        Set by :meth:`fit`: ``fitted``, ``level``, ``trend``, ``residuals``,
+        ``alpha``, ``beta``, ``phi``, ``sse``, ``aicc``, ``sigma``,
+        ``y_train``.
+
+    Raises
+    ------
+    ValueError
+        If ``error_type`` is not 'A'/'M'; if ``phi`` is not a number or is
+        outside [0.8, 0.98]; if ``conformal_params`` is not a
+        ``ConformalIntervals``; if ``iteration_scaling`` is not 'cubic' or
+        'quadratic'.
+    """
+
+    def conformity_scores(self, y: jnp.ndarray, X: jnp.ndarray | None = None):
+        """Sequential-window cross-validation (CV), overriding the base vmapped path.
+
+        Under the base CV vmap, Holt's optimizer fit batches every carry and
+        lowers the linesearch conds to ``select``, so the same edge-masked
+        windows run faster sequentially at every scale. Windows, masking and
+        values are the base implementation's exactly; only the execution
+        regime changes (``_conformity_scores_sequential``).
+
+        Parameters
+        ----------
+        y : jnp.ndarray
+            Univariate series, shape ``(T,)``.
+        X : jnp.ndarray or None, default None
+            Exogenous regressors, shape ``(T, F)``. Ignored by the model.
+
+        Returns
+        -------
+        jnp.ndarray
+            Signed scores, shape ``(n_windows, h)``.
         """
         return self._conformity_scores_sequential(y=y, X=X)
 
@@ -326,19 +358,19 @@ class Holt(BaseForecaster):
                 raise ValueError("All level values must be numbers between 0 and 100")
 
     def _initialize_states(self, y: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
-        """SF-style OLS warm-up for (l0, b0).
+        """statsforecast-style OLS warm-up for (l0, b0).
 
-        Matches statsforecast ``initstate``: regress y on a constant + a
-        **1-indexed** time index over the first ``maxn = min(10, n)``
-        observations (m=1 so ``max(10, 2m)=10``). Returns JAX scalars so
-        the result is ``jax.vmap`` traceable; the ``n_init >= 2`` branch is
-        decided at trace time from the static ``y.shape[0]``.
+        Matches statsforecast ``initstate``: regress y on a constant plus a
+        1-indexed time index over the first ``min(10, n)`` observations
+        (m=1, so ``max(10, 2m) = 10``). Returns JAX scalars so the result is
+        ``jax.vmap`` traceable; the ``n_init >= 2`` branch is decided at
+        trace time from the static ``y.shape[0]``.
         """
         n = y.shape[0]
         n_init = min(10, n)
 
         if n_init >= 2:
-            t = jnp.arange(1, n_init + 1, dtype=y.dtype)  # 1-indexed (SF)
+            t = jnp.arange(1, n_init + 1, dtype=y.dtype)  # 1-indexed, as statsforecast
             y_init = y[:n_init]
 
             t_mean = jnp.mean(t)
@@ -355,10 +387,10 @@ class Holt(BaseForecaster):
     def _fit_parameters(self, y: jnp.ndarray) -> dict:
         """Fit ETS(AAN/AAdN) parameters and return the results dict.
 
-        The candidate set is fixed by ``self._fit_mode`` and the NM ceiling
-        by ``self._n_iters`` — both static Python ints — so the cached
-        jitted fitter is selected without tracing any data, keeping the
-        call ``jax.vmap``-compatible.
+        The candidate set is fixed by ``self._fit_mode`` and the Nelder-Mead
+        ceiling by ``self._n_iters``, both static Python ints, so the cached
+        jitted fitter is selected without tracing any data and the call stays
+        ``jax.vmap``-compatible.
         """
         l0, b0 = self._initialize_states(y)
         is_additive = self.error_type == 'A'
@@ -367,9 +399,9 @@ class Holt(BaseForecaster):
                                   self.phi, self._n_iters)
         result = fit(y, l0, b0)
 
-        # σ̂ dof matches the reference AAN/AAdN convention (n − 6 undamped,
-        # n − 7 damped); |φ−1|<1e-7 ⇒ undamped, branchless so vmap-safe.
-        # Multiplicative error uses RELATIVE residuals (the M-error sigma is
+        # Sigma dof follows the AAN/AAdN convention (n - 6 undamped, n - 7
+        # damped); |φ-1| < 1e-7 means undamped, branchless so vmap-safe.
+        # Multiplicative error uses relative residuals (the M-error sigma is
         # dimensionless; the interval formula multiplies by |mean| once).
         near1 = jnp.abs(result['phi'] - 1.0) < 1e-7
         k = jnp.where(near1, 6, 7)
@@ -410,9 +442,9 @@ class Holt(BaseForecaster):
         """Native prediction-interval width (sigmah), Hyndman et al. (2008).
 
         Branchless in φ: computes both the damped (AAdN/MAdN) and undamped
-        (AAN/MAN) variance and selects with ``where(|φ−1|<1e-7, …)`` so a
-        traced/estimated φ stays vmap/jit-safe (the damped vs undamped
-        choice follows the *selected model's* φ, not ``self.damped``).
+        (AAN/MAN) variance and selects with ``where(|φ-1| < 1e-7, ...)`` so a
+        traced φ stays vmap/jit-safe. The damped versus undamped choice
+        follows the selected model's φ, not ``self.damped``.
         """
         dt = mean.dtype if hasattr(mean, 'dtype') else jnp.float64
         t = jnp.arange(1, h + 1, dtype=dt)
@@ -465,40 +497,7 @@ class Holt(BaseForecaster):
         allow_extended_iterations: bool = False,
         iteration_scaling: str = "quadratic",
     ):
-        """
-        Holt's linear exponential smoothing (SF-faithful ETS AAN/AAdN).
-
-        Parameters
-        ----------
-        season_length : int, default=1
-            Kept for API consistency (the AAN/AAdN model ignores it).
-        error_type : str, default='A'
-            'A' (additive) or 'M' (multiplicative). Must be 'A' or 'M'.
-        damped : bool | None, default=None
-            Gates the candidate set:
-            - None  → fit both AAN and AAdN, keep min-AICc (= statsforecast
-              ``Holt``; this is the default and the benchmark behaviour).
-            - False → AAN only (pure undamped Holt, φ≡1).
-            - True  → AAdN only (φ estimated in [0.8, 0.98]).
-        phi : float | None, default=None
-            Optional initial damping seed (used only when a damped model is
-            fitted). Must be in [0.8, 0.98] if given.
-        alias : str, default="Holt"
-            Custom name for the model.
-        conformal_params : ConformalIntervals | None, default=None
-            If None, uses native analytical prediction intervals.
-        allow_extended_iterations : bool, default=False
-            Raise the Nelder-Mead ceiling to 400 (default 200).
-        iteration_scaling : str, default="quadratic"
-            Accepted for API compatibility; no-op.
-
-        Raises
-        ------
-        ValueError
-            If error_type is not 'A'/'M'; if phi is not a number or is
-            outside [0.8, 0.98]; if conformal_params is not a
-            ConformalIntervals; if iteration_scaling is invalid.
-        """
+        """Validate the configuration; see the class docstring for parameters."""
         if error_type not in ('A', 'M'):
             raise ValueError(
                 f"error_type must be 'A' (additive) or 'M' (multiplicative), got '{error_type}'"
@@ -521,9 +520,8 @@ class Holt(BaseForecaster):
 
         self.season_length = season_length
         self.error_type = error_type
-        # Legacy attribute (some callers/repr read it); selection itself is
-        # driven by _fit_mode derived from the *raw* damped argument so that
-        # None (auto) and False (undamped-only) stay distinct.
+        # Selection is driven by _fit_mode, derived from the raw damped
+        # argument so that None (auto) and False (undamped-only) stay distinct.
         self.damped = damped if damped is not None else False
         self.phi = phi
         self.alias = alias
@@ -532,18 +530,13 @@ class Holt(BaseForecaster):
         self.iteration_scaling = iteration_scaling
 
         if damped is None:
-            self._fit_mode = _MODE_AUTO   # = statsforecast Holt
+            self._fit_mode = _MODE_AUTO   # statsforecast Holt
         elif damped:
             self._fit_mode = _MODE_AADN
         else:
             self._fit_mode = _MODE_AAN
-        # self.phi (float|None) is the fixed damping used only when
-        # damped=True with an explicit phi (textbook damped). It is passed
-        # as a *static* key to the cached jitted fitter.
-        # Flat NM ceiling — a static Python int (lru_cache key), reused
-        # across warm calls. allow_extended_iterations raises it (the user
-        # escape hatch for a pathological series); see _MAX_ITER comment
-        # for why flat (not adaptive) is empirically optimal.
+        # self.phi and self._n_iters are static keys of the cached jitted
+        # fitter; phi is the fixed damping used only when damped=True.
         self._n_iters = _MAX_ITER_EXTENDED if allow_extended_iterations else _MAX_ITER
 
     def fit(
@@ -551,27 +544,29 @@ class Holt(BaseForecaster):
         y: jnp.ndarray,
         X: jnp.ndarray | None = None,
     ) -> 'Holt':
-        """Fit the Holt model to training data.
+        """Fit the Holt model.
 
         Estimates (α, β[, φ]) and the level/trend states by minimising the
-        concentrated likelihood with Nelder-Mead; selects AAN vs AAdN by
+        concentrated likelihood with Nelder-Mead; selects AAN versus AAdN by
         AICc when ``damped=None``.
 
         Parameters
         ----------
         y : jnp.ndarray
-            Training series of shape (n,). At least 2 observations.
-        X : jnp.ndarray | None
-            Unused (API consistency).
+            Univariate series, shape ``(T,)``, at least 2 observations.
+        X : jnp.ndarray or None, default None
+            Exogenous regressors, shape ``(T, F)``. Ignored.
 
         Returns
         -------
-        self : Holt
+        Holt
+            ``self``.
 
         Raises
         ------
         ValueError
-            If y has fewer than 2 observations.
+            If ``y`` has fewer than 2 observations, or if ``error_type='M'``
+            and ``y`` has a non-positive value.
         """
         y = utils.ensure_float(y)
 
@@ -591,29 +586,31 @@ class Holt(BaseForecaster):
         X: jnp.ndarray | None = None,
         level: list[int] | None = None,
     ) -> dict:
-        """
-        Predict with fitted Holt model.
+        """Predict with the fitted Holt model.
 
         Parameters
         ----------
         h : int
-            Forecast horizon (must be positive).
-        X : jnp.ndarray, optional
-            Unused (API consistency).
-        level : list[int], optional
-            Confidence levels (0-100) for prediction intervals.
+            Forecast horizon (positive int).
+        X : jnp.ndarray or None, default None
+            Future exogenous regressors, shape ``(h, F)``. Only forwarded to
+            :meth:`conformity_scores`; otherwise ignored.
+        level : list of int or None, default None
+            Confidence levels in [0, 100], e.g. ``[80, 95]``.
 
         Returns
         -------
         dict
-            'mean' for point predictions and 'lo-{level}'/'hi-{level}' for
-            probabilistic predictions.
+            ``"mean"`` (shape ``(h,)``) plus ``"lo-{lv}"``/``"hi-{lv}"`` per
+            level when ``level`` is given.
 
         Raises
         ------
         ValueError
-            If model is not fitted, if h is not positive, or if level
-            values are outside [0, 100].
+            If the model is not fitted, if ``h`` is not a positive int, if
+            ``level`` is not a list of numbers in [0, 100], or if the
+            conformal path finds the training series too short for 2 CV
+            windows.
         """
         if not hasattr(self, 'model_'):
             raise ValueError("Model must be fitted before calling predict(). Call fit() first.")
@@ -657,24 +654,25 @@ class Holt(BaseForecaster):
         self,
         level: list[int] | None = None,
     ) -> dict:
-        """
-        Access fitted Holt model insample predictions.
+        """Return the in-sample fitted values of the fitted model.
 
         Parameters
         ----------
-        level : list[int], optional
-            Confidence levels (0-100) for prediction intervals.
+        level : list of int or None, default None
+            Confidence levels in [0, 100].
 
         Returns
         -------
         dict
-            'fitted' for point predictions and 'fitted-lo-{level}'/
-            'fitted-hi-{level}' for probabilistic predictions.
+            ``"fitted"`` (shape ``(T,)``) plus
+            ``"fitted-lo-{lv}"``/``"fitted-hi-{lv}"`` per level when ``level``
+            is given.
 
         Raises
         ------
         ValueError
-            If model is not fitted or if level values are outside [0, 100].
+            If the model is not fitted or if ``level`` is not a list of
+            numbers in [0, 100].
         """
         if not hasattr(self, 'model_'):
             raise ValueError("Model must be fitted before calling predict_in_sample(). Call fit() first.")
@@ -704,32 +702,39 @@ class Holt(BaseForecaster):
         level: list[int] | None = None,
         fitted: bool = False,
     ) -> dict:
-        """
-        Memory efficient Holt predictions (stateless fit-and-predict).
+        """Stateless fit-and-predict in one call.
 
         Parameters
         ----------
         y : jnp.ndarray
-            Clean time series of shape (n,). At least 2 observations.
+            Univariate series, shape ``(T,)``, at least 2 observations.
         h : int
-            Forecast horizon (must be positive).
-        X, X_future : jnp.ndarray, optional
-            Unused (API consistency).
-        level : list[int], optional
-            Confidence levels (0-100) for prediction intervals.
-        fitted : bool, default=False
-            Whether to return insample predictions.
+            Forecast horizon (positive int).
+        X : jnp.ndarray or None, default None
+            In-sample exogenous regressors, shape ``(T, F)``. Only forwarded
+            to :meth:`conformity_scores`; otherwise ignored.
+        X_future : jnp.ndarray or None, default None
+            Future exogenous regressors, shape ``(h, F)``. Ignored.
+        level : list of int or None, default None
+            Confidence levels in [0, 100].
+        fitted : bool, default False
+            Whether to return in-sample fitted values under ``"fitted"``.
 
         Returns
         -------
         dict
-            'mean', optional 'fitted', and 'lo-{level}'/'hi-{level}'.
+            ``"mean"`` (shape ``(h,)``); ``"fitted"`` (shape ``(T,)``) when
+            ``fitted``; ``"lo-{lv}"``/``"hi-{lv}"`` per level when ``level``
+            is given, plus ``"fitted-lo-{lv}"``/``"fitted-hi-{lv}"`` when
+            both are set.
 
         Raises
         ------
         ValueError
-            If y has fewer than 2 observations, if h is not positive, or
-            if level values are outside [0, 100].
+            If ``y`` has fewer than 2 observations, if ``h`` is not a
+            positive int, if ``level`` is not a list of numbers in
+            [0, 100], or if the conformal path finds the series too short
+            for 2 CV windows.
         """
         y = utils.ensure_float(y)
         if len(y) < 2:
@@ -792,33 +797,39 @@ class Holt(BaseForecaster):
         level: list[int] | None = None,
         fitted: bool = False,
     ) -> dict:
-        """
-        Apply the fitted Holt model structure to a new series (re-estimates
-        parameters on ``y``).
+        """Apply the fitted model's structure to a new series.
+
+        Re-estimates the parameters on ``y``; the stored ``model_`` is left
+        unchanged.
 
         Parameters
         ----------
         y : jnp.ndarray
-            Clean time series of shape (n,). At least 2 observations.
+            Univariate series, shape ``(T,)``, at least 2 observations.
         h : int
-            Forecast horizon (must be positive).
-        X, X_future : jnp.ndarray, optional
-            Unused (API consistency).
-        level : list[int], optional
-            Confidence levels (0-100) for prediction intervals.
-        fitted : bool, default=False
-            Whether to return insample predictions.
+            Forecast horizon (positive int).
+        X : jnp.ndarray or None, default None
+            In-sample exogenous regressors, shape ``(T, F)``. Only forwarded
+            to :meth:`conformity_scores`; otherwise ignored.
+        X_future : jnp.ndarray or None, default None
+            Future exogenous regressors, shape ``(h, F)``. Ignored.
+        level : list of int or None, default None
+            Confidence levels in [0, 100].
+        fitted : bool, default False
+            Whether to return in-sample fitted values under ``"fitted"``.
 
         Returns
         -------
         dict
-            'mean', optional 'fitted', and 'lo-{level}'/'hi-{level}'.
+            Same keys as :meth:`forecast`.
 
         Raises
         ------
         ValueError
-            If model is not fitted, if y has fewer than 2 observations,
-            if h is not positive, or if level values are outside [0, 100].
+            If the model is not fitted, if ``y`` has fewer than 2
+            observations, if ``h`` is not a positive int, if ``level`` is
+            not a list of numbers in [0, 100], or if the conformal path
+            finds the series too short for 2 CV windows.
         """
         if not hasattr(self, 'model_'):
             raise ValueError("Model must be fitted before calling forward(). Call fit() first.")

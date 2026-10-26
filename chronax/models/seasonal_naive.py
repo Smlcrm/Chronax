@@ -21,31 +21,36 @@ ForecastDict = Dict[str, jnp.ndarray]
 
 
 class SeasonalNaive(BaseForecaster):
+    """Seasonal naive model.
+
+    Each forecast equals the last observation of the same seasonal position
+    (for example the same month of the previous year). Native intervals use the
+    residual standard error scaled by ``sqrt(k + 1)``, where ``k`` is the
+    number of completed seasons in the horizon. Forecast values are float32.
+
+    References:
+        - [Rob J. Hyndman and George Athanasopoulos (2018). "forecasting principles and practice, Simple Methods"](https://otexts.com/fpp3/simple-methods.html#seasonal-na%C3%AFve-method).
+
+    Args:
+        season_length (int): Number of observations per seasonal cycle, e.g.
+            24 for hourly data with a daily cycle.
+        alias (str): Custom name of the model. Defaults to
+            ``"SeasonalNaive"``.
+        prediction_intervals (Optional[ConformalIntervals]): Configuration for
+            conformal prediction intervals. When ``None``, the model computes
+            native intervals. Defaults to ``None``.
+    """
+
     def __init__(
         self,
         season_length: int,
         alias: str = "SeasonalNaive",
         prediction_intervals: Optional[ConformalIntervals] = None,
     ) -> None:
-        """Seasonal naive model.
-
-        A method similar to the naive, but uses the last known observation of the same period (e.g. the same month of the previous year) in order to capture seasonal variations.
-
-        References:
-            - [Rob J. Hyndman and George Athanasopoulos (2018). "forecasting principles and practice, Simple Methods"](https://otexts.com/fpp3/simple-methods.html#seasonal-na%C3%AFve-method).
-
-        Args:
-            season_length (int): Number of observations per unit of time. Ex: 24 Hourly data.
-            alias (str): Custom name of the model.
-            prediction_intervals (Optional[ConformalIntervals]): Information to compute conformal prediction intervals.
-                By default, the model will compute the native prediction
-                intervals.
-        """
         self.season_length = season_length
         self.alias = alias
         self.prediction_intervals = prediction_intervals
-        # BaseForecaster.conformity_scores reads conformal_params (see
-        # seasonal_exponential_smoothing.py for the same aliasing).
+        # BaseForecaster.conformity_scores reads conformal_params.
         self.conformal_params = prediction_intervals
 
     def fit(
@@ -55,14 +60,23 @@ class SeasonalNaive(BaseForecaster):
     ) -> "SeasonalNaive":
         """Fit the SeasonalNaive model.
 
-        Fit an SeasonalNaive to a time series (numpy array) `y`.
+        Stores the last season, the in-sample fitted values and the residual
+        standard error in ``model_``. When ``prediction_intervals`` is set,
+        conformity scores are computed and cached for :meth:`predict`.
 
         Args:
-            y (jnp.ndarray): Clean time series of shape (t, ).
-            X (array-like): Optional exogenous of shape (t, n_x).
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            X (Optional[jnp.ndarray]): Exogenous regressors, shape ``(T, F)``.
+                Only forwarded to ``conformity_scores``. Defaults to ``None``.
 
         Returns:
-            self: SeasonalNaive fitted model.
+            SeasonalNaive: ``self``.
+
+        Raises:
+            ValueError: If ``y`` is not 1-D, has fewer than ``season_length``
+                observations, or ``season_length <= 0``; or if
+                ``prediction_intervals`` is set and the series is too short
+                for 2 cross-validation (CV) windows.
         """
         y = ensure_float(y)
         mod: ForecastDict = dict(
@@ -85,16 +99,22 @@ class SeasonalNaive(BaseForecaster):
         X: Optional[jnp.ndarray] = None,
         level: Optional[List[int]] = None,
     ) -> ForecastDict:
-        """Predict with fitted SeasonalNaive.
+        """Predict with the fitted SeasonalNaive model.
 
         Args:
             h (int): Forecast horizon.
-            X (array-like): Optional exogenous of shape (h, n_x).
-            level (List[float]): Confidence levels (0-100) for prediction intervals.
+            X (Optional[jnp.ndarray]): Future exogenous regressors, shape
+                ``(h, F)``. Ignored. Defaults to ``None``.
+            level (Optional[List[int]]): Confidence levels in (0, 100), e.g.
+                ``[80, 95]``. Defaults to ``None``.
 
         Returns:
-            dict: Dictionary with entries `mean` for point predictions and
-                `level_*` for probabilistic predictions.
+            dict: ``"mean"`` (shape ``(h,)``) plus ``"lo-{lv}"``/``"hi-{lv}"``
+            per level when ``level`` is given (conformal when
+            ``prediction_intervals`` is set, native otherwise).
+
+        Raises:
+            ValueError: If called before ``fit``.
         """
         self._require_fitted()
         del X
@@ -115,14 +135,16 @@ class SeasonalNaive(BaseForecaster):
         return res
 
     def predict_in_sample(self, level: Optional[List[int]] = None) -> ForecastDict:
-        """Access fitted SeasonalNaive in-sample predictions.
+        """Return the in-sample fitted values of the fitted model.
 
         Args:
-            level (List[float]): Confidence levels (0-100) for prediction intervals.
+            level (Optional[List[int]]): Confidence levels in (0, 100).
+                Defaults to ``None``.
 
         Returns:
-            dict: Dictionary with entries `fitted` for point predictions and
-                `level_*` for probabilistic predictions.
+            dict: ``"fitted"`` (shape ``(T,)``, NaN for the first season)
+            plus ``"fitted-lo-{lv}"``/``"fitted-hi-{lv}"`` per level when
+            ``level`` is given.
         """
         res: ForecastDict = {"fitted": self.model_["fitted"]}
         if level is not None:
@@ -139,23 +161,31 @@ class SeasonalNaive(BaseForecaster):
         level: Optional[List[int]] = None,
         fitted: bool = False,
     ) -> ForecastDict:
-        """Memory Efficient SeasonalNaive predictions.
-
-        This method avoids memory burden due from object storage.
-        It is analogous to `fit_predict` without storing information.
-        It assumes you know the forecast horizon in advance.
+        """Stateless fit+predict in one call.
 
         Args:
-            y (jnp.ndarray): Clean time series of shape (n, ).
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
             h (int): Forecast horizon.
-            X (array-like): Optional in-sample exogenous of shape (t, n_x).
-            X_future (array-like): Optional exogenous of shape (h, n_x).
-            level (List[float]): Confidence levels (0-100) for prediction intervals.
-            fitted (bool): Whether or not to return in-sample predictions.
+            X (Optional[jnp.ndarray]): In-sample exogenous regressors, shape
+                ``(T, F)``. Only forwarded to ``conformity_scores``. Defaults
+                to ``None``.
+            X_future (Optional[jnp.ndarray]): Future exogenous regressors,
+                shape ``(h, F)``. Ignored. Defaults to ``None``.
+            level (Optional[List[int]]): Confidence levels in (0, 100).
+                Defaults to ``None``.
+            fitted (bool): Whether to return in-sample fitted values under
+                ``"fitted"``. Defaults to ``False``.
 
         Returns:
-            dict: Dictionary with entries `mean` for point predictions and
-                `level_*` for probabilistic predictions.
+            dict: ``"mean"`` (shape ``(h,)``); ``"fitted"`` (shape ``(T,)``)
+            when ``fitted``; ``"lo-{lv}"``/``"hi-{lv}"`` per level when
+            ``level`` is given, plus ``"fitted-lo-{lv}"``/``"fitted-hi-{lv}"``
+            when both are set.
+
+        Raises:
+            ValueError: If ``y`` is not 1-D, has fewer than ``season_length``
+                observations, or ``h < 1``; or if the conformal path finds
+                the series too short for 2 CV windows.
         """
         del X_future
         y = ensure_float(y)
@@ -194,51 +224,25 @@ class SeasonalNaive(BaseForecaster):
         level: Optional[List[int]] = None,
         fitted: bool = False,
     ) -> ForecastDict:
-        """Apply the fitted model to a new or updated series.
+        """Apply the model to a new series; delegates to :meth:`forecast`.
 
         Args:
-            y (jnp.ndarray): Clean time series of shape (n,).
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
             h (int): Forecast horizon.
-            X (array-like): Optional in-sample exogenous of shape (t, n_x).
-            X_future (array-like): Optional exogenous of shape (h, n_x).
-            level (List[float]): Confidence levels (0-100) for prediction intervals.
-            fitted (bool): Whether or not to return in-sample predictions.
+            X (Optional[jnp.ndarray]): In-sample exogenous regressors, shape
+                ``(T, F)``. Defaults to ``None``.
+            X_future (Optional[jnp.ndarray]): Future exogenous regressors,
+                shape ``(h, F)``. Ignored. Defaults to ``None``.
+            level (Optional[List[int]]): Confidence levels in (0, 100).
+                Defaults to ``None``.
+            fitted (bool): Whether to return in-sample fitted values. Defaults
+                to ``False``.
 
         Returns:
-            dict: Dictionary with entries `mean` for point predictions and `level_*` for probabilistic predictions.
+            dict: Same keys as :meth:`forecast`.
         """
         y = ensure_float(y)
         res = self.forecast(
             y=y, h=h, X=X, X_future=X_future, level=level, fitted=fitted
         )
         return res
-
-# # Test Cases
-# def test():
-#     y = jnp.arange(24.0)
-
-#     model = SeasonalNaive(season_length=12)
-#     fitted_model = model.fit(y)
-
-#     result = fitted_model.predict(h=12, level=(60,75))
-#     forecast = fitted_model.forecast(y, h=12, level=[80, 95])
-    
-#     assert "mean" in result, "Missing mean forecast"
-
-#     assert len(result["mean"]) == 12, "Forecast length mismatch"
-
-#     for lvl in [60, 75]:
-#         assert f"lo-{lvl}" in result, f"Missing lower bound for {lvl}% interval"
-#         assert f"hi-{lvl}" in result, f"Missing upper bound for {lvl}% interval"
-#         assert f"lo-{lvl}" in result, f"Missing lower bound for {lvl}% interval"
-#         assert f"hi-{lvl}" in result, f"Missing upper bound for {lvl}% interval"
-
-#     for lvl in [80, 95]:
-#         assert f"lo-{lvl}" in forecast, f"Missing lower bound for {lvl}% interval"
-#         assert f"hi-{lvl}" in forecast, f"Missing upper bound for {lvl}% interval"
-#         assert len(forecast[f"lo-{lvl}"]) == 12, f"Lower interval {lvl}% has wrong length"
-#         assert len(forecast[f"hi-{lvl}"]) == 12, f"Upper interval {lvl}% has wrong length"
-
-# if __name__ == "__main__":
-#     test()
-#     print("Test passed!")

@@ -1,9 +1,8 @@
 """
-AutoMFLES (Automated Multi-Feature Locally Exponential Smoothing)
+AutoMFLES (automated Multi-Feature Locally Exponential Smoothing).
 
-This module provides an automated, parallelized grid-search wrapper for the MFLES 
-forecasting engine. It automatically identifies the optimal hyperparameters 
-using time-series cross-validation.
+A threaded grid-search wrapper around the MFLES forecaster that selects
+hyperparameters by rolling time-series cross-validation (CV).
 """
 
 import jax
@@ -13,19 +12,18 @@ from typing import Dict, Any, Optional, List, Union, Tuple, Iterable
 import numpy as np
 import itertools
 import concurrent.futures
-import threading  # Added for thread-safe tracking
+import threading  # thread-safe progress tracking
 
-# Assumes mfles.py is in the same directory
 from .mfles import MFLES, _ROBUST_AUTODETECT_MAX_N
 from chronax.models.base_forecaster import BaseForecaster
 
 # =============================================================================
-# 1. JAX JIT KERNELS (Compute Heavy / GPU)
+# 1. JAX just-in-time (JIT) compiled kernels
 # =============================================================================
 
 @jax.jit
 def _standardize_data(x: jnp.ndarray, mean: jnp.ndarray, std: jnp.ndarray) -> jnp.ndarray:
-    """Standardizes data using pre-computed stats (Fused GPU Kernel).
+    """Standardize data using pre-computed column statistics.
     
     Args:
         x (jnp.ndarray): The input data array to standardize.
@@ -40,7 +38,7 @@ def _standardize_data(x: jnp.ndarray, mean: jnp.ndarray, std: jnp.ndarray) -> jn
 
 @jax.jit
 def _get_stats(x: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """Computes mean/std on GPU to avoid CPU-sync.
+    """Compute column-wise mean and standard deviation on device.
     
     Args:
         x (jnp.ndarray): The input array (usually exogenous regressors).
@@ -94,7 +92,7 @@ def _z_from_levels(levels_float: jnp.ndarray) -> jnp.ndarray:
 # --- Metrics ---
 @jax.jit
 def _mse(y: jnp.ndarray, yhat: jnp.ndarray) -> jnp.ndarray:
-    """Calculates Mean Squared Error.
+    """Calculate the mean squared error (MSE).
     
     Args:
         y (jnp.ndarray): Ground truth values.
@@ -107,7 +105,7 @@ def _mse(y: jnp.ndarray, yhat: jnp.ndarray) -> jnp.ndarray:
 
 @jax.jit
 def _mae(y: jnp.ndarray, yhat: jnp.ndarray) -> jnp.ndarray:
-    """Calculates Mean Absolute Error.
+    """Calculate the mean absolute error (MAE).
     
     Args:
         y (jnp.ndarray): Ground truth values.
@@ -120,7 +118,7 @@ def _mae(y: jnp.ndarray, yhat: jnp.ndarray) -> jnp.ndarray:
 
 @jax.jit
 def _mape(y: jnp.ndarray, yhat: jnp.ndarray) -> jnp.ndarray:
-    """Calculates Mean Absolute Percentage Error.
+    """Calculate the mean absolute percentage error (MAPE).
     
     Args:
         y (jnp.ndarray): Ground truth values.
@@ -134,7 +132,7 @@ def _mape(y: jnp.ndarray, yhat: jnp.ndarray) -> jnp.ndarray:
 
 @jax.jit
 def _smape(y: jnp.ndarray, yhat: jnp.ndarray) -> jnp.ndarray:
-    """Calculates Symmetric Mean Absolute Percentage Error.
+    """Calculate the symmetric mean absolute percentage error (sMAPE).
     
     Args:
         y (jnp.ndarray): Ground truth values.
@@ -322,10 +320,11 @@ def cross_validation(
     has_exogenous: bool,
     cv_max_rounds: int = 10,
 ) -> float:
-    """Runs rolling CV for one config using pre-sliced folds.
-    
-    Uses reduced max_rounds during CV for speed — enough to rank configs
-    but not full convergence. The final model fit uses full max_rounds.
+    """Run rolling CV for one config using pre-sliced folds.
+
+    Uses a reduced ``max_rounds`` during CV: enough to rank configs, not full
+    convergence. The final model fit uses the full ``max_rounds``. The score
+    is always the symmetric mean absolute percentage error (sMAPE).
     
     Args:
         folds (List[tuple]): A list containing pre-sliced validation chunks.
@@ -454,11 +453,42 @@ def optimize_grid_threaded(
 # =============================================================================
 
 class AutoMFLES(BaseForecaster):
-    """Automated MFLES wrapper with parallelized grid-search hyperparameter optimization.
+    """MFLES wrapper that selects hyperparameters by threaded grid search.
 
-    Inherits from BaseForecaster, providing the standard ``fit()`` / ``predict()`` /
-    ``forecast()`` interface. Internally wraps an MFLES base-estimator, automatically
-    selecting optimal hyperparameters via time-series cross-validation.
+    ``fit`` scores every configuration in the grid with rolling CV (sMAPE),
+    then fits one :class:`MFLES` with the best configuration. Exogenous
+    regressors are standardised with statistics from the training ``X``.
+    Prediction intervals are conformal when ``prediction_intervals`` is set,
+    otherwise Gaussian bands from the in-sample residual standard deviation.
+
+    Args:
+        test_size (int): Forecast horizon of each CV window.
+        season_length (int | list[int] | None): Seasonal period(s). Drives the
+            default grid and the ``seasonal_period`` passed to the final fit
+            (the first period when a list is given). Default is None.
+        n_windows (int): Number of rolling CV windows. Default is 2.
+        config (list[dict] | dict[str, list] | None): Grid override. A list of
+            :meth:`MFLES.fit` keyword dicts is used as is; a dict of lists is
+            expanded to its Cartesian product. None builds the default grid
+            from ``season_length``. Default is None.
+        step_size (int | None): Observations between CV windows. None uses
+            ``test_size``. Default is None.
+        metric (str): Stored on the instance; the grid search always scores
+            sMAPE. Default is "smape".
+        verbose (bool): Print grid-search progress. Default is False.
+        prediction_intervals (ConformalIntervals | None): Conformal interval
+            configuration, stored as ``conformal_params`` and passed to the
+            inner MFLES. None selects Gaussian intervals. Default is None.
+        alias (str): Model name identifier. Default is "AutoMFLES".
+        n_jobs (int): Number of threads for the grid search. Default is 4.
+
+    Attributes:
+        model_ (dict | None): ``{"model": MFLES, "fitted": jnp.ndarray}`` after fit.
+        best_params_ (dict | None): Selected :meth:`MFLES.fit` keyword arguments.
+        sigma_ (jnp.ndarray): In-sample residual standard deviation after fit.
+
+    Raises:
+        ValueError: If ``test_size`` or ``n_windows`` is not positive.
     """
 
     def __init__(
@@ -474,23 +504,7 @@ class AutoMFLES(BaseForecaster):
         alias: str = "AutoMFLES",
         n_jobs: int = 4
     ) -> None:
-        """Initializes the AutoMFLES wrapper class.
-        
-        Args:
-            test_size (int): Primary step horizon to evaluate internal cross validation.
-            season_length (Optional[Union[int, List[int]]], optional): Structural repetition frequency.
-            n_windows (int, optional): Allowed number of cross validation iterations. Defaults to 2.
-            config (Optional[List[Dict[str, Any]]], optional): Hardcoded overrides. Defaults to None.
-            step_size (Optional[int], optional): Steps separating CV windows. Defaults to test_size.
-            metric (str, optional): Assessed target loss metric. Defaults to 'smape'.
-            verbose (bool, optional): Reporting status flag. Defaults to False.
-            prediction_intervals (Optional[Any], optional): Settings dictating conformal bound output.
-            alias (str, optional): Custom system tracking ID. Defaults to "AutoMFLES".
-            n_jobs (int, optional): Authorized CPU Thread limits. Defaults to 4.
-            
-        Raises:
-            ValueError: If test_size or n_windows are <= 0.
-        """
+        """Store the configuration; see the class docstring for the arguments."""
         if test_size <= 0: raise ValueError("test_size must be > 0")
         if n_windows <= 0: raise ValueError("n_windows must be > 0")
 
@@ -502,8 +516,8 @@ class AutoMFLES(BaseForecaster):
         self.metric: str = metric
         self.verbose: bool = verbose
         self.prediction_intervals: Optional[Any] = prediction_intervals
-        # Base-class conformal contract reads `conformal_params` (the ctor
-        # name `prediction_intervals` is kept for API compatibility).
+        # Base-class conformal contract reads `conformal_params` (the constructor
+        # name `prediction_intervals` is kept for interface compatibility).
         self.conformal_params = prediction_intervals
         self.alias: str = alias
         self.n_jobs: int = n_jobs
@@ -515,17 +529,18 @@ class AutoMFLES(BaseForecaster):
         self._cached_y_hash: Optional[int] = None  # Cache key for y (to detect changes)
 
     def fit(self, y: Union[np.ndarray, jnp.ndarray], X: Optional[jnp.ndarray] = None) -> "AutoMFLES":
-        """Fits the AutoMFLES engine to the given time series and regressors.
-        
-        Accepts training time series data, conducts parallelized grid optimization,
-        applies required structural scaling, and fits the base system.
-        
+        """Select hyperparameters by grid search and fit the inner MFLES.
+
+        The grid search runs only when ``y`` changed since the last fit (or on
+        the first fit); otherwise the cached ``best_params_`` are reused.
+
         Args:
-            y (Union[np.ndarray, jnp.ndarray]): Vector array of historical values.
-            X (Optional[jnp.ndarray], optional): Structural feature regressor inputs. Defaults to None.
-            
+            y (np.ndarray | jnp.ndarray): Univariate series, shape ``(T,)``.
+            X (jnp.ndarray | None): Exogenous regressors, shape ``(T, F)``;
+                standardised column-wise before fitting. Default is None.
+
         Returns:
-            AutoMFLES: A reference mapping back to itself to permit operation chaining.
+            AutoMFLES: ``self``, for method chaining.
         """
         y = _ensure_float(y)
         y_hash = hash(y.tobytes())  # Simple hash to detect y changes
@@ -539,7 +554,7 @@ class AutoMFLES(BaseForecaster):
         if self.best_params_ is None or self._cached_y_hash != y_hash:
             search_grid = generate_search_grid(self.season_length, self.config)
 
-            # Use THREADED optimization (Safe & Fast)
+            # Threaded grid search
             self.best_params_ = optimize_grid_threaded(
                 y=y,
                 X=X,
@@ -559,7 +574,7 @@ class AutoMFLES(BaseForecaster):
             alias=self.alias,
         )
         
-        # Fix: Handle season_length as list safely
+        # season_length may be a list; its first period is the fallback
         default_sl = None if self.season_length is None else (self.season_length[0] if isinstance(self.season_length, list) else self.season_length)
         final_sl = self.best_params_.get("seasonal_period", default_sl)
         fit_params = {k: v for k, v in self.best_params_.items() if k != "seasonal_period"}
@@ -571,19 +586,26 @@ class AutoMFLES(BaseForecaster):
         return self
 
     def predict(self, h: int, X: Optional[jnp.ndarray] = None, level: Optional[List[int]] = None) -> Dict[str, Any]:
-        """Calculates out-of-sample forward observations utilizing parameterized state mapping.
-        
+        """Forecast ``h`` steps ahead from the fitted inner MFLES.
+
         Args:
-            h (int): Out-of-sample target evaluation step count.
-            X (Optional[jnp.ndarray], optional): Expected out-of-sample features array. Defaults to None.
-            level (Optional[List[int]], optional): Percentage integer bounds (e.g. 90, 95). Defaults to None.
-            
+            h (int): Forecast horizon.
+            X (jnp.ndarray | None): Future exogenous regressors, shape ``(h, F)``;
+                standardised with the training statistics. Default is None.
+            level (list[int] | None): Confidence levels in (0, 100), e.g.
+                ``[80, 95]``. Default is None.
+
         Returns:
-            Dict[str, Any]: Dictionary keys mapping "mean", and conditionally bound arrays.
-            
+            dict: ``"mean"`` of shape ``(h,)``, plus ``"lo-{lv}"`` and
+            ``"hi-{lv}"`` of shape ``(h,)`` per level when ``level`` is given
+            (conformal when ``prediction_intervals`` is set, otherwise Gaussian).
+
         Raises:
-            RuntimeError: Tripped if action executed without preceding fit procedure.
-            ValueError: Tripped if inference attempts feature mapping absent historical features.
+            RuntimeError: If called before ``fit``.
+            ValueError: If ``X`` is given but the model was fitted without
+                ``X``; if ``level`` is empty or has a value outside (0, 100);
+                or, with ``prediction_intervals`` set, if ``h`` differs from
+                its ``h``.
         """
         if self.model_ is None: raise RuntimeError("Model not fitted.")
         level = _validate_levels(level)
@@ -612,39 +634,38 @@ class AutoMFLES(BaseForecaster):
         level: list[int | float] | None = None,
         fitted: bool = False,
     ) -> dict:
-        """Stateless fit+predict in one call.
+        """Fit-and-forecast in one call.
 
-        Parameters
-        ----------
-        y : jnp.ndarray
-            Input time series.
-        h : int
-            Forecast horizon.
-        X : jnp.ndarray or None, default None
-            In-sample exogenous variables.
-        X_future : jnp.ndarray or None, default None
-            Future exogenous variables.
-        level : list[int | float] or None, default None
-            Confidence levels for prediction intervals.
-        fitted : bool, default False
-            Whether to return in-sample fitted values.
+        On an unfitted instance this calls :meth:`fit` (grid search included)
+        and then :meth:`predict`, so it stores state on ``self``. On a fitted
+        instance it is stateless: the inner MFLES re-fits on ``y`` with the
+        selected configuration and nothing on ``self`` changes. The base-class
+        ``conformity_scores`` maps the fitted path over CV windows.
 
-        Returns
-        -------
-        dict
-            Keys: 'mean', and optionally 'lo-{lv}', 'hi-{lv}', 'fitted'.
+        Args:
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            h (int): Forecast horizon.
+            X (jnp.ndarray | None): In-sample exogenous regressors, shape ``(T, F)``. Default is None.
+            X_future (jnp.ndarray | None): Future exogenous regressors, shape ``(h, F)``. Default is None.
+            level (list[int | float] | None): Confidence levels in (0, 100), e.g. ``[80, 95]``. Default is None.
+            fitted (bool): If True, also return the in-sample fitted values of the full-series fit. Default is False.
+
+        Returns:
+            dict: ``"mean"`` of shape ``(h,)``; ``"lo-{lv}"`` and ``"hi-{lv}"`` per level when ``level`` is given; ``"fitted"`` of shape ``(T,)`` when ``fitted`` is True.
+
+        Raises:
+            ValueError: If ``X`` or ``X_future`` is given but the model was fitted without ``X``; if ``level`` is empty or has a value outside (0, 100) and ``prediction_intervals`` is None; or, with ``prediction_intervals`` set, if ``h`` differs from its ``h``.
         """
         if self.best_params_ is None or self.model_ is None:
-            # First call: the grid search is a host-side threaded loop by
-            # design (AutoARIMA pattern — selection stays eager) and needs
-            # concrete data.
+            # First call: the grid search is a host-side threaded loop and
+            # needs concrete data.
             self.fit(y, X=X)
             res = self.predict(h=h, X=X_future, level=level)
             if fitted:
                 res['fitted'] = self.model_['fitted']
             return res
 
-        # Fitted fast path — fully traceable and writes NOTHING to self (the
+        # Fitted fast path: fully traceable and writes NOTHING to self (the
         # base conformity_scores vmaps this method). Delegates to the inner
         # MFLES's stateless forecast, which replays the resolved fit config,
         # so every CV window re-fits the selected configuration on its own y.
@@ -681,32 +702,31 @@ class AutoMFLES(BaseForecaster):
     def conformity_scores(
         self, y: jnp.ndarray, X: Optional[jnp.ndarray] = None
     ) -> jnp.ndarray:
-        """Conformity scores with eager selection, per-window re-fit.
+        """Conformity scores with eager selection and a per-window re-fit.
 
-        The base implementation vmaps ``self.forecast`` over CV windows. The
-        grid search (threaded Python loop, ``.item()``/``np.argmin`` scoring)
-        cannot trace, so it runs ONCE, eagerly, here; the per-window
-        ``forecast`` then re-fits the SELECTED config independently per window
-        via MFLES's traceable config-replay path.
+        The grid search (a threaded Python loop with host-side scoring) cannot
+        trace, so it runs once, eagerly, here. The per-window ``forecast`` then
+        re-fits the selected configuration on each window through the inner
+        MFLES config-replay path. The replayed config does not pin ``robust``,
+        so windows shorter than ``_ROBUST_AUTODETECT_MAX_N`` auto-detect it as
+        a traced flag; those run sequentially to avoid the batched-``cond``
+        Siegel cost, longer windows run under the base-class vmap.
 
-        Execution regime: the replayed config never pins ``robust`` (a ctor field,
-        not a fit kwarg), so window fits below the ``_ROBUST_AUTODETECT_MAX_N``
-        guardrail live-auto-detect it as a traced scalar — under the CV vmap the
-        trend ``lax.cond`` lowers to ``select`` and Siegel executes every round of
-        every window. Those cells run the windows sequentially instead, at
-        bit-identical values. At or above the bound fit() pins robust=False
-        statically and the vmap amortizes fine. The window fit
-        length is ``n - h`` exactly (base padding: ``base_train_end +
-        (n_windows-1)*h`` with the ``n_windows`` terms cancelling).
+        Calibration caveat: the configuration is selected with sight of the
+        full series; per-window parameters are still re-fit, so scores vary
+        across windows.
 
-        Calibration caveat (shared with AutoARIMA and AutoETS): the CONFIG
-        is selected with sight of the full series; per-window parameters are
-        still honestly re-fit, so scores vary across windows.
+        Args:
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            X (jnp.ndarray | None): Exogenous regressors, shape ``(T, F)``. Default is None.
+
+        Returns:
+            jnp.ndarray: Conformity scores of shape ``(n_windows, h)``.
         """
         if self.best_params_ is None or self.model_ is None:
             self.fit(y, X)
             # fit() already ran the walk-forward on exactly this y via the
-            # inner model's _cs cache — reuse instead of paying CV twice.
+            # inner model's _cs cache; reuse instead of paying CV twice.
             inner_cs = getattr(self.model_["model"], "_cs", None)
             if inner_cs is not None:
                 return inner_cs

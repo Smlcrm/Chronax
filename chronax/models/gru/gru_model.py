@@ -1,50 +1,17 @@
-"""
-File: gru_model.py
+"""Gated recurrent unit (GRU) forecaster: BaseForecaster wrapper around the
+JAX/Flax-NNX backbone.
 
-High-level Purpose:
-    Provides a JAX/Flax/Optax GRU forecaster wrapper with a stable class
-    interface for fitting and forecasting univariate time series.
-
-Problem Solved:
-    Encapsulates GRU training (rolling-window sampling, per-window robust
-    scaling, JIT-compiled SGD with Adam) and direct-decoding inference behind
-    a `BaseForecaster`-compatible API so downstream pipelines can treat a
-    neural model identically to ARIMA / ETS / etc.
-
-Architectural Role:
-    Sits at the model-interface layer. Delegates network definition to
-    `gru_module.GRUNet`, training loop to `gru_training.train`, scaling to
-    `gru_scaler.RobustScaler`, and stateless single-window inference to
-    `gru_training.predict_step`.
-
-Major Classes/Functions:
-    - `GRU`: Direct-decoding univariate GRU forecaster.
-
-External Dependencies:
-    - `jax`, `jax.numpy`, `flax.nnx`
-    - Internal modules: `gru_module`, `gru_training`, `gru_scaler`,
-      `base_forecaster`
-
-Expected Inputs and Outputs:
-    - Input: a 1-D `jnp.ndarray`-compatible series and a forecast horizon.
-    - Output: dictionaries containing mean forecasts.
+Delegates the network to ``gru_module.GRUNet``, the training loop to
+``gru_training.train``, per-window scaling to ``gru_scaler.RobustScaler`` and
+single-window inference to ``gru_training.predict_step``.
 
 Example:
     >>> import jax.numpy as jnp
     >>> from chronax.models import GRU
     >>> y = jnp.asarray([1.0, 2.0, 1.5, 1.7, 2.2, 1.9, 2.1, 2.4])
     >>> model = GRU(h=2, input_size=4, hidden_size=16, max_steps=20)
-    >>> model.fit(y)
-    >>> model.predict(h=2)["mean"].shape
+    >>> model.fit(y).predict(h=2)["mean"].shape
     (2,)
-
-Assumptions:
-    - The series is non-empty, 1-D, numeric, and finite.
-    - `len(y) >= input_size + h` at fit time.
-
-Side Effects:
-    - Mutates instance state (`model_`, cached context window).
-    - JIT-compiles a forward pass on first `predict` call after `fit`.
 """
 from __future__ import annotations
 
@@ -61,77 +28,54 @@ from chronax.models.gru.gru_training import predict_step, train
 
 
 class GRU(BaseForecaster):
-    """
-    GRU
+    """Univariate gated recurrent unit (GRU) forecaster.
 
-    Description:
-        Univariate gated-recurrent-unit forecaster. The encoder is a stack of
-        Flax NNX `GRUCell`s rolled over time with `jax.lax.scan`; the decoder
-        is a 2-layer MLP. Each rolling window is z-scored with a robust
-        median/MAD scaler, and the model is trained in scaled space using
-        Optax `adam` with a pluggable point loss (see ``loss``).
+    The encoder is a stack of Flax NNX ``GRUCell`` layers rolled over time
+    with ``jax.lax.scan``; the decoder is a two-layer multilayer perceptron
+    (MLP). Each rolling window is z-scored with a robust median/MAD (median
+    absolute deviation) scaler, and the model trains in scaled space with
+    Optax ``adam`` and a pluggable point loss. The network is direct-decoded
+    for exactly ``h`` steps; ``predict(h=k)`` slices for any ``k <= h``.
 
-    Maintenance Status:
+    Maintenance status:
         Active univariate forecaster. Integrates with the ``BaseForecaster``
         interface, including conformal prediction intervals via
-        ``predict(level=...)``, pickle round-trip, and
-        ``forecast(fitted=True)``.
-
-    Attributes:
-        uses_exog (bool): Indicates support for exogenous regressors.
-        h (int): Forecast horizon (model is direct-decoded for exactly `h`
-            steps; `predict(h=k)` slices for any ``k <= h``).
-        input_size (int): Length of the input window. Defaults to ``3 * h``
-            when ``-1`` is passed.
-        hidden_size (int): GRU encoder hidden dimension.
-        n_layers (int): Number of stacked GRU layers.
-        decoder_hidden_size (int): MLP decoder hidden dimension.
-        dropout (float): Inter-layer dropout in the encoder.
-        max_steps (int): Number of optimizer steps during fit.
-        learning_rate: Adam learning rate — scalar or ``optax.ScalarOrSchedule``
-            callable. Passed through to ``optax.adam`` at fit time.
-        batch_size (int): Number of windows per gradient step.
-        random_seed (int): Seed used for parameter init and batch sampling.
-        alias (str): Display name for external reporting.
-        ``model_`` (GRUNet | None): Fitted network after ``fit``.
-        conformal_params: Conformal calibration set by ``BaseForecaster``
-            when ``fit`` is given ``prediction_intervals``; consumed by
-            ``predict(level=...)``.
+        ``predict(level=...)``, pickle round-trip, and ``forecast(fitted=True)``.
 
     Args:
         h (int): Forecast horizon.
-        input_size (int): Input-window length; -1 (default) uses ``3 * h``.
-        hidden_size (int): Encoder hidden dimension.
-        n_layers (int): Number of stacked GRU cells.
-        decoder_hidden_size (int): MLP-decoder hidden dimension.
-        dropout (float): Inter-layer dropout rate.
-        max_steps (int): Number of training steps.
-        learning_rate: Adam learning rate; see Attributes for the
-            scalar-or-schedule contract.
-        batch_size (int): Number of rolling windows sampled per step.
-        random_seed (int): Random seed for reproducibility.
-        alias (str): Friendly model name.
+        input_size (int): Input window length. Any value ``< 1`` (default
+            ``-1``) resolves to ``3 * h``.
+        hidden_size (int): Encoder hidden width. Default ``200``.
+        n_layers (int): Number of stacked GRU layers. Default ``2``.
+        decoder_hidden_size (int): Hidden width of the MLP decoder. Default
+            ``128``.
+        dropout (float): Dropout rate between encoder layers. Default ``0.0``.
+        max_steps (int): Number of Adam steps. Default ``1000``.
+        learning_rate (float | Callable[[int], float]): Adam learning rate, a
+            scalar or an ``optax`` schedule. Default ``1e-3``.
+        batch_size (int): Rolling windows sampled per step. Default ``128``.
+        random_seed (int): Seed for parameter init and window sampling.
+            Default ``1``.
+        alias (str): Display name. Default ``"GRU"``.
+        loss (str | LossFn): Registry name (``"mae"``, ``"mse"``, ``"huber"``)
+            or a callable ``(pred, target) -> scalar``. Default ``"mae"``.
+        recurrent_init (str): Initializer for the recurrent kernels:
+            ``"uniform"`` (``U(-1/sqrt(H), 1/sqrt(H))``) or ``"orthogonal"``
+            (Saxe-style). Input kernels and biases always use the uniform
+            init. Default ``"uniform"``.
 
-    Methods:
-        fit(): Train the network on a 1-D series.
-        predict(): Forecast ``h`` steps from the last fitted context.
-        forecast(): Stateless fit-then-predict.
+    Attributes:
+        model_ (GRUNet | None): Fitted network after ``fit``.
+        conformal_params (ConformalIntervals | None): Conformal settings read
+            by ``predict(level=...)``; ``None`` until set by the caller.
 
-    Returns:
-        Produces forecasts via dictionaries keyed by ``mean``.
-
-    Example:
-        >>> import jax.numpy as jnp
-        >>> from chronax.models import GRU
-        >>> y = jnp.asarray([1.0, 2.0, 1.5, 1.7, 2.2, 1.9, 2.1, 2.4])
-        >>> model = GRU(h=2, input_size=4, hidden_size=16, max_steps=20)
-        >>> model.fit(y).predict(h=2)["mean"].shape
-        (2,)
-
-    Notes:
-        This class is stateful and not thread-safe for concurrent mutation.
-        Defaults: `hidden_size=200`, `n_layers=2`, `decoder_hidden_size=128`,
-        `max_steps=1000`, `learning_rate=1e-3`.
+    Note:
+        A callable ``loss`` or ``learning_rate`` must itself be picklable for
+        the fitted estimator to pickle. An unknown ``loss`` name raises
+        ``ValueError`` at ``fit`` time. The decoder depth is fixed at two
+        layers. The instance is stateful and not safe for concurrent
+        mutation.
     """
 
     uses_exog = False
@@ -152,49 +96,11 @@ class GRU(BaseForecaster):
         loss: Union[str, LossFn] = "mae",
         recurrent_init: str = "uniform",
     ):
-        """
-        Initialize a GRU forecaster.
+        """Initialize a GRU forecaster.
 
-        Detailed Description:
-            Stores hyperparameters; the network is not built until ``fit`` is
-            called (so ``__init__`` is cheap and side-effect free).
-
-        Args:
-            h (int): Forecast horizon.
-            input_size (int): Input-window length. Use -1 for ``3 * h``.
-            hidden_size (int): Encoder hidden dimension.
-            n_layers (int): Number of stacked GRU cells.
-            decoder_hidden_size (int): MLP-decoder hidden dimension.
-            dropout (float): Inter-layer dropout rate.
-            max_steps (int): Optimizer steps for ``fit``.
-            learning_rate: Adam learning rate. Accepts either a scalar or any
-                ``optax.ScalarOrSchedule`` (a callable mapping step → LR, e.g.
-                ``optax.cosine_decay_schedule``). If you pass a callable and
-                later want to pickle the fitted estimator, ensure the
-                callable itself is picklable (a class-based callable or a
-                module-level helper — closures returned by some optax helpers
-                are not).
-            batch_size (int): Windows per training step.
-            random_seed (int): Random seed.
-            alias (str): User-facing model name.
-            loss: Either a registered name (``"mae"``, ``"mse"``, ``"huber"``)
-                from :mod:`chronax.models.gru.gru_losses` or a callable with
-                signature ``(pred, target) -> scalar``. Strings are validated
-                lazily at ``fit`` time so the constructor stays cheap and the
-                resulting estimator pickles cleanly.
-            recurrent_init: Initializer for the GRU recurrent kernels.
-                ``"uniform"`` (default) samples from Uniform(-1/sqrt(H), 1/sqrt(H));
-                ``"orthogonal"`` uses Saxe-style orthogonal initialization, which
-                stabilises gradients through time and often helps with longer
-                ``input_size``. The input kernel and biases use the uniform
-                init regardless.
-
-        Returns:
-            None: Constructor initializes estimator state.
-
-        Notes:
-            ``decoder_layers`` is hard-wired to 2; expose it again once the
-            decoder supports configurable depth.
+        Stores hyperparameters; the network is built at ``fit`` time, so
+        construction is cheap and side-effect free. Constructor arguments are
+        documented on the class.
         """
         if input_size < 1:
             input_size = 3 * h
@@ -237,32 +143,30 @@ class GRU(BaseForecaster):
         )
 
     def fit(self, y: jnp.ndarray, X: jnp.ndarray | None = None) -> "GRU":
-        """
-        Fit the GRU on a univariate series.
+        """Fit the network on a 1-D series.
 
-        Detailed Description:
-            Builds the network with the configured hyperparameters, then runs
-            ``self.max_steps`` Adam steps over rolling windows of length
-            ``input_size + h`` sampled uniformly at random. Each window is
-            normalized with the per-window robust scaler before the forward
-            pass; the configured ``loss`` is applied in scaled space.
+        Builds the network and runs ``max_steps`` Adam steps over rolling
+        windows of length ``input_size + h``, sampled uniformly with
+        replacement at every step. Each window is scaled by its own robust
+        median/MAD statistics before the forward pass, and the loss is taken
+        in scaled space.
 
         Args:
-            y (jnp.ndarray): 1-D series of length ``>= input_size + h``.
-            X: Reserved for future exogenous regressors; must be None in v1.
+            y (jnp.ndarray): Univariate series, shape ``(T,)`` with
+                ``T >= input_size + h``.
+            X (jnp.ndarray | None): Exogenous regressors. Not supported; must
+                be ``None``.
 
         Returns:
-            GRU: ``self``, with ``model_`` populated.
+            GRU: ``self`` with ``model_`` populated.
 
         Raises:
-            NotImplementedError: If ``X`` is provided.
-            ValueError: If ``y`` is not 1-D, or shorter than
-                ``input_size + h``.
-            RuntimeError: If a non-finite training loss is observed
-                (training diverged); message includes the offending step.
-
-        Side Effects:
-            Mutates ``self.model_`` and ``self._context``.
+            NotImplementedError: If ``X`` is not ``None``.
+            ValueError: If ``y`` is not 1-D, if it is shorter than
+                ``input_size + h``, or if ``loss`` is an unknown
+                registry name.
+            RuntimeError: If a non-finite training loss is observed (the
+                training run diverged).
         """
         if X is not None:
             raise NotImplementedError("Exogenous variables are not supported in v1.")
@@ -296,35 +200,30 @@ class GRU(BaseForecaster):
         X: jnp.ndarray | None = None,
         level: list[int | float] | None = None,
     ) -> dict:
-        """
-        Forecast from the fitted context.
+        """Forecast ``h`` steps from the fitted context.
 
-        Detailed Description:
-            Runs a single deterministic forward pass on the cached context
-            window (last ``input_size`` of the fit-time series), then slices
-            to the requested ``h``. Always materializes ``self.h`` outputs
-            internally so the JIT cache is shared across calls regardless of
-            the caller's ``h``.
+        The network is direct-decoded for ``self.h`` steps and the first ``h``
+        are returned.
 
         Args:
-            h (int): Forecast horizon. Must satisfy ``h <= self.h``.
-            X: Reserved for future exogenous regressors; ignored in v1.
-            level (list[int | float] | None): If provided, returns conformal
-                prediction intervals as additional ``lo-XX``/``hi-XX`` keys
-                (e.g. ``lo-80``, ``hi-80`` for level=[80]). Requires
-                ``self.conformal_params`` to be set. The inherited
-                conformity-score computation re-fits the model per CV
-                window; on GRU expect MINUTES per call. Reduce
-                ``n_windows`` or ``max_steps`` if interactive feedback
-                matters.
+            h (int): Forecast horizon, ``h <= self.h``.
+            X (jnp.ndarray | None): Exogenous regressors. Ignored.
+            level (list[int | float] | None): Confidence levels in (0, 100),
+                e.g. ``[80, 95]``. When given, conformal intervals come from
+                ``BaseForecaster.conformity_scores``, which re-fits the model on
+                every cross-validation (CV) window under ``vmap``; requires
+                ``self.conformal_params``. Expect minutes per call on this
+                model, scaling with ``n_windows`` and ``max_steps``.
 
         Returns:
-            dict: ``{"mean": jnp.ndarray of shape (h,)}``.
+            dict: ``"mean"`` (shape ``(h,)``) plus ``"lo-{lv}"`` and
+            ``"hi-{lv}"`` (shape ``(h,)``) for each level when ``level`` is
+            given.
 
         Raises:
-            ValueError: If ``h > self.h``.
-            NotImplementedError: If ``level`` is provided.
             RuntimeError: If called before ``fit``.
+            ValueError: If ``h > self.h``, or if ``level`` is given while
+                ``self.conformal_params`` is ``None``.
         """
         if h > self.h:
             raise ValueError(
@@ -367,37 +266,32 @@ class GRU(BaseForecaster):
         level: list[int | float] | None = None,
         fitted: bool = False,
     ) -> dict:
-        """
-        Stateless fit-then-predict.
+        """Fit on ``y`` and forecast ``h`` steps in one call.
 
-        Detailed Description:
-            Equivalent to ``self.fit(y).predict(h=h, level=level)`` (plus an
-            extra ``"fitted"`` key when ``fitted=True``) and numerically
-            identical to that pattern when seeded the same way.
+        Equivalent to ``self.fit(y).predict(h=h, level=level)``; the fitted
+        state stays on the estimator.
 
         Args:
-            y (jnp.ndarray): 1-D training series.
-            h (int): Forecast horizon (``<= self.h``).
-            X / X_future: Reserved; must be None in v1.
-            level: Optional confidence levels (e.g. [80, 95]). When set,
-                returns conformal intervals via the inherited
-                BaseForecaster.add_confidence_intervals path. See note on
-                cost (minutes per call) in ``predict``.
-            fitted (bool): If True, the returned dict additionally contains
-                a ``"fitted"`` key with one-step-ahead predictions over the
-                training series. The first ``input_size`` entries are NaN
-                (no input window available); the remaining entries are
-                finite. Matches the convention used by other Chronax models.
+            y (jnp.ndarray): Univariate series, shape ``(T,)``.
+            h (int): Forecast horizon, ``1 <= h <= self.h``.
+            X (jnp.ndarray | None): Exogenous regressors. Not supported; must
+                be ``None``.
+            X_future (jnp.ndarray | None): Future exogenous regressors. Not
+                supported; must be ``None``.
+            level (list[int | float] | None): Confidence levels; see
+                ``predict``.
+            fitted (bool): If ``True``, add a ``"fitted"`` key with
+                one-step-ahead in-sample predictions, shape ``(T,)``; the first
+                ``input_size`` entries are NaN.
 
         Returns:
-            dict: ``{"mean": ..., optional "fitted": ...}``.
+            dict: ``"mean"`` (shape ``(h,)``), the interval keys when ``level``
+            is given, and ``"fitted"`` when ``fitted=True``.
 
         Raises:
-            NotImplementedError: If ``X`` or ``X_future`` is non-None, or if
-                ``level`` is non-None.
-            ValueError: Forwarded from ``fit`` / ``predict``.
-            RuntimeError: Forwarded from ``fit`` (training divergence) or
-                ``predict``.
+            NotImplementedError: If ``X`` or ``X_future`` is not ``None``.
+            ValueError: Forwarded from ``fit`` and ``predict``.
+            RuntimeError: Forwarded from ``fit`` and ``predict``.
         """
         if X is not None or X_future is not None:
             raise NotImplementedError("Exogenous variables are not supported in v1.")

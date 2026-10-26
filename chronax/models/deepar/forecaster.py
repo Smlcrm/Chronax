@@ -1,4 +1,4 @@
-"""High-level forecaster API for DeepAR (JAX/FLAX/OPTAX, NumPy-free)."""
+"""High-level forecaster interface for DeepAR (JAX/FLAX/OPTAX, NumPy-free)."""
 
 from __future__ import annotations
 
@@ -17,14 +17,23 @@ from .train import TrainState, make_loss_fn, make_train_step
 
 
 class DeepARForecaster:
-    """High-level fit/predict API wrapping DeepAR_EncDec.
+    """High-level fit/predict interface wrapping :class:`DeepAR_EncDec`.
+
+    Probabilistic forecaster: a long short-term memory (LSTM) encoder-decoder
+    emits a Gaussian mean and scale per step, and :meth:`predict` draws Monte
+    Carlo (MC) sample paths from it. This class does not subclass
+    :class:`~chronax.models.base_forecaster.BaseForecaster`: its ``fit``,
+    ``predict`` and ``forecast`` signatures and return types differ from that
+    contract and no conformal intervals are available.
 
     Args:
-        h: Forecast horizon.
-        hidden_size: LSTM hidden dimension.
-        dropout_rate: Dropout probability.
-        min_sigma: Minimum σ floor.
-        seed: Master random seed.
+        h (int): Forecast horizon.
+        hidden_size (int): LSTM hidden dimension. Default ``64``.
+        dropout_rate (float): Dropout probability. Default ``0.1``.
+        min_sigma (float): Lower floor added to the predicted Gaussian scale.
+            Default ``0.02``.
+        seed (int): Master random seed for parameter init and training.
+            Default ``0``.
     """
 
     def __init__(
@@ -63,19 +72,28 @@ class DeepARForecaster:
     ) -> "DeepARForecaster":
         """Fit DeepAR to a collection of time series.
 
+        Each training step teacher-forces one series (cycling through
+        ``y_series`` in order) on the last ``input_size + h`` points of that
+        series and takes one AdamW step on the masked Gaussian negative
+        log-likelihood.
+
         Args:
-            y_series: List of 1-D JAX arrays (one per series).
-            x_futr_list: Future exogenous per series [T+h, F] or None.
-            x_stat_list: Static features per series [S] or None.
-            input_size: History window length.
-            num_steps: Training steps.
-            batch_size: Ignored (single-series batches currently).
-            learning_rate: Learning rate.
-            weight_decay: AdamW weight-decay.
-            verbose: Print progress.
+            y_series (list[jnp.ndarray]): One 1-D array per series, shape
+                ``(T_i,)``.
+            x_futr_list (list[jnp.ndarray | None] | None): Future exogenous
+                regressors per series, shape ``[T_i + h, F]``, or ``None``.
+            x_stat_list (list[jnp.ndarray | None] | None): Static features
+                per series, shape ``[S]``, or ``None``.
+            input_size (int): History window length. Default ``168``.
+            num_steps (int): Training steps. Default ``1000``.
+            batch_size (int): Accepted for interface parity; unused, every
+                step trains on a single series. Default ``32``.
+            learning_rate (float): AdamW learning rate. Default ``1e-3``.
+            weight_decay (float): AdamW weight decay. Default ``1e-5``.
+            verbose (bool): Print the loss every 100 steps. Default ``True``.
 
         Returns:
-            self
+            DeepARForecaster: ``self``.
         """
         self.input_size = input_size
         self.model = DeepAR_EncDec(
@@ -98,7 +116,7 @@ class DeepARForecaster:
         self.params = self.model.init(
             {"params": init_key, "dropout": init_key},
             dummy_y,
-            dummy_xf,   # futr_exog — history window length
+            dummy_xf,   # futr_exog over the history window
             dummy_xs,   # x_static
             True,
         )
@@ -177,17 +195,29 @@ class DeepARForecaster:
         num_samples: int = 100,
         seed: int = 0,
     ) -> jnp.ndarray:
-        """Monte Carlo sample paths.
+        """Draw Monte Carlo sample paths over the horizon.
+
+        The whole of ``y_series`` is encoded; the decoder then samples ``h``
+        steps autoregressively, ``num_samples`` times. Inputs are cast to
+        float32.
 
         Args:
-            y_series: Historical series [T].
-            x_futr: Future exogenous for the forecast horizon [h, F] or None.
-            x_stat: Static features [S] or None.
-            num_samples: Number of MC paths.
-            seed: Random seed.
+            y_series (jnp.ndarray): Historical series, shape ``(T,)``.
+            x_futr_hist (jnp.ndarray | None): Future-known exogenous
+                regressors aligned with the history, shape ``[T, F]``, or
+                ``None``.
+            x_futr (jnp.ndarray | None): Future exogenous regressors for the
+                forecast horizon, shape ``[h, F]``, or ``None``.
+            x_stat (jnp.ndarray | None): Static features, shape ``[S]``, or
+                ``None``.
+            num_samples (int): Number of MC paths. Default ``100``.
+            seed (int): Random seed for the sampling. Default ``0``.
 
         Returns:
-            Sample paths [num_samples, h].
+            jnp.ndarray: Sample paths, shape ``[num_samples, h]``.
+
+        Raises:
+            ValueError: If called before :meth:`fit`.
         """
         if self.model is None or self.params is None:
             raise ValueError("Call fit() before predict().")
@@ -211,8 +241,8 @@ class DeepARForecaster:
             H=self.h,
             N=num_samples,
             seed=seed,
-            # The forecaster's training pipeline (train.py loss path) does NOT
-            # use the lag-feature augmentation, so inference must not either —
+            # The forecaster's training pipeline (train.py loss path) does not
+            # use the lag-feature augmentation, so inference must not either;
             # otherwise the encoder input width no longer matches the params.
             use_lags=False,
         )
@@ -227,10 +257,28 @@ class DeepARForecaster:
         num_samples: int = 1000,
         seed: int = 0,
     ) -> Dict[float, jnp.ndarray]:
-        """Compute quantile forecasts.
+        """Compute quantile forecasts from MC sample paths.
+
+        Args:
+            y_series (jnp.ndarray): Historical series, shape ``(T,)``.
+            x_futr_hist (jnp.ndarray | None): Future-known exogenous
+                regressors aligned with the history, shape ``[T, F]``, or
+                ``None``.
+            x_futr (jnp.ndarray | None): Future exogenous regressors for the
+                horizon, shape ``[h, F]``, or ``None``.
+            x_stat (jnp.ndarray | None): Static features, shape ``[S]``, or
+                ``None``.
+            quantiles (tuple[float, ...]): Quantile levels in (0, 1).
+                Default ``(0.1, 0.5, 0.9)``.
+            num_samples (int): Number of MC paths. Default ``1000``.
+            seed (int): Random seed for the sampling. Default ``0``.
 
         Returns:
-            Dict mapping quantile level → [h] array.
+            dict[float, jnp.ndarray]: Quantile level to array of shape
+            ``(h,)``.
+
+        Raises:
+            ValueError: If called before :meth:`fit`.
         """
         paths = self.predict(y_series, x_futr_hist=x_futr_hist, x_futr=x_futr, x_stat=x_stat,
                              num_samples=num_samples, seed=seed)
@@ -243,10 +291,29 @@ class DeepARForecaster:
         x_futr: Optional[jnp.ndarray] = None,
         x_stat: Optional[jnp.ndarray] = None,
     ) -> Dict[str, jnp.ndarray]:
-        """Point forecast (median) with 10/90 uncertainty intervals.
+        """Median point forecast with 10th and 90th percentile bounds.
+
+        Draws 500 MC sample paths with ``seed=0``. Not the
+        :class:`~chronax.models.base_forecaster.BaseForecaster` ``forecast``
+        signature: it takes no ``h`` or ``level`` and returns different keys.
+
+        Args:
+            y_series (jnp.ndarray): Historical series, shape ``(T,)``.
+            x_futr_hist (jnp.ndarray | None): Future-known exogenous
+                regressors aligned with the history, shape ``[T, F]``, or
+                ``None``.
+            x_futr (jnp.ndarray | None): Future exogenous regressors for the
+                horizon, shape ``[h, F]``, or ``None``.
+            x_stat (jnp.ndarray | None): Static features, shape ``[S]``, or
+                ``None``.
 
         Returns:
-            Dict with keys ``median``, ``lower``, ``upper``, each [h].
+            dict[str, jnp.ndarray]: Keys ``"median"``, ``"lower"`` (10th
+            percentile) and ``"upper"`` (90th percentile), each of shape
+            ``(h,)``.
+
+        Raises:
+            ValueError: If called before :meth:`fit`.
         """
         q = self.quantile(y_series, x_futr_hist=x_futr_hist, x_futr=x_futr, x_stat=x_stat,
                           quantiles=(0.1, 0.5, 0.9), num_samples=500)

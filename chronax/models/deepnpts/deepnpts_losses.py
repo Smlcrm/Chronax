@@ -3,7 +3,7 @@
 Self-contained (no dependency on other models' loss modules). Each loss has
 signature ``(pred, target) -> scalar`` and reduces by mean over all elements.
 Functions are module-level so they pickle cleanly when stored as the ``loss``
-attribute of a fitted ``DeepNPTS``. NF ``DeepNPTS`` defaults to ``MAE()`` and
+attribute of a fitted ``DeepNPTS``. neuralforecast ``DeepNPTS`` defaults to ``MAE()`` and
 rejects any non-point loss.
 """
 from __future__ import annotations

@@ -1,10 +1,11 @@
-"""XLinear network: RevIN + projection + global token + dual gating + head (NF-faithful).
+"""XLinear network: RevIN + projection + global token + dual gating + head, following
+neuralforecast's forward.
 
 Univariate (n_series=1) adaptation of neuralforecast.XLinear's forward. Weight
-init replicates the *distribution* of torch defaults per layer (draws differ —
+init replicates the *distribution* of torch defaults per layer (draws differ,
 JAX vs torch RNG): U(+-1/sqrt(fan_in)) for every Linear's weight AND bias, with
 each layer's own fan_in; the global token is standard normal (torch.randn).
-Params are stored in TORCH layout ([out, in]) so NF weight transplant is a pure
+Params are stored in TORCH layout ([out, in]) so neuralforecast weight transplant is a pure
 copy. float32 throughout, matching torch/neuralforecast defaults.
 """
 from __future__ import annotations
@@ -17,7 +18,7 @@ from flax import nnx
 
 
 def _revin(y: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """NF ``use_norm`` block for ``y: [B, L]`` -> (y_norm, mean, stdev), stats [B, 1].
+    """neuralforecast ``use_norm`` block for ``y: [B, L]`` -> (y_norm, mean, stdev), stats [B, 1].
 
     Biased variance, eps 1e-5 INSIDE the sqrt, stats under stop_gradient
     (replicates torch ``.detach()``; a no-op for parameter gradients since the
@@ -33,13 +34,14 @@ def _revin(y: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
 
 def _gating(x: jnp.ndarray, w1: jnp.ndarray, b1: jnp.ndarray,
             w2: jnp.ndarray, b2: jnp.ndarray) -> jnp.ndarray:
-    """NF GatingBlock at dropout p=0: ``x * sigmoid(relu(x @ w1.T + b1) @ w2.T + b2)``."""
+    """neuralforecast ``GatingBlock`` at dropout p=0:
+    ``x * sigmoid(relu(x @ w1.T + b1) @ w2.T + b2)``."""
     hidden = jax.nn.relu(x @ w1.T + b1)
     return x * jax.nn.sigmoid(hidden @ w2.T + b2)
 
 
 class XLinearNet(nnx.Module):
-    """Forward per NF XLinear at n_series=1, no exog. I/O ``[B, L, 1] -> [B, h, 1]``."""
+    """Forward per neuralforecast XLinear at n_series=1, no exog. I/O ``[B, L, 1] -> [B, h, 1]``."""
 
     def __init__(self, h: int, input_size: int, hidden_size: int, temporal_ff: int,
                  channel_ff: int, use_norm: bool, *, rngs: nnx.Rngs):

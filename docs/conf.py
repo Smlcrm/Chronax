@@ -15,8 +15,8 @@ extensions = [
     "sphinx_copybutton",
 ]
 
-# Napoleon settings for NumPy-style docstrings
-napoleon_google_docstring = False
+# Napoleon settings: most docstrings use Google style; base_forecaster uses NumPy style
+napoleon_google_docstring = True
 napoleon_numpy_docstring = True
 
 # Autodoc settings
@@ -37,7 +37,7 @@ copybutton_prompt_is_regexp = True
 # HTML output
 html_theme = "pydata_sphinx_theme"
 html_theme_options = {
-    "github_url": "https://github.com/Smlcrm/ml-library-chronax",
+    "github_url": "https://github.com/Smlcrm/Chronax",
     "show_prev_next": False,
     "navbar_align": "left",
 }

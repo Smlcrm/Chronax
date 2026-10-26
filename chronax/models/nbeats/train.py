@@ -1,6 +1,6 @@
 """Training utilities for Chronax N-BEATS.
 
-Pure JAX/Flax/Optax — no PyTorch, no numpy.
+Pure JAX/Flax/Optax: no PyTorch, no numpy.
 
 All long-lived state is held in ``flax.training.train_state.TrainState`` and
 all randomness is threaded explicitly through ``jax.random.PRNGKey``.
@@ -15,15 +15,15 @@ Two training paths are provided:
 2. **Batch-based** (``train_batch_step`` / ``eval_batch_step``):
    Compatibility path. Accepts pre-scaled
    ``{insample_y, outsample_y, sample_mask}`` dicts and masked loss.
-   Mirrors the RNN / Autoformer training API for cross-model comparisons.
+   Mirrors the recurrent neural network (RNN) / Autoformer training interface.
 
-LR schedule:
+Learning-rate schedule:
     ``create_train_state`` accepts ``cosine_decay_steps`` + ``warmup_steps``
-    for a warmup-cosine schedule, OR ``num_lr_decays`` for the NF-style
-    StepLR (gamma=0.5 per decay). Both RNN and TSMixer benchmarks use the
-    cosine path.
+    for a warmup-cosine schedule, or ``num_lr_decays`` for the
+    neuralforecast-style StepLR (gamma=0.5 per decay); with neither, the
+    learning rate is constant.
 
-Optimizer structure (same as RNN / TSMixer benchmarks):
+Optimizer structure:
     ``chain(clip_by_global_norm(grad_clip), adam[w](schedule))``
 """
 
@@ -43,7 +43,7 @@ from chronax.models.nbeats.model import NBEATS, NBEATSConfig
 
 
 # ---------------------------------------------------------------------------
-# Module-level caches — ensure the same apply_fn / tx objects are reused so
+# Module-level caches: the same apply_fn / tx objects are reused so
 # JAX JIT never recompiles for the same config + optimizer combo.
 # ---------------------------------------------------------------------------
 
@@ -88,7 +88,7 @@ def _build_optimizer(
                 alpha=1e-2,
             )
     elif num_lr_decays > 0:
-        # NF-style StepLR: halve LR every (max_steps // num_lr_decays) steps
+        # neuralforecast-style StepLR: halve the learning rate every (max_steps // num_lr_decays) steps
         decay_every = max(max_steps // num_lr_decays, 1)
         schedules = [
             optax.constant_schedule(learning_rate * (0.5 ** i))
@@ -154,7 +154,7 @@ def create_train_state(
         cosine_decay_steps: Use warmup-cosine schedule decaying over this many
             steps (0 = disabled; takes precedence over ``num_lr_decays``).
         warmup_steps: Linear warmup steps for the cosine schedule.
-        num_lr_decays: NF-style StepLR decays with gamma=0.5 (used only when
+        num_lr_decays: neuralforecast-style StepLR decays with gamma=0.5 (used only when
             ``cosine_decay_steps <= 0``; -1 = constant LR).
         max_steps: Total training steps (used for StepLR spacing).
         weight_decay: Use AdamW when > 0; plain Adam otherwise.

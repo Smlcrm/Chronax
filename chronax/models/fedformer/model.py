@@ -7,7 +7,8 @@ case -- it does NOT import from any other chronax model.
 
 WHAT is FEDformer?
     A Transformer-style encoder/decoder for long-term time-series forecasting
-    whose attention sub-layers operate in the **frequency domain** (via the FFT)
+    whose attention sub-layers operate in the **frequency domain** (via the
+    fast Fourier transform, FFT)
     instead of the time domain. By keeping only a small, fixed number of Fourier
     modes it attains *linear* complexity in the sequence length, while a built-in
     seasonal-trend decomposition gives it a strong global view of the series.
@@ -54,12 +55,12 @@ import numpy as np  # host-side only: deterministic Fourier-mode index selection
 # ===========================================================================
 
 # Torch-matching initializers (parity with neuralforecast / PyTorch defaults).
-# TokenEmbedding uses kaiming-normal (NF override); Linear/other Conv1d use
+# TokenEmbedding uses kaiming-normal (neuralforecast override); Linear/other Conv1d use
 # torch's default uniform U(-1/sqrt(fan_in), 1/sqrt(fan_in)).
 
 
 class _TorchUniformInit:
-    """``U(-1/sqrt(fan_in), 1/sqrt(fan_in))`` — torch ``nn.Linear`` / ``nn.Conv1d`` default."""
+    """``U(-1/sqrt(fan_in), 1/sqrt(fan_in))``, the torch ``nn.Linear`` / ``nn.Conv1d`` default."""
 
     def __init__(self, fan_in: int) -> None:
         self.fan_in = fan_in
@@ -131,7 +132,7 @@ def _activation(name: str, x: jnp.ndarray) -> jnp.ndarray:
 # WHY:  FEDformer is a "deep decomposition" architecture. After every attention
 #       and feed-forward sub-layer it re-runs this decomposition so the network
 #       can model the smooth trend and the oscillatory seasonal part separately
-#       -- this is what gives it a robust *global* view of long series.
+#       -- this is what gives it a *global* view of long series.
 # HOW:  The trend is a centred moving average. We pad both ends by repeating the
 #       boundary values (so the output keeps the same length T) and compute the
 #       windowed mean efficiently with a cumulative sum (O(T) instead of O(T*k)).
@@ -153,7 +154,7 @@ def moving_avg(x: jnp.ndarray, kernel_size: int) -> jnp.ndarray:
         pad ``(kernel_size - 1) // 2`` steps on each side using the first/last
         observed value (edge padding) -- then take the running mean. The
         cumulative-sum trick computes every window mean in a single vectorised
-        pass, which is both fast and cleanly differentiable under XLA.
+        pass, which is both fast and cleanly differentiable under XLA (Accelerated Linear Algebra).
     """
     pad = (kernel_size - 1) // 2
     # Repeat the boundary samples so the smoothed trend does not "fall off" at
@@ -199,7 +200,8 @@ def series_decomp(
 #           signals also carry information in mid/high bands.
 #         * else ("lowest"): take the first `modes` (lowest) frequencies.
 #       Selection happens once, at model-construction time, on the host with a
-#       *seeded* RNG so the chosen indices are reproducible and identical across
+#       *seeded* random number generator (RNG) so the chosen indices are
+#       reproducible and identical across
 #       parameter init and every forward pass.
 
 
@@ -276,7 +278,7 @@ def _complex_uniform_init(scale: float):
 # NOTE on faithfulness: upstream FEDformer writes the per-mode outputs into the
 # *lowest* output-spectrum bins (positions 0..n_modes-1), regardless of which
 # input frequencies were read. We reproduce that exact behaviour so results line
-# up with the neuralforecast reference we benchmark against.
+# up with the neuralforecast reference.
 
 
 class FourierBlock(fnn.Module):
@@ -545,7 +547,7 @@ class MultiHeadProjection(fnn.Module):
 #       trend. A vanilla LayerNorm can introduce a small constant offset; removing
 #       the time-mean afterwards keeps the seasonal signal centred at zero so it
 #       does not leak into (and double-count with) the trend pathway.
-# HOW:  out = LN(x) - mean_over_time(LN(x)).
+# HOW:  out = LN(x) - mean_over_time(LN(x)), where LN is layer normalization.
 
 
 class SeasonalLayerNorm(fnn.Module):
@@ -598,13 +600,14 @@ class TokenEmbedding(fnn.Module):
 # ===========================================================================
 #
 # WHAT: One encoder block with progressive decomposition:
-#         self-FEB (+residual) -> decomp -> conv FFN (+residual) -> decomp.
+#         self-FEB (+residual) -> decomp -> conv feed-forward network (FFN) (+residual) -> decomp.
 # WHY:  The FEB mixes information across time in frequency space; the two
 #       decompositions strip the trend after each sub-layer so only the seasonal
 #       residual is propagated. The encoder therefore refines a clean seasonal
 #       representation of the history (its trend is intentionally discarded --
 #       the decoder reconstructs the forecast trend separately).
-# HOW:  See the call body; the Conv FFN is the usual position-wise MLP expressed
+# HOW:  See the call body; the Conv FFN is the usual position-wise multilayer
+#       perceptron (MLP) expressed
 #       as two width-1 convolutions (hidden -> conv_hidden -> hidden).
 
 

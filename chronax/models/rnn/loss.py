@@ -1,4 +1,4 @@
-"""Masked point-loss functions for the Chronax RNN model.
+"""Masked point-loss functions for the Chronax recurrent neural network (RNN) model.
 
 These mirror Nixtla NeuralForecast's ``BasePointLoss`` family (``MAE`` /
 ``MSE``) but in pure JAX, so they are JIT- and grad-friendly:

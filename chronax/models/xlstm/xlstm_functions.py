@@ -2,12 +2,12 @@
 
 Wires together the pure-functional pieces in :mod:`xlstm_backend` into a
 training entry point (:func:`xlstm_f`) and a stateless decode wrapper
-(:func:`forecast_xlstm`). Compiled XLA kernels are cached via
+(:func:`forecast_xlstm`). Compiled XLA (Accelerated Linear Algebra) kernels are cached via
 ``functools.lru_cache`` keyed on the static ``XLSTMConfig`` plus
 hyperparameters that affect compilation, mirroring the cached-jit
 pattern used in ``ets/ets_functions.py`` and ``holt._get_holt_optimizer``.
 
-Direct vs AR mode:
+Direct vs autoregressive (AR) mode:
 - AR (``cfg.decode_mode == "ar"``): training uses shifted-by-1 windows
   of length ``ctx_len + horizon_train``; loss on per-position next-step
   prediction. Inference autoregresses ``h`` steps from the final state.
@@ -63,7 +63,7 @@ def make_windows_direct(z: jnp.ndarray, ctx_len: int, horizon: int) -> Tuple[jnp
     return X, Y
 
 
-# Backward-compat alias used by older call sites
+# Backward-compatible alias.
 def make_windows(z, ctx_len, horizon_train):
     return make_windows_ar(z, ctx_len, horizon_train)
 
@@ -169,7 +169,7 @@ def xlstm_f(z: jnp.ndarray, cfg: XLSTMConfig, key: jax.Array, *,
     """Train an xLSTM / xLSTMTime model on series ``z``.
 
     Series-level normalization (z-score) is the caller's responsibility when
-    ``cfg.use_revin == False``. When RevIN is on, pass the RAW series — the
+    ``cfg.use_revin == False``. When RevIN is on, pass the RAW series; the
     model handles normalization internally.
 
     Returns a dict: ``{"params", "losses", "cfg"}``.
