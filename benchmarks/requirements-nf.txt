@@ -1,0 +1,4 @@
+# Intentionally empty. The neuralforecast reference venv pins live in
+# benchmarks/nf-venv-pins.txt (install: bash benchmarks/setup_nf_venv.sh).
+# This stub keeps GitHub's dependency graph entry for this path at zero
+# dependencies. Do not add pins here.
