@@ -343,7 +343,7 @@ def check_nf_venv(libs, venv_py=NF_VENV_PY) -> None:
             "  Unix:  bash benchmarks/setup_nf_venv.sh\n"
             "  Windows:\n"
             "    python -m venv benchmarks\\.venv-nf\n"
-            "    benchmarks\\.venv-nf\\Scripts\\pip.exe install -r benchmarks\\requirements-nf.txt")
+            "    benchmarks\\.venv-nf\\Scripts\\pip.exe install -r benchmarks\\nf-venv-pins.txt")
 
 
 def stream_worker_to_csv(model, dataset, library, config_path, csv_path, done, seeds) -> None:
