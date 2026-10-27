@@ -15,7 +15,7 @@ bash benchmarks/setup_nf_venv.sh
 ```powershell
 # Windows PowerShell
 python -m venv benchmarks\.venv-nf
-.\benchmarks\.venv-nf\Scripts\pip.exe install -r benchmarks\requirements-nf.txt
+.\benchmarks\.venv-nf\Scripts\pip.exe install -r benchmarks\nf-venv-pins.txt
 ```
 
 The harness auto-detects `Scripts\python.exe` (Windows) or `bin/python` (Unix).

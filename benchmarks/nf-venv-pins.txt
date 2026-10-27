@@ -1,3 +1,9 @@
+# Pinned packages for benchmarks/.venv-nf, the isolated neuralforecast reference venv
+# that only the neural benchmark harness uses (bash benchmarks/setup_nf_venv.sh).
+# The chronax package never installs any of this. The file is deliberately not named
+# requirements*.txt so the dependency graph does not scan a venv end users never install.
+# Install with: pip install -r benchmarks/nf-venv-pins.txt
+
 aiohappyeyeballs==2.6.1
 aiohttp==3.14.4
 aiosignal==1.4.0

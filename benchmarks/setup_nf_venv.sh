@@ -15,7 +15,7 @@ else
 fi
 
 benchmarks/.venv-nf/bin/pip install --upgrade pip
-benchmarks/.venv-nf/bin/pip install -r benchmarks/requirements-nf.txt
+benchmarks/.venv-nf/bin/pip install -r benchmarks/nf-venv-pins.txt
 
 echo
 echo "Done. Run the benchmark with:"
