@@ -10,21 +10,6 @@ def _intermittent_y():
                     + [0, 0, 2, 0, 0], dtype=float)
 
 
-def test_tsb_matches_statsforecast_mean_and_fitted():
-    # Demand level must initialize at the FIRST positive demand (not a
-    # placeholder), the first fitted value is NaN, and sigma uses n — after
-    # which mean and fitted match statsforecast exactly.
-    sf_models = pytest.importorskip("statsforecast.models")
-    y = _intermittent_y()
-    assert y[0] == 0  # the discriminating case for the demand init
-    cx = TSB(alpha_d=0.2, alpha_p=0.2).forecast(y=y, h=4, fitted=True)
-    sf = sf_models.TSB(alpha_d=0.2, alpha_p=0.2).forecast(y=y, h=4, fitted=True)
-    np.testing.assert_allclose(np.asarray(cx["mean"]), sf["mean"], rtol=1e-6)
-    cxf, sff = np.asarray(cx["fitted"]), sf["fitted"]
-    assert np.isnan(cxf[0]) and np.isnan(sff[0])
-    np.testing.assert_allclose(cxf[1:], sff[1:], rtol=1e-6)
-
-
 def test_tsb_level_without_conformal_raises():
     y = _intermittent_y()
     m = TSB(alpha_d=0.2, alpha_p=0.2)

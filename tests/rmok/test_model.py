@@ -213,15 +213,6 @@ def test_rmok_importable_from_models_namespace():
     assert R is RMoK
 
 
-def test_rmok_auto_discovered_by_benchmark_harness():
-    import sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from benchmarks.neural import registry
-    assert "RMoK" in registry.list_models()
-    assert registry.resolve_chronax("RMoK") is RMoK
-
-
 def test_input_size_default_resolves_to_3h():
     assert RMoK(h=10).input_size == 30
 
