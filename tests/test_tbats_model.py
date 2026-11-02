@@ -147,18 +147,6 @@ def test_predict_before_fit():
         assert "fit" in str(e).lower()
         print("  ✓ Predict before fit validation works")
 
-#-----------------COMPARE WITH STATSFORECAST---------------------#
-"""
-Compares JAX TBATS (class API: model.forecast) vs StatsForecast TBATS.
-
-Covers:
-- Basic fit/forecast workflow (AutoTBATS.forecast)
-- Multiple seasonal periods (core path; see note)
-- Box-Cox transformations (AutoTBATS.forecast)
-- Trend components (regular and damped) (AutoTBATS.forecast)
-- Prediction intervals (parametric via sigma(h) on JAX path)
-- Edge cases & numerical stability (AutoTBATS.forecast)
-"""
 
 # -----------------------------
 # Your JAX implementation
@@ -168,68 +156,6 @@ from chronax.models.tbats.tbats_core import (
     tbats_forecast as jax_tbats_forecast,
     compute_sigmah as jax_compute_sigmah,
 )
-
-# -----------------------------
-# StatsForecast compatibility
-# -----------------------------
-def _sf_normalize_forecast_output(obj) -> np.ndarray:
-    """Normalize SF predict outputs to 1D float array."""
-    if isinstance(obj, dict) and "mean" in obj:
-        return np.asarray(obj["mean"], dtype=float).reshape(-1)
-    if isinstance(obj, (list, tuple)) and len(obj) > 0:
-        first = obj[0]
-        if isinstance(first, dict) and "mean" in first:
-            return np.asarray(first["mean"], dtype=float).reshape(-1)
-        return np.asarray(obj, dtype=float).reshape(-1)
-    return np.asarray(obj, dtype=float).reshape(-1)
-
-
-try:
-    import inspect
-    from statsforecast.models import AutoTBATS as SF_AutoTBATS
-
-    _SF_SIG = inspect.signature(SF_AutoTBATS.__init__)
-    _HAS_SEASONAL_PERIODS = "seasonal_periods" in _SF_SIG.parameters
-    _HAS_SEASON_LENGTH = "season_length" in _SF_SIG.parameters
-    if not (_HAS_SEASONAL_PERIODS or _HAS_SEASON_LENGTH):
-        raise ImportError("AutoTBATS signature missing seasonality parameter")
-
-    HAS_STATSFORECAST = True
-
-    def sf_build_autotbats(season_length, *, use_boxcox, use_trend, use_damped_trend, use_arma_errors):
-        sp_arg = int(season_length)
-        kwargs = dict(
-            use_boxcox=bool(use_boxcox),
-            use_trend=bool(use_trend),
-            use_damped_trend=bool(use_damped_trend),
-            use_arma_errors=bool(use_arma_errors),
-        )
-        if _HAS_SEASONAL_PERIODS:
-            kwargs["seasonal_periods"] = sp_arg
-        else:
-            kwargs["season_length"] = sp_arg
-        return SF_AutoTBATS(**kwargs)
-
-    def sf_forecast(y: np.ndarray, season_length: int, h: int,
-                    *, use_boxcox: bool, use_trend: bool, use_damped_trend: bool, use_arma_errors: bool):
-        """Mimic class-API forecast for SF: fit then predict(h)."""
-        model = sf_build_autotbats(
-            season_length=season_length,
-            use_boxcox=use_boxcox,
-            use_trend=use_trend,
-            use_damped_trend=use_damped_trend,
-            use_arma_errors=use_arma_errors,
-        )
-        fitted = model.fit(np.asarray(y, dtype=float))
-        yhat = fitted.predict(h=h)
-        mean = _sf_normalize_forecast_output(yhat)
-        aic = getattr(fitted, "aic", np.nan)
-        return {"mean": mean, "aic": aic}
-
-except Exception as _e:
-    HAS_STATSFORECAST = False
-    print("Warning: StatsForecast not available. Install with: pip install -U statsforecast")
-    print(f"Import error: {_e}")
 
 
 # ============================================================================
@@ -266,207 +192,6 @@ def generate_exponential_data(n: int = 100, growth_rate: float = 0.05,
     return trend * seasonal_factor * noise
 
 
-# ============================================================================
-# Compare helpers
-# ============================================================================
-def compare_forecasts(y1: np.ndarray, y2: np.ndarray,
-                      name1: str = "JAX", name2: str = "StatsForecast",
-                      rtol: float = 0.05, atol: float = 1.0) -> Dict:
-    y1 = np.asarray(y1).ravel()
-    y2 = np.asarray(y2).ravel()
-    abs_diff = np.abs(y1 - y2)
-    rel_diff = abs_diff / (np.abs(y2) + 1e-10)
-    return {
-        "close": np.allclose(y1, y2, rtol=rtol, atol=atol),
-        "max_abs_diff": float(abs_diff.max()),
-        "mean_abs_diff": float(abs_diff.mean()),
-        "max_rel_diff": float(rel_diff.max()),
-        "mean_rel_diff": float(rel_diff.mean()),
-        f"{name1}_mean": float(y1.mean()),
-        f"{name2}_mean": float(y2.mean()),
-    }
-
-def print_comparison(result: Dict, test_name: str):
-    status = "✓ PASS" if result["close"] else "✗ FAIL"
-    print(f"\n{test_name}: {status}")
-    print(f"  Max absolute diff: {result['max_abs_diff']:.4f}")
-    print(f"  Mean absolute diff: {result['mean_abs_diff']:.4f}")
-    print(f"  Max relative diff: {result['max_rel_diff']:.4%}")
-    print(f"  Mean relative diff: {result['mean_rel_diff']:.4%}")
-
-
-# ============================================================================
-# Tests (favoring class API forecast on JAX side)
-# ============================================================================
-def test_basic_single_seasonality():
-    print("\n" + "="*70)
-    print("TEST 1: Basic Single Seasonality (AutoTBATS.forecast)")
-    print("="*70)
-
-    y = generate_seasonal_data(n=100, season_length=12, seed=42)
-    y_jax = jnp.array(y, dtype=jnp.float32)
-
-    # JAX: class API forecast
-    print("JAX AutoTBATS.forecast(...)")
-    jax_model = AutoTBATS(season_length=12, use_boxcox=False, use_trend=True, use_damped_trend=False, use_arma_errors=False)
-    out = jax_model.forecast(y=y_jax, h=12, fitted=False)  # returns dict with "mean"
-    jax_mean = np.asarray(out["mean"])
-    print(f"JAX forecast (first 6): {jax_mean[:6]}")
-
-    if HAS_STATSFORECAST:
-        print("\nStatsForecast (fit + predict to mimic forecast)")
-        sf_out = sf_forecast(y=y, season_length=12, h=12,
-                             use_boxcox=False, use_trend=True, use_damped_trend=False, use_arma_errors=False)
-        sf_mean = sf_out["mean"]
-        print(f"StatsForecast forecast (first 6): {sf_mean[:6]}")
-        res = compare_forecasts(jax_mean, sf_mean, rtol=0.10, atol=2.0)
-        print_comparison(res, "Forecast Comparison")
-        assert res["close"]
-    else:
-        assert np.all(np.isfinite(jax_mean))
-        print("✓ JAX model.forecast runs successfully")
-
-
-def test_multiple_seasonality():
-    print("\n" + "="*70)
-    print("TEST 2: Multiple Seasonal Periods (core path; see note)")
-    print("="*70)
-
-    # NOTE: If your TBATS class supports multiple seasonalities, replace this with class API.
-    y = generate_multiple_seasonal_data(n=365, periods=(7, 365), seed=42)
-    y_jax = jnp.array(y, dtype=jnp.float32)
-
-    print("JAX (tbats_selection + tbats_forecast)")
-    jax_model = jax_tbats_selection(
-        y=y_jax, seasonal_periods=[7, 365],
-        use_boxcox=False, bc_lower=0.0, bc_upper=1.0,
-        use_trend=True, use_damped_trend=False, use_arma_errors=False,
-    )
-    h = 30
-    jax_mean = np.array(jax_tbats_forecast(jax_model, h=h)["mean"])
-    print(f"JAX k_vector: {jax_model['k_vector']}")
-    print(f"JAX forecast (first 7): {jax_mean[:7]}")
-
-    if HAS_STATSFORECAST:
-        print("\nStatsForecast (fit + predict to mimic forecast) with single period=7")
-        # SF AutoTBATS only supports a single season length reliably across versions.
-        sf_out = sf_forecast(y=y, season_length=7, h=h,
-                             use_boxcox=False, use_trend=True, use_damped_trend=False, use_arma_errors=False)
-        sf_mean = sf_out["mean"]
-        print(f"StatsForecast forecast (first 7): {sf_mean[:7]}")
-        res = compare_forecasts(jax_mean, sf_mean, rtol=0.15, atol=3.0)
-        print_comparison(res, "Forecast Comparison (approx; seasonality mismatch)")
-        assert res["close"]
-    else:
-        assert np.all(np.isfinite(jax_mean))
-        print("✓ JAX multiple-season path runs successfully")
-
-
-def test_boxcox_transformation():
-    print("\n" + "="*70)
-    print("TEST 3: Box-Cox (AutoTBATS.forecast)")
-    print("="*70)
-
-    y = generate_exponential_data(n=100, seed=42)
-    y_jax = jnp.array(y, dtype=jnp.float32)
-
-    print("JAX AutoTBATS.forecast(...) with Box-Cox")
-    jax_model = AutoTBATS(season_length=12, use_boxcox=True, use_trend=True, use_damped_trend=False, use_arma_errors=False)
-    out = jax_model.forecast(y=y_jax, h=12, fitted=False)
-    jax_mean = np.asarray(out["mean"])
-    print(f"JAX forecast (first 6): {jax_mean[:6]}")
-
-    if HAS_STATSFORECAST:
-        print("\nStatsForecast (fit + predict to mimic forecast) with Box-Cox")
-        sf_out = sf_forecast(y=y, season_length=12, h=12,
-                             use_boxcox=True, use_trend=True, use_damped_trend=False, use_arma_errors=False)
-        sf_mean = sf_out["mean"]
-        print(f"StatsForecast forecast (first 6): {sf_mean[:6]}")
-        # After fixing tbats_core.tbats_forecast to always return original-scale forecasts,
-        # the comparison is apples-to-apples:
-        res = compare_forecasts(jax_mean, sf_mean, rtol=0.15, atol=5.0)
-        print_comparison(res, "Forecast Comparison")
-        assert res["close"]
-    else:
-        assert np.all(np.isfinite(jax_mean))
-        print("✓ JAX model.forecast runs successfully (Box-Cox)")
-
-def test_boxcox_transformation1_compare():
-    print("\n" + "="*70)
-    print("TEST 3b: Box-Cox (AutoTBATS.fit + predict) — simple geometric series")
-    print("="*70)
-
-    # Same series as your original test_boxcox_transformation1
-    y = jnp.array([1., 2., 4., 8., 16., 32., 64., 128.], dtype=jnp.float32)
-
-    # JAX side: fit + predict(h)
-    print("JAX AutoTBATS.fit(...); predict(h=2) with Box-Cox")
-    model = AutoTBATS(
-        season_length=2,
-        use_boxcox=True,
-        use_trend=True,
-        use_damped_trend=False,
-        use_arma_errors=False
-    )
-    model.fit(y)
-    out = model.predict(h=2, level=None)
-    jax_mean = np.asarray(out["mean"], dtype=float).reshape(-1)
-    print(f"JAX forecast (2): {jax_mean}")
-
-    if HAS_STATSFORECAST:
-        print("\nStatsForecast (fit + predict to mimic class API) with Box-Cox")
-        # Convert jax array to numpy for SF
-        y_np = np.asarray(y, dtype=float)
-        sf_out = sf_forecast(
-            y=y_np,
-            season_length=2,
-            h=2,
-            use_boxcox=True,
-            use_trend=True,
-            use_damped_trend=False,
-            use_arma_errors=False
-        )
-        sf_mean = np.asarray(sf_out["mean"], dtype=float).reshape(-1)
-        print(f"StatsForecast forecast (2): {sf_mean}")
-
-        # Compare with slightly generous tolerances (small sample, BC transform)
-        res = compare_forecasts(jax_mean, sf_mean, rtol=0.15, atol=1.0)
-        print_comparison(res, "Forecast Comparison (simple series, Box-Cox)")
-        assert res["close"]
-    else:
-        assert np.all(np.isfinite(jax_mean))
-        print("✓ JAX fit+predict runs successfully (Box-Cox, simple series)")
-
-def test_damped_trend():
-    print("\n" + "="*70)
-    print("TEST 4: Damped Trend (AutoTBATS.forecast)")
-    print("="*70)
-
-    y = generate_seasonal_data(n=120, season_length=12, trend=True, seed=42)
-    y_jax = jnp.array(y, dtype=jnp.float32)
-
-    print("JAX AutoTBATS.forecast(...) damped trend")
-    jax_model = AutoTBATS(season_length=12, use_boxcox=False, use_trend=True, use_damped_trend=True, use_arma_errors=False)
-    out = jax_model.forecast(y=y_jax, h=24, fitted=False)
-    jax_mean = np.asarray(out["mean"])
-    print(f"JAX (6-month):  {jax_mean[6:12]}")
-    print(f"JAX (18-month): {jax_mean[18:24]}")
-
-    if HAS_STATSFORECAST:
-        print("\nStatsForecast (fit + predict) damped trend")
-        sf_out = sf_forecast(y=y, season_length=12, h=24,
-                             use_boxcox=False, use_trend=True, use_damped_trend=True, use_arma_errors=False)
-        sf_mean = sf_out["mean"]
-        print(f"StatsForecast (6-month):  {sf_mean[6:12]}")
-        print(f"StatsForecast (18-month): {sf_mean[18:24]}")
-        res = compare_forecasts(jax_mean, sf_mean, rtol=0.10, atol=2.0)
-        print_comparison(res, "Forecast Comparison")
-        assert res["close"]
-    else:
-        assert np.all(np.isfinite(jax_mean))
-        print("✓ JAX model.forecast runs successfully (damped)")
-
-
 def test_prediction_intervals():
     print("\n" + "="*70)
     print("TEST 5: Prediction Intervals (JAX sigma(h))")
@@ -489,8 +214,6 @@ def test_prediction_intervals():
     is_increasing = np.all(np.diff(sigmah) >= -1e-6)
     print(f"Sigmah non-decreasing: {is_increasing}")
 
-    if HAS_STATSFORECAST:
-        print("StatsForecast TBATS does not consistently expose sigma(h); skipping direct compare.")
     assert is_increasing
 
 
@@ -834,222 +557,6 @@ def test_errors_key_present_and_finite_after_fit():
     assert jnp.all(jnp.isfinite(m.model_["errors"]))
     print("✓ errors present and finite after fit")
 
-# ===============================
-# JAX vs StatsForecast Parity Suite
-# ===============================
-import numpy as np
-import jax.numpy as jnp
-import warnings
-
-# Helper: compare and print a compact diff for debugging
-def _cmp_and_assert_close(jax_mean, sf_mean, name, rtol=0.12, atol=2.5):
-    jax_mean = np.asarray(jax_mean).ravel()
-    sf_mean  = np.asarray(sf_mean).ravel()
-    ok = np.allclose(jax_mean, sf_mean, rtol=rtol, atol=atol)
-    if not ok:
-        max_abs = float(np.max(np.abs(jax_mean - sf_mean)))
-        max_rel = float(np.max(np.abs(jax_mean - sf_mean) / (np.abs(sf_mean) + 1e-12)))
-        print(f"✗ {name}: not close (max_abs={max_abs:.4f}, max_rel={max_rel:.2%})")
-    else:
-        print(f"✓ {name}: close within rtol={rtol}, atol={atol}")
-    assert ok
-
-def _mk_series_single(n=120, season_length=12, trend=True, noise=1.0, seed=123):
-    np.random.seed(seed)
-    t = np.arange(n)
-    seasonal = 10 * np.sin(2 * np.pi * t / season_length)
-    trend_comp = 0.05 * t if trend else 0.0
-    noise_arr = np.random.normal(0, noise, n)
-    return 100 + trend_comp + seasonal + noise_arr
-
-def _mk_series_exp(n=120, season_length=12, growth=0.05, seed=123):
-    np.random.seed(seed)
-    t = np.arange(n)
-    trend = 10 * np.exp(growth * t / 10)
-    seasonal_factor = 1 + 0.2 * np.sin(2 * np.pi * t / season_length)
-    noise = np.random.lognormal(0, 0.1, n)
-    return trend * seasonal_factor * noise
-
-def test_sf_parity_single_season_trend_no_damp_no_bc_no_arma():
-    """Single season, trend, no damp, no Box–Cox, no ARMA → JAX vs SF means."""
-    y = _mk_series_single(n=140, season_length=12, trend=True, noise=1.2, seed=10)
-    h = 18
-    jax_model = AutoTBATS(season_length=12, use_boxcox=False, use_trend=True,
-                          use_damped_trend=False, use_arma_errors=False)
-    out = jax_model.forecast(jnp.array(y, dtype=jnp.float32), h=h)
-    jax_mean = out["mean"]
-
-    if HAS_STATSFORECAST:
-        sf_out = sf_forecast(y=y, season_length=12, h=h,
-                             use_boxcox=False, use_trend=True,
-                             use_damped_trend=False, use_arma_errors=False)
-        _cmp_and_assert_close(jax_mean, sf_out["mean"], "SF parity: trend no-damp no-BC no-ARMA", rtol=0.20, atol=20.0)
-    else:
-        print("~ SF not available: skipped comparison")
-
-def test_sf_parity_single_season_trend_damped_no_bc_no_arma():
-    y = _mk_series_single(n=160, season_length=12, trend=True, noise=1.5, seed=11)
-    h = 24
-    jax_model = AutoTBATS(season_length=12, use_boxcox=False, use_trend=True,
-                          use_damped_trend=True, use_arma_errors=False)
-    out = jax_model.forecast(jnp.array(y, dtype=jnp.float32), h=h)
-    jax_mean = out["mean"]
-
-    if HAS_STATSFORECAST:
-        sf_out = sf_forecast(y=y, season_length=12, h=h,
-                             use_boxcox=False, use_trend=True,
-                             use_damped_trend=True, use_arma_errors=False)
-        _cmp_and_assert_close(jax_mean, sf_out["mean"], "SF parity: trend damped no-BC no-ARMA", rtol=0.12, atol=2.5)
-    else:
-        print("~ SF not available: skipped comparison")
-
-def test_sf_parity_single_season_no_trend_no_bc_arma_on_off():
-    y = _mk_series_single(n=150, season_length=12, trend=False, noise=2.0, seed=12)
-    h = 12
-    for arma_flag in (False, True):
-        jax_model = AutoTBATS(season_length=12, use_boxcox=False, use_trend=False,
-                              use_damped_trend=False, use_arma_errors=arma_flag)
-        out = jax_model.forecast(jnp.array(y, dtype=jnp.float32), h=h)
-        jax_mean = out["mean"]
-
-        if HAS_STATSFORECAST:
-            sf_out = sf_forecast(y=y, season_length=12, h=h,
-                                 use_boxcox=False, use_trend=False,
-                                 use_damped_trend=False, use_arma_errors=arma_flag)
-            _cmp_and_assert_close(
-                jax_mean, sf_out["mean"],
-                f"SF parity: no-trend no-BC ARMA={arma_flag}",
-                rtol=0.15, atol=3.0
-            )
-        else:
-            print("~ SF not available: skipped comparison")
-
-def test_sf_parity_boxcox_on_trend_no_damp():
-    """Box–Cox ON (strictly positive data), trend, no damp."""
-    y = _mk_series_exp(n=130, season_length=12, growth=0.06, seed=13)  # > 0
-    h = 12
-    jax_model = AutoTBATS(season_length=12, use_boxcox=True, use_trend=True,
-                          use_damped_trend=False, use_arma_errors=False)
-    out = jax_model.forecast(jnp.array(y, dtype=jnp.float32), h=h)
-    jax_mean = out["mean"]
-
-    if HAS_STATSFORECAST:
-        sf_out = sf_forecast(y=y, season_length=12, h=h,
-                             use_boxcox=True, use_trend=True,
-                             use_damped_trend=False, use_arma_errors=False)
-        _cmp_and_assert_close(jax_mean, sf_out["mean"], "SF parity: Box–Cox on, trend, no damp", rtol=0.18, atol=5.0)
-    else:
-        print("~ SF not available: skipped comparison")
-
-def test_sf_parity_multiple_random_seeds_single_config():
-    """Run a few seeds to ensure parity is generally stable."""
-    seeds = [1, 7, 21, 42]
-    h = 12
-    for sd in seeds:
-        y = _mk_series_single(n=132, season_length=12, trend=True, noise=1.0, seed=sd)
-        jax_model = AutoTBATS(season_length=12, use_boxcox=False, use_trend=True,
-                              use_damped_trend=False, use_arma_errors=True)
-        out = jax_model.forecast(jnp.array(y, dtype=jnp.float32), h=h)
-        jax_mean = out["mean"]
-
-        if HAS_STATSFORECAST:
-            sf_out = sf_forecast(y=y, season_length=12, h=h,
-                                 use_boxcox=False, use_trend=True,
-                                 use_damped_trend=False, use_arma_errors=True)
-            _cmp_and_assert_close(jax_mean, sf_out["mean"],
-                                  f"SF parity multi-seed (seed={sd})", rtol=0.15, atol=3.0)
-        else:
-            print(f"~ SF not available: skipped comparison (seed={sd})")
-
-def test_sf_parity_fit_predict_vs_forecast_contract():
-    """JAX fit+predict vs SF fit+predict (class-like parity), plus JAX forecast parity."""
-    y = _mk_series_single(n=144, season_length=12, trend=True, noise=1.3, seed=77)
-    h = 15
-
-    # JAX fit + predict
-    m = AutoTBATS(season_length=12, use_boxcox=False, use_trend=True,
-                  use_damped_trend=False, use_arma_errors=False)
-    m.fit(jnp.array(y, dtype=jnp.float32))
-    out_pred = m.predict(h=h)
-    # JAX forecast
-    out_fc = m.forecast(y=jnp.array(y, dtype=jnp.float32), h=h)
-
-    # JAX internal parity (tight)
-    assert np.allclose(np.asarray(out_pred["mean"]), np.asarray(out_fc["mean"]), rtol=0.10, atol=2.0)
-    print("✓ JAX fit+predict vs JAX forecast parity")
-
-    if HAS_STATSFORECAST:
-        # SF fit + predict
-        sf_out = sf_forecast(y=y, season_length=12, h=h,
-                             use_boxcox=False, use_trend=True,
-                             use_damped_trend=False, use_arma_errors=False)
-        _cmp_and_assert_close(out_pred["mean"], sf_out["mean"], "SF parity: fit+predict", rtol=0.12, atol=2.5)
-    else:
-        print("~ SF not available: skipped comparison")
-
-def test_sf_parity_long_horizon_robustness():
-    """Longer horizon comparison to catch divergence tendencies."""
-    y = _mk_series_single(n=160, season_length=12, trend=True, noise=1.0, seed=5)
-    h = 36
-    jax_model = AutoTBATS(season_length=12, use_boxcox=False, use_trend=True,
-                          use_damped_trend=True, use_arma_errors=True)
-    out = jax_model.forecast(jnp.array(y, dtype=jnp.float32), h=h)
-    jax_mean = out["mean"]
-
-    if HAS_STATSFORECAST:
-        sf_out = sf_forecast(y=y, season_length=12, h=h,
-                             use_boxcox=False, use_trend=True,
-                             use_damped_trend=True, use_arma_errors=True)
-        _cmp_and_assert_close(jax_mean, sf_out["mean"], "SF parity: long horizon, damped+ARMA", rtol=0.18, atol=4.0)
-    else:
-        print("~ SF not available: skipped comparison")
-
-def test_sf_parity_boxcox_fit_predict_path():
-    """Box–Cox ON via fit()+predict on both JAX and SF."""
-    y = _mk_series_exp(n=128, season_length=12, growth=0.08, seed=33)
-    h = 10
-    m = AutoTBATS(season_length=12, use_boxcox=True, use_trend=True,
-                  use_damped_trend=False, use_arma_errors=False)
-    m.fit(jnp.array(y, dtype=jnp.float32))
-    out = m.predict(h=h)
-    jax_mean = out["mean"]
-
-    if HAS_STATSFORECAST:
-        sf_out = sf_forecast(y=y, season_length=12, h=h,
-                             use_boxcox=True, use_trend=True,
-                             use_damped_trend=False, use_arma_errors=False)
-        _cmp_and_assert_close(jax_mean, sf_out["mean"], "SF parity: Box–Cox fit+predict", rtol=0.18, atol=5.0)
-    else:
-        print("~ SF not available: skipped comparison")
-
-def test_sf_parity_single_season_strict():
-    """Strict parity: JAX(7) vs SF(7)."""
-    np.random.seed(2025)
-    n = 365
-    t = np.arange(n)
-    y = 100 + 0.05 * t \
-        + 12.0 * np.sin(2 * np.pi * t / 7) \
-        + 8.0  * np.sin(2 * np.pi * t / 30) \
-        + np.random.normal(0, 2.0, n)
-    yjax = jnp.array(y, dtype=jnp.float32)
-    h = 28
-
-    # JAX: single-season (7) to match SF
-    jax_model = AutoTBATS(season_length=7, use_boxcox=False, use_trend=True,
-                          use_damped_trend=False, use_arma_errors=False)
-    out_jax = jax_model.forecast(yjax, h=h)
-    jax_mean = out_jax["mean"]
-
-    if HAS_STATSFORECAST:
-        sf_out = sf_forecast(y=y, season_length=7, h=h,
-                             use_boxcox=False, use_trend=True,
-                             use_damped_trend=False, use_arma_errors=False)
-        _cmp_and_assert_close(
-            jax_mean, sf_out["mean"],
-            "SF parity: single-season(7) strict", rtol=0.15, atol=4.0
-        )
-    else:
-        print("~ SF not available: skipped comparison (single-season)")
 
 def test_arma_on_initialization_paths():
     y = jnp.array(generate_seasonal_data(n=120, season_length=12, seed=1), dtype=jnp.float32)
@@ -1211,7 +718,6 @@ def test_multiperiod_harmonics_selection_smoke():
     print(f"✓ multi-period k_vector computed: {np.asarray(kv)} for periods={periods}")
 
 
-
 # ---------- Optimizer behavior ----------
 
 def test_optimizer_reproducibility_same_data_same_result():
@@ -1319,77 +825,6 @@ def test_performance_long_series_long_horizon_smoke():
     assert arr.shape == (120,) and np.all(np.isfinite(arr))
     print("✓ performance smoke: long series & horizon ran and returned finite output")
 
-def test_performance_long_series_long_horizon_sf_parity():
-    """
-    Long n, long h performance + SF parity for an **annual (365)** seasonal model.
-
-    We generate data with a clear 365-day seasonality (which *is* modeled)
-    plus mild trend and small 30-day wiggle (unmodeled) to keep things realistic.
-    Both implementations are run with season_length=365 for an apples-to-apples test.
-    """
-    np.random.seed(42)
-    n, h = 900, 120  # give the model >2 seasonal cycles to estimate annual effects
-    t = np.arange(n)
-
-    # Annual-seasonal data generating process (matches the model we ask for)
-    y = (
-        100
-        + 0.02 * t                                  # mild trend
-        + 8.0 * np.sin(2 * np.pi * t / 365.0)      # annual seasonality (MODELED)
-        + 0.5 * np.sin(2 * np.pi * t / 30.0)       # small monthly-ish wiggle (unmodeled)
-        + np.random.normal(0, 1.2, n)              # noise
-    )
-    yj = jnp.array(y, dtype=jnp.float32)
-
-    # ---- JAX / yours ----
-    jax_model = AutoTBATS(
-        season_length=365,         # <-- annual seasonality
-        use_boxcox=False,
-        use_trend=True,
-        use_damped_trend=False,
-        use_arma_errors=False,
-    )
-    out_jax = jax_model.forecast(yj, h=h)
-    print(out_jax)
-    jax_mean = np.asarray(out_jax["mean"])
-    assert jax_mean.shape == (h,) and np.all(np.isfinite(jax_mean))
-
-    # Keep the state reasonable (no numeric explosion)
-    jax_std = float(np.std(jax_mean))
-    assert 0.1 <= jax_std <= 50.0
-
-    if HAS_STATSFORECAST:
-        # ---- StatsForecast baseline (annual seasonal) ----
-        sf_out = sf_forecast(
-            y=y,
-            season_length=365,     # <-- annual seasonality
-            h=h,
-            use_boxcox=False,
-            use_trend=True,
-            use_damped_trend=False,
-            use_arma_errors=False,
-        )
-        sf_mean = np.asarray(sf_out["mean"])
-        assert sf_mean.shape == (h,) and np.all(np.isfinite(sf_mean))
-        print(sf_out)
-
-        # Parity: forecasts broadly similar (allowing differences in internals)
-        # Long horizon is tougher; use modest tolerances.
-        assert np.allclose(jax_mean, sf_mean, rtol=0.20, atol=6.0), (
-            f"SF parity failed: max_abs={np.max(np.abs(jax_mean - sf_mean)):.3f}, "
-            f"mean_abs={np.mean(np.abs(jax_mean - sf_mean)):.3f}"
-        )
-
-        # Also compare overall scale (std devs of forecast vectors)
-        sf_std = float(np.std(sf_mean))
-        ratio = (jax_std + 1e-6) / (sf_std + 1e-6)
-        assert 0.5 <= ratio <= 2.0, f"Std ratio out of range: {ratio:.2f}"
-
-        print("✓ performance + SF parity: long series, long horizon, annual-season(365)")
-    else:
-        print("~ SKIP: StatsForecast not available; ran JAX side only (finite output OK)")
-
-
 
 # ---------- Error semantics ----------
 
@@ -1423,52 +858,6 @@ def test_boxcox_negative_input_semantics():
     out = m.forecast(y, h=2)
     assert np.all(np.isfinite(np.asarray(out["mean"])))  # degraded to untransformed fit
     print("✓ negative + forced Box–Cox: fit raises, forecast degrades to untransformed")
-
-
-# ============================================================================
-# Runner
-# ============================================================================
-def run_all_tests():
-    print("\n" + "="*70)
-    print("TBATS TEST SUITE: JAX (model.forecast) vs StatsForecast")
-    print("="*70)
-
-    if not HAS_STATSFORECAST:
-        print("\nWARNING: StatsForecast not available. Install with:\n  pip install -U statsforecast\n")
-
-    # Tests assert internally (pytest-style); a test "passes" here iff it
-    # returns without raising.
-    suite = {
-        "basic_single": test_basic_single_seasonality,
-        "multiple_seasonal": test_multiple_seasonality,
-        "boxcox": test_boxcox_transformation,
-        "damped_trend": test_damped_trend,
-        "prediction_intervals": test_prediction_intervals,
-        "edge_cases": test_edge_cases,
-        "numerical_stability": test_numerical_stability,
-    }
-    results = {}
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        for name, fn in suite.items():
-            try:
-                fn()
-                results[name] = True
-            except AssertionError as e:
-                print(f"✗ {name}: {e}")
-                results[name] = False
-
-    print("\n" + "="*70)
-    print("TEST SUMMARY")
-    print("="*70)
-    passed = sum(bool(v) for v in results.values())
-    total = len(results)
-    for k, v in results.items():
-        print(("✓ PASS" if v else "✗ FAIL") + f": {k}")
-    print("\n" + "-"*70)
-    print(f"Total: {passed}/{total} tests passed ({100*passed/total:.1f}%)")
-    print("="*70)
-    return results
 
 
 # ============================================================================
@@ -1547,14 +936,9 @@ if __name__ == "__main__":
     test_prediction_intervals_parametric()
     test_conformal_intervals()
     test_boxcox_transformation1() 
-    test_boxcox_transformation()
     test_input_validation()
     test_predict_before_fit()
-    test_boxcox_transformation1_compare()
 
-    print("Comparing with Statsforecast")
-
-    _ = run_all_tests()
 
     print("Testing predict_in_sample")
     print("=" * 60)
@@ -1579,15 +963,6 @@ if __name__ == "__main__":
     test_core_returns_original_scale_mean_when_boxcox_used()
     test_errors_key_present_and_finite_after_fit()
 
-    test_sf_parity_single_season_trend_no_damp_no_bc_no_arma()
-    test_sf_parity_single_season_trend_damped_no_bc_no_arma()
-    test_sf_parity_single_season_no_trend_no_bc_arma_on_off()
-    test_sf_parity_boxcox_on_trend_no_damp()
-    test_sf_parity_multiple_random_seeds_single_config()
-    test_sf_parity_fit_predict_vs_forecast_contract()
-    test_sf_parity_long_horizon_robustness()
-    test_sf_parity_boxcox_fit_predict_path()
-    test_sf_parity_single_season_strict()
     test_arma_on_initialization_paths()
     test_arma_order_selection_ar_only_ma_only_higher_orders()
     test_stationarity_invertibility_constraints_enforced()
@@ -1601,7 +976,6 @@ if __name__ == "__main__":
     test_performance_long_series_long_horizon_smoke()
     test_damped_without_trend_raises_in_selection()
     test_boxcox_negative_input_semantics()
-    test_performance_long_series_long_horizon_sf_parity()
 
     print("\n" + "=" * 60)
     print("✓ All AutoTBATS tests passed!")

@@ -8,8 +8,8 @@ Multivariate -> Namespace.
 
 Interpolation/pooling goldens were generated with torch (neuralforecast's
 engine) by probing ``F.interpolate`` / ``nn.{Max,Avg}Pool1d`` with identity
-basis vectors; the full-net transplant gate lives in
-``benchmarks/nhits_weight_parity.py``.
+basis vectors; the full-net transplant gate lives with the benchmark
+platform.
 """
 from __future__ import annotations
 

@@ -1308,9 +1308,3 @@ def test_dilated_rnn_importable_from_subpackage_all():
     import chronax.models.dilated_rnn as pkg
     assert pkg.__all__ == ["DilatedRNN"]
     assert pkg.DilatedRNN is DilatedRNN
-
-
-def test_dilated_rnn_is_auto_discovered_by_the_benchmark_registry():
-    registry = pytest.importorskip("benchmarks.neural.registry")
-    assert "DilatedRNN" in registry.list_models()
-    assert registry.resolve_chronax("DilatedRNN") is DilatedRNN

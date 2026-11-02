@@ -232,15 +232,6 @@ def test_xlinear_importable_from_models_namespace():
     assert X is XLinear
 
 
-def test_xlinear_auto_discovered_by_benchmark_harness():
-    import sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from benchmarks.neural import registry
-    assert "XLinear" in registry.list_models()
-    assert registry.resolve_chronax("XLinear") is XLinear
-
-
 def test_predict_smaller_h_is_prefix_of_full():
     # mutation-probe gap: full[-h:] instead of full[:h] passed every value test
     m = _tiny().fit(_make_y())
