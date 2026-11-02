@@ -487,8 +487,8 @@ def test_encoder_has_no_final_layernorm():
     # Note a zero-mean check CANNOT test this: every layer already ends in
     # `norm2`, so the encoder output is zero-mean either way. The observable
     # difference is the extra LayerNorm's LEARNABLE scale/bias, so pin the
-    # parameter set instead. benchmarks/softssharp_weight_parity.py is the
-    # end-to-end check; this is the unit-level guard against it creeping back.
+    # parameter set instead. The end-to-end weight-parity script lives with the
+    # benchmark platform; this is the unit-level guard against it creeping back.
     hidden, d_core = 16, 8
     enc = TransEncoder(e_layers=1, hidden_size=hidden, d_core=d_core, d_ff=32,
                        dropout=0.0, pe_keep_prob=0.5, rngs=nnx.Rngs(0))
@@ -905,18 +905,6 @@ def test_softssharp_importable_from_models_namespace():
 def test_softssharp_advertised_in_models_all():
     import chronax.models as models
     assert "SOFTSSharp" in models.__all__
-
-
-def test_softssharp_is_discovered_by_benchmark_registry():
-    # benchmarks/ is excluded from packaging (see tests/neural/conftest.py), so put
-    # the repo root on sys.path before importing the harness registry.
-    import sys
-    from pathlib import Path
-    root = str(Path(__file__).resolve().parents[1])
-    if root not in sys.path:
-        sys.path.insert(0, root)
-    from benchmarks.neural.registry import list_models
-    assert "SOFTSSharp" in list_models()
 
 
 def test_constant_series_returns_finite():

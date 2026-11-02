@@ -257,12 +257,3 @@ def test_conformity_scores_finite_2d():
 def test_dlinear_importable_from_models_namespace():
     from chronax.models import DLinear as D
     assert D is DLinear
-
-
-def test_dlinear_auto_discovered_by_benchmark_harness():
-    import sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from benchmarks.neural import registry
-    assert "DLinear" in registry.list_models()
-    assert registry.resolve_chronax("DLinear") is DLinear
