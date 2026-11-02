@@ -71,6 +71,27 @@ def test_conformal_signed_keys_match_distribution():
     assert set(r1.keys()) == expected_keys
     assert set(r2.keys()) == expected_keys
 
+def test_h_mismatch_in_add_confidence_intervals_raises_actionable():
+    """A forecast horizon that differs from the score horizon must raise a
+    ValueError naming both, never a raw broadcast TypeError."""
+    fcst = {"mean": jnp.zeros(5)}
+    cs = jnp.ones((4, 2))  # conformal_params.h == 2
+    with pytest.raises(ValueError, match=r"h=5 does not match conformal_params.h=2"):
+        BaseForecaster.add_confidence_intervals(fcst, cs, [80], "conformal_distribution")
+    with pytest.raises(ValueError, match=r"conformal_params.h=2"):
+        BaseForecaster.add_confidence_intervals(fcst, cs, [80], "conformal_signed")
+
+
+def test_one_step_scores_broadcast_across_the_horizon():
+    """conformal_params.h == 1 is the documented exception: the single score
+    column applies to every horizon step instead of raising."""
+    fcst = {"mean": jnp.array([10.0, 20.0, 30.0, 40.0])}
+    cs = jnp.array([[1.0], [-2.0], [0.5]])  # (n_windows=3, h=1)
+    out = BaseForecaster.add_confidence_intervals(fcst, cs, [80], "conformal_distribution")
+    assert out["lo-80"].shape == (4,) and out["hi-80"].shape == (4,)
+    assert jnp.all(out["lo-80"] <= out["mean"]) and jnp.all(out["mean"] <= out["hi-80"])
+
+
 def test_invalid_method_in_add_confidence_intervals():
     fcst = {"mean": jnp.array([1.0])}
     cs = jnp.array([[0.5]])

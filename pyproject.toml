@@ -45,4 +45,4 @@ Issues = "https://github.com/Smlcrm/Chronax/issues"
 
 [tool.setuptools.packages.find]
 include = ["chronax", "chronax.*"]
-exclude = ["benchmarks*", "tests*", "eval_dev*", "tutorials*"]
+exclude = ["tests*"]

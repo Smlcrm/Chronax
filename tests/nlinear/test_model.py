@@ -196,12 +196,3 @@ def test_conformity_scores_finite_2d():
 def test_nlinear_importable_from_models_namespace():
     from chronax.models import NLinear as N
     assert N is NLinear
-
-
-def test_nlinear_auto_discovered_by_benchmark_harness():
-    import sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from benchmarks.neural import registry
-    assert "NLinear" in registry.list_models()
-    assert registry.resolve_chronax("NLinear") is NLinear

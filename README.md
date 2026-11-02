@@ -82,7 +82,7 @@ hi-95: [140.9, 151.7, 165.7, 165.4, 161.8, 178.0]
 - **Unified API**: every model follows the same `fit()` then `predict()` pattern
 - **Prediction intervals**: conformal and native interval support
 - **NumPy compatible**: accepts and returns standard array types
-- **Benchmarked** against statsforecast and neuralforecast for accuracy and speed
+- **Benchmarked** against statsforecast and neuralforecast for accuracy and speed. The benchmark suite is being restructured and will be republished.
 
 ---
 
@@ -373,24 +373,6 @@ python forecast.py
 ### 5. Explore further
 
 Swap `AutoETS` for `AutoARIMA` or `AutoTheta` and compare the results. The API is identical across all models.
-
----
-
-## Evaluation benchmarks
-
-We provide a benchmarking suite to evaluate `chronax` against other time-series libraries.
-
-> **Note:** Benchmark dependencies such as `statsforecast` and `pandas` are not included in the core package.
-
-```bash
-# Install benchmark dependencies
-pip install statsforecast pandas matplotlib
-
-# Run the benchmark suite
-python benchmarks/benchmark_suite.py
-```
-
-A separate neural benchmark harness lives under `benchmarks/neural/` and compares Chronax neural forecasters against their Nixtla `neuralforecast` counterparts under a symmetric training budget. Set up the reference environment with `bash benchmarks/setup_nf_venv.sh`, then run it via `python benchmarks/neural/run.py` (models and settings are configured in `benchmarks/neural/config.yaml`).
 
 ---
 

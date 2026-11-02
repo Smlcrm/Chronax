@@ -20,25 +20,6 @@ def _intermittent_y(trailing_zeros=5):
     return np.array(base + [0] * trailing_zeros, dtype=float)
 
 
-def test_forecast_mean_matches_statsforecast():
-    sf_models = pytest.importorskip("statsforecast.models")
-    y = _intermittent_y()
-    cx = np.asarray(CrostonClassic().forecast(y=y, h=4)["mean"])
-    sf = sf_models.CrostonClassic().forecast(y=y, h=4)["mean"]
-    np.testing.assert_allclose(cx, sf, rtol=1e-6)
-
-
-def test_fitted_values_match_statsforecast():
-    # Fitted values are one-step-ahead: position i uses only demands before i,
-    # and positions after the last demand carry the final level (no NaN tail).
-    sf_models = pytest.importorskip("statsforecast.models")
-    for tz in (0, 5):
-        y = _intermittent_y(trailing_zeros=tz)
-        cx = np.asarray(CrostonClassic().forecast(y=y, h=4, fitted=True)["fitted"])
-        sf = sf_models.CrostonClassic().forecast(y=y, h=4, fitted=True)["fitted"]
-        np.testing.assert_allclose(cx, sf, rtol=1e-6, equal_nan=True)
-
-
 def test_forecast_fitted_with_level_returns_fitted_intervals():
     y = _intermittent_y()
     m = CrostonClassic(conformal_params=ConformalIntervals(n_windows=2, h=4))

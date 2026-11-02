@@ -234,8 +234,8 @@ def test_encoder_has_no_final_layernorm():
     # Note a zero-mean check CANNOT test this: every layer already ends in
     # `norm2`, so the encoder output is zero-mean either way. The observable
     # difference is the extra LayerNorm's LEARNABLE scale/bias, so pin the
-    # parameter set instead. benchmarks/softs_weight_parity.py is the end-to-end
-    # check; this is the unit-level guard against it creeping back.
+    # parameter set instead. The end-to-end weight-parity script lives with the
+    # benchmark platform; this is the unit-level guard against it creeping back.
     hidden, d_core = 32, 16
     enc = TransEncoder(e_layers=1, hidden_size=hidden, d_core=d_core, d_ff=64,
                        dropout=0.0, rngs=nnx.Rngs(0))
