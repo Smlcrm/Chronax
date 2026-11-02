@@ -62,6 +62,7 @@ Notes
 """
 import jax
 import jax.numpy as jnp
+import numpy as np
 from chronax import utils
 from abc import ABC, abstractmethod
 from jax import lax, vmap
@@ -481,8 +482,21 @@ class BaseForecaster(ABC):
         Raises
         ------
         ValueError
-            If ``method`` is not a recognised conformal method.
+            If ``method`` is not a recognised conformal method, or if the
+            forecast horizon ``len(fcst["mean"])`` differs from the score
+            horizon ``cs.shape[1]`` (the scores cover exactly
+            ``conformal_params.h`` steps, so ``h`` must equal it).
         """
+        mean_shape = np.shape(fcst["mean"])
+        cs_shape = np.shape(cs)
+        if len(mean_shape) == 1 and len(cs_shape) == 2 and cs_shape[1] != mean_shape[0]:
+            raise ValueError(
+                f"h={mean_shape[0]} does not match conformal_params.h={cs_shape[1]}; "
+                "conformity scores cover exactly conformal_params.h steps. Request "
+                "h equal to conformal_params.h, or construct the model with "
+                "ConformalIntervals(h=<forecast horizon>)."
+            )
+
         def conformal_distribution_intervals(fcst, cs, level):
             level = [int(lv) if float(lv).is_integer() else lv
                      for lv in sorted(level)]

@@ -71,6 +71,17 @@ def test_conformal_signed_keys_match_distribution():
     assert set(r1.keys()) == expected_keys
     assert set(r2.keys()) == expected_keys
 
+def test_h_mismatch_in_add_confidence_intervals_raises_actionable():
+    """A forecast horizon that differs from the score horizon must raise a
+    ValueError naming both, never a raw broadcast TypeError."""
+    fcst = {"mean": jnp.zeros(5)}
+    cs = jnp.ones((4, 2))  # conformal_params.h == 2
+    with pytest.raises(ValueError, match=r"h=5 does not match conformal_params.h=2"):
+        BaseForecaster.add_confidence_intervals(fcst, cs, [80], "conformal_distribution")
+    with pytest.raises(ValueError, match=r"conformal_params.h=2"):
+        BaseForecaster.add_confidence_intervals(fcst, cs, [80], "conformal_signed")
+
+
 def test_invalid_method_in_add_confidence_intervals():
     fcst = {"mean": jnp.array([1.0])}
     cs = jnp.array([[0.5]])
