@@ -485,11 +485,15 @@ class BaseForecaster(ABC):
             If ``method`` is not a recognised conformal method, or if the
             forecast horizon ``len(fcst["mean"])`` differs from the score
             horizon ``cs.shape[1]`` (the scores cover exactly
-            ``conformal_params.h`` steps, so ``h`` must equal it).
+            ``conformal_params.h`` steps, so ``h`` must equal it). The one
+            exception is ``conformal_params.h == 1``: a single one-step score
+            column broadcasts across every horizon step, the long-standing
+            way to get constant-width intervals from one cheap walk-forward.
         """
         mean_shape = np.shape(fcst["mean"])
         cs_shape = np.shape(cs)
-        if len(mean_shape) == 1 and len(cs_shape) == 2 and cs_shape[1] != mean_shape[0]:
+        if (len(mean_shape) == 1 and len(cs_shape) == 2
+                and cs_shape[1] != 1 and cs_shape[1] != mean_shape[0]):
             raise ValueError(
                 f"h={mean_shape[0]} does not match conformal_params.h={cs_shape[1]}; "
                 "conformity scores cover exactly conformal_params.h steps. Request "
