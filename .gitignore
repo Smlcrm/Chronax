@@ -143,8 +143,3 @@ docs/superpowers/
 
 # Cursor
 .cursor/
-
-# Only the agent platform settings are tracked under .claude/.
-!.claude/
-.claude/*
-!.claude/settings.json
